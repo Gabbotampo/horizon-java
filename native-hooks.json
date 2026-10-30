@@ -11,6 +11,11 @@
       "target": "horizon_client::game::native_hooks::Game<'_>::native_tick"
     },
     {
+      "name": "visuals",
+      "version": 1,
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_visuals"
+    },
+    {
       "name": "world_lifecycle",
       "version": 1,
       "target": "horizon_client::game::native_hooks::Game<'_>::native_world_lifecycle"
