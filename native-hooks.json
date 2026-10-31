@@ -16,6 +16,22 @@
       "target": "horizon_client::game::native_hooks::Game<'_>::native_world_lifecycle"
     },
     {
+      "name": "server_about_to_start",
+      "version": 1,
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_server_about_to_start",
+      "neoforge": "ServerAboutToStartEvent",
+      "side": "server",
+      "cancellable": false
+    },
+    {
+      "name": "server_stopping",
+      "version": 1,
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_server_stopping",
+      "neoforge": "ServerStoppingEvent",
+      "side": "server",
+      "cancellable": false
+    },
+    {
       "name": "server_tick",
       "version": 1,
       "target": "horizon_client::game::native_hooks::Game<'_>::native_server_tick"
@@ -239,26 +255,6 @@
       "name": "net_from_server",
       "version": 1,
       "target": "horizon_client::game::native_hooks::Game<'_>::native_net_from_server"
-    },
-    {
-      "name": "chunk_load",
-      "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_chunk_load"
-    },
-    {
-      "name": "chunk_unload",
-      "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_chunk_unload"
-    },
-    {
-      "name": "player_logged_in",
-      "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_player_logged_in"
-    },
-    {
-      "name": "player_logged_out",
-      "version": 1,
-      "target": "horizon_client::game::native_hooks::Game<'_>::native_player_logged_out"
     },
     {
       "name": "player_died",
