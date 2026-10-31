@@ -131,6 +131,11 @@
       "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity_container"
     },
     {
+      "name": "block_entity_fluids",
+      "version": 1,
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_block_entity_fluids"
+    },
+    {
       "name": "screen",
       "version": 1,
       "target": "horizon_client::game::native_hooks::Game<'_>::native_screen"
