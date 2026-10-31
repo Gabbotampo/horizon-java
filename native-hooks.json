@@ -309,6 +309,11 @@
       "name": "player_tick",
       "version": 1,
       "target": "horizon_client::game::native_hooks::Game<'_>::native_player_tick"
+    },
+    {
+      "name": "living_incoming_damage",
+      "version": 1,
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_living_incoming_damage"
     }
   ]
 }
