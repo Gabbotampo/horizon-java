@@ -251,6 +251,14 @@
       "target": "horizon_client::game::native_hooks::Game<'_>::native_mob_spawned"
     },
     {
+      "name": "entity_leave_level",
+      "version": 1,
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_entity_leave_level",
+      "neoforge": "EntityLeaveLevelEvent",
+      "side": "server",
+      "cancellable": false
+    },
+    {
       "name": "mob_killed",
       "version": 1,
       "target": "horizon_client::game::native_hooks::Game<'_>::native_mob_killed"
