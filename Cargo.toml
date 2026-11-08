@@ -14,3 +14,11 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 needless_range_loop = "allow"
 large_enum_variant = "allow"
+
+# Optimized but quick to link, matching Horizon's profile of the same name: the
+# corpus tools and CI build the probe with it.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
