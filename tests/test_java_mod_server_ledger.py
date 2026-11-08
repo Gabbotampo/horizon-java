@@ -79,9 +79,9 @@ class JavaModServerLedgerTests(unittest.TestCase):
         row = LEDGER.parse_log("starting", "slow.jar", timed_out=True, seconds=45.0)
         self.assertEqual(row.verdict, "refused")
         self.assertEqual(LEDGER.summary([row, LEDGER.Row("ok.jar", verdict="ran")]), {
-            "total": 2, "ran": 1, "refused": 1, "skipped": 0,
+            "total": 2, "ran": 1, "refused": 1, "skipped": 0, "native_ok": 1,
             "reason_categories": {"none": 1, "timeout": 1},
-            "recommendations": {"native-ok": 1, "native-gap": 1},
+            "recommendations": {"ran-hollow": 1, "native-gap": 1},
         })
 
     def test_parse_entrypoint_refusals_are_skipped_by_subtype(self):
@@ -130,9 +130,11 @@ class JavaModServerLedgerTests(unittest.TestCase):
             "gamefix.jar",
         )
         client = LEDGER.Row("client.jar", verdict="skipped", subtype="client-only", engine="refused")
+        library = LEDGER.Row("lib.jar", verdict="skipped", subtype="library", engine="refused")
         refused = LEDGER.Row("broken.jar", verdict="refused", engine="refused", reason="Metadata(bad)")
         self.assertEqual(ran.recommend, "needs-loader")
-        self.assertEqual(LEDGER.recommendation(client), "native-ok")
+        self.assertEqual(LEDGER.recommendation(client), "client-only-untested")
+        self.assertEqual(LEDGER.recommendation(library), "library")
         self.assertEqual(LEDGER.recommendation(refused), "native-gap")
 
     def test_runtime_refusal_is_the_whole_cause_and_survives_the_text_ledger(self):
@@ -170,7 +172,9 @@ class JavaModServerLedgerTests(unittest.TestCase):
         self.assertEqual((row.verdict, row.skipped), ("ran", 4))
         self.assertEqual(row.recommend, "needs-loader")
         own = dict(runtime, skipped_by_reason={"cancellable": 4})
-        self.assertEqual(LEDGER.parse_log("Done (1s)", "own.jar", runtime=own).recommend, "native-ok")
+        # No host-call count was measured for the run: it is not called clean.
+        self.assertEqual(LEDGER.parse_log("Done (1s)", "own.jar", runtime=own).recommend,
+                         "ran-hollow")
 
     def test_recommendation_prefers_loader_engine(self):
         row = LEDGER.Row("knot.jar", verdict="refused", engine="knot")
@@ -329,6 +333,110 @@ class JavaModServerLedgerTests(unittest.TestCase):
             row = LEDGER.parse_log(self._clipped_log("etf"), "etf.jar", jar=jar)
         self.assertEqual((row.verdict, row.subtype), ("skipped", "client-only"))
 
+    def test_labels_distinguish_clean_hollow_and_the_two_skips(self):
+        clean = LEDGER.Row("clean.jar", verdict="ran", unknown=0, unknown_source="probe")
+        hollow = LEDGER.Row("hollow.jar", verdict="ran", unknown=417, unknown_source="probe",
+                            unknown_top=(("demo/Host#call ()V", 400),
+                                         ("demo/Host#other (I)V", 17),
+                                         ("demo/Host#third ()I", 3)))
+        unmeasured = LEDGER.Row("unmeasured.jar", verdict="ran")
+        client = LEDGER.Row("client.jar", verdict="skipped", subtype="client-only")
+        library = LEDGER.Row("library.jar", verdict="skipped", subtype="library")
+        self.assertEqual(LEDGER.label(clean), "ran-clean")
+        self.assertEqual(LEDGER.label(hollow), "ran-hollow")
+        # No measurement is not a clean bill of health.
+        self.assertEqual(LEDGER.label(unmeasured), "ran-hollow")
+        self.assertEqual(unmeasured.unknown_source, "none")
+        self.assertEqual(LEDGER.label(client), "client-only-untested")
+        self.assertEqual(LEDGER.label(library), "library")
+        self.assertTrue(all(LEDGER.native_ok(row) for row in
+                            (clean, hollow, unmeasured, client, library)))
+        self.assertFalse(LEDGER.native_ok(LEDGER.Row("gap.jar", verdict="refused")))
+        # The label follows the count parse_log was given.
+        self.assertEqual(LEDGER.parse_log(
+            "Done (1s)", "clean.jar", unknown=0, unknown_source="probe").recommend,
+            "ran-clean")
+        self.assertEqual(LEDGER.parse_log(
+            "Done (1s)", "hollow.jar", unknown=417, unknown_source="probe").recommend,
+            "ran-hollow")
+
+    def test_unknown_host_call_fields_survive_the_text_ledger(self):
+        row = LEDGER.Row(
+            "hollow.jar", "demo", "1", "ran", engine="native-qualified",
+            unknown=3, unknown_source="probe",
+            unknown_top=(("demo/Host#call (Lnet/minecraft/A;)V", 2),
+                         ("demo/Host#other ()V", 1)))
+        text = LEDGER.format_row(row)
+        self.assertIn("unknown=3", text)
+        self.assertIn("unknown_source=probe", text)
+        self.assertIn("unknown_top=", text)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.txt"
+            path.write_text(text + "\n", encoding="utf-8")
+            [back] = LEDGER.read_ledger(path)
+        self.assertEqual((back.unknown, back.unknown_source, back.recommend),
+                         (3, "probe", "ran-hollow"))
+        self.assertEqual(back.unknown_top, row.unknown_top)
+        self.assertEqual(LEDGER.label(back), "ran-hollow")
+        # A skipped row has no host-call evidence and says so.
+        self.assertIn("unknown_source=none", LEDGER.format_row(
+            LEDGER.Row("client.jar", verdict="skipped", subtype="client-only")))
+
+    def test_an_old_native_ok_row_is_mapped_by_verdict_and_subtype(self):
+        lines = [
+            "ran.jar\trecommend=native-ok\tid=a\tverdict=ran\tskipped=0",
+            "client.jar\trecommend=native-ok\tid=b\tverdict=skipped\tsubtype=client-only",
+            "lib.jar\trecommend=native-ok\tid=c\tverdict=skipped\tsubtype=library",
+            # The older spelling, same meaning.
+            "old.jar\trecommend=native\tid=d\tverdict=ran\tskipped=0",
+            "loader.jar\trecommend=loader\tid=e\tverdict=ran\tskipped=1",
+            "gap.jar\trecommend=native-gap\tid=f\tverdict=refused\treason=Metadata(x)",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.txt"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            rows = {row.file: row for row in LEDGER.read_ledger(path)}
+        self.assertEqual(
+            [LEDGER.label(rows[name]) for name in
+             ("ran.jar", "client.jar", "lib.jar", "old.jar", "loader.jar", "gap.jar")],
+            ["ran-hollow", "client-only-untested", "library",
+             "ran-hollow", "needs-loader", "native-gap"])
+        # An old ran-row carries no host-call measurement, so it is not clean.
+        self.assertEqual(rows["ran.jar"].unknown_source, "none")
+        self.assertIsNone(rows["ran.jar"].unknown)
+
+    def test_the_probe_supplies_the_host_call_count_and_top_three(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jar = self._jar(root, "app.jar", fabric={
+                "id": "app", "version": "1", "entrypoints": {"server": ["demo.Server"]}})
+            report = {
+                "status": "ok", "unknown_host_call_count": 7,
+                "unknown_host_calls": [
+                    ["demo/Host#four ()V", 1],
+                    ["demo/Host#one (I)V", 4],
+                    ["demo/Host#three ()V", 2],
+                    ["demo/Host#two ()V", 0],
+                ],
+            }
+            probe = root / "fake-probe"
+            probe.write_text(
+                "#!/bin/sh\nprintf '%s' '" + json.dumps(report) + "'\n", encoding="utf-8")
+            probe.chmod(0o755)
+            count, source, top = LEDGER.probe_counts(probe, jar, None)
+            game = LEDGER.probe_counts(probe, jar, {
+                "file": "app.jar", "engine": "native",
+                "unknown_host_call_count": 2,
+                "unknown_host_calls": [["demo/Host#one (I)V", 2]]})
+            missing = LEDGER.probe_counts(root / "absent", jar, None)
+        self.assertEqual((count, source), (7, "probe"))
+        # The top three, most frequent first; a zero count is not a call.
+        self.assertEqual(top, (("demo/Host#one (I)V", 4), ("demo/Host#three ()V", 2),
+                               ("demo/Host#four ()V", 1)))
+        # A game-written count wins over the probe: it measured that run.
+        self.assertEqual((game[0], game[1]), (2, "game"))
+        self.assertEqual(missing, (None, "none", ()))
+
     def test_integration_requires_prepared_resources(self):
         resources = ROOT / ".local/horizon-client/26.3"
         if os.environ.get("HORIZON_LEDGER_INTEGRATION") != "1" or not resources.is_dir():
@@ -460,7 +568,7 @@ class DependencyClosureTests(unittest.TestCase):
         text = LEDGER.closure_text(log, Path("/mods/app-2.jar"), deps)
         self.assertNotIn("lib-2.jar", text)
         row = LEDGER.parse_log(text, "app-2.jar", runtime={"file": "app-2.jar", "engine": "native"})
-        self.assertEqual((row.verdict, LEDGER.label(row)), ("ran", LEDGER.NATIVE_OK))
+        self.assertEqual((row.verdict, LEDGER.label(row)), ("ran", LEDGER.RAN_HOLLOW))
         # The batch's one `skipping` line can name the jar's file as a substring of
         # a dependency's; a jar the runtime report says started is not refused.
         joined = "skipping /mods/xapp-2.jar: no native entrypoint\nDone (1.0s)!\n"
@@ -520,23 +628,34 @@ class DependencyClosureTests(unittest.TestCase):
                           reason=reason, recommend=recommend)
 
     def test_a_started_jar_turned_native_gap_is_a_regression(self):
-        before = [self._ledger_row("ok.jar", "ran", "native-ok"),
+        before = [self._ledger_row("ok.jar", "ran", "ran-clean"),
                   self._ledger_row("loader.jar", "ran", "needs-loader"),
-                  self._ledger_row("moved.jar", "ran", "native-ok"),
+                  self._ledger_row("moved.jar", "ran", "ran-clean"),
                   self._ledger_row("fixed.jar", "refused", "native-gap"),
                   self._ledger_row("absent.jar", "refused", "missing-dependency")]
         after = [self._ledger_row("ok.jar", "refused", "native-gap", "uncaught exception NPE"),
                  self._ledger_row("loader.jar", "refused", "native-gap", "Metadata(x)"),
-                 # Between the two started labels only the plan count moved.
+                 # Between ran-clean and needs-loader only the plan count moved.
                  self._ledger_row("moved.jar", "ran", "needs-loader"),
-                 self._ledger_row("fixed.jar", "ran", "native-ok"),
+                 self._ledger_row("fixed.jar", "ran", "ran-clean"),
                  self._ledger_row("absent.jar", "refused", "native-gap"),
                  self._ledger_row("new.jar", "refused", "native-gap")]
         regressions = LEDGER.label_regressions(before, after)
         self.assertEqual([(r.file, r.before, r.after) for r in regressions],
                          [("loader.jar", "ran/needs-loader", "refused/native-gap"),
-                          ("ok.jar", "ran/native-ok", "refused/native-gap")])
+                          ("ok.jar", "ran/ran-clean", "refused/native-gap")])
         self.assertIn("uncaught exception NPE", regressions[1].line())
+
+    def test_a_clean_run_turned_hollow_is_a_regression(self):
+        # The jar still runs, but now falls through unmodelled host calls (or
+        # nobody can show it does not): that is worse than a measured clean run.
+        before = [self._ledger_row("clean.jar", "ran", "ran-clean"),
+                  self._ledger_row("hollow.jar", "ran", "ran-hollow")]
+        after = [self._ledger_row("clean.jar", "ran", "ran-hollow"),
+                 self._ledger_row("hollow.jar", "ran", "ran-clean")]
+        regressions = LEDGER.label_regressions(before, after)
+        self.assertEqual([(r.file, r.before, r.after) for r in regressions],
+                         [("clean.jar", "ran/ran-clean", "ran/ran-hollow")])
 
     def test_a_jar_that_ran_and_is_refused_regresses_whatever_its_label(self):
         # A row of an older ledger with a legacy label still counts by verdict.
@@ -553,7 +672,7 @@ class DependencyClosureTests(unittest.TestCase):
             old = Path(tmp) / "old.txt"
             new = Path(tmp) / "new.txt"
             old.write_text("\n".join(LEDGER.format_row(row) for row in [
-                self._ledger_row("a.jar", "ran", "native-ok"),
+                self._ledger_row("a.jar", "ran", "ran-clean"),
                 self._ledger_row("b.jar", "ran", "needs-loader")]) + "\n", encoding="utf-8")
             new.write_text("\n".join(LEDGER.format_row(row) for row in [
                 self._ledger_row("a.jar", "refused", "native-gap", "uncaught exception boom"),
@@ -563,7 +682,7 @@ class DependencyClosureTests(unittest.TestCase):
                 worse = LEDGER.main(["--from", str(new), "--compare-to", str(old)])
             self.assertEqual(worse, 1)
             self.assertIn("compared 2 jar(s)", err.getvalue())
-            self.assertIn("a.jar: ran/native-ok -> refused/native-gap: uncaught exception boom",
+            self.assertIn("a.jar: ran/ran-clean -> refused/native-gap: uncaught exception boom",
                           err.getvalue())
             self.assertNotIn("b.jar:", err.getvalue())
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

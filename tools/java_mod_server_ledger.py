@@ -1,19 +1,45 @@
 #!/usr/bin/env python3
 """Run one Horizon dedicated-server process per Java mod and record outcomes.
 
-Every row ends in one of three labels: `native-ok` (the server runs the jar, and the
-plans it skips stay inside the jar), `needs-loader` (it runs, but its mixin plans
-target game classes, which only a real loader applies) or `native-gap` (native
-execution refuses it yet). `--table` prints the label table, and `--docs PATH`
-rewrites the generated block of `docs/java-mod-compat-status.md` between its
-`java-mod-ledger` markers. `--from PATH` reads an earlier text ledger instead of
-starting servers, so a table can be regenerated without a jar set.
+Every row ends in one honest label:
+
+* `ran-clean`: the server ran its entrypoint to `Done (`, the run fell through no
+  unmodelled host call, and no server-side plan targets a game class;
+* `ran-hollow`: it ran to `Done (`, but at least one unmodelled host call returned
+  the host's neutral value instead of refusing (the row records how many and the
+  three most frequent calls), or the count could not be measured;
+* `client-only-untested`: the server skipped it because it is client-only. The
+  server ledger says nothing about whether it works;
+* `library`: the server skipped it because it has no entrypoint of its own;
+* `needs-loader`: it ran, but its mixin plans target game classes, which only a
+  real loader applies;
+* `native-gap`: native execution refuses it yet;
+* `missing-dependency` (`--with-deps` only): its closure needs an id no corpus jar
+  provides, so no loader would start it and it was not run.
+
+The four native-ok labels (`ran-clean`, `ran-hollow`, `client-only-untested`,
+`library`) are what the old single `native-ok` label meant: the phase gate treats them
+as not-gaps, but the docs and summary count them separately so "the server ran it" is
+never confused with "the server skipped it" or "it ran but leaned on neutral answers".
+
+A ledger written before those labels existed is read back by its verdict and subtype:
+an old `native-ok` row becomes `ran-hollow` when it ran (no host-call count was
+recorded, so it is not silently called clean), `client-only-untested` or `library`
+when the server skipped it, and never `ran-clean`.
+
+`--table` prints the label table, and `--docs PATH` rewrites the generated block of
+`docs/java-mod-compat-status.md` between its `java-mod-ledger` markers. `--from PATH`
+reads an earlier text ledger instead of starting servers, so a table can be
+regenerated without a jar set.
 
 The game's dedicated log names a started jar's engine but no identity or plan counts,
 so a run also reads the `java-runtime.json` that role writes under the scratch home,
 and asks `horizon-native-java --mixin-plans` how many of the jar's plans name a class
-the jar does not hold (the `target-outside-jar` count the label needs). A jar the log
-names after `skipping` did not start, whatever else the process reached.
+the jar does not hold (the `target-outside-jar` count the label needs). The runtime
+report carries no unmodelled-host-call count yet, so a started jar's count comes from
+the probe (`horizon-native-java --json <jar> <kind>`): the row says which source it
+used (`unknown_source=game|probe|none`). A jar the log names after `skipping` did not
+start, whatever else the process reached.
 
 `--with-deps` runs each jar together with its declared dependency closure, the way a
 real loader would refuse to load it without one: the required ids of its
@@ -29,9 +55,10 @@ labelled `--rerun-label` (default `native-gap`).
 
 `--compare-to LEDGER` guards against silent regressions: after the ledger is built
 (or read with `--from`), every jar that LEDGER also holds is compared, and the tool
-exits 1 listing each one whose outcome got worse: a jar that started (`native-ok`
-or `needs-loader`) now `native-gap`, or a jar that ran now refused. Jars only one
-side holds, and a move to `missing-dependency` (no native cause), are not compared.
+exits 1 listing each one whose outcome got worse: a jar that started (`ran-clean`,
+`ran-hollow` or `needs-loader`) now `native-gap`, a jar that ran now refused, or a
+`ran-clean` row now `ran-hollow`. Jars only one side holds, and a move to
+`missing-dependency` (no native cause), are not compared.
 """
 
 from __future__ import annotations
@@ -61,18 +88,46 @@ MAX_REASON = 240
 MAX_CAUSE = 2048
 MAX_TABLE_REASON = 80
 
-# The three answers a row can give. `native-ok` runs natively; `needs-loader` runs
-# but its skipped plans target game classes the weaver cannot rewrite, so only a
-# real loader applies them; `native-gap` is refused before it runs.
-NATIVE_OK = "native-ok"
+# The answers a row can give. `ran-clean` is the only one that says the server ran
+# the jar without leaning on unmodelled host calls; `ran-hollow` says it ran to
+# `Done (` but a call the host does not model returned a neutral value; the two
+# skip labels say the server never ran it at all. `needs-loader` runs but its
+# skipped plans target game classes the weaver cannot rewrite; `native-gap` is
+# refused before it runs.
+RAN_CLEAN = "ran-clean"
+RAN_HOLLOW = "ran-hollow"
+CLIENT_ONLY_UNTESTED = "client-only-untested"
+LIBRARY = "library"
 NEEDS_LOADER = "needs-loader"
 NATIVE_GAP = "native-gap"
 # Only `--with-deps` writes this one: the jar's declared closure needs an id no corpus
 # jar provides, so no loader (native or real) would start it and it was not run.
 MISSING_DEPENDENCY = "missing-dependency"
-LABELS = (NATIVE_OK, NEEDS_LOADER, NATIVE_GAP, MISSING_DEPENDENCY)
-# Labels earlier runs wrote; `read_ledger` normalises them.
-LEGACY_LABELS = {"native": NATIVE_OK, "loader": NEEDS_LOADER}
+LABELS = (RAN_CLEAN, RAN_HOLLOW, NEEDS_LOADER, CLIENT_ONLY_UNTESTED, LIBRARY,
+          NATIVE_GAP, MISSING_DEPENDENCY)
+# What the retired `native-ok` label meant for the phase gates: the jar was not a
+# gap. The four labels are reported separately, but a gate still counts their sum.
+NATIVE_OK_LABELS = (RAN_CLEAN, RAN_HOLLOW, CLIENT_ONLY_UNTESTED, LIBRARY)
+# The labels earlier runs wrote. `native-ok` is mapped by verdict and subtype in
+# `legacy_label`, not here, because one stored label stood for four outcomes.
+LEGACY_NATIVE_LABELS = frozenset({"native", "native-ok"})
+LEGACY_LABELS = {"loader": NEEDS_LOADER}
+
+
+def legacy_label(stored: str, verdict: str, subtype: str) -> str:
+    """Map a stored label from an older ledger to today's honest one.
+
+    An old `native-ok` row that ran becomes `ran-hollow`: that ledger recorded no
+    unmodelled-host-call count, so calling it `ran-clean` would claim a check
+    nobody made. An old skipped row keeps what its subtype said.
+    """
+    if stored in LEGACY_NATIVE_LABELS:
+        if verdict == "skipped" and subtype == "client-only":
+            return CLIENT_ONLY_UNTESTED
+        if verdict == "skipped" and subtype == "library":
+            return LIBRARY
+        return RAN_HOLLOW
+    return LEGACY_LABELS.get(stored, stored)
 
 # The generated table in docs/java-mod-compat-status.md lives between these two lines.
 DOC_START = "<!-- java-mod-ledger:start -->"
@@ -138,6 +193,12 @@ class Row:
     # label stays the jar's (native execution still cannot carry the pack); this says
     # whose code to fix.
     blocked_in: str = ""
+    # Unmodelled host calls a started jar's run fell through to: the count, where the
+    # number came from (`probe`, `game`, or `none` when nobody measured it), and the
+    # three most frequent calls (`owner#name descriptor`, count).
+    unknown: int | None = None
+    unknown_source: str = "none"
+    unknown_top: tuple[tuple[str, int], ...] = ()
 
 
 def bounded(value: str, limit: int = MAX_REASON) -> str:
@@ -487,9 +548,99 @@ def outside_plans(probe: Path | None, jar: Path, report: dict) -> int:
     return count
 
 
+def entrypoint_kind(entrypoints: JarEntrypoints | None) -> str | None:
+    """The entrypoint kind the dedicated server would run, or None.
+
+    `entrypoint_role.rs` tries Fabric's `server` then `main`; a jar with no Fabric
+    metadata runs its NeoForge `@Mod` classes. The probe needs the same kind to
+    execute what the game executed.
+    """
+    if entrypoints is None:
+        return None
+    if "server" in entrypoints.kinds:
+        return "server"
+    if "main" in entrypoints.kinds:
+        return "main"
+    if entrypoints.neoforge:
+        return "neoforge"
+    return None
+
+
+def top_unknown_calls(calls: object, limit: int = 3) -> tuple[tuple[str, int], ...]:
+    """The most frequent `(call, count)` rows of a probe or runtime report."""
+    pairs = []
+    for item in calls if isinstance(calls, list) else ():
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        name, count = item
+        if isinstance(count, int) and count > 0:
+            pairs.append((str(name), count))
+    pairs.sort(key=lambda pair: (-pair[1], pair[0]))
+    return tuple(pairs[:limit])
+
+
+def runtime_unknown(runtime: dict | None) -> tuple[int, tuple[tuple[str, int], ...]] | None:
+    """A started jar's unknown-host-call count from its `java-runtime.json` row.
+
+    The game does not write the count today (schema 1 has no field for it), but a
+    later writer that does must win over the probe: it measured the run the label
+    describes, not a re-run.
+    """
+    if not isinstance(runtime, dict):
+        return None
+    count = runtime.get("unknown_host_call_count")
+    if not isinstance(count, int) or count < 0:
+        return None
+    return count, top_unknown_calls(runtime.get("unknown_host_calls"))
+
+
+def probe_unknown(probe: Path | None, jar: Path) -> tuple[int, tuple[tuple[str, int], ...]] | None:
+    """Re-run the jar's server entrypoint through the probe for its host-call count.
+
+    The probe seeds a bare host of its own, so its count can exceed the game's (the
+    game models more of its own surface), but it is the only measurement available
+    and a non-zero count is a fact about the jar's code. `None` means no probe, no
+    matching entrypoint, or a probe that did not finish: the row then records
+    `unknown_source=none` and stays `ran-hollow` rather than claiming zero.
+    """
+    if probe is None or not probe.is_file():
+        return None
+    kind = entrypoint_kind(read_jar_entrypoints(jar))
+    if kind is None:
+        return None
+    try:
+        result = subprocess.run(
+            [str(probe), "--json", str(jar), kind],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        report = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if not isinstance(report, dict) or report.get("status") != "ok":
+        return None
+    count = report.get("unknown_host_call_count")
+    if not isinstance(count, int) or count < 0:
+        return None
+    return count, top_unknown_calls(report.get("unknown_host_calls"))
+
+
+def probe_counts(probe: Path | None, jar: Path, runtime: dict | None) -> tuple[int | None, str,
+                                                                          tuple[tuple[str, int], ...]]:
+    """`(count, source, top three)` for a jar the server started."""
+    measured = runtime_unknown(runtime)
+    if measured is not None:
+        return measured[0], "game", measured[1]
+    measured = probe_unknown(probe, jar)
+    if measured is not None:
+        return measured[0], "probe", measured[1]
+    return None, "none", ()
+
+
 def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool = False,
               exit_code: int | None = None, jar: Path | None = None,
-              runtime: dict | None = None, game_plans: int = 0) -> Row:
+              runtime: dict | None = None, game_plans: int = 0,
+              unknown: int | None = None, unknown_source: str = "none",
+              unknown_top: tuple[tuple[str, int], ...] = ()) -> Row:
     """Extract the stable fields the dedicated role's log and runtime report carry.
 
     `runtime` is the jar's `java-runtime.json` row: a started jar's carries the
@@ -628,35 +779,55 @@ def parse_log(text: str, filename: str, *, seconds: float = 0.0, timed_out: bool
             # than leaving the row's engine unknown.
             engine = "refused"
     row = Row(filename, ident, version, verdict, subtype, engine, woven, skipped,
-              reason, round(seconds, 3), skip_reasons, game_plans)
+              reason, round(seconds, 3), skip_reasons, game_plans,
+              unknown=unknown, unknown_source=unknown_source, unknown_top=unknown_top)
     return Row(filename, ident, version, verdict, subtype, engine, woven, skipped,
-               reason, round(seconds, 3), skip_reasons, game_plans, recommendation(row))
+               reason, round(seconds, 3), skip_reasons, game_plans, recommendation(row),
+               unknown=unknown, unknown_source=unknown_source, unknown_top=unknown_top)
 
 
 LOADER_SKIP_REASONS = {"target-outside-jar", "target-missing", "game-class"}
 
 
 def recommendation(row: Row) -> str:
-    """Choose the next compatibility path from the stable server outcome."""
+    """Choose the honest label from the stable server outcome.
+
+    A `ran` row is `ran-clean` only when something measured zero unmodelled host
+    calls. Without a measurement (`unknown` is None) it stays `ran-hollow`: the
+    run may have fallen through a call nobody counted, and a label that says
+    otherwise would be a claim the ledger cannot support.
+    """
     if row.verdict == "unresolved":
         return MISSING_DEPENDENCY
     if row.engine.lower() in {"loader", "jvm", "knot"}:
         return NEEDS_LOADER
-    if row.verdict == "skipped" and row.subtype in {"client-only", "library"}:
-        return NATIVE_OK
+    if row.verdict == "skipped":
+        if row.subtype == "client-only":
+            return CLIENT_ONLY_UNTESTED
+        if row.subtype == "library":
+            return LIBRARY
+        # A skip with no subtype is still a jar the server did not run.
+        return LIBRARY
     if row.verdict == "ran":
         loader_skips = row.game_plans or sum(
             reason.lower() in LOADER_SKIP_REASONS for reason in row.skip_reasons)
         if row.skipped and loader_skips * 2 >= row.skipped and loader_skips:
             return NEEDS_LOADER
-        return NATIVE_OK
+        if row.unknown_source == "none" or row.unknown is None or row.unknown > 0:
+            return RAN_HOLLOW
+        return RAN_CLEAN
     return NATIVE_GAP
 
 
 def label(row: Row) -> str:
     """The row's stored label, normalised; `recommendation` when it has none."""
-    stored = LEGACY_LABELS.get(row.recommend, row.recommend)
+    stored = legacy_label(row.recommend, row.verdict, row.subtype)
     return stored if stored in LABELS else recommendation(row)
+
+
+def native_ok(row: Row) -> bool:
+    """Whether the row is one of the four labels the old `native-ok` stood for."""
+    return label(row) in NATIVE_OK_LABELS
 
 
 def own_reason(reason: str) -> str:
@@ -711,6 +882,9 @@ def summary(rows: list[Row]) -> dict[str, object]:
         "ran": sum(row.verdict == "ran" for row in rows),
         "refused": sum(row.verdict == "refused" for row in rows),
         "skipped": sum(row.verdict == "skipped" for row in rows),
+        # What the retired `native-ok` counted, so a phase gate still reads one
+        # number while the four label counts below say what it is made of.
+        "native_ok": sum(native_ok(row) for row in rows),
         "reason_categories": {category: sum(reason_category(row) == category for row in rows)
                               for category in categories},
         "recommendations": {value: sum(label(row) == value for row in rows)
@@ -720,18 +894,22 @@ def summary(rows: list[Row]) -> dict[str, object]:
 
 # What each label asks a player or maintainer to do.
 MEANING = {
-    NATIVE_OK: "the dedicated server runs it on its own",
+    RAN_CLEAN: "the dedicated server ran its entrypoint to `Done (` with no unmodelled host call",
+    RAN_HOLLOW: "it ran to `Done (`, but calls the host does not model returned neutral values",
     NEEDS_LOADER: "it runs, but its plans target the game, so only a real loader applies them",
+    CLIENT_ONLY_UNTESTED: "client-only: the server skipped it, so this ledger says nothing about it working",
+    LIBRARY: "no server entrypoint of its own: the server skipped it",
     NATIVE_GAP: "native execution cannot carry it yet",
     MISSING_DEPENDENCY: "it requires a mod no corpus jar provides, so no loader starts it; not run",
 }
 
 # The clause a row adds to its label's `why`, in the generated summary table.
 CAUSE_TEXT = {
-    (NATIVE_OK, "ran-clean"): "ran with no plan skipped",
-    (NATIVE_OK, "ran"): "ran, every skipped plan stayed inside the jar",
-    (NATIVE_OK, "client-only"): "client-only (the server role has no entrypoint to run)",
-    (NATIVE_OK, "library"): "libraries (nothing for the server to execute)",
+    (RAN_CLEAN, "ran-clean"): "ran to Done with no unmodelled host call",
+    (RAN_HOLLOW, "hollow"): "ran to Done, but fell through unmodelled host calls",
+    (RAN_HOLLOW, "hollow-unmeasured"): "ran to Done; the unmodelled-host-call count was not recorded",
+    (CLIENT_ONLY_UNTESTED, "client-only"): "client-only (the server role never ran it)",
+    (LIBRARY, "library"): "libraries (nothing for the server to execute)",
     (NEEDS_LOADER, "game-plans"): "ran, but their skipped plans target the game",
     (NEEDS_LOADER, "loader-engine"): "ran through the reference loader",
     (NATIVE_GAP, "metadata"): "refused while decoding metadata",
@@ -766,13 +944,26 @@ GAP_TEXT = {
 def cause_key(row: Row) -> str:
     """The bucket a row contributes to in its label's `why`."""
     kind = label(row)
-    if kind == NATIVE_OK:
-        if row.verdict == "skipped" and row.subtype:
-            return row.subtype
-        return "ran" if row.skipped else "ran-clean"
+    if kind == RAN_CLEAN:
+        return "ran-clean"
+    if kind == RAN_HOLLOW:
+        return "hollow" if row.unknown_source != "none" and row.unknown else "hollow-unmeasured"
+    if kind == CLIENT_ONLY_UNTESTED:
+        return "client-only"
+    if kind == LIBRARY:
+        return "library"
     if kind == NEEDS_LOADER:
         return "game-plans" if row.verdict == "ran" and row.skipped else "loader-engine"
     return reason_category(row)
+
+
+def unknown_text(row: Row) -> str:
+    """The unmodelled-host-call clause of a row's `why`."""
+    if row.unknown_source == "none" or row.unknown is None:
+        return "the unmodelled-host-call count was not recorded (`unknown_source=none`)"
+    top = ", ".join(f"`{name}` ×{count}" for name, count in row.unknown_top[:3])
+    measured = f"{row.unknown} unmodelled host call(s), {row.unknown_source}-measured"
+    return f"{measured}: {top}" if top else measured
 
 
 def why(row: Row) -> str:
@@ -783,13 +974,18 @@ def why(row: Row) -> str:
                 f" (`target-outside-jar`)"
                 if row.verdict == "ran" and row.skipped
                 else "ran through the reference loader")
-    if kind == NATIVE_OK:
-        if row.subtype == "client-only":
-            return "client-only: no server-role entrypoint"
-        if row.subtype == "library":
-            return "library: nothing for the server to execute"
-        return (f"ran; {row.skipped} plan(s) skipped, none aimed at the game"
-                if row.skipped else "ran; no plan skipped")
+    if kind == RAN_CLEAN:
+        plans = (f"; {row.skipped} plan(s) skipped, none aimed at the game"
+                 if row.skipped else "; no plan skipped")
+        return f"ran to Done; no unmodelled host call{plans}"
+    if kind == RAN_HOLLOW:
+        plans = (f"; {row.skipped} plan(s) skipped, none aimed at the game"
+                 if row.skipped else "")
+        return f"ran to Done, but {unknown_text(row)}{plans}"
+    if kind == CLIENT_ONLY_UNTESTED:
+        return "client-only: the server never ran it, so it is untested"
+    if kind == LIBRARY:
+        return "library: nothing for the server to execute"
     text = GAP_TEXT[reason_category(row)]
     if row.blocked_in:
         text += f" in `{row.blocked_in}`'s code"
@@ -832,9 +1028,20 @@ def compat_table(rows: list[Row], *, source: str = "", per_jar_limit: int = 60) 
         parts = [f"{count} {CAUSE_TEXT.get((kind, cause), cause)}"
                  for cause, count in sorted(causes[kind].items(), key=lambda item: (-item[1], item[0]))]
         lines.append(f"| `{kind}` | {counts[kind]} | {MEANING[kind]} | {'; '.join(parts)} |")
-    rest = sorted((row for row in rows if label(row) != NATIVE_OK),
-                  key=lambda row: (LABELS.index(label(row)), row.file))
-    lines.extend(["", f"**Jars that are not `native-ok` ({len(rest)}).**", ""])
+    # The summary table already counts the skipped jars; the per-jar table keeps
+    # the rows where something ran (clean or hollow) or failed, so a 100-row
+    # client-only list does not push the refusals out of it.
+    # Refusals and loader-only rows come first: with the table's row limit they
+    # must not be pushed out by a long tail of hollow runs.
+    order = {NATIVE_GAP: 0, MISSING_DEPENDENCY: 0, NEEDS_LOADER: 1, RAN_HOLLOW: 2}
+    rest = sorted((row for row in rows if label(row) not in (RAN_CLEAN, CLIENT_ONLY_UNTESTED,
+                                                             LIBRARY)),
+                  key=lambda row: (order.get(label(row), 3), row.file))
+    skipped = (sum(label(row) == CLIENT_ONLY_UNTESTED for row in rows),
+               sum(label(row) == LIBRARY for row in rows))
+    lines.extend(["", f"**Jars that did not run clean ({len(rest)}).**  "
+                  f"{skipped[0]} `client-only-untested` and {skipped[1]} `library` "
+                  "row(s) ran nothing and are counted in the table above, not listed here.", ""])
     if rest:
         lines.extend(["| Jar | Label | Why |", "|---|---|---|"])
         for row in rest[:per_jar_limit]:
@@ -854,7 +1061,7 @@ def compat_table(rows: list[Row], *, source: str = "", per_jar_limit: int = 60) 
             lines.append("")
             lines.append(f"_{len(rest) - per_jar_limit} more row(s) are in the ledger, not this table._")
     else:
-        lines.append("_None: every jar in this run is `native-ok`._")
+        lines.append("_None: every jar in this run is `ran-clean`._")
     return "\n".join(lines) + "\n"
 
 
@@ -872,8 +1079,24 @@ def write_docs(path: Path, block: str) -> bool:
     return True
 
 
+def unknown_pairs(value: str) -> tuple[tuple[str, int], ...]:
+    """Parse `unknown_top=`'s `call=count|call=count` list."""
+    pairs = []
+    for item in value.split("|"):
+        name, separator, count = item.rpartition("=")
+        if separator and name and count.isdigit():
+            pairs.append((name, int(count)))
+    return tuple(pairs)
+
+
 def read_ledger(path: Path) -> list[Row]:
-    """Rows from an earlier `format_row` text ledger, labels normalised."""
+    """Rows from an earlier `format_row` text ledger, labels normalised.
+
+    A ledger written before the honest labels is mapped from its verdict and
+    subtype by `legacy_label`: an old `native-ok` ran-row becomes `ran-hollow`
+    with `unknown_source=none`, never `ran-clean`. The stored label of a newer
+    row is kept as written.
+    """
     rows = []
     for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
         if not line.strip() or line.startswith("summary\t"):
@@ -883,13 +1106,23 @@ def read_ledger(path: Path) -> list[Row]:
             continue
         values = dict(field.partition("=")[::2] for field in fields[1:])
         stored = values.get("recommend", "")
+        verdict = values.get("verdict", "refused")
+        subtype = values.get("subtype", "")
+        unknown_value = values.get("unknown", "")
+        try:
+            unknown = int(unknown_value) if unknown_value else None
+        except ValueError as error:
+            raise ValueError(f"{path}:{number}: unknown is not a number ({error})") from error
+        unknown_source = values.get("unknown_source", "none") or "none"
+        if unknown_source not in ("game", "probe", "none"):
+            raise ValueError(f"{path}:{number}: unknown unknown_source {unknown_source!r}")
         try:
             rows.append(Row(
                 fields[0],
                 values.get("id", "?"),
                 values.get("version", "?"),
-                values.get("verdict", "refused"),
-                values.get("subtype", ""),
+                verdict,
+                subtype,
                 values.get("engine", "?"),
                 int(values.get("woven", "0") or 0),
                 int(values.get("skipped", "0") or 0),
@@ -897,10 +1130,13 @@ def read_ledger(path: Path) -> list[Row]:
                 float(values.get("seconds", "0") or 0),
                 (),
                 0,
-                LEGACY_LABELS.get(stored, stored),
+                legacy_label(stored, verdict, subtype) if stored else "",
                 id_list(values.get("deps", "")),
                 id_list(values.get("dep_refused", "")),
                 values.get("blocked_in", ""),
+                unknown,
+                unknown_source,
+                unknown_pairs(values.get("unknown_top", "")),
             ))
         except (ValueError, IndexError) as error:
             raise ValueError(f"{path}:{number}: not a ledger row ({error})") from error
@@ -920,17 +1156,18 @@ class Regression:
 
 
 # Labels of a jar the server started; losing one of them is a regression.
-STARTED_LABELS = (NATIVE_OK, NEEDS_LOADER)
+STARTED_LABELS = (RAN_CLEAN, RAN_HOLLOW, NEEDS_LOADER)
 
 
 def label_regressions(baseline: list[Row], fresh: list[Row]) -> list[Regression]:
     """The rows of `fresh` worse than the same file's row in `baseline`, by file.
 
-    Worse is `native-ok`/`needs-loader` becoming `native-gap`, or `ran` becoming
-    `refused`. A label moving between the two started labels is not a regression
-    (the plan count moved, not native execution), and neither is a move to
-    `missing-dependency`, which says a requirement is absent, not that native
-    execution failed.
+    Worse is `ran-clean`/`ran-hollow`/`needs-loader` becoming `native-gap`, `ran`
+    becoming `refused`, or a `ran-clean` row becoming `ran-hollow` (the run now
+    falls through unmodelled host calls, or nobody can show it does not). A move
+    between `ran-hollow` and `needs-loader` is not a regression: the plan count
+    moved, not native execution. Neither is a move to `missing-dependency`, which
+    says a requirement is absent, not that native execution failed.
     """
     before = {row.file: row for row in baseline}
     found = []
@@ -938,11 +1175,13 @@ def label_regressions(baseline: list[Row], fresh: list[Row]) -> list[Regression]
         old = before.get(row.file)
         if old is None:
             continue
-        lost_start = label(old) in STARTED_LABELS and label(row) == NATIVE_GAP
+        old_label, new_label = label(old), label(row)
+        lost_start = old_label in STARTED_LABELS and new_label == NATIVE_GAP
         lost_run = old.verdict == "ran" and row.verdict == "refused"
-        if lost_start or lost_run:
-            found.append(Regression(row.file, f"{old.verdict}/{label(old)}",
-                                    f"{row.verdict}/{label(row)}", row.reason))
+        hollowed = old_label == RAN_CLEAN and new_label == RAN_HOLLOW
+        if lost_start or lost_run or hollowed:
+            found.append(Regression(row.file, f"{old.verdict}/{old_label}",
+                                    f"{row.verdict}/{new_label}", row.reason))
     return found
 
 
@@ -1089,6 +1328,13 @@ def run_one(binary: Path, resources: Path, jar: Path, *, timeout: float, port: i
         row = parse_log(closure_text(text, jar, deps), jar.name,
                         seconds=time.monotonic() - start, timed_out=timed_out,
                         exit_code=proc.returncode, jar=jar, runtime=runtime, game_plans=plans)
+        if started and row.verdict == "ran":
+            # The game's runtime row has no host-call count yet, so the probe
+            # measures it; the row says which source answered.
+            unknown, unknown_source, unknown_top = probe_counts(probe, jar, runtime)
+            row = replace(row, unknown=unknown, unknown_source=unknown_source,
+                          unknown_top=unknown_top)
+            row = replace(row, recommend=recommendation(row))
         if closure is None:
             return row
         blocked = (blocking_dependency(row.reason, jar, closure.jars, closure.ids)
@@ -1104,6 +1350,13 @@ def format_row(row: Row) -> str:
               f"engine={row.engine}", f"woven={row.woven}", f"skipped={row.skipped}",
               f"reason={bounded(row.reason, MAX_CAUSE)}", f"recommend={label(row)}",
               f"seconds={row.seconds:.3f}"]
+    # The host-call evidence a label rests on: an unmeasured row says so.
+    if row.unknown is not None:
+        values.append(f"unknown={row.unknown}")
+    values.append(f"unknown_source={row.unknown_source}")
+    if row.unknown_top:
+        values.append("unknown_top=" + "|".join(
+            f"{name}={count}" for name, count in row.unknown_top))
     # Only a `--with-deps` row names a closure, so a one-jar ledger keeps its format.
     if row.deps:
         values.append(f"deps={','.join(row.deps)}")

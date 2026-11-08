@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Partition a Java mod pack for a hybrid native + Fabric-loader session.
 
-The server ledger (`tools/java_mod_server_ledger.py`) labels every jar
-`native-ok`, `needs-loader` or `native-gap`. This tool turns those labels into
-an experiment:
+The server ledger (`tools/java_mod_server_ledger.py`) labels every jar with what the
+server actually did: `ran-clean`, `ran-hollow`, `client-only-untested`, `library`,
+`needs-loader` or `native-gap` (`missing-dependency` with `--with-deps`). This tool
+turns those labels into an experiment:
 
-* `native-ok` jars run through Horizon's native Java path;
+* the four non-gap labels (`ran-clean`, `ran-hollow`, `client-only-untested`,
+  `library`) are what `native-ok` used to mean; those jars run through Horizon's
+  native Java path, and the coverage reports each label separately;
 * `needs-loader` jars run through the real Fabric loader, together with the
   dependency closure the loader half needs (a jar may therefore run in both
   halves — the two runtimes are separate processes);
@@ -19,7 +22,8 @@ both halves (hybrid) on a real pack, and reports how many mods actually ran.
 
 `--coverage` turns the same ledgers into a tier-coverage ledger over whole
 corpora (`corpus-xl`, `mega`): every jar is `native-ok`, `needs-loader` or
-`native-gap`, and a `needs-loader` row only counts when a real Fabric loader
+`native-gap`, with the four `native-ok` labels counted under that tier, and a
+`needs-loader` row only counts when a real Fabric loader
 launch lists the jar and reaches `Done`. `--measure-proof` drives those loader
 launches for the rows that have no proof yet, batching a jar with its declared
 dependency closure and splitting a batch that cannot boot. `--docs` writes the
@@ -58,19 +62,48 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lab  # noqa: E402
 
-# The labels the server ledger writes. Older ledgers used `native` and
-# `loader`; `read_ledger` normalises both. `--with-deps` adds
-# `missing-dependency`: the jar's declared closure needs an id no corpus jar
-# provides, so the ledger never started it. Any loader refuses such a jar too,
-# so it stays out of both halves and is never sent for loader proof; coverage
-# counts it as uncovered with a "missing dependency" cause, not as a native
-# refusal.
-NATIVE_OK = "native-ok"
+# The honest labels the server ledger writes. `native-ok` is a *tier* here (the
+# phase-gate answer: the jar is not a gap), and the ledger's four non-gap labels
+# say what the server actually did: ran clean, ran but fell through unmodelled
+# host calls, was skipped as client-only, or was skipped as a library.
+# `needs-loader` runs but the real loader applies its game-class plans;
+# `native-gap` is refused; `--with-deps` adds `missing-dependency`: the jar's
+# declared closure needs an id no corpus jar provides, so the ledger never
+# started it. Any loader refuses such a jar too, so it stays out of both halves
+# and is never sent for loader proof; coverage counts it as uncovered with a
+# "missing dependency" cause, not as a native refusal.
+RAN_CLEAN = "ran-clean"
+RAN_HOLLOW = "ran-hollow"
+CLIENT_ONLY_UNTESTED = "client-only-untested"
+LIBRARY = "library"
 NEEDS_LOADER = "needs-loader"
 NATIVE_GAP = "native-gap"
 MISSING_DEPENDENCY = "missing-dependency"
-LABELS = (NATIVE_OK, NEEDS_LOADER, NATIVE_GAP, MISSING_DEPENDENCY)
-LEGACY_LABELS = {"native": NATIVE_OK, "loader": NEEDS_LOADER}
+LABELS = (RAN_CLEAN, RAN_HOLLOW, NEEDS_LOADER, CLIENT_ONLY_UNTESTED, LIBRARY,
+          NATIVE_GAP, MISSING_DEPENDENCY)
+# The four labels the retired `native-ok` stood for; the phase gates count their
+# sum, the summary and the docs report each one separately.
+NATIVE_OK_LABELS = frozenset({RAN_CLEAN, RAN_HOLLOW, CLIENT_ONLY_UNTESTED, LIBRARY})
+# The coverage tier: a jar in it is not a phase-1 gap.
+NATIVE_OK = "native-ok"
+# Older ledgers used `native`/`native-ok` and `loader`; `read_ledger` maps them.
+LEGACY_NATIVE_LABELS = frozenset({"native", "native-ok"})
+LEGACY_LABELS = {"loader": NEEDS_LOADER}
+
+
+def legacy_label(stored: str, verdict: str, subtype: str) -> str:
+    """Map a stored label from an older ledger to today's honest one.
+
+    An old `native-ok` row that ran becomes `ran-hollow`: nothing in that ledger
+    measured unmodelled host calls, so it is not silently called clean.
+    """
+    if stored in LEGACY_NATIVE_LABELS:
+        if verdict == "skipped" and subtype == "client-only":
+            return CLIENT_ONLY_UNTESTED
+        if verdict == "skipped" and subtype == "library":
+            return LIBRARY
+        return RAN_HOLLOW
+    return LEGACY_LABELS.get(stored, stored)
 
 # Ids the loader/game itself provides, so no pack jar has to carry them.
 PLATFORM_IDS = frozenset({
@@ -110,6 +143,12 @@ class LedgerRow:
     verdict: str = ""
     skipped: int = 0
     reason: str = ""
+    # The server ledger's `subtype` (an old ledger's `native-ok` needs it to say
+    # whether the skip was client-only or a library), and the host-call evidence
+    # behind a `ran-clean`/`ran-hollow` label.
+    subtype: str = ""
+    unknown: int | None = None
+    unknown_source: str = "none"
 
 
 def file_digest(path: Path) -> str:
@@ -151,16 +190,24 @@ def read_ledger(path: Path) -> dict[str, LedgerRow]:
             continue
         values = dict(field.partition("=")[::2] for field in fields[1:])
         stored = values.get("recommend", "")
-        label = LEGACY_LABELS.get(stored, stored)
+        verdict = values.get("verdict", "")
+        subtype = values.get("subtype", "")
+        label = legacy_label(stored, verdict, subtype)
         if label not in LABELS:
             raise ValueError(f"{path}:{number}: unknown label {stored!r}")
         try:
             skipped = int(values.get("skipped", "0") or 0)
         except ValueError as error:
             raise ValueError(f"{path}:{number}: skipped is not a number ({error})") from error
+        unknown_value = values.get("unknown", "")
+        try:
+            unknown = int(unknown_value) if unknown_value else None
+        except ValueError as error:
+            raise ValueError(f"{path}:{number}: unknown is not a number ({error})") from error
         rows[fields[0]] = LedgerRow(
             fields[0], label, values.get("id", "?"), values.get("version", "?"),
-            values.get("verdict", ""), skipped, values.get("reason", ""),
+            verdict, skipped, values.get("reason", ""), subtype, unknown,
+            values.get("unknown_source", "none") or "none",
         )
     if not rows:
         raise ValueError(f"{path}: no ledger rows")
@@ -537,7 +584,7 @@ def partition_pack(pack: Path, rows: dict[str, LedgerRow], *,
     for jar in jars:
         if jar.row is None:
             result.unlabelled.append(jar)
-        elif jar.row.label == NATIVE_OK:
+        elif jar.row.label in NATIVE_OK_LABELS:
             result.native.append(jar)
         elif jar.row.label == NEEDS_LOADER or (jar.row.label == NATIVE_GAP and (
                 gap_to_loader or jar.row.file in (loader_proven or ()))) or (
@@ -951,7 +998,7 @@ def parse_loader(text: str, jars: list[PackJar], requested: int) -> dict[str, ob
     # Count the jars the loader half was created for, not the native-ok
     # dependencies closure added to make them boot.
     wanted = {jar.mod_id.lower() for jar in jars
-              if jar.label != NATIVE_OK and not jar.declaration.error}
+              if jar.label not in NATIVE_OK_LABELS and not jar.declaration.error}
     loaded = tuple(sorted(ident for ident in listing if ident.lower() in wanted))
     audit = ""
     applied = 0
@@ -1277,7 +1324,9 @@ def classify_jar(corpus: str, jar: PackJar, digest: str,
     label = row.label if row else "unlabelled"
     mod_id = jar.mod_id
     proof_row = _loader_evidence(jar.name, by_jar)
-    if label == NATIVE_OK:
+    if label in NATIVE_OK_LABELS:
+        # The four honest labels share the `native-ok` tier: none of them is a
+        # phase-1 gap. `native_label` keeps the distinction for the counts.
         return CoverageRow(corpus, jar.name, mod_id, digest, label, NATIVE_OK,
                            NOT_NEEDED, proof_row.mod_id if proof_row else "", 0, "",
                            bounded(row.reason) if row else "")
@@ -1286,9 +1335,12 @@ def classify_jar(corpus: str, jar: PackJar, digest: str,
                            NOT_NEEDED, proof_row.mod_id, 0, "minecraft-version",
                            f"built for another game version ({proof_row.error}); it cannot run on 26.3")
     if label == NATIVE_GAP and row is not None and row.reason.startswith("no native entrypoint"):
-        # The server role has nothing to execute; the ledger's own `native-ok`
-        # rows with that reason are counted the same way.
-        return CoverageRow(corpus, jar.name, mod_id, digest, label, NATIVE_OK,
+        # An old ledger recorded "no entrypoint" as a gap; the server role has
+        # nothing to execute, which is a library or a client-only jar, not a
+        # native failure.
+        client_only = "available: client" in row.reason or "available: modmenu" in row.reason
+        return CoverageRow(corpus, jar.name, mod_id, digest,
+                           CLIENT_ONLY_UNTESTED if client_only else LIBRARY, NATIVE_OK,
                            NOT_NEEDED, proof_row.mod_id if proof_row else "", 0, "no entrypoint",
                            "no native entrypoint; the dedicated server has nothing to run")
     if label == MISSING_DEPENDENCY and not (proof_row is not None and proof_row.listed):
@@ -1306,7 +1358,7 @@ def classify_jar(corpus: str, jar: PackJar, digest: str,
         # server, whatever entrypoint kinds it declares. The server role has
         # nothing to run, exactly like the client-only rows the ledger already
         # counts as native-ok.
-        return CoverageRow(corpus, jar.name, mod_id, digest, label, NATIVE_OK,
+        return CoverageRow(corpus, jar.name, mod_id, digest, CLIENT_ONLY_UNTESTED, NATIVE_OK,
                            NOT_NEEDED, proof_row.mod_id if proof_row else "", 0, "client-only",
                            "client-only (`environment: client`); the dedicated server loads nothing of it")
     if proof_row is not None and proof_row.listed:
@@ -1383,12 +1435,22 @@ def union_rows(rows: list[CoverageRow]) -> list[CoverageRow]:
 
 
 def coverage_counts(rows: list[CoverageRow]) -> dict[str, int]:
+    """Counts by tier, with the `native-ok` tier split by honest label.
+
+    `NATIVE_OK` keeps the phase-gate meaning (the jar is not a gap); the four
+    label keys say whether the server ran it and whether that run was clean, so a
+    reader can never mistake a skipped client-only jar for a working one.
+    """
     counts = {"jars": len(rows), NATIVE_OK: 0, NEEDS_LOADER: 0, NATIVE_GAP: 0,
               OUT_OF_SCOPE: 0, PROVEN: 0, PARTIAL: 0, UNPROVEN: 0}
+    for name in NATIVE_OK_LABELS:
+        counts[name] = 0
     for row in rows:
         counts[row.tier] += 1
         if row.tier == NEEDS_LOADER:
             counts[row.proof] += 1
+        if row.tier == NATIVE_OK and row.native_label in counts:
+            counts[row.native_label] += 1
     return counts
 
 
@@ -1404,10 +1466,13 @@ def coverage_conflicts(rows: list[CoverageRow]) -> list[tuple[str, list[Coverage
 def coverage_payload(rows: list[CoverageRow], union: list[CoverageRow]) -> dict[str, object]:
     corpora: dict[str, dict[str, int]] = {}
     for row in rows:
-        corpora.setdefault(row.corpus, {"jars": 0, NATIVE_OK: 0, NEEDS_LOADER: 0,
-                                        NATIVE_GAP: 0, OUT_OF_SCOPE: 0})
+        corpora.setdefault(row.corpus, {
+            "jars": 0, NATIVE_OK: 0, NEEDS_LOADER: 0, NATIVE_GAP: 0, OUT_OF_SCOPE: 0,
+            **{name: 0 for name in NATIVE_OK_LABELS}})
         corpora[row.corpus]["jars"] += 1
         corpora[row.corpus][row.tier] += 1
+        if row.tier == NATIVE_OK and row.native_label in corpora[row.corpus]:
+            corpora[row.corpus][row.native_label] += 1
     return {
         "corpora": corpora,
         "union": coverage_counts(union),
@@ -1612,8 +1677,11 @@ def coverage_lines(rows: list[CoverageRow], sources: list[Path]) -> list[str]:
     sources = list(dict.fromkeys(sources))
     lines = [
         "# Horizon corpus tier coverage",
-        "# native-ok: the dedicated server runs it; needs-loader: a real Fabric loader run lists",
-        "# it and reaches Done; native-gap: neither tier carries it, with the cause;",
+        "# native-ok: the dedicated server did not refuse it, split into ran-clean (ran to Done",
+        "# with no unmodelled host call), ran-hollow (ran, but fell through unmodelled calls or",
+        "# nobody counted), client-only-untested and library (the server skipped it, which says",
+        "# nothing about it working); needs-loader: a real Fabric loader run lists it and",
+        "# reaches Done; native-gap: neither tier carries it, with the cause;",
         "# out-of-scope: built for another game version, so no 26.3 tier can carry it.",
         "# Sources: " + ", ".join(path.name for path in sources),
         "",
@@ -1622,11 +1690,17 @@ def coverage_lines(rows: list[CoverageRow], sources: list[Path]) -> list[str]:
         subset = [row for row in rows if row.corpus == corpus]
         part = coverage_counts(subset)
         lines.append(f"corpus={corpus}\tjars={part['jars']}\tnative-ok={part[NATIVE_OK]}"
+                     f"\tran-clean={part[RAN_CLEAN]}\tran-hollow={part[RAN_HOLLOW]}"
+                     f"\tclient-only-untested={part[CLIENT_ONLY_UNTESTED]}"
+                     f"\tlibrary={part[LIBRARY]}"
                      f"\tneeds-loader={part[NEEDS_LOADER]}\tnative-gap={part[NATIVE_GAP]}"
                      f"\tout-of-scope={part[OUT_OF_SCOPE]}"
                      f"\tproven={part[PROVEN]}\tpartial={part[PARTIAL]}\tunproven={part[UNPROVEN]}")
     union_counts = coverage_counts(union)
     lines.append(f"union\tdigests={union_counts['jars']}\tnative-ok={union_counts[NATIVE_OK]}"
+                 f"\tran-clean={union_counts[RAN_CLEAN]}\tran-hollow={union_counts[RAN_HOLLOW]}"
+                 f"\tclient-only-untested={union_counts[CLIENT_ONLY_UNTESTED]}"
+                 f"\tlibrary={union_counts[LIBRARY]}"
                  f"\tneeds-loader={union_counts[NEEDS_LOADER]}\tnative-gap={union_counts[NATIVE_GAP]}"
                  f"\tout-of-scope={union_counts[OUT_OF_SCOPE]}")
     for row in sorted(rows, key=lambda item: (item.corpus, item.tier, item.jar)):
@@ -1650,6 +1724,11 @@ def _counts_cell(part: dict[str, int]) -> str:
             f"{part[NATIVE_GAP]} | {part[OUT_OF_SCOPE]}")
 
 
+def _labels_cell(part: dict[str, int]) -> str:
+    return (f"{part[RAN_CLEAN]} | {part[RAN_HOLLOW]} | {part[CLIENT_ONLY_UNTESTED]} | "
+            f"{part[LIBRARY]}")
+
+
 def coverage_docs(rows: list[CoverageRow], sources: list[Path]) -> str:
     sources = list(dict.fromkeys(sources))
     union = union_rows(rows)
@@ -1660,9 +1739,17 @@ def coverage_docs(rows: list[CoverageRow], sources: list[Path]) -> str:
         f"from {', '.join(f'`{path.name}`' for path in sources)}; edit the tool, not this block._",
         "",
         f"**{merged['jars']} unique jars ({total['jars']} rows across "
-        f"{len({row.corpus for row in rows})} corpora): {merged[NATIVE_OK]} `native-ok`, "
+        f"{len({row.corpus for row in rows})} corpora): {merged[NATIVE_OK]} `native-ok` "
+        f"({merged[RAN_CLEAN]} `ran-clean`, {merged[RAN_HOLLOW]} `ran-hollow`, "
+        f"{merged[CLIENT_ONLY_UNTESTED]} `client-only-untested`, {merged[LIBRARY]} `library`), "
         f"{merged[NEEDS_LOADER]} `needs-loader`, {merged[NATIVE_GAP]} `native-gap`, "
         f"{merged[OUT_OF_SCOPE]} out of scope.**",
+        "",
+        "`native-ok` is the phase-gate tier: the jar is not a gap. Only `ran-clean` says the "
+        "server ran its entrypoint to `Done (` with no unmodelled host call. `ran-hollow` ran, "
+        "but a call the host does not model returned a neutral value (or no ledger recorded the "
+        "count: `unknown_source=none`). `client-only-untested` and `library` were skipped on the "
+        "server, so this report says nothing about whether they work.",
         "",
         "| Corpus | Jars | `native-ok` | `needs-loader` | `native-gap` | out of scope |",
         "|---|---:|---:|---:|---:|---:|",
@@ -1671,6 +1758,15 @@ def coverage_docs(rows: list[CoverageRow], sources: list[Path]) -> str:
         subset = [row for row in rows if row.corpus == corpus]
         lines.append(f"| `{corpus}` | {_counts_cell(coverage_counts(subset))} |")
     lines.append(f"| union (SHA-256) | {_counts_cell(merged)} |")
+    lines += [
+        "",
+        "| Corpus | `ran-clean` | `ran-hollow` | `client-only-untested` | `library` |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for corpus in sorted({row.corpus for row in rows}):
+        subset = [row for row in rows if row.corpus == corpus]
+        lines.append(f"| `{corpus}` | {_labels_cell(coverage_counts(subset))} |")
+    lines.append(f"| union (SHA-256) | {_labels_cell(merged)} |")
     lines += [
         "",
         f"**Loader proof.** {total[PROVEN]} of {total[NEEDS_LOADER]} `needs-loader` rows are "
@@ -2525,7 +2621,8 @@ def self_test() -> int:
         pack = root / "corpus"
         pack.mkdir()
         specs = {
-            "native.jar": "native-ok",
+            "native.jar": "ran-clean",
+            "hollow.jar": "ran-hollow",
             "needs.jar": "needs-loader",
             "refused.jar": "native-gap",
             "orphan.jar": "native-gap",
@@ -2557,6 +2654,7 @@ def self_test() -> int:
         result = {row.jar: row for row in coverage}
         expects = {
             "native.jar": (NATIVE_OK, NOT_NEEDED),
+            "hollow.jar": (NATIVE_OK, NOT_NEEDED),
             "needs.jar": (NEEDS_LOADER, PROVEN),
             "refused.jar": (NEEDS_LOADER, PROVEN),
             "orphan.jar": (NATIVE_GAP, UNPROVEN),
@@ -2574,8 +2672,27 @@ def self_test() -> int:
             return 1
         counts = coverage_counts(coverage)
         if (counts[NATIVE_OK], counts[NEEDS_LOADER], counts[NATIVE_GAP],
-                counts[OUT_OF_SCOPE]) != (1, 2, 2, 1):
+                counts[OUT_OF_SCOPE]) != (2, 2, 2, 1):
             print(f"self-test: wrong counts {counts}", file=sys.stderr)
+            return 1
+        if (counts[RAN_CLEAN], counts[RAN_HOLLOW]) != (1, 1):
+            print(f"self-test: native-ok labels not split: {counts}", file=sys.stderr)
+            return 1
+        # An old ledger's `native-ok` ran-row is not silently clean.
+        legacy = root / "legacy.txt"
+        legacy.write_text(
+            "ran.jar\trecommend=native-ok\tverdict=ran\tskipped=0\n"
+            "client.jar\trecommend=native-ok\tverdict=skipped\tsubtype=client-only\n"
+            "lib.jar\trecommend=native-ok\tverdict=skipped\tsubtype=library\n",
+            encoding="utf-8")
+        old_rows = read_ledger(legacy)
+        mapped = (old_rows["ran.jar"], old_rows["client.jar"], old_rows["lib.jar"])
+        if [row.label for row in mapped] != [RAN_HOLLOW, CLIENT_ONLY_UNTESTED, LIBRARY]:
+            print(f"self-test: legacy mapping {[row.label for row in mapped]}",
+                  file=sys.stderr)
+            return 1
+        if mapped[0].unknown_source != "none":
+            print("self-test: a legacy ran-row claimed a host-call measurement", file=sys.stderr)
             return 1
         partial = read_loader_ledger(loader)[:1]
         partial = [LoaderRow(row.jar, row.mod_id, row.status, row.mixins, False, row.source)
