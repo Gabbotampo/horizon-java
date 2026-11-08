@@ -2328,6 +2328,9 @@ pub struct StdHost {
     /// (`minecraft:fire` → `FireBlock`, `BaseFireBlock`, `Block`, `ItemLike`),
     /// which a game host seeds from its prepared `block-behaviours.json`.
     game_block_classes: Arc<BTreeMap<String, Vec<String>>>,
+    /// The vanilla block class a block's game constructor named, for blocks
+    /// built through a `Block` subclass (`FenceBlock(Properties)`).
+    block_game_classes: BTreeMap<String, String>,
     /// Explicitly seeded Java service providers. Native execution never scans
     /// the host classpath; callers must supply the service and provider class
     /// names they want visible to `ServiceLoader`.
@@ -2469,6 +2472,7 @@ impl StdHost {
             classes: BTreeMap::new(),
             linked_classes: Arc::default(),
             game_block_classes: Arc::default(),
+            block_game_classes: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
@@ -3491,10 +3495,21 @@ impl StdHost {
             }
             "minecraft:data_component_type" => self.content_builders.component_declaration(marker),
             "minecraft:block" => {
+                // A block built through a vanilla subclass takes a vanilla block
+                // of that same class as its template, so it behaves as that
+                // class does; with none to copy it stays opaque.
+                let template = match self.block_game_classes.get(marker) {
+                    None => INFERRED_BLOCK_TEMPLATE.to_owned(),
+                    Some(class) => self
+                        .game_block_classes
+                        .iter()
+                        .find(|(_, chain)| chain.first() == Some(class))
+                        .map(|(id, _)| id.clone())?,
+                };
                 self.block_property_builders
                     .get(marker)
                     .map(|builder| RegistryDeclaration::Block {
-                        template: INFERRED_BLOCK_TEMPLATE.to_owned(),
+                        template: template.clone(),
                         properties: block_declaration_properties(builder),
                         // A block built this way has the item vanilla gives
                         // every block; a mod that registers its own block item
@@ -3705,6 +3720,33 @@ impl StdHost {
                     return Ok(Some(receiver.clone()));
                 }
                 Ok(None)
+            }
+            // A vanilla `Block` subclass's constructor (`FenceBlock(Properties)`,
+            // `StairBlock(BlockState, Properties)`): the properties carry over as
+            // for `Block`, and the class picks the template below.
+            owner
+                if r.name == "<init>"
+                    && owner != BLOCK_CLASS
+                    && owner.starts_with("net/minecraft/world/level/block/")
+                    && !self.game_block_classes.is_empty() =>
+            {
+                let Some(properties) = args
+                    .iter()
+                    .filter_map(expect_ref)
+                    .find_map(|arg| self.block_property_builders.get(arg).cloned())
+                else {
+                    return Ok(None);
+                };
+                if self.block_property_builders.contains_key(marker)
+                    || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
+                {
+                    self.block_property_builders
+                        .insert(marker.to_owned(), properties);
+                    let simple = owner.rsplit('/').next().unwrap_or(owner);
+                    self.block_game_classes
+                        .insert(marker.to_owned(), simple.to_owned());
+                }
+                Ok(Some(Value::Void))
             }
             ITEM_CLASS | BLOCK_CLASS if r.name == "<init>" => {
                 let Some(builder) = args.first().and_then(expect_ref) else {
@@ -27916,6 +27958,54 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// A block built through a vanilla subclass's constructor takes a vanilla
+    /// block of that class as its template; an unknown class stays opaque.
+    #[test]
+    fn subclass_built_blocks_take_a_vanilla_template_of_their_class() {
+        let classes = BTreeMap::from([(
+            "minecraft:oak_fence".to_owned(),
+            vec![
+                "FenceBlock".into(),
+                "CrossCollisionBlock".into(),
+                "Block".into(),
+            ],
+        )]);
+        let mut host = StdHost::new().with_game_block_classes(Arc::new(classes));
+        let call = |owner: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: "<init>".into(),
+            descriptor: descriptor.into(),
+        };
+        let builder = Value::Ref(Some("props#1".into()));
+        host.invoke_instance(&call(BLOCK_PROPERTIES_CLASS, "()V"), &builder, &[])
+            .unwrap();
+        let properties = "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V";
+        let fence = Value::Ref(Some("fence#1".into()));
+        host.invoke_instance(
+            &call("net/minecraft/world/level/block/FenceBlock", properties),
+            &fence,
+            std::slice::from_ref(&builder),
+        )
+        .unwrap();
+        let odd = Value::Ref(Some("odd#1".into()));
+        host.invoke_instance(
+            &call(
+                "net/minecraft/world/level/block/NotAVanillaBlock",
+                properties,
+            ),
+            &odd,
+            std::slice::from_ref(&builder),
+        )
+        .unwrap();
+        match host.inferred_declaration("minecraft:block", &fence) {
+            Some(RegistryDeclaration::Block { template, .. }) => {
+                assert_eq!(template, "minecraft:oak_fence")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(host.inferred_declaration("minecraft:block", &odd).is_none());
+    }
 
     /// With the game's block classes seeded, a vanilla block constant answers
     /// `instanceof` for its real class chain and interfaces, and only those.
