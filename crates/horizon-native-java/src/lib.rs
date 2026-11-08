@@ -3983,6 +3983,20 @@ impl Host for StdHost {
                 "rarity/{}",
                 r.name.to_ascii_lowercase()
             )))),
+            // Any other game constant of a game type (`SoundType.WOOD`,
+            // `MapColor.STONE`, `Blocks.FIRE`) is one stable object of its
+            // declared type: the bounded host doesn't model its state, but
+            // identity and the declared type's `instanceof` hold, where null
+            // failed the first `Objects.requireNonNull` or `==` on it.
+            // Registries and resource keys keep their own rules above.
+            (owner, name, descriptor)
+                if owner.starts_with("net/minecraft/")
+                    && !owner.starts_with("net/minecraft/core/registries/")
+                    && game_object_type(descriptor).is_some() =>
+            {
+                let declared = game_object_type(descriptor).unwrap_or_default();
+                Ok(Value::Ref(Some(format!("{declared}#{owner}.{name}"))))
+            }
             _ => self.unknown_host_call(r),
         }
     }
@@ -9003,6 +9017,24 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
 ];
 
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
+/// The game class a field descriptor names (`Lnet/minecraft/...;`), if any.
+/// Registries and resource keys are excluded: an unknown one stays null, so a
+/// registration against it is reported rather than recorded against a guess.
+fn game_object_type(descriptor: &str) -> Option<&str> {
+    descriptor
+        .strip_prefix('L')
+        .and_then(|class| class.strip_suffix(';'))
+        .filter(|class| class.starts_with("net/minecraft/"))
+        .filter(|class| {
+            !matches!(
+                *class,
+                "net/minecraft/core/Registry"
+                    | "net/minecraft/core/WritableRegistry"
+                    | "net/minecraft/resources/ResourceKey"
+            )
+        })
+}
+
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
     if !matches!(
         owner,
@@ -27847,6 +27879,51 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// A game constant (`SoundType.WOOD`, `Blocks.FIRE`) is a stable, typed
+    /// marker rather than null: the same field reads back the same object, so
+    /// `==` and the declared type's `instanceof` hold.
+    #[test]
+    fn game_constants_are_stable_typed_markers() {
+        let field = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let mut host = StdHost::new();
+        let wood = field(
+            "net/minecraft/world/level/block/SoundType",
+            "WOOD",
+            "Lnet/minecraft/world/level/block/SoundType;",
+        );
+        let first = host.get_static(&wood).unwrap();
+        assert_eq!(first, host.get_static(&wood).unwrap());
+        assert_eq!(
+            class_of_value(&first).as_deref(),
+            Some("net/minecraft/world/level/block/SoundType")
+        );
+        let fire = host
+            .get_static(&field(
+                "net/minecraft/world/level/block/Blocks",
+                "FIRE",
+                "Lnet/minecraft/world/level/block/Block;",
+            ))
+            .unwrap();
+        assert_eq!(
+            class_of_value(&fire).as_deref(),
+            Some("net/minecraft/world/level/block/Block")
+        );
+        assert_ne!(fire, first);
+        // Registries keep their rule: an unknown one stays null.
+        let unknown_registry = host
+            .get_static(&field(
+                "net/minecraft/core/registries/Registries",
+                "NOT_A_REGISTRY",
+                "Lnet/minecraft/core/Registry;",
+            ))
+            .unwrap();
+        assert_eq!(unknown_registry, Value::Ref(None));
+    }
 
     /// A class with one static `m()V` that returns, the smallest shape the
     /// weaver accepts. Pool: 1 name, 2 Class 1, 3 `java/lang/Object`, 4 Class 3,
