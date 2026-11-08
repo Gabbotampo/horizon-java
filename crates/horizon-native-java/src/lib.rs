@@ -2074,6 +2074,12 @@ pub trait Host {
     /// `readAllBytes` or `read(byte[], int, int)` on a resource stream needs
     /// the exact bytes. An empty answer is end of stream. A host that keeps
     /// no stream table keeps the default.
+    /// Whether a game object marker is an instance of `wanted`, when the host
+    /// knows that object's class chain; `None` leaves the interpreter's answer.
+    fn game_instance_of(&self, _marker: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
+
     fn resource_stream_bytes(&mut self, _marker: &str, _limit: Option<usize>) -> Option<Vec<u8>> {
         None
     }
@@ -2318,6 +2324,10 @@ pub struct StdHost {
     /// `Arc` so a pack can build one table and every mod's host uses it
     /// without copying the class bytes again.
     linked_classes: Arc<LinkedClassTable>,
+    /// Each vanilla block's class chain and interfaces by simple name
+    /// (`minecraft:fire` → `FireBlock`, `BaseFireBlock`, `Block`, `ItemLike`),
+    /// which a game host seeds from its prepared `block-behaviours.json`.
+    game_block_classes: Arc<BTreeMap<String, Vec<String>>>,
     /// Explicitly seeded Java service providers. Native execution never scans
     /// the host classpath; callers must supply the service and provider class
     /// names they want visible to `ServiceLoader`.
@@ -2458,6 +2468,7 @@ impl StdHost {
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
             linked_classes: Arc::default(),
+            game_block_classes: Arc::default(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
@@ -2749,6 +2760,13 @@ impl StdHost {
 
     /// Share one linked table across many hosts (`Self::link_jar` clones it
     /// per host otherwise, which doubles the class bytes of a whole pack).
+    /// Seed each vanilla block's class chain and interfaces (simple names), so
+    /// `Blocks.FIRE instanceof FireBlock` answers as in the game.
+    pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
+        self.game_block_classes = classes;
+        self
+    }
+
     pub fn with_linked_class_table(mut self, table: Arc<LinkedClassTable>) -> Self {
         self.linked_classes = table;
         self
@@ -3764,6 +3782,22 @@ impl Host for StdHost {
         let text = String::from_utf8_lossy(&bytes[*index..]).into_owned();
         *index = bytes.len();
         Some(text)
+    }
+
+    fn game_instance_of(&self, marker: &str, wanted: &str) -> Option<bool> {
+        let field = marker
+            .split_once('#')?
+            .1
+            .strip_prefix("net/minecraft/world/level/block/Blocks.")?;
+        let classes = self
+            .game_block_classes
+            .get(&format!("minecraft:{}", field.to_ascii_lowercase()))?;
+        let simple = wanted.rsplit('/').next().unwrap_or(wanted);
+        Some(
+            wanted == "java/lang/Object"
+                || (wanted.starts_with("net/minecraft/")
+                    && classes.iter().any(|class| class == simple)),
+        )
     }
 
     fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
@@ -19564,6 +19598,9 @@ impl<H: Host> Runtime<'_, H> {
         if wanted == "java/lang/Object" {
             return true;
         }
+        if let Some(answer) = self.host.game_instance_of(marker, wanted) {
+            return answer;
+        }
         if generic_type_instance_of(marker, wanted) {
             return true;
         }
@@ -27879,6 +27916,50 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// With the game's block classes seeded, a vanilla block constant answers
+    /// `instanceof` for its real class chain and interfaces, and only those.
+    #[test]
+    fn seeded_block_classes_answer_instanceof() {
+        let classes = BTreeMap::from([(
+            "minecraft:fire".to_owned(),
+            vec![
+                "FireBlock".into(),
+                "BaseFireBlock".into(),
+                "Block".into(),
+                "ItemLike".into(),
+            ],
+        )]);
+        let mut host = StdHost::new().with_game_block_classes(Arc::new(classes));
+        let fire = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/Blocks".into(),
+                name: "FIRE".into(),
+                descriptor: "Lnet/minecraft/world/level/block/Block;".into(),
+            })
+            .unwrap();
+        let marker = expect_string(&fire).to_owned();
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/FireBlock"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/ItemLike"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/ChestBlock"),
+            Some(false)
+        );
+        // An unseeded block keeps the interpreter's own answer.
+        assert_eq!(
+            host.game_instance_of(
+                "net/minecraft/world/level/block/Block#net/minecraft/world/level/block/Blocks.STONE",
+                "net/minecraft/world/level/block/FireBlock"
+            ),
+            None
+        );
+    }
 
     /// A game constant (`SoundType.WOOD`, `Blocks.FIRE`) is a stable, typed
     /// marker rather than null: the same field reads back the same object, so
