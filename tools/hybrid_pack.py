@@ -2186,7 +2186,8 @@ def score_lines(rows: list[ScoreRow], *, sources: list[Path],
     for row in sorted(rows, key=lambda item: (SCORE_ORDER.index(item.status),
                                               item.corpus, item.jar)):
         note = f"\tnote={row.note}" if row.note else ""
-        lines.append(f"mod={row.mod_id}\tjar={row.jar}\tcorpus={row.corpus}"
+        digest = f"\tdigest={row.digest}" if row.digest else ""
+        lines.append(f"mod={row.mod_id}\tjar={row.jar}\tcorpus={row.corpus}{digest}"
                      f"\tstatus={row.status}\tengine={row.engine}"
                      f"\twoven={row.woven}\tskipped={row.skipped}"
                      f"\tgame_plans={row.game_plans}\tserver_plans={row.server_plans}"
@@ -2194,6 +2195,46 @@ def score_lines(rows: list[ScoreRow], *, sources: list[Path],
     summary = "\t".join(f"{key}={value}" for key, value in counts.items())
     lines.append("summary\t" + summary + ("\tpartial=true" if partial else ""))
     return lines
+
+
+def read_score_report(path: Path, corpora: dict[str, Path]) -> list[ScoreRow]:
+    """Read a phase-2 score report back into rows, for `--score-from`.
+
+    Reports written before rows carried `digest=` are still readable: the
+    digest is recomputed from the jar in its corpus directory, so two copies of
+    the same bytes still count once. The report's own `summary` line must agree
+    with the rows read, or the report is rejected rather than half-trusted.
+    """
+    rows: list[ScoreRow] = []
+    summary: dict[str, str] = {}
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        if line.startswith("summary\t"):
+            summary = dict(field.split("=", 1) for field in line.split("\t")[1:])
+            continue
+        fields = dict(field.split("=", 1) for field in line.split("\t") if "=" in field)
+        try:
+            corpus, jar = fields["corpus"], fields["jar"]
+            digest = fields.get("digest", "")
+            if not digest and corpus in corpora and (corpora[corpus] / jar).is_file():
+                digest = file_digest(corpora[corpus] / jar)
+            rows.append(ScoreRow(corpus, jar, fields["mod"], digest, fields["status"],
+                                 fields["engine"], int(fields["woven"]),
+                                 int(fields["skipped"]), int(fields["game_plans"]),
+                                 int(fields["server_plans"]), float(fields["seconds"]),
+                                 fields.get("note", "")))
+        except (KeyError, ValueError) as error:
+            raise ValueError(f"{path}:{number}: malformed score row ({error})") from error
+    if summary.get("partial") == "true":
+        raise ValueError(f"{path}: a partial (--score-limit) report cannot write the docs")
+    counts = score_counts(rows)
+    mismatched = [key for key, value in summary.items()
+                  if key in counts and str(counts[key]) != value]
+    if not summary or mismatched:
+        raise ValueError(f"{path}: rows do not match the summary line "
+                         f"({', '.join(mismatched) or 'no summary'})")
+    return rows
 
 
 SCORE_HISTORY_FIELDS = ("date", "commit", "binary", "hooks", "jars", "unique",
@@ -2376,6 +2417,27 @@ def native_score_main(args: argparse.Namespace) -> int:
             print(f"hybrid_pack: {error}", file=sys.stderr)
             return 2
         sources.append(ledger)
+    if args.score_from is not None:
+        # Rebuild the docs block from a saved report: no servers start, so a
+        # measurement taken elsewhere (frozen binaries, another machine) can be
+        # published without rerunning the hour-long score.
+        try:
+            score_rows = read_score_report(args.score_from, dict(corpora))
+        except ValueError as error:
+            print(f"hybrid_pack: {error}", file=sys.stderr)
+            return 2
+        if not args.docs:
+            print("hybrid_pack: --score-from only writes the docs block; pass --docs",
+                  file=sys.stderr)
+            return 2
+        try:
+            history = read_score_history(args.score_history)
+            changed = write_score_docs(args.docs, score_docs(score_rows, history, sources))
+        except ValueError as error:
+            print(f"hybrid_pack: {error}", file=sys.stderr)
+            return 2
+        print(f"docs: {args.docs}{'' if changed else ' (unchanged)'}")
+        return 0
     if not args.native_binary.is_file():
         print(f"hybrid_pack: native binary does not exist: {args.native_binary}",
               file=sys.stderr)
@@ -2616,6 +2678,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--score-report", type=Path,
                         default=FIXTURES / "LAST_NATIVE_SCORE.txt",
                         help="phase-2 score ledger (default: tools/real_mod_fixtures/LAST_NATIVE_SCORE.txt)")
+    parser.add_argument("--score-from", type=Path, dest="score_from",
+                        help="with --native-score --docs: rebuild the docs block from this saved "
+                             "score report instead of running servers")
     parser.add_argument("--score-history", type=Path,
                         default=FIXTURES / "NATIVE_SCORE_HISTORY.txt",
                         help="phase-2 trend file (default: tools/real_mod_fixtures/NATIVE_SCORE_HISTORY.txt)")
@@ -2697,7 +2762,7 @@ def main(argv: list[str] | None = None) -> int:
         return self_test()
     if args.native_score:
         for name in ("native_binary", "resources", "plan_probe", "score_work",
-                     "score_report", "score_history", "docs"):
+                     "score_report", "score_history", "score_from", "docs"):
             value = getattr(args, name)
             if value is not None:
                 setattr(args, name, value.resolve())

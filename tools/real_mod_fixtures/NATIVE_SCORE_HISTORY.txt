@@ -1,3 +1,4 @@
 # Horizon phase-2 native score trend
 # date	commit	binary	hooks	jars	unique	loader-free	loader	refused	skipped	missing	plans_skipped	game_plans	server_plans
 2026-11-06T12:08:39Z	efca454f4	20261106-2255	off	174	150	30	94	50	0	0	5028	1285	1285
+2026-11-08T01:26:07Z	8a3c8dc59	20261108-1200	on	174	150	33	124	17	0	0	6753	1786	1786

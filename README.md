@@ -34,19 +34,22 @@ linked; the game supplies the `Host` implementation.
 ## Measured status
 
 These are the numbers in [docs/java-mod-compat-status.md](docs/java-mod-compat-status.md), measured
-on 6 November 2026 for the two Fabric ledgers and 8 November 2026 for NeoForge. They describe how
-far the runtime is from the two gates, not a claim that the corpus runs.
+on 8 November 2026 at commit `8a3c8dc59` (one fresh dedicated server per jar). They describe how far
+the runtime is from the two gates, not a claim that the corpus runs.
 
 | Corpus | Jars | `native-ok` | `needs-loader` | `native-gap` |
 |---|---:|---:|---:|---:|
-| wide (`corpus-xl`) | 223 | 151 (68%) | 45 (20%) | 27 (12%) |
-| mega (500 unique) | 500 | 346 (69%) | 86 (17%) | 68 (14%) |
+| wide (`corpus-xl`) | 223 | 182 (82%) | 38 (17%) | 3 (1%) |
+| mega (500 unique) | 500 | 416 (83%) | 73 (15%) | 11 (2%) |
 | NeoForge 26.3 | 85 | 51 | 20 | 14 |
 
-- **Phase 2 score:** 124 of 174 `needs-loader` rows (150 unique jars) run natively on a fresh
-  native-only run; 30 are loader-free, 94 still need the loader and 50 were refused.
-- **Mixins:** 0 were woven in either corpus run, with 2,944 (wide) and 7,742 (mega) plans skipped,
-  overwhelmingly `target-outside-jar`. Game-class mixins are the main phase-2 gap.
+- **With declared dependencies** loaded beside each refused jar, `native-gap` is 3 and 6.
+- **Phase 2 score** (game-hook tier on): 157 of 174 `needs-loader` rows (150 unique jars) run
+  natively; 33 are loader-free, 124 still need the loader and 17 were refused (from 30 / 94 / 50
+  on 6 November).
+- **Mixins:** the one-jar runs weave no game-class mixins (4,891 and 10,099 plans skipped,
+  overwhelmingly `target-outside-jar`); the opt-in hook tier binds plans to game hook sites instead.
+  Game-class mixins remain the main phase-2 gap.
 
 Phase 1 is not met yet: neither Fabric ledger has 0 `native-gap`, and the NeoForge ledger is
 measured but not gated. See the status page for per-row detail and repro commands.
