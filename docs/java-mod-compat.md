@@ -1,5 +1,10 @@
 # Java mods on Horizon: the compatibility runtime (design)
 
+> **Extracted repository.** Game-side paths in this page (`crates/horizon-client/...`, `.local/`,
+> `target/fast/horizon-client`, the full `tools/lab.py`) refer to the Horizon branch
+> `port/native-java-on-main` of [github.com/Solenopsisbot/horizon](https://github.com/Solenopsisbot/horizon);
+> they are not part of this repository. The runtime crates and corpus tools are here.
+
 Status: Phase 1 probe, 2 November 2026. Phase 0 is measured ([mod-abi-census.md](mod-abi-census.md));
 the maintained progress checklist is [java-mod-compat-status.md](java-mod-compat-status.md). The façade generator and embedded JVM runner are now built and exercised against Fabric API and Hollow
 Dawn. Read it with [mods.md](mods.md) (what runs today), [modpacks.md](modpacks.md) (the

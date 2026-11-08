@@ -1,5 +1,10 @@
 # Java mod compatibility: status
 
+> **Extracted repository.** Game-side paths in this page (`horizon-client`, `.local/`,
+> `target/fast/horizon-client`, the full `tools/lab.py`) refer to the Horizon branch
+> `port/native-java-on-main` of [github.com/Solenopsisbot/horizon](https://github.com/Solenopsisbot/horizon);
+> they are not part of this repository. The runtime crates and corpus tools are here.
+
 Status: **ported onto the main tree** (branch `port/native-java-on-main`). Measured 6 November 2026 with
 binaries built from this branch at 19:02. The design, tier model and phase plan are
 [java-mod-compat.md](java-mod-compat.md); this page is the maintained progress view: what runs today, what the
