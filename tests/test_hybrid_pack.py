@@ -443,5 +443,57 @@ class HybridPackTests(unittest.TestCase):
         self.assertEqual(failed["loaded_ids"], ("alpha",))
 
 
+class ScoreReportTests(unittest.TestCase):
+    """`--score-from` must publish exactly what a saved report measured."""
+
+    def _row(self, jar, status, digest, corpus="corpus-xl", skipped=3):
+        return HYBRID.ScoreRow(corpus, jar, jar.split(".")[0], digest, status,
+                               "native-qualified", 0, skipped, 2, 2, 1.5, "")
+
+    def test_a_written_report_reads_back_and_dedupes_by_digest(self):
+        rows = [self._row("a.jar", HYBRID.SCORE_NATIVE, "aa"),
+                self._row("b.jar", HYBRID.SCORE_LOADER, "bb"),
+                # the same bytes in the second corpus: one unique jar, two rows
+                self._row("x-b.jar", HYBRID.SCORE_LOADER, "bb", corpus="mega")]
+        meta = {"date": "2026-11-08T00:00:00Z", "commit": "abc", "binary": "b",
+                "hooks": "on"}
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "score.txt"
+            report.write_text("\n".join(HYBRID.score_lines(rows, sources=[], meta=meta))
+                              + "\n", encoding="utf-8")
+            back = HYBRID.read_score_report(report, {})
+        self.assertEqual(back, rows)
+        counts = HYBRID.score_counts(back)
+        self.assertEqual((counts["jars"], counts["unique"]), (3, 2))
+        self.assertEqual(counts["plans_skipped"], 6)
+
+    def test_an_old_report_without_digests_hashes_the_corpus_jar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus = Path(tmp) / "corpus"
+            corpus.mkdir()
+            (corpus / "a.jar").write_bytes(b"same bytes")
+            (corpus / "b.jar").write_bytes(b"same bytes")
+            report = Path(tmp) / "score.txt"
+            row = ("mod={id}\tjar={jar}\tcorpus=c\tstatus=loader\tengine=native"
+                   "\twoven=0\tskipped=1\tgame_plans=1\tserver_plans=1\tseconds=1.0")
+            report.write_text("\n".join([row.format(id="a", jar="a.jar"),
+                                         row.format(id="b", jar="b.jar"),
+                                         "summary\tjars=2\tunique=1\tloader=2"]) + "\n",
+                              encoding="utf-8")
+            back = HYBRID.read_score_report(report, {"c": corpus})
+        self.assertEqual(len({row.digest for row in back}), 1)
+        self.assertEqual(HYBRID.score_counts(back)["unique"], 1)
+
+    def test_a_report_whose_rows_contradict_its_summary_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "score.txt"
+            report.write_text(
+                "mod=a\tjar=a.jar\tcorpus=c\tdigest=aa\tstatus=loader\tengine=n\twoven=0"
+                "\tskipped=0\tgame_plans=0\tserver_plans=0\tseconds=1.0\n"
+                "summary\tjars=2\tunique=2\tloader=2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "summary"):
+                HYBRID.read_score_report(report, {})
+
+
 if __name__ == "__main__":
     unittest.main()
