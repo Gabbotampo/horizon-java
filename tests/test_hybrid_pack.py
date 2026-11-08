@@ -60,12 +60,51 @@ class HybridPackTests(unittest.TestCase):
                 "gap.jar": "native-gap",
             })
             rows = HYBRID.read_ledger(ledger)
-            self.assertEqual(rows["native.jar"].label, "native-ok")
+            self.assertEqual(rows["native.jar"].label, "ran-hollow")
             self.assertEqual(rows["loader.jar"].label, "needs-loader")
             self.assertEqual(rows["gap.jar"].label, "native-gap")
             ledger.write_text("bad.jar\trecommend=perhaps\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 HYBRID.read_ledger(ledger)
+
+    def test_coverage_counts_native_ok_by_its_four_honest_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("clean.jar", "hollow.jar", "client.jar", "lib.jar",
+                         "needs.jar", "gap.jar"):
+                _jar(tmp, name, fabric={"id": name[:-4], "version": "1"})
+            ledger = Path(tmp) / "server.txt"
+            ledger.write_text("\n".join([
+                "clean.jar\trecommend=ran-clean\tid=clean\tverdict=ran\tskipped=0"
+                "\tunknown=0\tunknown_source=probe",
+                "hollow.jar\trecommend=ran-hollow\tid=hollow\tverdict=ran\tskipped=0"
+                "\tunknown=12\tunknown_source=probe",
+                # An old row: the server skipped it because it is client-only.
+                "client.jar\trecommend=native-ok\tid=client\tverdict=skipped"
+                "\tsubtype=client-only",
+                "lib.jar\trecommend=library\tid=lib\tverdict=skipped\tsubtype=library",
+                "needs.jar\trecommend=needs-loader\tid=needs\tverdict=ran\tskipped=2",
+                "gap.jar\trecommend=native-gap\tid=gap\tverdict=refused",
+                "summary\ttotal=6",
+            ]) + "\n", encoding="utf-8")
+            proof = Path(tmp) / "proof.txt"
+            proof.write_text(
+                "mod=needs\tstatus=listed\tjar=needs.jar\tdone=true\n"
+                "summary\tmods_found=1\tmods_listed=1\tdone=true\n", encoding="utf-8")
+            rows = HYBRID.read_ledger(ledger)
+            coverage = HYBRID.coverage_rows(
+                [("corpus", Path(tmp))], rows, HYBRID.read_loader_ledger(proof))
+            counts = HYBRID.coverage_counts(coverage)
+            targets, _pairs = HYBRID.score_targets(
+                [("corpus", Path(tmp))], rows, HYBRID.read_loader_ledger(proof))
+        self.assertEqual((counts["jars"], counts[HYBRID.NATIVE_OK],
+                          counts[HYBRID.NEEDS_LOADER], counts[HYBRID.NATIVE_GAP]),
+                         (6, 4, 1, 1))
+        self.assertEqual((counts[HYBRID.RAN_CLEAN], counts[HYBRID.RAN_HOLLOW],
+                          counts[HYBRID.CLIENT_ONLY_UNTESTED], counts[HYBRID.LIBRARY]),
+                         (1, 1, 1, 1))
+        # The native score only asks about the loader tier; a hollow native row
+        # is not a target.
+        self.assertEqual([target.jar.name for target in targets], ["needs.jar"])
 
     def test_partition_routes_by_label_and_closes_loader_dependencies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,8 +115,8 @@ class HybridPackTests(unittest.TestCase):
             _jar(tmp, "gap.jar", fabric={"id": "gap", "version": "1"})
             _jar(tmp, "unknown.jar", fabric={"id": "unknown", "version": "1"})
             rows = HYBRID.read_ledger(_ledger(tmp, {
-                "app.jar": "native-ok",
-                "lib.jar": "native-ok",
+                "app.jar": "ran-clean",
+                "lib.jar": "ran-clean",
                 "mixin.jar": "needs-loader",
                 "gap.jar": "native-gap",
             }))
@@ -111,7 +150,7 @@ class HybridPackTests(unittest.TestCase):
             _jar(tmp, "native.jar", fabric={"id": "native", "version": "1"})
             _jar(tmp, "gap.jar", fabric={"id": "gap", "version": "1"})
             rows = HYBRID.read_ledger(_ledger(tmp, {
-                "native.jar": "native-ok", "gap.jar": "native-gap"}))
+                "native.jar": "ran-clean", "gap.jar": "native-gap"}))
             strict = HYBRID.partition_pack(Path(tmp), rows)
             full = HYBRID.partition_pack(Path(tmp), rows, gap_to_loader=True)
         self.assertEqual([jar.name for jar in strict.excluded], ["gap.jar"])
@@ -134,11 +173,11 @@ class HybridPackTests(unittest.TestCase):
                                              "depends": {"gap": "*"}})
             rows = HYBRID.read_ledger(_ledger(tmp, {
                 "lib.jar": "needs-loader",
-                "addon.jar": "native-ok",
-                "printer.jar": "native-ok",
-                "alone.jar": "native-ok",
+                "addon.jar": "ran-clean",
+                "printer.jar": "ran-clean",
+                "alone.jar": "ran-clean",
                 "gap.jar": "native-gap",
-                "gapuser.jar": "native-ok",
+                "gapuser.jar": "ran-clean",
             }))
             part = HYBRID.partition_pack(Path(tmp), rows)
             issues = HYBRID.check_compatibility(part)
@@ -208,7 +247,7 @@ class HybridPackTests(unittest.TestCase):
             _jar(tmp, "inv.jar", fabric={"id": "inv", "version": "1",
                                          "depends": {"balm-fabric": "*"}})
             rows = HYBRID.read_ledger(_ledger(tmp, {
-                "balm.jar": "native-ok", "inv.jar": "needs-loader"}))
+                "balm.jar": "ran-clean", "inv.jar": "needs-loader"}))
             part = HYBRID.partition_pack(Path(tmp), rows)
             pack = HYBRID.load_pack(Path(tmp), rows)
             closure = HYBRID._closure([jar for jar in pack if jar.name == "inv.jar"],
@@ -233,8 +272,8 @@ class HybridPackTests(unittest.TestCase):
             _jar(tmp, "mixin.jar", fabric={"id": "mixin", "version": "1",
                                            "depends": {"lib": "*"}})
             rows = HYBRID.read_ledger(_ledger(tmp, {
-                "app.jar": "native-ok",
-                "lib.jar": "native-ok",
+                "app.jar": "ran-clean",
+                "lib.jar": "ran-clean",
                 "mixin.jar": "needs-loader",
             }))
             split = HYBRID.partition_pack(Path(tmp), rows, closure=False)
@@ -256,7 +295,7 @@ class HybridPackTests(unittest.TestCase):
                      {"registry": "minecraft:item", "id": "same:wand", "kind": "item"}]})
             _jar(tmp, "dupe.jar", fabric={"id": "same", "version": "2"})
             rows = HYBRID.read_ledger(_ledger(tmp, {
-                "one.jar": "native-ok", "two.jar": "native-ok", "dupe.jar": "native-ok"}))
+                "one.jar": "ran-clean", "two.jar": "ran-clean", "dupe.jar": "ran-clean"}))
             issues = HYBRID.check_compatibility(HYBRID.partition_pack(Path(tmp), rows))
         codes = [issue.code for issue in issues]
         self.assertIn("duplicate-mod-id", codes)
@@ -314,7 +353,7 @@ class HybridPackTests(unittest.TestCase):
             _jar(tmp, "ok.jar", fabric={"id": "ok", "version": "1"})
             _jar(tmp, "gap.jar", fabric={"id": "gap", "version": "1"})
             rows = HYBRID.read_ledger(_ledger(tmp, {
-                "ok.jar": "native-ok", "gap.jar": "native-gap"}))
+                "ok.jar": "ran-clean", "gap.jar": "native-gap"}))
             issues = HYBRID.check_compatibility(HYBRID.partition_pack(Path(tmp), rows))
         gap = next(issue for issue in issues if issue.code == "native-gap")
         self.assertEqual(gap.severity, "warning")
@@ -385,7 +424,7 @@ class HybridPackTests(unittest.TestCase):
             _jar(tmp, "native.jar", fabric={"id": "native", "version": "1"})
             _jar(tmp, "mixin.jar", fabric={"id": "mixin", "version": "1"})
             rows = HYBRID.read_ledger(_ledger(tmp, {
-                "native.jar": "native-ok", "mixin.jar": "needs-loader"}))
+                "native.jar": "ran-clean", "mixin.jar": "needs-loader"}))
             part = HYBRID.partition_pack(Path(tmp), rows)
             native = HYBRID.native_command(
                 part.native, binary=Path("client"), resources=Path("res"), work=Path("w"))

@@ -37,11 +37,17 @@ These are the numbers in [docs/java-mod-compat-status.md](docs/java-mod-compat-s
 on 8 November 2026 at commit `8a3c8dc59` (one fresh dedicated server per jar). They describe how far
 the runtime is from the two gates, not a claim that the corpus runs.
 
-| Corpus | Jars | `native-ok` | `needs-loader` | `native-gap` |
-|---|---:|---:|---:|---:|
-| wide (`corpus-xl`) | 223 | 182 (82%) | 38 (17%) | 3 (1%) |
-| mega (500 unique) | 500 | 416 (83%) | 73 (15%) | 11 (2%) |
-| NeoForge 26.3 | 85 | 51 | 20 | 14 |
+| Corpus | Jars | `ran-clean` | `ran-hollow` | `client-only-untested` | `library` | `needs-loader` | `native-gap` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 223 | 0 | 58 | 103 | 21 | 38 (17%) | 3 (1%) |
+| mega (500 unique) | 500 | 0 | 116 | 262 | 38 | 73 (15%) | 11 (2%) |
+| NeoForge 26.3 | 85 | 0 | 40 | 6 | 5 | 20 | 14 |
+
+The four non-gap labels are what the retired `native-ok` meant: the server did not refuse the jar. Only
+`ran-clean` says the server ran the entrypoint with no unmodelled host call; `ran-hollow` ran but leaned on
+neutral answers (or nobody recorded the count), `client-only-untested` and `library` were skipped and say
+nothing about whether the mod works. The committed ledgers predate the host-call count, so every `ran` row is
+`ran-hollow` with `unknown_source=none` until the next measurement.
 
 - **With declared dependencies** loaded beside each refused jar, `native-gap` is 3 and 6.
 - **Phase 2 score** (game-hook tier on): 157 of 174 `needs-loader` rows (150 unique jars) run

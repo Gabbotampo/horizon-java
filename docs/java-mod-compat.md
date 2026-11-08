@@ -1751,9 +1751,16 @@ check, and `--measure` runs both ways.
 
 | Ledger label | Where it runs | Why |
 |---|---|---|
-| `native-ok` | native half | the dedicated server ran it and its skipped plans stayed inside the jar (or it has no server-role entrypoint) |
+| `ran-clean` | native half | the dedicated server ran its entrypoint to `Done (` with no unmodelled host call and no game-class plan |
+| `ran-hollow` | native half | it ran to `Done (`, but fell through unmodelled host calls (or the count was not recorded), so it is not clean |
+| `client-only-untested` | native half | the server skipped it as client-only; this ledger does not say it works |
+| `library` | native half | no server entrypoint of its own |
 | `needs-loader` | loader half | it ran, but the plans it skipped target game classes, which only a real loader applies |
 | `native-gap` | neither by default; the loader with `--gap-to-loader` | native execution refuses it, so the loader is the other path that can carry it |
+
+The first four replace the single `native-ok` label and are what the phase gates count as a non-gap; an old
+`native-ok` row is read back as `ran-hollow` when it ran (no host-call count), or as `client-only-untested` /
+`library` when the server skipped it.
 
 The halves are separate processes. The native half is one `horizon-client --java-mod` run (the window, the
 integrated server or `--dedicated`); the loader half is `horizon-jvm --real-loader --launch-game` booting
@@ -1799,8 +1806,9 @@ Before either command runs, the tool checks the pack's own declarations rather t
 ### Results: Helix (112 jars)
 
 The pack is the Helix client pack used by the loader ledger (112 jars). Labels come from the two corpus
-ledger runs by content match: 89 `native-ok`, 1 `needs-loader` (`baguettelib`), 15 `native-gap`, and 7
-jars with no ledger row. The ledger's own split puts 2 jars in the loader half: `baguettelib` and the
+ledger runs by content match: 89 non-gap (`ran-hollow` until the host-call count is measured;
+`client-only-untested` and `library` for the skipped ones), 1 `needs-loader` (`baguettelib`), 15 `native-gap`,
+and 7 jars with no ledger row. The ledger's own split puts 2 jars in the loader half: `baguettelib` and the
 `fabric-api` its closure requires (which also stays in the native half as `shared`). The full variant,
 `--gap-to-loader`, has 26 loader jars: the 16 non-native jars plus ten libraries they require, 10 of them
 shared with the native half.

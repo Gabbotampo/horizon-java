@@ -27,17 +27,26 @@ date:
 | **2. Native-only** | the same corpus runs on `horizon-native-java` alone; the loader tier is retired and no game path starts a JVM | 0 `needs-loader` and 0 `native-gap`; every exercised mixin plan is applied by the native weaver or bound to a named host hook; `backends.jvm` stays zero because nothing has a JVM to fall back to |
 
 Phase 1 is a checkpoint, not the product: a `needs-loader` jar is proven, not ported. Skipped client-only jars and
-libraries stay `native-ok` throughout — the server role has nothing of theirs to run, so they are not failures.
-Phase 2 starts from phase 1's zero-refusal baseline and adds what the loader was carrying: game-class mixins, event
-callbacks and the client surface. The design and tier model are
+libraries count as `client-only-untested` and `library`: the phase gate treats them as non-gaps, but the ledger never
+claims they work. `ran-hollow` says the server ran the jar while falling through calls the host does not model, so
+it is not `ran-clean` either. Phase 2 starts from phase 1's zero-refusal baseline and adds what the loader was
+carrying: game-class mixins, event callbacks and the client surface. The design and tier model are
 [java-mod-compat.md](java-mod-compat.md#native-first-strategy-and-tiers).
 
 ### Coverage of the two gates (8 November 2026, commit `8a3c8dc59`)
 
-| Corpus | Jars | `native-ok` | `needs-loader` | `native-gap` | with declared dependencies | Phase 1 met? |
-|---|---:|---:|---:|---:|---:|---|
-| wide (`corpus-xl`) | 223 | 182 (82%) | 38 (17%) | 3 (1%) | 3 | no |
-| mega (500 unique) | 500 | 416 (83%) | 73 (15%) | 11 (2%) | 6 | no |
+The committed ledgers predate the per-run unmodelled-host-call count, so every row that ran reads `ran-hollow` with
+`unknown_source=none`; no row is called `ran-clean` on evidence nobody collected. The next measurement fills
+`unknown`, `unknown_source` and the three most frequent calls, and a run that measured zero becomes `ran-clean`.
+
+| Corpus | Jars | `ran-clean` | `ran-hollow` | `client-only-untested` | `library` | `needs-loader` | `native-gap` | with declared dependencies | Phase 1 met? |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| wide (`corpus-xl`) | 223 | 0 | 58 | 103 | 21 | 38 (17%) | 3 (1%) | 3 | no |
+| mega (500 unique) | 500 | 0 | 116 | 262 | 38 | 73 (15%) | 11 (2%) | 6 | no |
+
+`ran-clean` + `ran-hollow` + `client-only-untested` + `library` is the old `native-ok` column (182 and 416); the
+summary's `native_ok=` field is that sum, so the phase gate still reads one number, and it still requires
+0 `native-gap` and every `needs-loader` row proven.
 
 The label columns are the one-jar server ledgers (one fresh dedicated server per jar, 60 s, frozen binaries).
 "With declared dependencies" reruns the `native-gap` rows with each jar's required mods beside it
@@ -74,8 +83,9 @@ score below is measured with it on. 96 wide and 189 mega jars ran a server entry
    halves inside the 180 s bound with 0 static conflicts (71 native jars, 43 loader jars, the loader half at
    `Done (` in 15 s; [Hybrid sessions](#hybrid-sessions-a-native-half-and-a-loader-half)). Sway stays out of
    it (client code), seven Helix jars have no ledger row, and no client-role hybrid has been measured.
-4. **NeoForge is measured, not gated.** An 85-jar NeoForge 26.3 corpus now has a server ledger (51 `native-ok`, 20
-   `needs-loader`, 14 `native-gap`; [NeoForge corpus](#neoforge-corpus-8-november-2026)) and both server roles have
+4. **NeoForge is measured, not gated.** An 85-jar NeoForge 26.3 corpus now has a server ledger (40 `ran-hollow`,
+   6 `client-only-untested`, 5 `library`, 20 `needs-loader`, 14 `native-gap`;
+   [NeoForge corpus](#neoforge-corpus-8-november-2026)) and both server roles have
    the opt-in FML preflight, but phase 1's gate still counts only the two Fabric corpora: the NeoForge loader tier
    has no `Done (` proof (the FML probe loads and constructs mods without opening a world) and no hybrid session.
    Remapping is not a blocker: 26.3 ships unobfuscated and NeoForge jars name official classes.
@@ -327,9 +337,10 @@ game's logging jars already provide, so the game's copy wins as in Fabric's own 
 ### Tools and tests
 
 `tools/real_mod_corpus.py` (outer + nested probe with a verdict per jar), `tools/java_mod_server_ledger.py` (one real
-dedicated server per jar, verdict from its log, `java-runtime.json` and plan report as
-`native-ok`/`needs-loader`/`native-gap`; `--with-deps` runs a jar with its declared closure and labels an
-unresolvable one `missing-dependency`; `--docs` regenerates the
+dedicated server per jar, verdict from its log, `java-runtime.json`, the plan report and the probe's
+`unknown_host_call_count` as `ran-clean`/`ran-hollow`/`client-only-untested`/`library`/`needs-loader`/`native-gap`;
+`--with-deps` runs a jar with its declared closure and labels an unresolvable one `missing-dependency`; `--docs`
+regenerates the
 table below), `tools/java_mod_loader_ledger.py` (real Fabric loader),
 `tools/real_mod_fixtures/build.py` (source-only Fabric/NeoForge/legacy-Forge fixtures), the
 `real-mod-corpus` workflow (fixtures and harness self-test only, never third-party jars), the fixture suites under
@@ -366,8 +377,9 @@ config or listener phase, reflection on a null class, a mixed-loader guard, a mi
 Mega adds one verifier refusal (`StackUnderflow` in spell_engine's datagen), two jars that exceed the interpreter's
 128 nested-jar-frame bound, one duplicate native item declaration, and one jar whose metadata cannot be read at all.
 The Kotlin entrypoint adapter now runs (`fzzy_config` starts), so no refusal is attributed to it. The ledger marks
-27 / 68 rows as `native-gap`, 45 / 86 as `needs-loader`, and the remainder, 151 / 346, as `native-ok` (client-only,
-libraries, or already running).
+27 / 68 rows as `native-gap`, 45 / 86 as `needs-loader`, and the remainder, 151 / 346, as non-gaps — today's
+labels split those into `ran-hollow` (a run whose host-call count nobody recorded), `client-only-untested` and
+`library`.
 
 The role-agnostic probe over the same 500 jars (`real_mod_corpus.py`) reports **167 ok (33.4%), 303 fallback (60.6%),
 30 unsupported (6.0%)**, with the top non-ok groups being "no main entrypoint but needs the loader/embedded JVM",
@@ -386,14 +398,17 @@ Native, each jar with its declared closure through the real dedicated server
 
 | Label | Jars | What |
 |---|---:|---|
-| `native-ok` | 51 | 40 ran, 6 client-only, 5 libraries with nothing to run |
+| `ran-clean` | 0 | no committed row recorded a host-call count |
+| `ran-hollow` | 40 | ran; the host-call count was not recorded (`unknown_source=none`) |
+| `client-only-untested` | 6 | the server skipped them; nothing says they work |
+| `library` | 5 | libraries with nothing for the server to run |
 | `needs-loader` | 20 | ran, with server mixin plans on game classes the weave skips |
 | `native-gap` | 14 | 9 uncaught exceptions, 3 missing members, 1 metadata, 1 no entrypoint |
 | `missing-dependency` | 0 | (6 before the reader fixes below) |
 
 The real FancyModLoader of an installed NeoForge 26.3.0.101 server (`horizon-jvm --real-loader --entry-kind
 neoforge`, `Dist.DEDICATED_SERVER`, one run per jar with the same closure; it bootstraps the game and constructs
-every mod, but opens no world) loads and initializes 76 of 85: 48 of the 51 `native-ok` (Essential misses
+every mod, but opens no world) loads and initializes 76 of 85: 48 of the 51 non-gap native rows (Essential misses
 commons-codec, ImmediatelyFast reaches LWJGL, Cubes Without Borders fails its own init), 18 of the 20 `needs-loader`
 (sodium-extra needs client Sodium; Carry On asks for `javafml` 26.3.0.37-beta) and 10 of the 14 `native-gap`. The
 other 4 gaps fail under FML too: fzzy_config's init, and veinminer, veinminer-client and zoomify need the `klf`
@@ -407,11 +422,17 @@ template comments (`modId = "almanac" #mandatory`) were kept in the value, and J
 
 ## What runs native, what needs the loader, why
 
-Every ledger row ends in one of three labels (four with `--with-deps`), so a verdict says what to do instead of
+Every ledger row ends in one of six labels (seven with `--with-deps`), so a verdict says what to do instead of
 counting a refusal:
 
-- `native-ok`: the dedicated server runs the jar on its own. Either it executes its entrypoint and no skipped plan
-  aims at the game, or it is a client-only jar or a library the server role never loads.
+- `ran-clean`: the dedicated server ran its entrypoint to `Done (`, no server-side plan targets a game class, and
+  the run fell through no unmodelled host call. Only a measured zero earns this label.
+- `ran-hollow`: it ran to `Done (`, but at least one call the host does not model returned a neutral value instead of
+  refusing (the row records the count, its source and the three most frequent calls), or nobody measured the count
+  (`unknown_source=none`). The old `native-ok` label hid this.
+- `client-only-untested`: the server skipped it because it is client-only. This ledger says nothing about whether the
+  mod works; a client-role measurement has to answer that.
+- `library`: the server skipped it because it has no entrypoint of its own.
 - `needs-loader`: it runs, but at least half of its skipped mixin plans target game classes (`target-outside-jar`), so
   only a real loader applies them.
 - `native-gap`: native execution refuses it yet; [Known gaps](#known-gaps) and the row's reason say where.
@@ -429,8 +450,8 @@ both alone and with the pack class path and the two causes differ, the game repo
 alone lacked, so its cause is the blocker the pack hits, and the ledger categorises the row by it.
 
 Measured on 7 November 2026 (one build, the 95 `native-gap` rows of the two committed ledgers): one jar per server,
-15 stay `native-gap` and 80 leave it from native fixes landed since those ledgers (68 run: 31 `native-ok`, 37
-`needs-loader`; 12 are now read as client-only, `native-ok`); with the closure, 14 stay `native-gap`, 1 more runs
+15 stay `native-gap` and 80 leave it from native fixes landed since those ledgers (68 run: 31 non-gaps, 37
+`needs-loader`; 12 are now read as client-only, `client-only-untested`); with the closure, 14 stay `native-gap`, 1 more runs
 (archers, `needs-loader`) and none is `missing-dependency`. The closure moves the blocker more than the label:
 wizards and paladins now stop in `spell_power`'s `SpellSchools.createMagic`, zoomify in YACL's
 `JsonFileCodecConfig.saveToFile`. The native host already answers a required mod's presence, so most dependents
@@ -442,18 +463,23 @@ The block below is generated from the wide corpus's committed ledger, and the to
 <!-- java-mod-ledger:start -->
 _Generated by `tools/java_mod_server_ledger.py --docs docs/java-mod-compat-status.md` from `tools/real_mod_fixtures/LAST_SERVER_LEDGER_223.txt`; edit the tool, not this block._
 
-**223 jars: 182 `native-ok`, 38 `needs-loader`, 3 `native-gap`.**
+**223 jars: 58 `ran-hollow`, 38 `needs-loader`, 103 `client-only-untested`, 21 `library`, 3 `native-gap`.**
 
 | Label | Jars | What it means | Why |
 |---|---:|---|---|
-| `native-ok` | 182 | the dedicated server runs it on its own | 103 client-only (the server role has no entrypoint to run); 46 ran, every skipped plan stayed inside the jar; 21 libraries (nothing for the server to execute); 12 ran with no plan skipped |
+| `ran-hollow` | 58 | it ran to `Done (`, but calls the host does not model returned neutral values | 58 ran to Done; the unmodelled-host-call count was not recorded |
 | `needs-loader` | 38 | it runs, but its plans target the game, so only a real loader applies them | 38 ran, but their skipped plans target the game |
+| `client-only-untested` | 103 | client-only: the server skipped it, so this ledger says nothing about it working | 103 client-only (the server role never ran it) |
+| `library` | 21 | no server entrypoint of its own: the server skipped it | 21 libraries (nothing for the server to execute) |
 | `native-gap` | 3 | native execution cannot carry it yet | 2 refused by an uncaught exception in its entrypoint; 1 refused while decoding metadata |
 
-**Jars that are not `native-ok` (41).**
+**Jars that did not run clean (99).**  103 `client-only-untested` and 21 `library` row(s) ran nothing and are counted in the table above, not listed here.
 
 | Jar | Label | Why |
 |---|---|---|
+| `809311-8919465.jar` | `native-gap` | refused by an uncaught exception: `uncaught exception java/lang/ExceptionInInitializerError (at io/github/suel_ki/…` |
+| `Legacy4J-26.3-1.9.1-fabric.jar` | `native-gap` | refused while decoding metadata: `with the pack class path: Metadata("malformed java/util/Iterator marker (at wil…` |
+| `servercore-fabric-1.5.20+26.3.jar` | `native-gap` | refused by an uncaught exception: `with the pack class path: uncaught exception java/lang/ExceptionInInitializerEr…` |
 | `1399257-8910835.jar` | `needs-loader` | ran; 14 plan(s) skipped, at least half aimed at the game (`target-outside-jar`) |
 | `241160-8893517.jar` | `needs-loader` | ran; 2 plan(s) skipped, at least half aimed at the game (`target-outside-jar`) |
 | `248787-8907912.jar` | `needs-loader` | ran; 11 plan(s) skipped, at least half aimed at the game (`target-outside-jar`) |
@@ -492,9 +518,27 @@ _Generated by `tools/java_mod_server_ledger.py --docs docs/java-mod-compat-statu
 | `swinginglanterns-fabric-26.3-2.0.3.jar` | `needs-loader` | ran; 38 plan(s) skipped, at least half aimed at the game (`target-outside-jar`) |
 | `takeitout-1.1.28-26.3.jar` | `needs-loader` | ran; 20 plan(s) skipped, at least half aimed at the game (`target-outside-jar`) |
 | `xaeroworldmap-fabric-26.3-1.47.0.jar` | `needs-loader` | ran; 45 plan(s) skipped, at least half aimed at the game (`target-outside-jar`) |
-| `809311-8919465.jar` | `native-gap` | refused by an uncaught exception: `uncaught exception java/lang/ExceptionInInitializerError (at io/github/suel_ki/…` |
-| `Legacy4J-26.3-1.9.1-fabric.jar` | `native-gap` | refused while decoding metadata: `with the pack class path: Metadata("malformed java/util/Iterator marker (at wil…` |
-| `servercore-fabric-1.5.20+26.3.jar` | `native-gap` | refused by an uncaught exception: `with the pack class path: uncaught exception java/lang/ExceptionInInitializerEr…` |
+| `1005914-8891048.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`) |
+| `241895-8893531.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`) |
+| `257814-8894326.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 24 plan(s) skipped, none aimed at the game |
+| `258587-8894337.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 24 plan(s) skipped, none aimed at the game |
+| `361579-8918571.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 8 plan(s) skipped, none aimed at the game |
+| `367706-8917645.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 369 plan(s) skipped, none aimed at the game |
+| `368825-8901843.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 13 plan(s) skipped, none aimed at the game |
+| `411813-8925261.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`) |
+| `452834-8914313.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 1 plan(s) skipped, none aimed at the game |
+| `470193-8893473.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 45 plan(s) skipped, none aimed at the game |
+| `531761-8889669.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 98 plan(s) skipped, none aimed at the game |
+| `535489-8909383.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 24 plan(s) skipped, none aimed at the game |
+| `547434-8889946.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`) |
+| `582327-7898857.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 13 plan(s) skipped, none aimed at the game |
+| `639842-8906536.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 41 plan(s) skipped, none aimed at the game |
+| `689467-8889627.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 22 plan(s) skipped, none aimed at the game |
+| `714059-8925906.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 6 plan(s) skipped, none aimed at the game |
+| `938643-8912168.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`); 6 plan(s) skipped, none aimed at the game |
+| `ConfigManager-fabric-26.1_26.2-1.1.3.jar` | `ran-hollow` | ran to Done, but the unmodelled-host-call count was not recorded (`unknown_source=none`) |
+
+_39 more row(s) are in the ledger, not this table._
 <!-- java-mod-ledger:end -->
 
 After a ledger run, regenerate the block without touching a jar set again:
@@ -508,8 +552,10 @@ python3 tools/java_mod_server_ledger.py --from tools/real_mod_fixtures/LAST_SERV
 
 ### Tier coverage over the whole corpus
 
-Every jar in both corpora gets exactly one tier. `native-ok` means the dedicated server runs it, or the
-server role has nothing to run (client-only and library jars). `needs-loader` means native execution cannot
+Every jar in both corpora gets exactly one tier. `native-ok` means the dedicated server did not refuse it; the
+ledger's label says what that run was: `ran-clean` (measured clean), `ran-hollow` (ran, but leaned on unmodelled
+host calls or nobody counted), `client-only-untested`, or `library` (the server role had nothing to run).
+`needs-loader` means native execution cannot
 carry it but a real Fabric loader launch of its pack lists it; the row also says whether that launch reached
 `Done (`. `native-gap` means neither tier carries it, with the cause. The block below is generated from the
 two committed server ledgers and the two committed loader proof ledgers:
@@ -517,13 +563,21 @@ two committed server ledgers and the two committed loader proof ledgers:
 <!-- java-mod-coverage:start -->
 _Generated by `tools/hybrid_pack.py --coverage --docs docs/java-mod-compat-status.md` from `LAST_SERVER_LEDGER_223.txt`, `LAST_SERVER_LEDGER_500.txt`, `LAST_LOADER_PROOF_223.txt`, `LAST_LOADER_PROOF_500.txt`; edit the tool, not this block._
 
-**599 unique jars (723 rows across 2 corpora): 486 `native-ok`, 107 `needs-loader`, 6 `native-gap`, 0 out of scope.**
+**599 unique jars (723 rows across 2 corpora): 486 `native-ok` (0 `ran-clean`, 138 `ran-hollow`, 297 `client-only-untested`, 51 `library`), 107 `needs-loader`, 6 `native-gap`, 0 out of scope.**
+
+`native-ok` is the phase-gate tier: the jar is not a gap. Only `ran-clean` says the server ran its entrypoint to `Done (` with no unmodelled host call. `ran-hollow` ran, but a call the host does not model returned a neutral value (or no ledger recorded the count: `unknown_source=none`). `client-only-untested` and `library` were skipped on the server, so this report says nothing about whether they work.
 
 | Corpus | Jars | `native-ok` | `needs-loader` | `native-gap` | out of scope |
 |---|---:|---:|---:|---:|---:|
 | `corpus-xl` | 223 | 182 | 36 | 5 | 0 |
 | `mega` | 500 | 416 | 82 | 2 | 0 |
 | union (SHA-256) | 599 | 486 | 107 | 6 | 0 |
+
+| Corpus | `ran-clean` | `ran-hollow` | `client-only-untested` | `library` |
+|---|---:|---:|---:|---:|
+| `corpus-xl` | 0 | 58 | 103 | 21 |
+| `mega` | 0 | 116 | 262 | 38 |
+| union (SHA-256) | 0 | 138 | 297 | 51 |
 
 **Loader proof.** 116 of 118 `needs-loader` rows are proven: a real Fabric loader launch lists the jar, reaches `Done (` and no failure line of that run names its mod id. 2 are listed without that proof (below), and 0 have no loader evidence.
 
@@ -756,7 +810,8 @@ python3 tools/hybrid_pack.py --native-score --docs docs/java-mod-compat-status.m
 
 ### Hybrid sessions: a native half and a loader half
 
-The label decides where a jar runs: `native-ok` in one `horizon-client --java-mod` process, `needs-loader` in
+The label decides where a jar runs: the four `native-ok`-tier labels (`ran-clean`, `ran-hollow`,
+`client-only-untested`, `library`) in one `horizon-client --java-mod` process, `needs-loader` in
 `horizon-jvm --real-loader --launch-game`, and `native-gap` in neither unless the loader proof lists it
 (`--loader-ledger`, a listing that reached `Done (`) or `--gap-to-loader` routes every refusal there.
 `tools/hybrid_pack.py` partitions a pack by these ledgers (falling back to SHA-256 when the pack's filenames differ
@@ -777,7 +832,7 @@ world, each half stops at `Done (`, 180 s bound):
 
 Both halves complete. The loader half carries 21 `needs-loader` jars, 8 `native-gap` jars the loader proof lists
 (nochatreports, clientsort, collective, modernfix, puzzleslib, swinginglanterns, worldedit, xaeroworldmap), 10
-`native-ok` libraries shared with the native half, and 4 `native-ok` jars that follow their dependency
+native-ok-tier libraries shared with the native half, and 4 non-gap jars that follow their dependency
 (litematica-printer, pickupnotifier, stackrefill, wakes). The static check reports 0 conflicts (was 5
 `cross-partition-dependency`) and 42 warnings: 34 `declared-break` version ranges it does not evaluate, 7 jars with
 no ledger row, and the excluded sway. The loader half's log has one ERROR line, vanilla's
@@ -841,7 +896,7 @@ tax is startup (the Java entrypoint plus its share of resource work, ~60 ms per 
 | 25 | 25 | 3.26 s | 544 MiB | 21 |
 | 50 | 50 | 3.82 s | 700 MiB | 21 |
 | 74 | 51 | 4.39 s | 695 MiB | 21 |
-| 89 (all native-ok) | 52 | 5.22 s | 689 MiB | 21 |
+| 89 (all non-gap) | 52 | 5.22 s | 689 MiB | 21 |
 
 Only 52 of the 89 natively-runnable jars declare a dedicated-server entrypoint, so the 74-jar point is 51 executed
 mods and time/RSS flatten past 50. There were zero fallbacks to the JVM and zero startup failures in any run.
