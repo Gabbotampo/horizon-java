@@ -21431,6 +21431,65 @@ impl<H: Host> Runtime<'_, H> {
 
     /// A `byte[]` marker holding `bytes`, as `InputStream#readAllBytes`
     /// answers.
+    /// The text a `java.lang.String` constructor builds from its arguments, for
+    /// the shapes the bounded runtime models: none, a `String`, a `byte[]`
+    /// (decoded as UTF-8, with or without a charset, whole or a range) and a
+    /// `char[]` (whole or a range).
+    fn string_constructor_text(&self, descriptor: &str, args: &[Value]) -> Option<String> {
+        let range =
+            |len: usize, offset: Option<&Value>, count: Option<&Value>| match (offset, count) {
+                (Some(Value::Int(offset)), Some(Value::Int(count))) => {
+                    let start = usize::try_from(*offset).ok()?;
+                    let end = start.checked_add(usize::try_from(*count).ok()?)?;
+                    (end <= len).then_some(start..end)
+                }
+                _ => Some(0..len),
+            };
+        let ints = |value: &Value| {
+            self.array(value).ok().map(|values| {
+                values
+                    .iter()
+                    .map(|value| match value {
+                        Value::Int(value) => *value,
+                        _ => 0,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        match descriptor {
+            "()V" => Some(String::new()),
+            "(Ljava/lang/String;)V" => args.first().and_then(expect_ref).cloned(),
+            "([B)V" | "([BLjava/nio/charset/Charset;)V" | "([BLjava/lang/String;)V" => {
+                let bytes = ints(args.first()?)?;
+                Some(
+                    String::from_utf8_lossy(&bytes.iter().map(|b| *b as u8).collect::<Vec<_>>())
+                        .into_owned(),
+                )
+            }
+            "([BII)V" | "([BIILjava/nio/charset/Charset;)V" | "([BIILjava/lang/String;)V" => {
+                let bytes = ints(args.first()?)?;
+                let range = range(bytes.len(), args.get(1), args.get(2))?;
+                Some(
+                    String::from_utf8_lossy(
+                        &bytes[range].iter().map(|b| *b as u8).collect::<Vec<_>>(),
+                    )
+                    .into_owned(),
+                )
+            }
+            "([C)V" | "([CII)V" => {
+                let chars = ints(args.first()?)?;
+                let range = if descriptor == "([C)V" {
+                    0..chars.len()
+                } else {
+                    range(chars.len(), args.get(1), args.get(2))?
+                };
+                let units = chars[range].iter().map(|c| *c as u16).collect::<Vec<_>>();
+                Some(String::from_utf16_lossy(&units))
+            }
+            _ => None,
+        }
+    }
+
     fn io_bytes_array(&mut self, bytes: Vec<u8>, class: &str, method: &str) -> Value {
         let marker = self.new_array(class, method);
         let values = bytes
@@ -23874,6 +23933,25 @@ impl<H: Host> Runtime<'_, H> {
                         && matches!(receiver, Some(Value::Ref(None)))
                     {
                         self.pending_skipped_new.pop();
+                        continue;
+                    }
+                    // Strings are values here, so `new String(bytes, UTF_8)`
+                    // and its siblings turn the allocated object, wherever the
+                    // frame holds it, into the text the constructor builds.
+                    if op == 0xb7
+                        && r.name == "<init>"
+                        && r.owner == "java/lang/String"
+                        && let Some(Value::Ref(Some(object))) = receiver.as_ref()
+                        && let Some(text) = self.string_constructor_text(&r.descriptor, &args)
+                    {
+                        let object = object.clone();
+                        let text = Value::Ref(Some(text));
+                        for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                            if matches!(slot, Value::Ref(Some(marker)) if *marker == object) {
+                                *slot = text.clone();
+                            }
+                        }
+                        self.calls += 1;
                         continue;
                     }
                     self.calls += 1;
