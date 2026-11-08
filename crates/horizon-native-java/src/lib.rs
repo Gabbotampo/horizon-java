@@ -2318,6 +2318,11 @@ pub struct StdHost {
     /// `Arc` so a pack can build one table and every mod's host uses it
     /// without copying the class bytes again.
     linked_classes: Arc<LinkedClassTable>,
+    /// Objects a game `Item` constructor built (a mod's item subclasses
+    /// included), and the `BlockItem` built for each block: vanilla's
+    /// `Item.BY_BLOCK`, which `Block.asItem()` reads.
+    constructed_items: BTreeSet<String>,
+    block_items: BTreeMap<String, Value>,
     /// Explicitly seeded Java service providers. Native execution never scans
     /// the host classpath; callers must supply the service and provider class
     /// names they want visible to `ServiceLoader`.
@@ -2458,6 +2463,8 @@ impl StdHost {
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
             linked_classes: Arc::default(),
+            constructed_items: BTreeSet::new(),
+            block_items: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
@@ -2749,6 +2756,44 @@ impl StdHost {
 
     /// Share one linked table across many hosts (`Self::link_jar` clones it
     /// per host otherwise, which doubles the class bytes of a whole pack).
+    /// `ItemLike.asItem()` as vanilla answers it, for objects whose game
+    /// superclass the runtime doesn't hold: an item is its own item, a block
+    /// the `BlockItem` built for it, else `Items.AIR`. Records the item
+    /// constructors that make this answerable; those return `None` so the
+    /// call goes on to the rest of the host.
+    fn item_like_call(&mut self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
+        let marker = expect_ref(receiver)?.clone();
+        if r.name == "<init>"
+            && matches!(
+                r.owner.as_str(),
+                "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem"
+            )
+        {
+            self.constructed_items.insert(marker.clone());
+            if r.owner == "net/minecraft/world/item/BlockItem"
+                && r.descriptor
+                    .starts_with("(Lnet/minecraft/world/level/block/Block;")
+                && let Some(Value::Ref(Some(block))) = args.first()
+            {
+                self.block_items
+                    .entry(block.clone())
+                    .or_insert_with(|| receiver.clone());
+            }
+            return None;
+        }
+        if r.name != "asItem" || r.descriptor != "()Lnet/minecraft/world/item/Item;" {
+            return None;
+        }
+        if self.constructed_items.contains(&marker) {
+            return Some(receiver.clone());
+        }
+        Some(self.block_items.get(&marker).cloned().unwrap_or_else(|| {
+            Value::Ref(Some(
+                "net/minecraft/world/item/Item#net/minecraft/world/item/Items.AIR".into(),
+            ))
+        }))
+    }
+
     pub fn with_linked_class_table(mut self, table: Arc<LinkedClassTable>) -> Self {
         self.linked_classes = table;
         self
@@ -5185,6 +5230,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(value) = self.item_like_call(r, receiver, args) {
+            return Ok(value);
+        }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
             return value;
