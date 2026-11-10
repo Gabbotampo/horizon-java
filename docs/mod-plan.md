@@ -230,6 +230,38 @@ drops", and it travels through the same bake. Without the package the item is na
   that needs it is counted as an unknown host call instead of answering the overworld. Filed as
   `arismoko/horizon#2747`; the acting player itself is already carried (M2c).
 
+### Mod-owned data attachments (`Player#getData`)
+
+NeoForge's `AttachmentType<T>` is the contract behind `getData`: a mod declares a key with a
+default supplier, an optional `IAttachmentSerializer` (so a value may be unserializable, in which
+case it lives only while the holder does), `copyOnDeath`, and an optional `StreamCodec` plus
+`syncData` for clients. `IAttachmentHolder` answers `getData`, `getExistingData` and `hasData`.
+carryon's `ServerTickEvent.Post` listener reads its own attachment every tick, which is why the
+first in-game survey counts 660 failures on `Player#getData(Supplier)`.
+
+The pinned fork already owns this contract on the **Rust** side: `horizon-mod-runtime`'s
+`AttachmentType<T>` has the default, optional codec, `copy_on_death`, `sync`, and a store for
+players, entities, chunks, block entities and levels; values persist under
+`horizon:attachments` (`{value, copy_on_death, sync}`), copy on respawn, and sync to Horizon
+clients (`docs/modding/src/concepts/trait-mods/028-server-attachments.md`). What is missing is the
+**Java** bridge, not storage:
+
+- the runtime's `Host`/`StdHost` has no attachment read or write member, so a listener cannot
+  reach that store;
+- no Java-facing `AttachmentType`/`IAttachmentHolder` marker exists, so the runtime cannot read a
+  mod's key, its serializer or its codec from bytecode;
+- serializer calls (`IAttachmentSerializer.serialize`/`deserialize`) run mod bytecode at save,
+  load and `getData` time, which needs a bridge that hands the runtime the holder and the value
+  and gets a `Compound` back — no such call path is modelled;
+- death copying and the client sync stream have no Java-side equivalent either.
+
+Honest mod-owned storage today would be a `HashMap<holder, Compound>` inside the runtime, filled
+from the mod's serializer on write and never persisted, copied or synced: it would make
+`getData` return a value on the same server lifetime but silently lose it on restart and on
+death, which is worse than the counted refusal. So `Player#getData(Supplier)` stays counted until
+the attachment seam exists; `ServerPlayer#level()` remains separately blocked on
+`arismoko/horizon#2747`. This note does not implement either.
+
 ## Pin bump to `cf0113879e`
 
 The survey the bump from `1376e3bcb6` was made from (`git log 1376e3bcb6..cf0113879e -- crates/horizon-mod-api
