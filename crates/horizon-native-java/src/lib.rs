@@ -3993,14 +3993,6 @@ impl Host for StdHost {
             ("java/lang/Double", "NaN", "D") => Ok(Value::Float(f64::NAN)),
             ("java/lang/Double", "POSITIVE_INFINITY", "D") => Ok(Value::Float(f64::INFINITY)),
             ("java/lang/Double", "NEGATIVE_INFINITY", "D") => Ok(Value::Float(f64::NEG_INFINITY)),
-            ("java/nio/charset/StandardCharsets", name, "Ljava/nio/charset/Charset;")
-                if charset_name(name).is_some() =>
-            {
-                Ok(Value::Ref(Some(format!(
-                    "charset/{}",
-                    charset_name(name).unwrap_or("UTF-8")
-                ))))
-            }
             ("java/util/Locale", "US", "Ljava/util/Locale;") => {
                 Ok(Value::Ref(Some("locale/US".into())))
             }
@@ -4867,10 +4859,6 @@ impl Host for StdHost {
                     r.name == "max",
                 )))
             }
-            // Since Java 18 the default charset is UTF-8 everywhere.
-            ("java/nio/charset/Charset", "defaultCharset", "()Ljava/nio/charset/Charset;") => {
-                Ok(Value::Ref(Some("charset/UTF-8".into())))
-            }
             ("java/lang/Math", "max", "(II)I") => Ok(Value::Int(
                 expect_int(r, Self::argument(r, args, 0)?)?
                     .max(expect_int(r, Self::argument(r, args, 1)?)?),
@@ -5273,14 +5261,6 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
-        if r.owner == "java/nio/charset/Charset"
-            && let Some(name) =
-                expect_ref(receiver).and_then(|marker| marker.strip_prefix("charset/"))
-            && matches!(r.name.as_str(), "name" | "displayName" | "toString")
-            && r.descriptor == "()Ljava/lang/String;"
-        {
-            return Ok(Value::Ref(Some(name.to_owned())));
-        }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
             return Ok(value);
@@ -9188,19 +9168,6 @@ fn java_float_extremum(left: f64, right: f64, max: bool) -> f64 {
     } else {
         left.min(right)
     }
-}
-
-/// The canonical name of a `StandardCharsets` constant.
-fn charset_name(field: &str) -> Option<&'static str> {
-    Some(match field {
-        "UTF_8" => "UTF-8",
-        "US_ASCII" => "US-ASCII",
-        "ISO_8859_1" => "ISO-8859-1",
-        "UTF_16" => "UTF-16",
-        "UTF_16BE" => "UTF-16BE",
-        "UTF_16LE" => "UTF-16LE",
-        _ => return None,
-    })
 }
 
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
@@ -28184,10 +28151,9 @@ mod tests {
     use std::process::Command;
 
     /// `Math.max`/`min` on doubles and floats follow Java: NaN wins, and the
-    /// signed zeros order as -0.0 < 0.0. UTF-8 is both `StandardCharsets.UTF_8`
-    /// and the default charset (Java 18 and later), and names itself.
+    /// signed zeros order as -0.0 < 0.0.
     #[test]
-    fn jdk_float_extrema_and_charsets() {
+    fn jdk_float_extrema_follow_java() {
         let mut host = StdHost::new();
         let jdk = |owner: &str, name: &str, descriptor: &str| MethodRef {
             owner: owner.into(),
@@ -28211,33 +28177,6 @@ mod tests {
         assert_eq!(
             call(&mut host, &jdk("java/lang/Math", "min", "(FF)F"), 3.0, 0.5),
             0.5
-        );
-        let utf8 = host
-            .get_static(&jdk(
-                "java/nio/charset/StandardCharsets",
-                "UTF_8",
-                "Ljava/nio/charset/Charset;",
-            ))
-            .unwrap();
-        let default = host
-            .invoke(
-                &jdk(
-                    "java/nio/charset/Charset",
-                    "defaultCharset",
-                    "()Ljava/nio/charset/Charset;",
-                ),
-                &[],
-            )
-            .unwrap();
-        assert_eq!(utf8, default);
-        assert_eq!(
-            host.invoke_instance(
-                &jdk("java/nio/charset/Charset", "name", "()Ljava/lang/String;"),
-                &utf8,
-                &[]
-            )
-            .unwrap(),
-            Value::Ref(Some("UTF-8".into()))
         );
         assert_eq!(
             host.unknown_host_call_count(),
