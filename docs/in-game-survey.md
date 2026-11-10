@@ -330,6 +330,10 @@ is that the side's own entrypoint runs after it. The departure from Fabric: this
 failed stage and continues, while Fabric throws after the `main` stage; the jar is refused only
 when every stage failed, and a jar with any failed stage is `ran-partial`, never clean.
 
+The run's own summary line read `1 jar(s) ...: 0 ran-clean, 0 ran-hollow, 1 ran-partial,
+0 refused`, and the row's `reason` was `entrypoint(s) failed:
+eu.pb4.entityviewdistance.EVDMod: Metadata("malformed java/util/Iterator marker ...")`.
+
 **Interpreter bug for the next batch:** `entity-view-distance`'s `main` fails on
 `Metadata("malformed java/util/Iterator marker (at .../EVDMod#onInitialize +17)")`. That is this
 interpreter refusing the jar's iterator construction, not a mod error; it should become `ran-clean`
