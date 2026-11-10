@@ -98,8 +98,8 @@ fn facade(tick_count: i32) -> Arc<EventFacade> {
         players: vec![FacadePlayer {
             uuid: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
             name: "Alex".into(),
-            level: "minecraft:overworld".into(),
-            entity_id: 7,
+            level: Some("minecraft:overworld".into()),
+            entity_id: Some(7),
         }],
         levels: vec![],
         server: Default::default(),
@@ -355,7 +355,7 @@ fn fabric_listeners_keep_their_event_and_run_once_per_firing() {
         entity: Some(FacadeEntity {
             id: 3,
             kind: "minecraft:zombie".into(),
-            level: "minecraft:overworld".into(),
+            level: Some("minecraft:overworld".into()),
         }),
         damage: Some("minecraft:player_attack".into()),
         amount,

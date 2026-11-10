@@ -976,9 +976,11 @@ impl GameListeners {
 pub struct FacadePlayer {
     pub uuid: u128,
     pub name: String,
-    /// Dimension id (`minecraft:overworld`).
-    pub level: String,
-    pub entity_id: i32,
+    /// Dimension id (`minecraft:overworld`); `None` when the host hook gives
+    /// no level for the player, so `level()` refuses instead of guessing one.
+    pub level: Option<String>,
+    /// `Entity.getId`; `None` when the host hook does not know it.
+    pub entity_id: Option<i32>,
 }
 
 /// A level as the façade shows it.
@@ -996,7 +998,9 @@ pub struct FacadeEntity {
     pub id: i32,
     /// Entity type id (`minecraft:zombie`).
     pub kind: String,
-    pub level: String,
+    /// Dimension id (`minecraft:overworld`); `None` when the host hook does
+    /// not name the entity's level.
+    pub level: Option<String>,
 }
 
 /// The server state every firing exposes, snapshotted by the game.
@@ -1373,7 +1377,7 @@ impl StdHost {
                         let players = facade
                             .players
                             .iter()
-                            .filter(|p| p.level == *id)
+                            .filter(|p| p.level.as_deref() == Some(*id))
                             .map(|p| player_marker(p.uuid))
                             .collect();
                         Some(self.facade_list("level-players", players))
@@ -1388,9 +1392,9 @@ impl StdHost {
                     ("getStringUUID", _) => Some(marker(uuid_text(*uuid))),
                     ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
-                    ("getId", "I") => int(p.entity_id),
+                    ("getId", "I") => Some(Value::Int(p.entity_id?)),
                     ("isAlive", "Z") => flag(true),
-                    ("level" | "serverLevel", _) => Some(level_marker(&p.level)),
+                    ("level" | "serverLevel", _) => p.level.as_deref().map(level_marker),
                     ("getServer", _) => Some(marker(SERVER.into())),
                     _ => None,
                 }
@@ -1404,7 +1408,7 @@ impl StdHost {
                 match (name, returns) {
                     ("getId", "I") => int(entity.id),
                     ("isAlive", "Z") => flag(true),
-                    ("level", _) => Some(level_marker(&entity.level)),
+                    ("level", _) => entity.level.as_deref().map(level_marker),
                     _ => None,
                 }
             }
@@ -2222,8 +2226,8 @@ mod tests {
             players: vec![FacadePlayer {
                 uuid: alex,
                 name: "Alex".into(),
-                level: "minecraft:overworld".into(),
-                entity_id: 7,
+                level: Some("minecraft:overworld".into()),
+                entity_id: Some(7),
             }],
             server: Arc::new(ServerFacts {
                 world_dir: Some("/horizon/game/world".into()),

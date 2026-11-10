@@ -16,6 +16,7 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 | **M1, run jars** | At `server_about_to_start`, every `.jar` in `config/horizon_java/java-mods/` is read as bytes through `config_files`, loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `refused`, its host-call and unknown-host-call counts, and the refusal reason. |
 | **M2a, lifecycle** | Each jar's `StdHost` (heap, statics, recorded listeners) is kept for the server's life. `server_about_to_start` fires the Fabric `SERVER_STARTING` and NeoForge `ServerAboutToStartEvent` listeners, `server_starting` the NeoForge `ServerStartingEvent` ones, `server_started` the Fabric `SERVER_STARTED` and NeoForge `ServerStartedEvent` ones, and `server_stopping`/`server_stopped` their own. Each hook logs callbacks run/failed and unmodelled host calls; every row's `callbacks` object totals them; a jar's `System.out` lines reach the game log with its id. |
 | **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text` and `integer` nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
+| **M2c, game events** | Every other modelled server event reaches its matching mod API hook, moment for moment: server and level ticks, level load/unload, player join/leave/respawn/clone/dimension change, entity join/leave, living damage before/after, item and block use, block and entity attack, and block break (whose cancel also fires Fabric's `CANCELED`). A cancellable hook carries the firing's cancel and, where the hook has one, the Fabric `InteractionResult` back as the hook's cancellation result. The full table, arguments and departures: [docs/mod-hooks.md](mod-hooks.md). |
 
 The verdicts are the ones the corpus ledgers already use:
 
@@ -89,6 +90,22 @@ Named here, not just in comments:
 - **A player's dimension for command sources.** `CommandSourceStack.getLevel()` has no mod API read
   to answer it: `PlayerRef` exposes identity, permission and messages but no level. Fabric/NeoForge
   mods read it in command bodies; today every player source answers the overworld.
+- **`living_after_death`.** The runtime records Fabric `ServerLivingEntityEvents.AFTER_DEATH`, which
+  has no NeoForge counterpart event; `living_death` is NeoForge's `LivingDeathEvent`, before the
+  death. Add a listen-only hook at `LivingEntity.die`'s return.
+- **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; `break_block`
+  is NeoForge's `BreakBlockEvent`, before the block goes. Add a listen-only hook after the block
+  and its drops are gone.
+- **A dimension on the block and entity action hooks.** `break_block`, `left_click_block`,
+  `attack_entity` and `entity_interact` do not name the level (or, for the entity hooks, the acting
+  player), but a Fabric `Level` argument needs it. Add `dimension: &str` (and the acting
+  `player: u128`) to those events; today the callback gets a marker whose level calls are counted
+  unknowns.
+- **An item's id from an `ItemStack`/`ItemKey`.** Hooks give an `ItemStack` but no read turns its
+  key back into `minecraft:diamond`; the Java callback's item, and a NeoForge `getItemStack()`,
+  cannot be filled. Add `Host::item_id(ItemKey) -> Option<&str>`.
+- **The hand on `entity_interact`.** The hook fires once per hand but the event carries no `hand`,
+  so the Java callback always sees the main hand. Add `hand: Hand` to the event.
 
 ## Pinned fork commit
 
