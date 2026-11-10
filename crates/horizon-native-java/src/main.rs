@@ -160,7 +160,10 @@ fn read_jar(input: &Path) -> Result<(Vec<JarEntry>, BTreeMap<String, ClassFile>)
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("{}: entry {index}: {error}", input.display()))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| format!("{}: entry {index}: {error}", input.display()))?
+            .into_owned();
         if name.ends_with('/') {
             entries.push(JarEntry {
                 name,

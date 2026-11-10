@@ -359,7 +359,8 @@ pub(crate) fn with_data_recipes<R: std::io::Read + std::io::Seek>(
     let declared: BTreeSet<String> = declarations.iter().map(RegistryEntry::key).collect();
     let mut names: Vec<(String, String)> = zip
         .file_names()
-        .filter_map(|name| Some((recipe_id(name)?, name.to_owned())))
+        .filter_map(Result::ok)
+        .filter_map(|name| Some((recipe_id(&name)?, name.to_string())))
         .filter(|(id, _)| !declared.contains(&format!("minecraft:recipe/{id}")))
         .collect();
     names.sort();

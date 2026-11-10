@@ -14097,16 +14097,27 @@ impl NativeJar {
     /// read because its NeoForge/Forge entrypoint is only in a class
     /// annotation.
     pub fn from_path_metadata(path: &Path) -> Result<Self, NativeError> {
-        Self::read(path, false)
+        let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
+        Self::read(file, false)
     }
 
     pub fn from_path(path: &Path) -> Result<Self, NativeError> {
-        Self::read(path, true)
+        let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
+        Self::read(file, true)
     }
 
-    fn read(path: &Path, parse_classes: bool) -> Result<Self, NativeError> {
-        let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        let mut zip = zip::ZipArchive::new(file).map_err(|e| NativeError::Zip(e.to_string()))?;
+    /// Reads a jar this process already holds in memory, the way [`Self::from_path`] reads one
+    /// from disk. A host that hands a mod its files as bytes (Horizon's `Host::config_files`)
+    /// runs them without staging a copy on the file system first.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeError> {
+        Self::read(std::io::Cursor::new(bytes), true)
+    }
+
+    fn read<R: std::io::Read + std::io::Seek>(
+        source: R,
+        parse_classes: bool,
+    ) -> Result<Self, NativeError> {
+        let mut zip = zip::ZipArchive::new(source).map_err(|e| NativeError::Zip(e.to_string()))?;
         let mut classes = Vec::new();
         let mut resources = BTreeMap::new();
         let mut resource_bytes = BTreeMap::new();
@@ -14121,7 +14132,10 @@ impl NativeJar {
             let mut e = zip
                 .by_index(i)
                 .map_err(|e| NativeError::Zip(e.to_string()))?;
-            let name = e.name().to_owned();
+            let name = e
+                .name()
+                .map_err(|e| NativeError::Zip(e.to_string()))?
+                .into_owned();
             if !name.ends_with('/') && !name.ends_with(".class") {
                 resources
                     .entry(name.clone())
@@ -28120,6 +28134,55 @@ mod tests {
         assert_eq!(woven.fabric_entrypoints, jar.fabric_entrypoints);
         assert_eq!(woven.resources, jar.resources);
         assert_eq!(woven.resource_bytes, jar.resource_bytes);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn from_bytes_reads_a_jar_held_in_memory_like_from_path_reads_one_on_disk() {
+        // A jar assembled by a `ZipWriter` over memory: the same bytes a host
+        // hands a mod through `Host::config_files` instead of a file.
+        let class = weavable_class_bytes("demo/T");
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"memory","version":"3.1","depends":{"dep":"*"},"entrypoints":{"main":["demo.T"]}}"#,
+        )
+        .unwrap();
+        zip.start_file("assets/demo.txt", options).unwrap();
+        zip.write_all(b"payload").unwrap();
+        zip.start_file("demo/T.class", options).unwrap();
+        zip.write_all(&class).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+
+        let root = std::env::temp_dir().join(format!(
+            "horizon-native-java-from-bytes-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("memory.jar");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let memory = NativeJar::from_bytes(&bytes).unwrap();
+        let disk = NativeJar::from_path(&path).unwrap();
+        assert_eq!(memory.fabric_id.as_deref(), Some("memory"));
+        assert_eq!(memory.fabric_version.as_deref(), Some("3.1"));
+        assert_eq!(memory.required_mods, disk.required_mods);
+        assert_eq!(memory.fabric_entrypoints, disk.fabric_entrypoints);
+        assert_eq!(memory.resources, disk.resources);
+        assert_eq!(memory.resource_bytes, disk.resource_bytes);
+        assert_eq!(memory.classes.len(), disk.classes.len());
+        // The parsed class is the same one from either source, so the same
+        // entrypoint executes identically.
+        assert_eq!(memory.classes["demo/T"].write().unwrap(), class);
+        assert_eq!(
+            memory.discover_entrypoints("main"),
+            disk.discover_entrypoints("main")
+        );
+        // Bytes that are not a zip are refused, not silently empty.
+        let error = NativeJar::from_bytes(b"not a jar").unwrap_err();
+        assert!(matches!(error, NativeError::Zip(_)), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
 

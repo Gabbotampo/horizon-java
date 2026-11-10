@@ -4322,7 +4322,10 @@ fn read_mapping_text(path: &Path) -> Result<String, String> {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
             };
-            let name = entry.name().to_ascii_lowercase();
+            let Some(name) = entry_name(&entry) else {
+                continue;
+            };
+            let name = name.to_ascii_lowercase();
             if !name.ends_with(".tiny") {
                 continue;
             }
@@ -6152,6 +6155,12 @@ fn metadata_path(jar: &Path) -> Result<Option<&'static str>, String> {
 
 /// `@Mod`-annotated top-level classes, in sorted order. NeoForge's
 /// `neoforge.mods.toml` does not name its mod class, so this stays a scan.
+/// A zip entry's decoded name. `zip` 9 reports a name its encoding cannot decode as an error, so
+/// an entry with an unreadable name is skipped like one whose name matches nothing.
+fn entry_name<R: std::io::Read>(entry: &zip::read::ZipFile<'_, R>) -> Option<String> {
+    entry.name().ok().map(|name| name.into_owned())
+}
+
 fn neoforge_mod_classes(jar: &Path) -> Result<Vec<String>, String> {
     let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;
@@ -6160,7 +6169,9 @@ fn neoforge_mod_classes(jar: &Path) -> Result<Vec<String>, String> {
         let mut entry = archive
             .by_index(index)
             .map_err(|e| format!("{}: reading zip entry: {e}", jar.display()))?;
-        let name = entry.name().to_owned();
+        let Some(name) = entry_name(&entry) else {
+            continue;
+        };
         if !name.ends_with(".class") || name.contains('$') {
             continue;
         }
@@ -6220,7 +6231,9 @@ fn declared_entrypoint_kinds(jar: &Path) -> Result<Vec<String>, String> {
         let Ok(mut entry) = archive.by_index(index) else {
             return false;
         };
-        let name = entry.name().to_owned();
+        let Some(name) = entry_name(&entry) else {
+            return false;
+        };
         if !name.ends_with(".class") || name.contains('$') {
             return false;
         }
@@ -6509,7 +6522,9 @@ fn neoforge_metadata(jar: &Path) -> Result<NeoForgeMetadata, String> {
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        let name = entry.name().to_owned();
+        let Some(name) = entry_name(&entry) else {
+            continue;
+        };
         if let Some(nested) = name.strip_prefix("META-INF/jarjar/") {
             if nested.ends_with(".jar") {
                 metadata.jar_jars += 1;
@@ -6742,7 +6757,9 @@ fn jar_mixin_configs(jar: &Path) -> Option<Vec<(String, MixinEnvironment)>> {
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        let name = entry.name().to_owned();
+        let Some(name) = entry_name(&entry) else {
+            continue;
+        };
         if !name.contains('/') && name.ends_with(".mixins.json") {
             push_root_mixin_config(&mut configs, &name);
         }
@@ -7590,7 +7607,9 @@ fn is_minecraft_runtime_jar(path: &Path) -> bool {
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        let name = entry.name().to_owned();
+        let Some(name) = entry_name(&entry) else {
+            continue;
+        };
         if is_minecraft_class(&name) {
             game_classes += 1;
             if game_classes >= 32 {
@@ -7621,7 +7640,7 @@ fn is_minecraft_runtime_jar(path: &Path) -> bool {
             let Ok(entry) = inner.by_index(index) else {
                 continue;
             };
-            if is_minecraft_class(entry.name()) {
+            if entry_name(&entry).is_some_and(|name| is_minecraft_class(&name)) {
                 classes += 1;
                 if classes >= 32 {
                     return true;
@@ -7663,10 +7682,12 @@ fn expand_nested_jars(
             let mut entry = archive
                 .by_index(entry_index)
                 .map_err(|e| format!("{}: reading zip entry: {e}", path.display()))?;
-            let Some(name) = nested_jar_name(entry.name()) else {
+            let Some(name) =
+                entry_name(&entry).and_then(|name| nested_jar_name(&name).map(str::to_owned))
+            else {
                 continue;
             };
-            if dedupe_log4j && is_duplicate_log4j_jar(name, classpath) {
+            if dedupe_log4j && is_duplicate_log4j_jar(&name, classpath) {
                 continue;
             }
             if serial >= MAX_NESTED_JARS {
@@ -7749,8 +7770,9 @@ fn shadow_platform_logging(
         provided.extend(
             archive
                 .file_names()
+                .filter_map(Result::ok)
                 .filter(|name| name.ends_with(".class") && !name.starts_with("META-INF/"))
-                .map(str::to_owned),
+                .map(|name| name.to_string()),
         );
     }
     let mut lines = Vec::new();
@@ -7767,7 +7789,8 @@ fn shadow_platform_logging(
         };
         let hidden = archive
             .file_names()
-            .filter(|name| provided.contains(*name))
+            .filter_map(Result::ok)
+            .filter(|name| provided.contains(name.as_ref()))
             .count();
         if hidden == 0 {
             continue;
@@ -7784,7 +7807,7 @@ fn shadow_platform_logging(
             let entry = archive
                 .by_index_raw(entry_index)
                 .map_err(|e| format!("{}: reading zip entry: {e}", source.display()))?;
-            if provided.contains(entry.name()) {
+            if entry_name(&entry).is_some_and(|name| provided.contains(&name)) {
                 continue;
             }
             writer
@@ -7825,7 +7848,11 @@ mod logging_shadow_tests {
 
     fn names(path: &Path) -> Vec<String> {
         let archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
-        let mut out: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        let mut out: Vec<String> = archive
+            .file_names()
+            .filter_map(Result::ok)
+            .map(|name| name.to_string())
+            .collect();
         out.sort();
         out
     }
