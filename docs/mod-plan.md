@@ -18,7 +18,7 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 | **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text` and `integer` nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 | **M2c, game events** | Every other modelled server event reaches its matching mod API hook, moment for moment: server and level ticks, level load/unload, player join/leave/respawn/clone/dimension change, entity join/leave, living damage before/after, item and block use, block and entity attack, and block break (whose cancel also fires Fabric's `CANCELED`). A cancellable hook carries the firing's cancel and, where the hook has one, the Fabric `InteractionResult` back as the hook's cancellation result. The full table, arguments and departures: [docs/mod-hooks.md](mod-hooks.md). |
 | **M3, content** | The jars now run at the game's **Registration** phase, before any resource or world loads and while the content root can still grow, instead of at `server_about_to_start`. Each `RegistryDeclaration::{Item, Block}` the runtime recorded becomes a native content declaration (`Hooks::blocks`/`items`, NeoForge's `RegisterEvent`): an item keeps the template and the properties the content vocabulary carries, and a block brings its block item. The game joins them under the jar's namespace, so `/give`, `setblock` and the inventory see `<jar id>:<path>`. A jar's own assets, lang and loot need the bake route in [m3-content-design.md](m3-content-design.md). |
-| **M3b, baked assets** | An install-time bake (`tools/bake.py`) reads every jar in `config/horizon_java/java-mods/`, keeps the resource kinds a content package accepts, and writes one `.hmod` per namespace into `<game-dir>/horizon-mods/`, turned on in `horizon-mods.txt`. The game loads it as any content mod; the runtime's declarations join the package whose id is their namespace (`mod_content::accept_declared`), so `m3_fixture:ruby` gets the jar's own model, texture, name and block loot instead of the template's. Class files, metadata and unsafe paths never enter the package; everything left out is in `config/horizon_java/bake-report.json` with its reason. The install-time ownership seam this needs is under [Fork seams needed](#fork-seams-needed). |
+| **M3b, baked assets and declarations** | An install-time bake (`tools/bake.py`) runs each jar's server entrypoints through the offline runtime (`horizon-native-java --json <jar>`, the code the mod vendors), keeps the resource kinds a content package accepts, and writes one `.hmod` per namespace into `<game-dir>/horizon-mods/`, turned on in `horizon-mods.txt`. The package carries the jar's models, textures, item definitions, blockstates, lang and loot **and** its blocks/items as `data/<ns>/horizon/{block,item}/*.json` (the runtime's own mapping, `crates/horizon-native-java/src/content.rs`). It owns its namespace, so the game loads it without the native ownership fence; the mod's runtime declaration for that namespace is skipped (see the fence note below). Class files, metadata and unsafe paths never enter the package; everything left out is in `config/horizon_java/bake-report.json` with its reason. |
 
 The verdicts are the ones the corpus ledgers already use:
 
@@ -145,23 +145,63 @@ Horizon Java: m3_fixture.jar: content: 1 block(s), 1 item(s) in namespace m3_fix
 ```
 
 `tools/bake.py` (M3b) writes those declarations into a content package of the jar's namespace, which
-the game accepts without the fence. Without the skip, one jar with content would stop the game at
-start, and the M3 proof above would not run at this pin.
+the game accepts without the fence — the package owns the namespace, and no native declaration is
+involved. Without the skip, one jar with content would stop the game at start, and the M3 proof
+above would not run at this pin.
+
+## M3b proof
+
+The bake needs the runtime probe; it is the same `horizon-native-java` crate the mod vendors, so
+the declarations it records offline are exactly what the mod would have declared at Registration:
+
+```
+cargo build -p horizon-native-java
+python3 tools/bake.py --probe target/debug/horizon-native-java --game-dir SCRATCH/game-dir
+m3_fixture.jar: 1 package(s) [m3_fixture], 2 file(s) skipped
+report: SCRATCH/game-dir/config/horizon_java/bake-report.json
+```
+
+`sorted(zipfile.namelist())` of `SCRATCH/game-dir/horizon-mods/m3_fixture.hmod` is the jar's own
+`assets/` and `data/` (blockstate, models, item definitions, the two generated 16x16 ruby textures,
+`lang/en_us.json`, the block loot table), its `data/minecraft/tags/block/mineable/pickaxe.json`, and
+the package's own declarations:
+
+```
+data/m3_fixture/horizon/block/ruby_block.json  {"item":true,"properties":{},"template":"minecraft:stone"}
+data/m3_fixture/horizon/item/ruby.json         {"template":"minecraft:stick"}
+```
+
+The manifest is `id = "m3_fixture"`, `api = "0.2"`, `side = "both"`,
+`capabilities = ["registries"]`; the report lists `fabric.mod.json` and `m3fixture/Content.class` as
+skipped (not a content path / code) and `declarations: {"blocks":1,"items":1}`. The game loads the
+package beside the native mod, and the jar's own declaration is skipped by the fence:
+
+```
+Horizon Java: m3_fixture.jar: content: 1 block(s), 1 item(s) in namespace m3_fixture not declared: not owned by horizon_java; run tools/bake.py
+Horizon: content from 2 mod(s) in .horizon-cache/mod-content/<stamp>
+```
+
+`horizon-ctl` then shows the jar's name, art and loot:
+
+```
+give m3_fixture:ruby 1        {"given":1,"ok":true}
+messages 1                    Gave 1 [Ruby] to Player...
+select m3_fixture:ruby        (hotbar shows the red gem and the name "Ruby" above it)
+screenshot ruby-hotbar.png    the ruby texture, not the stick
+setblock 7 73 3 m3_fixture:ruby_block
+break 7 73 3                  {"block_before":"m3_fixture:ruby_block",
+                               "drops":{"m3_fixture:ruby":1},
+                               "picked_up":{"m3_fixture:ruby":1}, ...}
+inventory                     counts {"m3_fixture:ruby":1} -> {"m3_fixture:ruby":2}
+```
+
+The block drops only with a pickaxe because a `minecraft:stone` template keeps stone's
+`requires_tool`; the jar's own `mineable/pickaxe` tag is what makes the wooden pickaxe "correct for
+drops", and it travels through the same bake. Without the package the item is named
+`block.m3_fixture.ruby` and draws as the stick.
 
 ## Fork seams needed
 
-- **A jar's namespace at install time (M3b's bake).** The generated `dispatch_blocks`/`dispatch_items`
-  attribute each declaration with `parts::owned_declaration_id`, which accepts only the declaring
-  mod's manifest id and `namespaces`. A manifest line for the jar's namespace does not help either:
-  the native package's `namespaces` are content claims, so `content::clash` then refuses the baked
-  package of that namespace. A Java jar's namespace is learned when it is installed, not when the
-  native mod is built, so the bridge cannot list it.
-  What the bake needs: a namespace owned by an installed content package counts as owned (the local
-  function above), and the content package's files and the native declaration may share it.
-  *NeoForge/Fabric*: the namespace is chosen by the registering code at runtime — a mod's `modid`
-  is its namespace, its `DeferredRegister.create(..., "m3_fixture")` /
-  `Registry.register(ResourceLocation.fromNamespaceAndPath("m3_fixture", ...))` names it, and
-  `assets/m3_fixture/` is in the same jar; no loader reads a static ownership list.
 - **A namespace a manifest id cannot spell.** A package id is `[a-z0-9_]{1,64}`
   (`Manifest::parse`), while a namespace is `[a-z0-9_.-]`; a jar that registers in `my-mod` or
   `my.mod` has no package id its declarations can join by (`accept_declared` matches `m.id == ns`).
@@ -382,9 +422,8 @@ Horizon Java: client_only_demo.jar (client_only_demo) refused (0 host calls, 0 u
    maps to a game hook site is one hook row in `[inject]`-free form: `Hooks` methods the mod
    implements and forwards to the runtime's event table.
 2. **Content assets.** Blocks and items a jar registers are in the world (M3), and its models,
-   textures, lang, loot and recipes now bake into a content `.hmod` beside it (M3b); the runtime
-   declarations join that package once the fork ownership seam above lands. Mob effects, entity
-   types and menus still have no native declaration hook.
+   textures, lang, loot and recipes now bake into a content `.hmod` beside it, which declares them
+   too (M3b). Mob effects, entity types and menus still have no native declaration hook.
 3. **Mixins as hook rows** rather than a weaver: bind the plans the runtime discovers to the game's
    named hook sites, as `docs/modding/src/how-to/native-mods/011-named-hook-points.md` describes,
    and leave the bounded weaver for jars that need their own classes rewritten.

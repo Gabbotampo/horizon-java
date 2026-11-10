@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Bake a Java mod jar's assets and data into a Horizon content package.
 
-Milestone 3 declares a jar's blocks and items in the game, but a native mod may not own another
-namespace's files (`Content::check_namespace` in the fork), so the jar's own models, textures,
-names, blockstates and loot never reach the game. This tool closes that gap at install time: it
-reads every jar in ``java-mods/``, keeps the resource kinds a content package accepts, and writes
-one ``.hmod`` per namespace into ``<game-dir>/horizon-mods/``. The game loads those packages as
-ordinary content mods next to the native mod, and the runtime's declarations join the package whose
-id is their namespace (`mod_content::accept_declared`).
+A native mod may not own another namespace's files or declarations (`Content::check_namespace`
+and the generated declaration fence in the fork), so a jar's own models, textures, names,
+blockstates, loot, blocks and items never reach the game by themselves. This tool closes that gap at
+install time: it runs each jar's server entrypoints through the offline runtime
+(``horizon-native-java --json <jar>``, the code the mod vendors), reads the typed blocks and items
+it recorded, keeps the resource kinds a content package accepts, and writes one ``.hmod`` per
+namespace into ``<game-dir>/horizon-mods/``. The package declares its own blocks and items
+(``data/<ns>/horizon/{block,item}/*.json``) next to the jar's assets, and the game loads it as an
+ordinary content mod; the mod's runtime declaration for that namespace is skipped.
 
-    python3 tools/bake.py --game-dir /tmp/m3b-env/game-dir
+    python3 tools/bake.py --probe target/debug/horizon-native-java --game-dir /tmp/m3b-env/game-dir
     python3 tools/bake.py --game-dir SCRATCH --java-mods SCRATCH/config/horizon_java/java-mods
+
+The probe is ``--probe``, ``$HORIZON_NATIVE_JAVA`` or a cargo build under ``target/``; without one
+the bake refuses the jar rather than writing a package whose items do not exist.
 
 The bake is deterministic: same jar bytes, same package bytes. A jar with an unsafe entry path
 (zip-slip) is refused whole and named in the report; nothing is extracted from it. Class files,
@@ -24,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import zipfile
 from dataclasses import dataclass, field
@@ -94,6 +100,12 @@ MAX_FILE = 16 << 20  # the fork's `content::MAX_FILE`
 MAX_TOTAL = 512 << 20  # the fork's `content::MAX_TOTAL`
 MAX_FILES = 65_536  # the fork's `content::MAX_FILES`
 
+# The runtime probe (`crates/horizon-native-java`) runs a jar's entrypoints offline and prints its
+# typed blocks and items as content declarations. The bake never re-implements the interpreter.
+PROBE_ENV = "HORIZON_NATIVE_JAVA"
+PROBE = "horizon-native-java"
+SERVER_KINDS = ("main", "server", "neoforge")
+
 # The fixed entry timestamp: a package's bytes must not depend on when the bake ran.
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 ZIP_MODE = 0o644 << 16
@@ -101,6 +113,10 @@ ZIP_MODE = 0o644 << 16
 
 class UnsafeJar(Exception):
     """A jar entry could escape the package (zip-slip) or is not a plain file."""
+
+
+class ProbeError(Exception):
+    """The offline runtime could not say what content a jar declares."""
 
 
 @dataclass
@@ -127,6 +143,8 @@ class Package:
     path: Path
     files: list[str]
     bytes: int
+    blocks: int = 0
+    items: int = 0
 
     def as_json(self, game_dir: Path) -> dict:
         return {
@@ -135,6 +153,7 @@ class Package:
             "path": _relative(self.path, game_dir),
             "files": len(self.files),
             "bytes": self.bytes,
+            "declarations": {"blocks": self.blocks, "items": self.items},
         }
 
 
@@ -296,6 +315,62 @@ def _manifest(namespace: str, jar: str) -> str:
     )
 
 
+def find_probe(explicit: Path | None) -> Path | None:
+    """The runtime probe: the flag, `$HORIZON_NATIVE_JAVA`, or a cargo build in this checkout."""
+    if explicit is not None:
+        return explicit if explicit.is_file() else None
+    configured = os.environ.get(PROBE_ENV)
+    if configured:
+        path = Path(configured)
+        if path.is_file():
+            return path
+    for folder in ("target/release", "target/debug", ".local/parity-target/release", ".local/parity-target/debug"):
+        path = Path(folder) / PROBE
+        if path.is_file():
+            return path
+    return None
+
+
+def probe_declarations(probe: Path, jar: Path) -> list[tuple[str, str, dict]]:
+    """Runs the jar's server entrypoints offline and returns its (kind, id, content file) blocks
+    and items. The probe is the same runtime the mod vendors, so what it records is exactly what
+    the mod would have declared at Registration."""
+    last = "no output"
+    for kind in SERVER_KINDS:
+        try:
+            run = subprocess.run(
+                [str(probe), "--json", str(jar), kind],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ProbeError(str(error)) from error
+        lines = [line for line in run.stdout.splitlines() if line.strip()]
+        if run.returncode != 0 or not lines:
+            errors = [line for line in run.stderr.splitlines() if line.strip()]
+            last = errors[-1] if errors else f"exit status {run.returncode}"
+            continue
+        try:
+            report = json.loads(lines[-1])
+        except json.JSONDecodeError as error:
+            last = f"not JSON: {error}"
+            continue
+        if report.get("status") != "ok":
+            last = str(report.get("error", report.get("status")))
+            continue
+        if not report.get("entrypoints"):
+            last = "no server entrypoint"
+            continue
+        content = report.get("content") or {}
+        declarations = []
+        for name, key in (("block", "blocks"), ("item", "items")):
+            for entry in content.get(key, []):
+                declarations.append((name, entry["id"], entry["file"]))
+        return declarations
+    raise ProbeError(f"no server entrypoint ran ({last})")
+
+
 def write_package(path: Path, namespace: str, jar: str, files: list[tuple[str, bytes]]) -> int:
     """Writes a deterministic `.hmod` (a zip: `horizon-mod.toml` then the sorted files)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,13 +390,29 @@ def write_package(path: Path, namespace: str, jar: str, files: list[tuple[str, b
     return path.stat().st_size
 
 
-def bake_jar(jar: Path, out: Path, claimed: dict[str, str]) -> JarBake:
+def _declaration_bytes(file: dict) -> bytes:
+    """The declaration file, deterministic (sorted keys, compact) and newline-terminated."""
+    return json.dumps(file, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def bake_jar(jar: Path, out: Path, claimed: dict[str, str], probe: Path | None) -> JarBake:
     """Bakes one jar into one package per namespace; `claimed` refuses a shared namespace."""
     bake = JarBake(jar=jar.name)
     try:
         entries = _zip_entries(jar, bake)
     except UnsafeJar as error:
         bake.error = str(error)
+        return bake
+    if probe is None:
+        bake.error = (
+            f"no runtime probe: pass --probe <{PROBE}> or set {PROBE_ENV}, so the jar's blocks "
+            "and items can be declared in its package"
+        )
+        return bake
+    try:
+        declarations = probe_declarations(probe, jar)
+    except ProbeError as error:
+        bake.error = f"the runtime could not run the jar's entrypoints: {error}"
         return bake
 
     by_namespace: dict[str, list[tuple[str, bytes]]] = {}
@@ -344,6 +435,48 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str]) -> JarBake:
             shared.append((name, data))
         else:
             by_namespace.setdefault(namespace, []).append((name, data))
+
+    # The runtime's typed registrations become the package's own declarations
+    # (`data/<namespace>/horizon/{block,item}/<path>.json`), which the content loader reads without
+    # the native ownership fence. A block with `item: true` declares its own item; an item file for
+    # the same id would refuse the namespace.
+    block_items = {
+        declaration_id
+        for kind, declaration_id, file in declarations
+        if kind == "block" and file.get("item", True)
+    }
+    declared = set()
+    for kind, declaration_id, file in declarations:
+        namespace, path = declaration_id.split(":", 1) if ":" in declaration_id else ("", "")
+        if not namespace or not path:
+            bake.skip("declaration id is not namespace:path", declaration_id)
+            continue
+        if namespace == "minecraft":
+            bake.skip("vanilla's namespace: a mod does not declare vanilla content", declaration_id)
+            continue
+        if not NAMESPACE.match(namespace) or not plain_path(path):
+            bake.skip("declaration id is not a content namespace and path", declaration_id)
+            continue
+        if not PACKAGE_ID.match(namespace) or namespace in RESERVED_IDS:
+            # A manifest id is `[a-z0-9_]`; a package id its declarations can join has the same
+            # shape (`mod_content::accept_declared` matches the id). `-` and `.` have no package.
+            bake.error = (
+                f"namespace {namespace!r} is not a content package id ([a-z0-9_], not a device "
+                "name): its declarations cannot join a package (docs/mod-plan.md, "
+                "Fork seams needed)"
+            )
+            continue
+        if kind == "item" and declaration_id in block_items:
+            bake.skip("the block's own item (its block declares it)", declaration_id)
+            continue
+        if declaration_id in declared:
+            bake.skip("declared more than once in the jar", declaration_id)
+            continue
+        declared.add(declaration_id)
+        target = f"data/{namespace}/horizon/{kind}/{path}.json"
+        by_namespace.setdefault(namespace, []).append(
+            (target, _declaration_bytes(file))
+        )
 
     bake.namespaces = sorted(by_namespace)
     if not bake.namespaces:
@@ -374,12 +507,15 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str]) -> JarBake:
             files = files + shared
         target = out / f"{namespace}.hmod"
         size = write_package(target, namespace, jar.name, files)
+        prefix = f"data/{namespace}/horizon/"
         package = Package(
             id=namespace,
             namespace=namespace,
             path=target,
             files=[name for name, _ in sorted(files)],
             bytes=size,
+            blocks=sum(1 for name, _ in files if name.startswith(prefix + "block/")),
+            items=sum(1 for name, _ in files if name.startswith(prefix + "item/")),
         )
         bake.packages.append(package)
         claimed[namespace] = jar.name
@@ -414,15 +550,20 @@ def enable(game_dir: Path, ids: list[str]) -> list[str]:
 
 
 def bake_directory(
-    java_mods: Path, game_dir: Path, out: Path | None = None, turn_on: bool = True
+    java_mods: Path,
+    game_dir: Path,
+    out: Path | None = None,
+    turn_on: bool = True,
+    probe: Path | None = None,
 ) -> BakeReport:
     """Bakes every `*.jar` under `java_mods` into `out` (default `<game_dir>/horizon-mods`)."""
     out = out if out is not None else game_dir / MODS_DIR
     report = BakeReport(java_mods=java_mods, game_dir=game_dir, out=out)
     jars = sorted(java_mods.glob("*.jar")) if java_mods.is_dir() else []
+    probe = find_probe(probe)
     claimed: dict[str, str] = {}
     for jar in jars:
-        report.jars.append(bake_jar(jar, out, claimed))
+        report.jars.append(bake_jar(jar, out, claimed, probe))
     if turn_on:
         ids = [package.id for jar in report.jars for package in jar.packages]
         report.enabled = enable(game_dir, ids)
@@ -461,12 +602,17 @@ def main(argv: list[str]) -> int:
         type=Path,
         help="the report file (default: config/horizon_java/bake-report.json)",
     )
+    parser.add_argument(
+        "--probe",
+        type=Path,
+        help=f"the {PROBE} runtime probe (default: ${PROBE_ENV} or a cargo build)",
+    )
     args = parser.parse_args(argv)
 
     game_dir = args.game_dir.resolve()
     java_mods = args.java_mods or game_dir / "config" / "horizon_java" / "java-mods"
     out = args.out or game_dir / MODS_DIR
-    report = bake_directory(java_mods, game_dir, out, not args.no_enable)
+    report = bake_directory(java_mods, game_dir, out, not args.no_enable, args.probe)
     report_path = args.report or game_dir / REPORT
     _write_report(report, report_path)
 
