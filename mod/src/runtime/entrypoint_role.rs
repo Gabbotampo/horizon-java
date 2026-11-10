@@ -51,9 +51,14 @@ impl NativeJar {
     /// The first of [`Self::role_entrypoint_kinds`] that declares entrypoints,
     /// with every entrypoint of that kind, or `None` when the jar runs nothing
     /// in this role.
+    ///
+    /// Discovery uses the role's physical side, so a NeoForge
+    /// `@Mod(dist = Dist.CLIENT)` class (fzzy_config's shape) never reaches
+    /// the server: FML constructs it only on a client.
     pub fn role_entrypoints(&self, client: bool) -> Option<(&'static str, Vec<Entrypoint>)> {
+        let side = if client { "CLIENT" } else { "SERVER" };
         self.role_entrypoint_kinds(client).iter().find_map(|kind| {
-            let entries = self.discover_entrypoints(kind);
+            let entries = self.discover_entrypoints_on(kind, side);
             (!entries.is_empty()).then_some((*kind, entries))
         })
     }
@@ -109,6 +114,53 @@ mod tests {
         out
     }
 
+    /// A class file `demo/NeoClient` whose `@Mod(value = "demo", dist =
+    /// [Dist.CLIENT])` is the shape javap shows for fzzy_config's client
+    /// class. The `dist` element is an array of enum constants, not strings.
+    fn client_only_neoforge_mod_class() -> Vec<u8> {
+        fn u2(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn utf8(out: &mut Vec<u8>, value: &str) {
+            out.push(1);
+            u2(out, value.len() as u16);
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
+        u2(&mut out, 12); // pool slots 1..=11
+        utf8(&mut out, "demo/NeoClient"); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2 Class
+        utf8(&mut out, "java/lang/Object"); // 3
+        out.extend_from_slice(&[7, 0, 3]); // 4 Class
+        utf8(&mut out, "Lnet/neoforged/fml/common/Mod;"); // 5
+        utf8(&mut out, "RuntimeVisibleAnnotations"); // 6
+        utf8(&mut out, "value"); // 7
+        utf8(&mut out, "demo"); // 8
+        utf8(&mut out, "dist"); // 9
+        utf8(&mut out, "Lnet/neoforged/api/distmarker/Dist;"); // 10
+        utf8(&mut out, "CLIENT"); // 11
+        // public class, this #2, super #4, no interfaces, fields or methods.
+        out.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0]);
+        // One RuntimeVisibleAnnotations attribute.
+        u2(&mut out, 1);
+        u2(&mut out, 6);
+        let mut annotations = Vec::new();
+        u2(&mut annotations, 1); // one annotation
+        u2(&mut annotations, 5); // type
+        u2(&mut annotations, 2); // two pairs
+        u2(&mut annotations, 7); // value =
+        annotations.extend_from_slice(&[b's', 0, 8]);
+        u2(&mut annotations, 9); // dist =
+        annotations.push(b'[');
+        u2(&mut annotations, 1); // one enum element
+        annotations.push(b'e');
+        u2(&mut annotations, 10);
+        u2(&mut annotations, 11);
+        out.extend_from_slice(&(annotations.len() as u32).to_be_bytes());
+        out.extend_from_slice(&annotations);
+        out
+    }
+
     const UNIVERSAL_FABRIC_JSON: &[u8] = br#"{"schemaVersion":1,"id":"demo","version":"1",
         "entrypoints":{"client":["demo.ClientInit"]}}"#;
     const NEOFORGE_TOML: &[u8] = br#"modLoader = "javafml"
@@ -153,6 +205,31 @@ version = "1"
             assert_eq!(kind, "neoforge");
             assert_eq!(entries[0].class, "demo.NeoMod");
         }
+    }
+
+    #[test]
+    fn a_client_only_mod_class_never_reaches_the_server_role() {
+        // FML constructs a `@Mod(dist = Dist.CLIENT)` class only on a client;
+        // fzzy_config's client class carries this shape and must not run on a
+        // server.
+        let class = client_only_neoforge_mod_class();
+        let jar = jar(&[
+            ("META-INF/neoforge.mods.toml", NEOFORGE_TOML),
+            ("demo/NeoClient.class", &class),
+        ]);
+        assert_eq!(
+            jar.discover_entrypoints_on("neoforge", "SERVER").len(),
+            0,
+            "a CLIENT-only @Mod class must be filtered out of the server role"
+        );
+        let client = jar.discover_entrypoints_on("neoforge", "CLIENT");
+        assert_eq!(client.len(), 1);
+        assert_eq!(client[0].class, "demo.NeoClient");
+        assert!(jar.role_entrypoints(false).is_none());
+        assert_eq!(
+            jar.role_entrypoints(true).unwrap().1[0].class,
+            "demo.NeoClient"
+        );
     }
 
     #[test]
