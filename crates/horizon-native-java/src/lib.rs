@@ -20,6 +20,7 @@ mod class_init;
 pub mod client_surface;
 mod color_collection;
 mod commons_io;
+pub mod content;
 mod declarations_content;
 mod dfu_pair;
 mod entrypoint_role;

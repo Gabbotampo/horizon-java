@@ -16,7 +16,10 @@ one (the definition of ``ran-clean`` in the mod's report). ``lifecycle`` registe
 in the game log. ``command`` registers ``/javahello [name]`` through Fabric's
 ``CommandRegistrationCallback``, which milestone 2b runs in the game. ``content`` registers one
 plain item and one plain block, which milestone 3 turns into game content (the runtime infers a
-``minecraft:stick`` item and a ``minecraft:stone`` block).
+``minecraft:stick`` item and a ``minecraft:stone`` block), and ships the jar's own assets, name
+and loot for the milestone 3b bake: a generated 16x16 ruby texture and ruby block texture, their
+item definitions, models and blockstate, ``lang/en_us.json`` (Ruby, Block of Ruby), and the block's
+loot table dropping one ruby.
 
 The loader and game classes are compiled as stubs so ``javac`` accepts the mod, but only the
 mod's own classes go into the jar: the native host answers the API classes, exactly as it does
@@ -28,10 +31,12 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 # Common stubs every fixture compiles against; none of them enter the jar.
@@ -306,8 +311,119 @@ public class Block {
 """,
 }
 
+# The 16x16 art the content fixture ships, generated here so no binary is committed. The game's
+# content bake copies it; the proof checks that this exact colour reaches the hotbar.
+RUBY_BASE = (0xB3, 0x1F, 0x3E, 255)
+RUBY_DARK = (0x5E, 0x0B, 0x1F, 255)
+RUBY_LIGHT = (0xE8, 0x5A, 0x78, 255)
+
+
+def png(pixels: list[list[tuple[int, int, int, int]]]) -> bytes:
+    """A minimal RGBA PNG: the fixture's own texture, deterministic and dependency-free."""
+    height, width = len(pixels), len(pixels[0])
+    raw = b"".join(b"\x00" + b"".join(bytes(pixel) for pixel in row) for row in pixels)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def ruby_item_texture() -> bytes:
+    """A 16x16 cut gem: dark outline, ruby fill, a light diagonal facet."""
+    pixels = []
+    for y in range(16):
+        row = []
+        for x in range(16):
+            edge = x in (2, 15) or y in (1, 14) or x - y >= 13 or y - x >= 13
+            if edge:
+                row.append(RUBY_DARK)
+            elif y == x or y == x + 1:
+                row.append(RUBY_LIGHT)
+            else:
+                row.append(RUBY_BASE)
+        pixels.append(row)
+    return png(pixels)
+
+
+def ruby_block_texture() -> bytes:
+    """A 16x16 ruby block: a framed face with a faceted middle, the same palette."""
+    pixels = []
+    for y in range(16):
+        row = []
+        for x in range(16):
+            border = x in (0, 15) or y in (0, 15)
+            inner_border = x in (1, 14) or y in (1, 14)
+            facet = x in (7, 8) or y in (7, 8)
+            if border:
+                row.append(RUBY_DARK)
+            elif inner_border or facet:
+                row.append(RUBY_LIGHT)
+            else:
+                row.append(RUBY_BASE)
+        pixels.append(row)
+    return png(pixels)
+
+
+def content_assets() -> dict[str, bytes]:
+    """The content fixture's jar assets: model, item definition, texture, name and loot."""
+    cube = {
+        "parent": "minecraft:block/cube_all",
+        "textures": {"all": "m3_fixture:block/ruby_block"},
+    }
+    return {
+        "assets/m3_fixture/textures/item/ruby.png": ruby_item_texture(),
+        "assets/m3_fixture/textures/block/ruby_block.png": ruby_block_texture(),
+        "assets/m3_fixture/items/ruby.json": (
+            b'{"model":{"type":"minecraft:model","model":"m3_fixture:item/ruby"}}'
+        ),
+        "assets/m3_fixture/items/ruby_block.json": (
+            b'{"model":{"type":"minecraft:model","model":"m3_fixture:block/ruby_block"}}'
+        ),
+        "assets/m3_fixture/models/item/ruby.json": (
+            b'{"parent":"minecraft:item/generated",'
+            b'"textures":{"layer0":"m3_fixture:item/ruby"}}'
+        ),
+        "assets/m3_fixture/models/block/ruby_block.json": json.dumps(cube).encode(),
+        "assets/m3_fixture/blockstates/ruby_block.json": (
+            b'{"variants":{"":{"model":"m3_fixture:block/ruby_block"}}}'
+        ),
+        "assets/m3_fixture/lang/en_us.json": (
+            b'{"item.m3_fixture.ruby":"Ruby",'
+            b'"block.m3_fixture.ruby_block":"Block of Ruby"}'
+        ),
+        # A stone-template block keeps stone's "needs the right tool" rule, so the jar names its
+        # own block as pickaxe-mineable; without this a pickaxe would break it and drop nothing.
+        "data/minecraft/tags/block/mineable/pickaxe.json": (
+            b'{"values":["m3_fixture:ruby_block"]}'
+        ),
+        "data/m3_fixture/loot_table/blocks/ruby_block.json": json.dumps(
+            {
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{"type": "minecraft:item", "name": "m3_fixture:ruby"}],
+                    }
+                ],
+                "random_sequence": "m3_fixture:blocks/ruby_block",
+            }
+        ).encode(),
+    }
+
+
 # The mod id, entrypoint class and jar name per fixture; the mod's log line names the id.
-FIXTURES: dict[str, dict[str, str]] = {
+FIXTURES: dict[str, dict] = {
     "m0": {
         "id": "m0_fixture",
         "entry": "m0fixture.Hello",
@@ -364,6 +480,7 @@ public final class Lifecycle {
         "entry": "m3fixture.Content",
         "jar": "m3_fixture.jar",
         "stubs": CONTENT_STUBS,
+        "assets": content_assets(),
         "source": """
 package m3fixture;
 
@@ -631,6 +748,8 @@ def build(out: Path, kind: str = "m0") -> Path:
         # The stubs are compile-time only; the native host answers those classes.
         with zipfile.ZipFile(jar, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("fabric.mod.json", json.dumps(metadata, indent=2))
+            for name, data in sorted(fixture.get("assets", {}).items()):
+                archive.writestr(name, data)
             for class_file in sorted(classes.rglob("*.class")):
                 archive.write(class_file, class_file.relative_to(classes).as_posix())
     return jar

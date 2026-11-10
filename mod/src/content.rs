@@ -13,11 +13,11 @@
 //! directory (`--game-dir` is a `set_current_dir`), and native mods are trusted code. The report
 //! still goes through the config service, where it exists.
 //!
-//! Transcription is deliberately narrow. Only `RegistryDeclaration::{Block, Item}` has a content
-//! field for what the runtime recorded, and only the property keys
-//! `item_declaration_properties`/`block_declaration_properties` already translated (the host keeps
-//! the rest). Anything else stays in the jar's row and is named in `docs/m3-content-design.md`,
-//! not guessed into content.
+//! Transcription is deliberately narrow. `runtime::content` maps a typed
+//! `RegistryDeclaration::{Block, Item}` into the content vocabulary (the template and the property
+//! keys the fork reads); this module only applies the event fields, skips ids the game's
+//! namespace fence does not let the mod own, and leaves the rest in the jar's row as
+//! `docs/m3-content-design.md` maps it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -64,20 +64,12 @@ impl State {
             }
         }
         for jar in &mut self.jars {
+            let declarations = runtime::content::declarations(jar.host.registrations());
             jar.row.content_skipped = unowned_counts(
                 owned,
-                jar.host
-                    .registrations()
+                declarations
                     .iter()
-                    .filter_map(|entry| match &entry.declaration {
-                        Some(runtime::RegistryDeclaration::Block { .. }) => {
-                            Some((entry.id.as_str(), true))
-                        }
-                        Some(runtime::RegistryDeclaration::Item { .. }) => {
-                            Some((entry.id.as_str(), false))
-                        }
-                        _ => None,
-                    }),
+                    .map(|declaration| (declaration.id(), declaration.is_block())),
             );
         }
         for jar in &self.jars {
@@ -145,33 +137,29 @@ pub(crate) fn declare_blocks(
     let mut declared = BTreeSet::new();
     let mut count = 0;
     for jar in &mut state.jars {
-        for entry in jar.host.registrations() {
-            let Some(runtime::RegistryDeclaration::Block {
-                template,
-                properties,
-                item,
-            }) = &entry.declaration
-            else {
+        for declaration in runtime::content::declarations(jar.host.registrations()) {
+            let runtime::content::ContentDeclaration::Block(declaration) = declaration else {
                 continue;
             };
-            if !usable_id(&entry.id) {
+            let id = declaration.id.clone();
+            if !usable_id(&id) {
                 log::warn!(
                     "{LOG}: {}: block {} is not an id this mod can declare; left out",
                     jar.row.id,
-                    entry.id
+                    id
                 );
                 continue;
             }
-            if !owns(&owned, &entry.id) {
+            if !owns(&owned, &id) {
                 // The game's declaration fence would refuse it, and a refusal is fatal at start.
                 // It is in the row's `content.skipped`; a baked content package declares it.
                 continue;
             }
-            if !declared.insert(entry.id.clone()) {
+            if !declared.insert(id.clone()) {
                 log::warn!(
                     "{LOG}: {}: block {} is declared more than once; only the first is used",
                     jar.row.id,
-                    entry.id
+                    id
                 );
                 continue;
             }
@@ -180,29 +168,19 @@ pub(crate) fn declare_blocks(
             // mod may not depend on (docs/m3-content-design.md, seam 1).
             event.blocks.push(Default::default());
             let block = event.blocks.last_mut().expect("just pushed");
-            block.id = entry.id.clone();
-            block.template = template.clone();
-            block.item = *item;
-            if let Some(value) = properties.get("hardness").and_then(|v| v.parse().ok()) {
-                block.properties.hardness = Some(value);
-            }
-            if let Some(value) = properties
-                .get("explosion_resistance")
-                .and_then(|v| v.parse().ok())
-            {
-                block.properties.explosion_resistance = Some(value);
-            }
-            if let Some(value) = properties.get("friction").and_then(|v| v.parse().ok()) {
-                block.properties.friction = Some(value);
-            }
-            block.properties.requires_tool =
-                properties.get("requires_tool").map(|value| value == "true");
+            block.id = id;
+            block.template = declaration.template.clone();
+            block.item = declaration.item;
+            block.properties.hardness = declaration.hardness;
+            block.properties.explosion_resistance = declaration.explosion_resistance;
+            block.properties.friction = declaration.friction;
+            block.properties.requires_tool = declaration.requires_tool;
             // A content package of the same namespace supplies the block item's own model; with
             // none, the item keeps the template's so the block has the template's look.
-            if !owns_assets(context, &entry.id) {
+            if !owns_assets(context, &block.id) {
                 block.components.push((
                     "minecraft:item_model".to_owned(),
-                    Some(mod_api::Tag::String(template.as_str().into())),
+                    Some(mod_api::Tag::String(declaration.template.as_str().into())),
                 ));
             }
             jar.row.content_blocks += 1;
@@ -228,66 +206,57 @@ pub(crate) fn declare_items(
     let mut declared = BTreeSet::new();
     let mut count = 0;
     for jar in &mut state.jars {
-        for entry in jar.host.registrations() {
-            let Some(runtime::RegistryDeclaration::Item {
-                template,
-                properties,
-            }) = &entry.declaration
-            else {
+        for declaration in runtime::content::declarations(jar.host.registrations()) {
+            let runtime::content::ContentDeclaration::Item(declaration) = declaration else {
                 continue;
             };
-            if !usable_id(&entry.id) {
+            let id = declaration.id.clone();
+            if !usable_id(&id) {
                 log::warn!(
                     "{LOG}: {}: item {} is not an id this mod can declare; left out",
                     jar.row.id,
-                    entry.id
+                    id
                 );
                 continue;
             }
-            if !owns(&owned, &entry.id) {
+            if !owns(&owned, &id) {
                 // See the block counterpart: refused by the game's fence, counted in the row,
                 // and declared by a baked content package instead.
                 continue;
             }
-            if block_items.contains(&entry.id) {
+            if block_items.contains(&id) {
                 // A block's item is declared with the block (`item: true`); declaring the same id
                 // again refuses the whole namespace at the content root.
                 continue;
             }
-            if !declared.insert(entry.id.clone()) {
+            if !declared.insert(id.clone()) {
                 log::warn!(
                     "{LOG}: {}: item {} is declared more than once; only the first is used",
                     jar.row.id,
-                    entry.id
+                    id
                 );
                 continue;
             }
             event.items.push(Default::default());
             let item = event.items.last_mut().expect("just pushed");
-            item.id = entry.id.clone();
-            item.template = template.clone();
-            item.max_stack_size = properties
-                .get("max_stack_size")
-                .and_then(|value| value.parse().ok())
-                .filter(|size| (1..=99).contains(size));
-            item.rarity = properties
-                .get("rarity")
-                .and_then(|rarity| match rarity.to_ascii_lowercase().as_str() {
-                    "common" => Some(mod_api::Rarity::Common),
-                    "uncommon" => Some(mod_api::Rarity::Uncommon),
-                    "rare" => Some(mod_api::Rarity::Rare),
-                    "epic" => Some(mod_api::Rarity::Epic),
-                    _ => None,
-                });
-            item.crafting_remainder = properties.get("crafting_remainder").cloned();
+            item.id = id;
+            item.template = declaration.template.clone();
+            item.max_stack_size = declaration.max_stack_size;
+            item.rarity = declaration.rarity.map(|rarity| match rarity {
+                runtime::content::Rarity::Common => mod_api::Rarity::Common,
+                runtime::content::Rarity::Uncommon => mod_api::Rarity::Uncommon,
+                runtime::content::Rarity::Rare => mod_api::Rarity::Rare,
+                runtime::content::Rarity::Epic => mod_api::Rarity::Epic,
+            });
+            item.crafting_remainder = declaration.crafting_remainder.clone();
             // The content plan renames the template's `minecraft:item_model` to the new id, and
             // nothing then defines that id. A content package of the same namespace (the bake in
             // docs/m3-content-design.md) supplies the real definition; without one, keep the
             // template's model so the item draws with the vanilla art.
-            if !owns_assets(context, &entry.id) {
+            if !owns_assets(context, &item.id) {
                 item.components.push((
                     "minecraft:item_model".to_owned(),
-                    Some(mod_api::Tag::String(template.as_str().into())),
+                    Some(mod_api::Tag::String(declaration.template.as_str().into())),
                 ));
             }
             jar.row.content_items += 1;
@@ -318,11 +287,12 @@ fn owns_assets(context: &RegistrationContext, id: &str) -> bool {
 fn block_item_ids(state: &State) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     for jar in &state.jars {
-        for entry in jar.host.registrations() {
-            if let Some(runtime::RegistryDeclaration::Block { item: true, .. }) = &entry.declaration
-                && usable_id(&entry.id)
+        for declaration in runtime::content::declarations(jar.host.registrations()) {
+            if let runtime::content::ContentDeclaration::Block(block) = declaration
+                && block.item
+                && usable_id(&block.id)
             {
-                ids.insert(entry.id.clone());
+                ids.insert(block.id);
             }
         }
     }

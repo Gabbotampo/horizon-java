@@ -1,6 +1,7 @@
 use horizon_native_java::{
     ClassFile, Entrypoint, MethodRef, MixinInjectionPlan, NativeJar, StdHost,
-    mixin_plans_in_weave_order, weave_class_with_extras, weave_classes_with_extras,
+    content::declarations, mixin_plans_in_weave_order, weave_class_with_extras,
+    weave_classes_with_extras,
 };
 use std::{
     collections::BTreeMap,
@@ -579,6 +580,18 @@ fn execution_json(
     host: &StdHost,
     jar: &NativeJar,
 ) -> serde_json::Value {
+    // The typed blocks and items as the fork's content declarations, for the offline bake
+    // (`tools/bake.py`): the file value plus the id the package's path comes from.
+    let typed = declarations(host.registrations());
+    let content = |block: bool| -> Vec<serde_json::Value> {
+        typed
+            .iter()
+            .filter(|declaration| declaration.is_block() == block)
+            .map(|declaration| {
+                serde_json::json!({ "id": declaration.id(), "file": declaration.file_json() })
+            })
+            .collect()
+    };
     serde_json::json!({
         "status": "ok",
         "kind": kind,
@@ -600,6 +613,10 @@ fn execution_json(
                 "typed": entry.declaration.is_some(),
             }))
             .collect::<Vec<_>>(),
+        "content": {
+            "blocks": content(true),
+            "items": content(false),
+        },
         "listeners": host.listener_registrations().count(),
         "events": host.posted_events().len(),
         "mixin_targets": mixin_target_labels(
