@@ -3,7 +3,9 @@
 `mod/` is a Horizon **native mod**: the first way this runtime runs inside the game rather than in
 the probe. It is built against the game-side mod API on
 [arismoko/horizon](https://github.com/arismoko/horizon) (crate `horizon-mod-api`, library
-`mod_api`), which is where that API lives.
+`mod_api`), which is where that API lives. Since the fork's `a5ca9a72fd` the types themselves are in
+`crates/horizon-mod-vocab` (library `mod_vocab`) and `horizon-mod-api` re-exports them; a mod still
+depends on `horizon-mod-api`.
 
 Nothing in `crates/horizon-native-java` or `crates/horizon-jvm` moves or changes shape for this:
 the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod is one flat crate.
@@ -228,9 +230,111 @@ drops", and it travels through the same bake. Without the package the item is na
   that needs it is counted as an unknown host call instead of answering the overworld. Filed as
   `arismoko/horizon#2747`; the acting player itself is already carried (M2c).
 
+## Pin bump to `cf0113879e`
+
+The survey the bump from `1376e3bcb6` was made from (`git log 1376e3bcb6..cf0113879e -- crates/horizon-mod-api
+crates/horizon-mod-vocab crates/horizon-mod-package crates/cargo-horizon-mod docs/native-mods.md
+docs/modding`, then the diffs). It changed nothing this mod must rewrite; the pin alone moves it.
+
+**Crate and path moves.**
+
+- The mod API's trait, vocabulary, host traits, wire types and hook declarations moved verbatim to a
+  new `crates/horizon-mod-vocab` (library `mod_vocab`; `a5ca9a72fd`, "Move mod vocabulary sources
+  verbatim", followed by the dispatch dependency closure in `fbcc919f8c` and the facade wiring in
+  `3e98e1cc21`). `horizon-mod-api` is now a 13-line facade: `pub use mod_vocab::*;` plus the wasm
+  `wire` module. Its `extern crate self as mod_api` makes the re-export transparent, so every
+  `mod_api::<name>` path this mod uses (`Hooks`, the events, `Hand`, `InteractionResult`, `Text`,
+  `RegistrationContext`, `Block`/`Item`/`Rarity`/`Tag`, `#[mod_api::horizon_mod]`,
+  `__private::game::RegistrationContextNew`) still resolves. The mod still depends on
+  **`horizon-mod-api`**, not on `horizon-mod-vocab` directly: the crate docs
+  (`docs/modding/src/how-to/native-mods/016-the-mods-crate.md`) and both builders name that package.
+  The launcher rewrites the `horizon-mod-api` dependency to `../../crates/horizon-mod-api`
+  (`launcher/src/native_mods/api.rs`, `PACKAGES` unchanged); that crate's own path dependency
+  `../horizon-mod-vocab` resolves inside the fork checkout, which `cargo horizon-mod` and the
+  launcher both have. No `mod/Cargo.toml` dependency change was needed.
+- `horizon-platform` (new, `3e98e1cc21`) is the layer-split facade. It is not in the native mod
+  build: `PACKAGES` in the launcher still lists only `horizon-mod-api`, `horizon-mod-points` and
+  `horizon-internals`.
+
+**API renames.** None on the surface this mod implements or calls. The `Hooks` trait, every hook
+file it implements, and its event types are byte-identical between the two commits (`git diff
+--find-renames` reports only additions: `hooks/entity_invulnerability_check.rs` is a new hook this
+mod does not listen to, and `hooks/notes.rs` loses four lines of comment). What did change:
+
+- `RegistrationContext::refuse(&self, reason: &str)` is new (`parts/owned_namespaces.rs`): a mod can
+  refuse its own registration with a bounded reason (first wins, 4096 UTF-8 bytes, truncated at a
+  character boundary). The registrar rolls back that mod's declarations from a checkpoint
+  (`parts/registration_refusal.rs`) and records `"mod <id> refused registration: <reason>"`. This
+  mod never calls it, so nothing changes.
+- The wasm guest's `world::phase::install_guest_packages` is now `install_guest_packages` at the
+  root; wasm-only, unused here.
+- `parts/menus.rs` moved out of the facade into the vocabulary crate, and a mod's menu declarations
+  are now validated (`menu_books::validate_registered`, called from
+  `game/modding/mods/mod.rs::register_menu_types`, which is now fallible). This mod declares no
+  menus.
+
+**New fences and validation.**
+
+- **Namespace ownership is unchanged.** `parts/owned_namespaces.rs` only gained `refuse`; a native
+  mod may still declare content only in its manifest id and `namespaces`, and `mod/src/content.rs`
+  still skips other namespaces and points at the bake. `Content::check_namespace`,
+  `accept_declared` and the content package reader are untouched (no diff in
+  `crates/horizon-mod-package/src/content*`), so a baked `.hmod` is read exactly as before:
+  `id` = the jar namespace, `api = "0.2"`, `side = "both"`, `capabilities = ["registries"]`.
+- **Manifest: mod points only.** `Manifest::parse` gained `mod_point_dependency`: a wasm
+  `internals` listener may be backed by a declared dependency whose mod id (with `-` as `_`) starts
+  its `at`, and a mod point library's crate must be named after its mod id (`Refusal::LibraryCrate`).
+  This mod is native, declares no `[inject]`, no `[internals]` and no `[dependencies]`, so neither
+  rule is reachable. `capabilities = ["registries"]` is still required and still the only spelling.
+- **Mod self-refusal** (above) is the only new admission path, and it is opt-in.
+- **Menu layouts** are refused on a declaration mismatch instead of published half-decoded; no menu
+  declarations here.
+
+**Dependencies.** `zip 9.1.3` and `serde_json 1.0.151` are still Horizon's locked versions, so
+`mod/Cargo.toml`'s `=` pins are unchanged. `MIXINS_REV` is still
+`5a64af938ec86b00d53d16a408aabc0038fb3e57`.
+
+**Build check.** A game built from `cf0113879e` unpatched (`crates/native-game` generated as the
+launcher does, `mod/` staged with `horizon-mod-api` rewritten to `../../crates/horizon-mod-api`)
+compiles `horizon-java-mod 0.1.0` with no source change: the re-export covers the moved vocabulary.
+
+**In-game proof.** One run of that game (log's own line `Horizon 0.1.0`; fork worktree HEAD
+`cf0113879ebee600bff86070466f75b2db90b40a`, no edit to the checkout), six fixture jars plus the
+baked `m3_fixture.hmod`, offscreen test terrain:
+
+```
+Horizon Java: m0_fixture.jar (m0_fixture) ran-clean (11 host calls, 0 unknown host calls)
+Horizon Java: m3_fixture.jar: content: 1 block(s), 1 item(s) in namespace m3_fixture not declared: not owned by horizon_java; run tools/bake.py
+Horizon Java: content: 0 block declaration(s) from 6 jar(s)
+Horizon: content from 2 mod(s) in .horizon-cache/mod-content/<stamp>
+```
+
+`horizon-ctl` / the log then showed, in order:
+
+```
+command "javahello Viola"                {"chat":["Hello, Viola!"]}
+command "give @s m3_fixture:ruby 1"      Gave 1 [Ruby] to Player00316
+select m3_fixture:ruby                   hotbar icon; screenshot ruby-hotbar.png
+command "setblock 0 71 7 m3_fixture:ruby_block"   Changed the block at 0, 71, 7
+break 0 71 7                             {"block":"minecraft:air","block_before":"m3_fixture:ruby_block","drops":{"m3_fixture:ruby":1}}
+inventory                                counts {"m3_fixture:ruby":3} after collect
+break 1 71 7 (stone)                     {"block":"minecraft:stone","drops":{}} and block 1 71 7 still stone
+  Horizon Java: m2c_fixture: m2c: kept stone at 1,71,7
+  Horizon Java: m2c_fixture: m2c: break canceled at 1,71,7
+interact-entity 7 (both hands empty)     Horizon Java: m2d_fixture: m2d: interact hand=null id=7
+  Horizon Java: use_entity (dedicated=false): 1 callback(s) ran, 0 failed, 1 unknown host call(s)   (twice)
+kill @e[type=minecraft:cow]              Horizon Java: m2d_fixture: m2d: after death id=7
+  Horizon Java: living_after_death (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
+```
+
+Every jar's report row is `ran-clean`; `m2d_fixture`'s `callbacks` is
+`{"ran":3,"failed":0,"unknown_host_call_count":2}` (the two empty-hand reads), and `m3_fixture`'s
+`content.skipped` is `[{"namespace":"m3_fixture","blocks":1,"items":1}]` while the baked package
+supplies them.
+
 ## Pinned fork commit
 
-The mod targets **`arismoko/horizon` at `1376e3bcb68b771373ea75637b0201381ccfa6bd`** (2026-11-10),
+The mod targets **`arismoko/horizon` at `cf0113879ebee600bff86070466f75b2db90b40a`** (2026-11-11),
 recorded in `mod/horizon-mod.toml`'s `[native] horizon` and in `mod/Cargo.toml`'s
 `horizon-mod-api` dependency. Why that commit and not `main`'s head:
 
@@ -243,21 +347,17 @@ recorded in `mod/horizon-mod.toml`'s `[native] horizon` and in `mod/Cargo.toml`'
   `docs/modding/src/how-to/native-mods/005-native-mod-source-revisions.md`): hooks, host methods and
   their call sites are the game's source, and a later game may not build the mod unchanged.
 
-This commit replaced `c4bcfcca5e` (2026-11-07) to pick up our own merged fork changes:
+This commit replaced `1376e3bcb6` (2026-11-10), which had replaced `c4bcfcca5e` (2026-11-07). The
+earlier bumps picked up our own merged fork changes:
 
-- #2591, typed `level_tick_pre`/`level_tick_post` events on `HostSide`/`LevelRef`;
-- #2592, the `living_death_post` hook at the end of `LivingEntity.die`;
-- #2626, the load-owned registry key tables (`item_keys`, `item_id`).
+- from `c4bcfcca5e`, #2591 `level_tick_pre`/`level_tick_post` on `HostSide`/`LevelRef`, #2592 the
+  `living_death_post` hook, #2626 the load-owned registry key tables;
+- from `1376e3bcb6`, the mod API's own renames (`Command`, `Authority`, `InteractionResult`,
+  `BreakBlockEvent.state` as a `BlockState`, a level tick's dimension, `Text::translate` by value);
+- this one carries the vocabulary move to `horizon-mod-vocab` and the self-refusal, mod-point and
+  menu-layout changes surveyed above. None of them changes a call this mod makes.
 
-The API also moved between the two commits, and the mod follows it: `NativeCommand`,
-`NativeAuthority` and `NativeInteractionResult` are `Command`, `Authority` and `InteractionResult`;
-`BreakBlockEvent.state` is a `BlockState`; a level tick's `LevelRef` names its dimension; and
-`Text::translate` takes the argument list by value.
-
-**Next pin bump.** Fork main has since moved the mod API sources into a new `horizon-mod-vocab`
-crate (`a5ca9a72fd`, after `1376e3bcb6`). This pin does not follow that move; the next bump rewrites
-the mod's `mod_api` imports against the new crate first, so the source move and the behaviour
-changes of that bump land in separate reviewable steps.
+The M0–M3b proofs below were re-run on this pin, unpatched, with the game's own commit line.
 
 The game version is pinned beside it as `game = "26.3"`, and `mixins` at the fork's
 `MIXINS_REV` (`5a64af938ec86b00d53d16a408aabc0038fb3e57`) because the manifest requires all three.
