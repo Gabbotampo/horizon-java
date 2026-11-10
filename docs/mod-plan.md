@@ -130,6 +130,23 @@ is needed for the proof. The stopped report's row is
   Config, after Registration; `config/horizon_java/java-mods` is the mod's own folder and the game
   folder is the process's working directory. The report still goes through `config_files`.
 
+### The pinned fork's ownership fence
+
+The pinned commit added a namespace-ownership check to the generated `dispatch_blocks`/
+`dispatch_items` (`crates/horizon-mod-api/src/parts/owned_namespaces.rs`): a native mod may declare
+content only in its manifest id and its manifest `namespaces`, and any other id is a fatal refusal
+at start. A Java jar's namespace is learned at install time and is not in the mod's manifest, so the
+bridge declares only ids it owns; every other typed declaration is counted in the jar's row
+(`content.skipped`, per namespace with block and item counts) and logged:
+
+```
+Horizon Java: m3_fixture.jar: content: 1 block(s), 1 item(s) in namespace m3_fixture not declared: not owned by horizon_java; run tools/bake.py
+```
+
+`tools/bake.py` (M3b) writes those declarations into a content package of the jar's namespace, which
+the game accepts without the fence. Without the skip, one jar with content would stop the game at
+start, and the M3 proof above would not run at this pin.
+
 ## Fork seams needed
 
 - **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; NeoForge has
