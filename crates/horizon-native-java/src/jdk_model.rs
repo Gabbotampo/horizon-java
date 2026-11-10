@@ -268,6 +268,28 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         {
             kotlin_null_check(name, args)
         }
+        // Fabric's resource loader, one per pack type: the real
+        // `ResourceLoaderImpl.get` is `IMPL_MAP.computeIfAbsent(type, ...)`, so
+        // it always answers the same instance for a type. The listener a mod
+        // registers is accepted; the runtime has no resource reload, so it
+        // never runs (named in the PR).
+        (
+            "net/fabricmc/fabric/api/resource/v1/ResourceLoader",
+            "get",
+            "(Lnet/minecraft/server/packs/PackType;)Lnet/fabricmc/fabric/api/resource/v1/ResourceLoader;",
+        ) => {
+            let kind = args
+                .first()
+                .map(expect_string)
+                .unwrap_or("SERVER_DATA")
+                .rsplit('/')
+                .next()
+                .unwrap_or("SERVER_DATA")
+                .to_owned();
+            Some(Ok(Value::Ref(Some(format!(
+                "fabric-resource-loader/{kind}"
+            )))))
+        }
         _ => None,
     }
 }
@@ -328,6 +350,25 @@ pub(crate) fn instance_call(
         && (is_logger_owner(&r.owner) || r.owner == "java/lang/Object")
     {
         return logger_call(r, name);
+    }
+    if let Some(kind) = marker.strip_prefix("fabric-resource-loader/") {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            // Registration is kept nowhere: with no resource reload modelled,
+            // there is no event to fire the listener from, and pretending one
+            // had run would be worse than accepting the registration.
+            (
+                "registerReloadListener",
+                "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/server/packs/resources/PreparableReloadListener;)V",
+            )
+            | (
+                "addListenerOrdering",
+                "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/resources/Identifier;)V",
+            ) => Some(Ok(Value::Void)),
+            ("toString", "()Ljava/lang/String;") => {
+                Some(Ok(Value::Ref(Some(format!("ResourceLoader[{kind}]")))))
+            }
+            _ => None,
+        };
     }
     if let Some(pattern) = marker.strip_prefix("regex-pattern/") {
         return match (r.name.as_str(), r.descriptor.as_str()) {

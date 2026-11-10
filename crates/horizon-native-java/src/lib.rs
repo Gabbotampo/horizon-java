@@ -8387,6 +8387,7 @@ impl Host for StdHost {
             }
             (
                 "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/neoforged/neoforge/registries/DeferredRegister$DataComponents"
                 | "net/minecraftforge/registries/DeferredRegister",
                 "register",
                 descriptor,
@@ -8569,7 +8570,8 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(format!("optional/resource-key/{key}"))))
             }
             (
-                "net/neoforged/neoforge/registries/DeferredRegister",
+                "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/neoforged/neoforge/registries/DeferredRegister$DataComponents",
                 "register",
                 "(Lnet/neoforged/bus/api/IEventBus;)V",
             ) => Ok(Value::Void),
