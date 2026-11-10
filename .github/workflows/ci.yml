@@ -30,6 +30,33 @@ jobs:
         run: cargo +stable clippy --locked --all-targets -- -D warnings
       - name: Rust tests
         run: cargo +stable test --locked
+      - name: Vendored runtime (mod changes)
+        # `mod/src/runtime/` is a copy of `crates/horizon-native-java/src` (the native mod is one
+        # crate), recorded per file in `mod/vendor.lock`. Only a PR that touches the mod or the
+        # tool must carry a current copy: a runtime-only PR is unaffected, because the mod carries
+        # the commit its lock records until a mod PR refreshes it (`python3 tools/vendor.py`).
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          # The base's tree only, so no merge base is needed in the shallow checkout.
+          if ! git fetch --no-tags --depth=1 origin "$BASE_SHA"; then
+            echo "::warning::could not fetch the base commit; skipping the vendored-copy check (the mod's lock check still runs in the Python tests)"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA" HEAD)
+          if ! printf '%s\n' "$changed" | grep -qE '^(mod/|tools/vendor\.py$)'; then
+            echo "no mod/ or tools/vendor.py change: the mod's copy is not this PR's to refresh"
+            exit 0
+          fi
+          python3 tools/vendor.py --check
+      - name: Vendored runtime (main, warning only)
+        # On main it reports a stale copy instead of failing the branch: the next mod PR (or a
+        # release) refreshes it with `python3 tools/vendor.py`.
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: python3 tools/vendor.py --check
       - name: Python tests
         # The fixture tests look for the debug binaries the step above built.
         run: python3 -m unittest discover -s tests

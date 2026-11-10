@@ -14,10 +14,24 @@ made, so the mod never drifts from ``crates/horizon-native-java``:
   ``#[path]`` submodules of ``client_surface.rs`` need no change;
 * ``mod/vendor.lock`` records the source commit and the SHA-256 of every vendored file and of the
   file it was made from. The vendored files are committed: a clean clone builds without running
-  this tool, and ``--check`` (which ``tests/test_vendor_mod.py`` runs) fails on any drift.
+  this tool.
 
-    python3 tools/vendor.py            # write (or refresh) mod/src/runtime and mod/vendor.lock
-    python3 tools/vendor.py --check    # fail on any drift, write nothing
+The mod carries the runtime **commit** `mod/vendor.lock` records, not the runtime as it is on every
+later commit, so there are two checks and they run in different places:
+
+* ``--check-lock`` — the committed copy is what the lock says, i.e. nobody edited
+  ``mod/src/runtime/`` by hand. Always applies (``tests/test_vendor_mod.py`` runs it, and so CI).
+  A runtime-only change never fails it.
+* ``--check`` — the committed copy also matches ``crates/horizon-native-java/src`` **as it is now**,
+  i.e. the mod carries the runtime's current behaviour. A PR that changes ``mod/**`` or this tool
+  must pass it, and CI runs it then (``.github/workflows/ci.yml``); a release of the mod refreshes
+  the copy first. The runtime's own PRs are unaffected.
+
+To refresh: run ``python3 tools/vendor.py`` in a mod PR (and before a mod release).
+
+    python3 tools/vendor.py              # write (or refresh) mod/src/runtime and mod/vendor.lock
+    python3 tools/vendor.py --check-lock # fail on a hand edit to the committed copy
+    python3 tools/vendor.py --check      # also fail unless it matches the runtime source now
 """
 
 from __future__ import annotations
@@ -99,20 +113,56 @@ def load_lock(root: Path) -> dict:
         return {}
 
 
-def drift(root: Path) -> list[str]:
-    """Every difference between the vendored copy, its lock and the crate it came from."""
-    problems = []
-    files = expected(root)
+def recorded_files(root: Path) -> dict[str, dict]:
+    """The lock's per-file rows, or an empty map with the schema problem already reported."""
     lock = load_lock(root)
-    recorded = lock.get("files", {})
+    if lock.get("schema") != LOCK_SCHEMA:
+        return {}
+    return lock.get("files", {})
+
+
+def lock_drift(root: Path) -> list[str]:
+    """Every hand edit to the committed copy: `mod/src/runtime/**` against `mod/vendor.lock`.
+
+    This is the check that always applies. It says nothing about the runtime crate: the mod
+    carries the commit its lock records, and that commit is refreshed in a mod PR, so a runtime
+    change alone must not turn this red.
+    """
+    problems = []
+    lock = load_lock(root)
     if lock.get("schema") != LOCK_SCHEMA:
         problems.append(f"{LOCK}: missing or not schema {LOCK_SCHEMA}")
+    recorded = lock.get("files", {})
     on_disk = (
         {path.relative_to(root / VENDOR).as_posix() for path in (root / VENDOR).rglob("*.rs")}
         if (root / VENDOR).is_dir()
         else set()
     )
+    for name, entry in sorted(recorded.items()):
+        path = root / VENDOR / name
+        want = entry.get("sha256")
+        if not path.is_file():
+            problems.append(f"{path}: recorded in {LOCK} but missing")
+        elif sha256(path.read_bytes()) != want:
+            problems.append(
+                f"{path}: edited by hand; it is generated from {RUNTIME_SRC} (run tools/vendor.py)"
+            )
+    for name in sorted(on_disk - set(recorded)):
+        problems.append(f"{VENDOR / name}: vendored file is not recorded in {LOCK}")
+    return problems
 
+
+def source_drift(root: Path) -> list[str]:
+    """Every difference between the committed copy and the runtime source as it is now.
+
+    This is the check a PR that touches `mod/**` or this tool must pass: it means the mod carries
+    the runtime's current behaviour, not an older commit of it.
+    """
+    problems = []
+    files = expected(root)
+    recorded = recorded_files(root)
+    if load_lock(root).get("schema") != LOCK_SCHEMA:
+        problems.append(f"{LOCK}: missing or not schema {LOCK_SCHEMA}")
     for name, (source_bytes, vendored_bytes) in sorted(files.items()):
         entry = recorded.get(name)
         want = sha256(vendored_bytes)
@@ -125,17 +175,19 @@ def drift(root: Path) -> list[str]:
             )
         if entry is not None and entry.get("source_sha256") != sha256(source_bytes):
             problems.append(f"{RUNTIME_SRC / name.replace('mod.rs', 'lib.rs')}: changed since {LOCK}")
-        path = root / VENDOR / name
-        if not path.is_file():
-            problems.append(f"{path}: missing")
-        elif sha256(path.read_bytes()) != want:
-            problems.append(
-                f"{path}: edited by hand; it is generated from {RUNTIME_SRC} (run tools/vendor.py)"
-            )
-
+    on_disk = (
+        {path.relative_to(root / VENDOR).as_posix() for path in (root / VENDOR).rglob("*.rs")}
+        if (root / VENDOR).is_dir()
+        else set()
+    )
     for name in sorted(on_disk - set(files)):
         problems.append(f"{VENDOR / name}: vendored file has no source in {RUNTIME_SRC}")
     return problems
+
+
+def drift(root: Path) -> list[str]:
+    """Both checks: the committed copy is unedited and matches the runtime source as it is now."""
+    return lock_drift(root) + source_drift(root)
 
 
 def write(root: Path) -> None:
@@ -172,17 +224,32 @@ def write(root: Path) -> None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--check", action="store_true", help="fail on drift instead of writing")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="fail unless the committed copy is unedited and matches the runtime source (a mod PR)",
+    )
+    parser.add_argument(
+        "--check-lock",
+        action="store_true",
+        help="fail unless the committed copy matches mod/vendor.lock (always applies)",
+    )
     parser.add_argument("--repo", type=Path, default=None, help="the tree to vendor (default: this one)")
     args = parser.parse_args(argv)
     root = (args.repo or repo_root()).resolve()
-    if args.check:
-        problems = drift(root)
+    if args.check or args.check_lock:
+        problems = lock_drift(root) if args.check_lock else drift(root)
         for problem in problems:
             print(f"drift: {problem}", file=sys.stderr)
         if problems:
-            print(f"{len(problems)} vendored file(s) are not what tools/vendor.py produces", file=sys.stderr)
+            print(
+                f"{len(problems)} vendored file(s) are not what tools/vendor.py produces",
+                file=sys.stderr,
+            )
             return 1
+        if args.check_lock:
+            print(f"{len(load_lock(root).get('files', {}))} vendored file(s) match {LOCK}")
+            return 0
         recorded = load_lock(root).get("source_commit")
         current = source_commit(root)
         if recorded and recorded != current:
