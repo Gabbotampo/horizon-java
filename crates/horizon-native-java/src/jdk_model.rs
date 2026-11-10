@@ -248,10 +248,12 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         ("java/lang/Runtime", "getRuntime", "()Ljava/lang/Runtime;") => {
             Some(Ok(Value::Ref(Some("runtime/bootstrap".into()))))
         }
-        // `Pattern.compile(text)` validates the syntax and keeps the text; the
-        // matching methods are not modelled here. Returning an opaque pattern
-        // is what the JVM does for any syntactically valid text: the caller
-        // stores it, and only a matcher call needs the regex engine.
+        // `Pattern.compile(text)` keeps the text as an opaque pattern; the
+        // matching methods are not modelled here, so a matcher call stays a
+        // counted unknown. Departure from the JVM: the syntax is NOT checked
+        // (the runtime has no regex engine), so text Java would reject with
+        // `PatternSyntaxException` compiles here. For valid text this matches
+        // the JVM: the caller stores the pattern and only a matcher needs it.
         ("java/util/regex/Pattern", "compile", "(Ljava/lang/String;)Ljava/util/regex/Pattern;") => {
             let pattern = expect_string(args.first()?);
             Some(Ok(Value::Ref(Some(format!("regex-pattern/{pattern}")))))
