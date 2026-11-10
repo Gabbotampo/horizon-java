@@ -620,7 +620,9 @@ impl crate::runtime::StdHost {
             })
             .filter_map(|(marker, values)| {
                 values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .position(|pair| &pair[0] == key && &pair[1] == old)
                     .map(|pair| (marker.clone(), pair * 2 + 1))
             })
