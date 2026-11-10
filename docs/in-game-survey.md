@@ -308,3 +308,18 @@ python3 tools/bake.py --probe /tmp/target/debug/horizon-native-java --game-dir /
 
 The batch driver written for this survey is `tools/in_game_survey.py`; it takes the game, the
 control tool, the probe and the jars, and writes one JSON per batch plus the reports and logs.
+
+## Follow-up: client `@Mod` classes on a server
+
+Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`).
+NeoForge constructs a `@Mod(dist = Dist.CLIENT)` class only on a client, and the probe's
+`discover_entrypoints_on("neoforge", "SERVER")` always skipped it; the game used the side-agnostic
+discovery and ran it.
+
+| jar | before | after |
+|---|---|---|
+| `fzzy_config` | refused: `me.fzzyhmstrs.fzzy_config.FzzyConfigNeoForgeClient: Metadata("malformed java/lang/Boolean marker ...")` | **ran-clean**, 0 unknown host calls |
+
+The fixture in `entrypoint_role.rs` pins the annotation shape javap shows
+(`dist = [Lnet/neoforged/api/distmarker/Dist;.CLIENT]`) and asserts the SERVER discovery drops it
+while the CLIENT discovery keeps it.
