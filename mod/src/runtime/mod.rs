@@ -2890,7 +2890,12 @@ impl StdHost {
                 for (key, value) in additions {
                     let key = Value::Ref(Some(key));
                     let value = Value::Ref(Some(value));
-                    match values.chunks_exact_mut(2).find(|pair| pair[0] == key) {
+                    match values
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .find(|pair| pair[0] == key)
+                    {
                         Some(pair) => pair[1] = value,
                         None => values.extend([key, value]),
                     }
@@ -2904,7 +2909,9 @@ impl StdHost {
                     .get(marker)
                     .and_then(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .find(|pair| pair[0] == key)
                             .map(|pair| pair[1].clone())
                     })
@@ -2919,7 +2926,9 @@ impl StdHost {
                     .get(marker)
                     .and_then(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .find(|pair| pair[0] == key)
                             .map(|pair| pair[1].clone())
                     })
@@ -2933,7 +2942,7 @@ impl StdHost {
                     .mutable_collections
                     .entry(marker.to_owned())
                     .or_default();
-                for pair in values.chunks_exact_mut(2) {
+                for pair in values.as_chunks_mut::<2>().0 {
                     if pair[0] == key {
                         return Ok(Some(std::mem::replace(&mut pair[1], value)));
                     }
@@ -2947,7 +2956,9 @@ impl StdHost {
                     .get(marker)
                     .map(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|pair| pair[0].clone())
                             .collect::<Vec<_>>()
                     })
@@ -5881,10 +5892,10 @@ impl Host for StdHost {
                 }
                 return Ok(Value::Void);
             }
-            if r.owner == "java/util/Properties" {
-                if let Some(value) = self.properties_member(r, marker, args)? {
-                    return Ok(value);
-                }
+            if r.owner == "java/util/Properties"
+                && let Some(value) = self.properties_member(r, marker, args)?
+            {
+                return Ok(value);
             }
             match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
                 (owner, "<init>", "(Ljava/util/Map;)V") if is_map_owner(owner) => {
@@ -6211,7 +6222,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         return Ok(values[index * 2 + 1].clone());
                     }
                     let computed = match function {
@@ -6239,7 +6255,9 @@ impl Host for StdHost {
                     let function = Self::argument(r, args, 1)?.clone();
                     let current = self.mutable_collections.get(marker).and_then(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .find(|pair| pair[0] == key)
                             .map(|pair| pair[1].clone())
                     });
@@ -6260,7 +6278,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         if matches!(computed, Value::Ref(None)) {
                             values.drain(index * 2..index * 2 + 2);
                             return Ok(Value::Ref(None));
@@ -6275,7 +6298,9 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|pair| [pair[0].clone(), pair[1].clone()])
                         .collect::<Vec<_>>();
                     for [key, value] in entries {
@@ -6303,7 +6328,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         let current = values[index * 2 + 1].clone();
                         let merged = self.invoke_instance(
                             &MethodRef {
@@ -6341,7 +6371,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         return Ok(values[index * 2 + 1].clone());
                     }
                     values.extend([key, value]);
@@ -6356,7 +6391,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| &pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| &pair[0] == key)
+                    {
                         return Ok(std::mem::replace(&mut values[index * 2 + 1], value));
                     }
                     return Ok(Value::Ref(None));
@@ -6372,7 +6412,9 @@ impl Host for StdHost {
                         .entry(marker.to_owned())
                         .or_default();
                     if let Some(index) = values
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .position(|pair| &pair[0] == key && &pair[1] == old)
                     {
                         values[index * 2 + 1] = new;
@@ -6388,7 +6430,9 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|pair| [pair[0].clone(), pair[1].clone()])
                         .collect::<Vec<_>>();
                     let mut replacements = Vec::with_capacity(entries.len());
@@ -6429,7 +6473,7 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    for pair in values.chunks_exact_mut(2) {
+                    for pair in values.as_chunks_mut::<2>().0 {
                         if pair[0] == key {
                             return Ok(std::mem::replace(&mut pair[1], value));
                         }
@@ -6440,15 +6484,15 @@ impl Host for StdHost {
                 (owner, "putAll", "(Ljava/util/Map;)V") if is_map_owner(owner) => {
                     let source = Self::argument(r, args, 0)?;
                     let entries = host_collection_values(self, source)?;
-                    let mut pairs = entries.chunks_exact(2);
+                    let (pairs, remainder) = entries.as_chunks::<2>();
                     let mut updates = Vec::new();
-                    for pair in &mut pairs {
+                    for pair in pairs {
                         updates.push((
                             parse_collection_value(&pair[0])?,
                             parse_collection_value(&pair[1])?,
                         ));
                     }
-                    if !pairs.remainder().is_empty() {
+                    if !remainder.is_empty() {
                         return Err(NativeError::Metadata(
                             "map marker contains an odd number of entries".into(),
                         ));
@@ -6458,7 +6502,11 @@ impl Host for StdHost {
                         .entry(marker.to_owned())
                         .or_default();
                     for (key, value) in updates {
-                        if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key)
+                        if let Some(index) = values
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .position(|pair| pair[0] == key)
                         {
                             values[index * 2 + 1] = value;
                         } else {
@@ -6477,7 +6525,9 @@ impl Host for StdHost {
                         .entry(marker.to_owned())
                         .or_default();
                     if let Some(index) = values
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .position(|pair| &pair[0] == key && &pair[1] == expected)
                     {
                         let index = index * 2;
@@ -6494,7 +6544,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| &pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| &pair[0] == key)
+                    {
                         let index = index * 2;
                         values.remove(index);
                         return Ok(values.remove(index));
@@ -6895,8 +6950,10 @@ impl Host for StdHost {
             (owner, "get", "(Ljava/lang/Object;)Ljava/lang/Object;") if is_map_owner(owner) => {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 let values = host_collection_values(self, receiver)?;
-                let mut pairs = values.chunks_exact(2);
-                Ok(pairs
+                Ok(values
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .find(|pair| pair[0] == needle)
                     .map(|pair| parse_collection_value(&pair[1]))
                     .transpose()?
@@ -6908,8 +6965,12 @@ impl Host for StdHost {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 let fallback = Self::argument(r, args, 1)?.clone();
                 let values = host_collection_values(self, receiver)?;
-                let mut pairs = values.chunks_exact(2);
-                if let Some(pair) = pairs.find(|pair| pair[0] == needle) {
+                if let Some(pair) = values
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .find(|pair| pair[0] == needle)
+                {
                     parse_collection_value(&pair[1])
                 } else {
                     Ok(fallback)
@@ -6919,7 +6980,9 @@ impl Host for StdHost {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .any(|pair| pair[0] == needle) as i32,
                 ))
             }
@@ -6927,14 +6990,18 @@ impl Host for StdHost {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .any(|pair| pair[1] == needle) as i32,
                 ))
             }
             (owner, "entrySet", "()Ljava/util/Set;") if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
                 let entries = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| {
                         let key = parse_collection_value(&pair[0])?;
                         let value = parse_collection_value(&pair[1])?;
@@ -6952,7 +7019,9 @@ impl Host for StdHost {
             ) if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
                 let keys = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| parse_collection_value(&pair[0]))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(collection_value("set", &keys))
@@ -6960,7 +7029,9 @@ impl Host for StdHost {
             (owner, "values", "()Ljava/util/Collection;") if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
                 let values = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| parse_collection_value(&pair[1]))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(collection_value("list", &values))
@@ -10388,7 +10459,7 @@ fn format_integer_us(value: i64) -> String {
     let digits = value.unsigned_abs().to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
-        if index != 0 && (digits.len() - index) % 3 == 0 {
+        if index != 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);
@@ -18318,7 +18389,7 @@ fn gson_json_array<H: Host>(host: &H, values: &[String]) -> Result<String, Nativ
 }
 
 fn gson_json_object<H: Host>(host: &H, values: &[String]) -> Result<String, NativeError> {
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         return Err(NativeError::Metadata(
             "native map marker has an odd value count".into(),
         ));
@@ -24000,10 +24071,10 @@ impl<H: Host> Runtime<'_, H> {
                         desc,
                         at,
                     )?;
-                    if outcome == AnchorOutcome::Normal {
-                        if let Some(key) = instance_field_key(&receiver, &r) {
-                            self.fields.insert(key, value);
-                        }
+                    if outcome == AnchorOutcome::Normal
+                        && let Some(key) = instance_field_key(&receiver, &r)
+                    {
+                        self.fields.insert(key, value);
                     }
                 }
                 0xb6..=0xb9 => {
@@ -25832,13 +25903,13 @@ fn parse_neoforge_metadata(
     let mut client_side_only = false;
     let mut flush = |dependency: &mut Option<String>, required_flag: &mut bool| {
         if *required_flag {
-            if let Some(id) = dependency.take() {
-                if !matches!(
+            if let Some(id) = dependency.take()
+                && !matches!(
                     id.as_str(),
                     "minecraft" | "neoforge" | "forge" | "java" | "fabricloader"
-                ) {
-                    required.push(id);
-                }
+                )
+            {
+                required.push(id);
             }
         } else {
             dependency.take();
@@ -27192,17 +27263,16 @@ fn modify_variable_plan_reason(
     }
     // A target class the jar owns must actually declare the method, so an
     // otherwise-plausible local hook never attaches to a typo.
-    if let Some(target_class) = jar.classes.get(&plan.target.owner) {
-        if !plan.target.descriptor.is_empty()
-            && target_class
-                .method(&plan.target.name, &plan.target.descriptor)
-                .is_none()
-        {
-            return Some(format!(
-                "target {}{} is not declared by {}",
-                plan.target.name, plan.target.descriptor, plan.target.owner
-            ));
-        }
+    if let Some(target_class) = jar.classes.get(&plan.target.owner)
+        && !plan.target.descriptor.is_empty()
+        && target_class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .is_none()
+    {
+        return Some(format!(
+            "target {}{} is not declared by {}",
+            plan.target.name, plan.target.descriptor, plan.target.owner
+        ));
     }
     plan.at = anchor.anchor.clone();
     None

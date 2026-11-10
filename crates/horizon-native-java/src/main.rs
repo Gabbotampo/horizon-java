@@ -398,17 +398,15 @@ fn write_woven_jar(
 /// written.  A status of `ok` needs at least one woven class, and the output is
 /// the only file this ever creates.
 fn weave_jar(input: &Path, output: &Path) -> Result<WeaveReport, String> {
-    if output.exists() {
-        if let (Ok(source), Ok(target)) =
+    if output.exists()
+        && let (Ok(source), Ok(target)) =
             (std::fs::canonicalize(input), std::fs::canonicalize(output))
-        {
-            if source == target {
-                return Err(format!(
-                    "refusing to weave {} onto itself; pass a different output jar",
-                    input.display()
-                ));
-            }
-        }
+        && source == target
+    {
+        return Err(format!(
+            "refusing to weave {} onto itself; pass a different output jar",
+            input.display()
+        ));
     }
     let (entries, classes) = read_jar(input)?;
     // From the jar rather than its classes alone: the callback order depends on

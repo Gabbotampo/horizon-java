@@ -2,6 +2,8 @@
 name = "horizon-java-mod"
 version = "0.1.0"
 edition = "2024"
+# zip 9.1.3 (below, the runtime's only non-trivial dependency) is `rust-version = "1.88"`.
+rust-version = "1.88"
 publish = false
 description = "Horizon Java: runs Java mod jars on the native bytecode runtime"
 

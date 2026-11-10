@@ -2440,13 +2440,12 @@ fn run_launch_game_child(
             // may only reach the game's own log, so both streams and the log
             // are checked.
             let mut done = stdout_capture.text().contains("Done (");
-            if !done {
-                if let Ok(meta) = std::fs::metadata(&done_log) {
-                    if meta.len() != done_log_len {
-                        done_log_len = meta.len();
-                        done = log_tail_contains(&done_log, "Done (");
-                    }
-                }
+            if !done
+                && let Ok(meta) = std::fs::metadata(&done_log)
+                && meta.len() != done_log_len
+            {
+                done_log_len = meta.len();
+                done = log_tail_contains(&done_log, "Done (");
             }
             if done {
                 stopped_at_done = true;
@@ -3159,10 +3158,10 @@ fn dist_constant<'local>(env: &mut JNIEnv<'local>, side: MixinSide) -> JObject<'
         return JObject::null();
     };
     for field in neoforge_dist_fields(side) {
-        if let Ok(value) = env.get_static_field(&class, *field, NEOFORGE_DIST_TYPE) {
-            if let Ok(value) = value.l() {
-                return value;
-            }
+        if let Ok(value) = env.get_static_field(&class, *field, NEOFORGE_DIST_TYPE)
+            && let Ok(value) = value.l()
+        {
+            return value;
         }
         // A field this build does not have must not leave a throwable behind
         // for the constructor call.
@@ -4505,10 +4504,10 @@ struct ClientReadiness {
 impl ClientReadiness {
     fn detect(home: Option<&Path>, version: &str, game_jars: &[PathBuf]) -> Self {
         let mut missing = Vec::new();
-        if let Some(game_jar) = game_jars.first() {
-            if !game_jar.is_file() {
-                missing.push(game_jar.display().to_string());
-            }
+        if let Some(game_jar) = game_jars.first()
+            && !game_jar.is_file()
+        {
+            missing.push(game_jar.display().to_string());
         }
         let home = home
             .map(Path::to_path_buf)
@@ -5481,7 +5480,7 @@ impl MeasureReport {
         }
         values.sort_by(f64::total_cmp);
         let middle = values.len() / 2;
-        Some(if values.len() % 2 == 0 {
+        Some(if values.len().is_multiple_of(2) {
             (values[middle - 1] + values[middle]) / 2.0
         } else {
             values[middle]

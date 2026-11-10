@@ -226,7 +226,7 @@ impl<H: Host> Runtime<'_, H> {
             }
             return Ok(Some(collection_value("set", &unique)));
         }
-        if values.len() % 2 != 0 {
+        if !values.len().is_multiple_of(2) {
             return Ok(None);
         }
         let bimap = r.owner == "com/google/common/collect/ImmutableBiMap";
