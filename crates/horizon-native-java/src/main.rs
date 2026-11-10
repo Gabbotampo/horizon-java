@@ -24,6 +24,11 @@ struct Cli {
     mixin_plans: bool,
     /// `--weave <out.jar>`: write a woven copy of the jar instead of running it.
     weave: Option<String>,
+    /// `--link <jar>`: a dependency jar on the same class path, repeatable.
+    links: Vec<String>,
+    /// `--game-version <version>`: the release the host reports to the
+    /// loader and the game's own version detector.
+    game_version: Option<String>,
     path: String,
     kind: Option<String>,
     class: Option<String>,
@@ -34,6 +39,8 @@ impl Cli {
         let mut json = false;
         let mut mixin_plans = false;
         let mut weave = None;
+        let mut links = Vec::new();
+        let mut game_version = None;
         let mut positional = Vec::new();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -44,6 +51,10 @@ impl Cli {
             } else if arg == "--weave" {
                 // The output path is the flag's value, never a positional.
                 weave = Some(args.next()?);
+            } else if arg == "--link" {
+                links.push(args.next()?);
+            } else if arg == "--game-version" {
+                game_version = Some(args.next()?);
             } else {
                 positional.push(arg);
             }
@@ -53,6 +64,8 @@ impl Cli {
             json,
             mixin_plans,
             weave,
+            links,
+            game_version,
             path: positional.next()?,
             kind: positional.next(),
             class: positional.next(),
@@ -599,7 +612,8 @@ fn execution_json(
 fn main() -> ExitCode {
     let Some(cli) = Cli::parse(std::env::args().skip(1)) else {
         eprintln!(
-            "usage: horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] <mod.jar> \
+            "usage: horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] \
+             [--link <jar>]... [--game-version <version>] <mod.jar> \
              [main|client|server|neoforge] [class]"
         );
         return ExitCode::FAILURE;
@@ -608,6 +622,8 @@ fn main() -> ExitCode {
         json,
         mixin_plans,
         weave,
+        links,
+        game_version,
         path,
         kind: requested_kind,
         class: explicit_class,
@@ -671,7 +687,40 @@ fn main() -> ExitCode {
         }
         return ExitCode::FAILURE;
     };
-    let mut host = jar.seed_host(StdHost::new());
+    // A probe run is a dedicated server unless it asked for the client role.
+    let side = if kind == "client" { "CLIENT" } else { "SERVER" };
+    let mut seed = StdHost::new().with_environment_type(side);
+    if let Some(version) = game_version {
+        seed = seed.with_game_version(version);
+    }
+    let mut host = jar.seed_host(seed);
+    for link in &links {
+        let dependency = match NativeJar::from_path(&PathBuf::from(link)) {
+            Ok(dependency) => dependency,
+            Err(error) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "error", "stage": "load", "error": format!("{link}: {error}")})
+                    );
+                } else {
+                    eprintln!("error loading {link}: {error}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) = host.link_jar(link.clone(), &dependency) {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "error", "stage": "load", "error": error.to_string()})
+                );
+            } else {
+                eprintln!("error linking {link}: {error}");
+            }
+            return ExitCode::FAILURE;
+        }
+    }
     let mut calls = 0;
     let mut error = None;
     for entry in &entrypoints {
@@ -877,6 +926,8 @@ mod tests {
             json: true,
             mixin_plans: false,
             weave: None,
+            links: Vec::new(),
+            game_version: None,
             path: "mod.jar".into(),
             kind: Some("client".into()),
             class: Some("demo.Main".into()),
@@ -897,6 +948,8 @@ mod tests {
             json: false,
             mixin_plans: true,
             weave: None,
+            links: Vec::new(),
+            game_version: None,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -911,6 +964,8 @@ mod tests {
             json: false,
             mixin_plans: false,
             weave: Some("out.jar".into()),
+            links: Vec::new(),
+            game_version: None,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -925,6 +980,36 @@ mod tests {
     }
 
     #[test]
+    fn link_and_game_version_flags_take_their_values() {
+        let expected = Cli {
+            json: false,
+            mixin_plans: false,
+            weave: None,
+            links: vec!["a.jar".into(), "b.jar".into()],
+            game_version: Some("26.3".into()),
+            path: "mod.jar".into(),
+            kind: Some("neoforge".into()),
+            class: None,
+        };
+        assert_eq!(
+            parse(&[
+                "--link",
+                "a.jar",
+                "mod.jar",
+                "neoforge",
+                "--game-version",
+                "26.3",
+                "--link",
+                "b.jar"
+            ]),
+            Some(expected.clone())
+        );
+        // Each value is required: a lone flag cannot fall back to a positional.
+        assert_eq!(parse(&["mod.jar", "--link"]), None);
+        assert_eq!(parse(&["mod.jar", "--game-version"]), None);
+    }
+
+    #[test]
     fn bare_jar_is_a_valid_invocation() {
         assert_eq!(
             parse(&["mod.jar"]),
@@ -932,6 +1017,8 @@ mod tests {
                 json: false,
                 mixin_plans: false,
                 weave: None,
+                links: Vec::new(),
+                game_version: None,
                 path: "mod.jar".into(),
                 kind: None,
                 class: None,
