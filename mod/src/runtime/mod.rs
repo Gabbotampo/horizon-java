@@ -2064,6 +2064,12 @@ pub trait Host {
         Vec::new()
     }
 
+    /// Text a jar wrote to `System.out`. The bounded host keeps it in memory for the length of
+    /// one invocation; a host that shows the jar's output (the game's mod) keeps it across calls
+    /// and reads it back through its own accessor. Hosts that do not model a console keep the
+    /// default and lose only the text.
+    fn write_console(&mut self, _text: &str) {}
+
     /// The text a bounded input-stream marker exposes, when the host holds it.
     ///
     /// The interpreter models `java.io` readers itself; a stream the host
@@ -2344,6 +2350,9 @@ pub struct StdHost {
     calls: Vec<MethodRef>,
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
+    /// Text the jar wrote to `System.out`, kept for callers that show it (the game's mod). The
+    /// interpreter's own `io_writers` sink lives for one invocation; this one outlives them.
+    console_out: String,
     registrations: Vec<RegistryEntry>,
     /// Registry keys (`registry/id`) whose declaration was inferred from the
     /// builder calls a registration's value carries. An explicit adapter may
@@ -2477,6 +2486,7 @@ impl StdHost {
             calls: Vec::new(),
             invocations: Vec::new(),
             posted_events: Vec::new(),
+            console_out: String::new(),
             registrations: Vec::new(),
             inferred_declarations: BTreeSet::new(),
             content_builders: Default::default(),
@@ -2537,6 +2547,14 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// The text the jar wrote to `System.out` since the last call, and forget
+    /// it. A real `PrintStream` writes to the process console; the bounded
+    /// host keeps it in memory, so a caller that shows the jar's output (the
+    /// game's mod) takes it here instead of losing it.
+    pub fn take_stdout(&mut self) -> String {
+        std::mem::take(&mut self.console_out)
     }
 
     fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
@@ -3743,6 +3761,10 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    fn write_console(&mut self, text: &str) {
+        self.console_out.push_str(text);
+    }
+
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
@@ -20975,6 +20997,9 @@ impl<H: Host> Runtime<'_, H> {
         let Some(key) = self.io_sink_key(marker) else {
             return;
         };
+        if key == "mem:system-out" {
+            self.host.write_console(text);
+        }
         self.io_writers.entry(key).or_default().push_str(text);
     }
 
