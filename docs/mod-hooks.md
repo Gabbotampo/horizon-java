@@ -25,19 +25,19 @@ hook for it. *can't map* — the mod API has a hook, but this mod cannot reach i
 | `level_unload` | `level_unload` (`LevelEvent.Unload`) | listen | wired |
 | `player_join` | `player_logged_in` (`PlayerEvent.PlayerLoggedInEvent`) | listen | wired |
 | `player_leave` | `player_logged_out` (`PlayerEvent.PlayerLoggedOutEvent`) | listen | wired |
-| `entity_load` | `entity_join_level` (`EntityJoinLevelEvent`) | cancel | pending (cancel PR) |
-| `living_allow_death` | `living_death` (`LivingDeathEvent`) | cancel | pending (cancel PR) |
+| `entity_load` | `entity_join_level` (`EntityJoinLevelEvent`) | cancel | wired |
+| `living_allow_death` | `living_death` (`LivingDeathEvent`) | cancel | wired |
 | `living_after_death` | — (Fabric `ServerLivingEntityEvents.AFTER_DEATH`) | listen | missing on fork |
-| `use_block` | `right_click_block` (`PlayerInteractEvent.RightClickBlock`) | cancel + result | pending (cancel PR) |
-| `use_item` | `right_click_item` (`PlayerInteractEvent.RightClickItem`) | cancel + result | pending (cancel PR) |
-| `attack_entity` | `attack_entity` (`AttackEntityEvent`) | cancel | pending (cancel PR) |
-| `block_break_before` | `break_block` (`BreakBlockEvent`) | cancel | pending (cancel PR) |
+| `use_block` | `right_click_block` (`PlayerInteractEvent.RightClickBlock`) | cancel + result | wired |
+| `use_item` | `right_click_item` (`PlayerInteractEvent.RightClickItem`) | cancel + result | wired |
+| `attack_entity` | `attack_entity` (`AttackEntityEvent`) | cancel | wired |
+| `block_break_before` | `break_block` (`BreakBlockEvent`) | cancel | wired |
 | `block_break_after` | — (Fabric `PlayerBlockBreakEvents.AFTER`) | listen | missing on fork |
-| `attack_block` | `left_click_block` (`PlayerInteractEvent.LeftClickBlock`) | cancel | pending (cancel PR) |
-| `use_entity` | `entity_interact` (`PlayerInteractEvent.EntityInteract`) | cancel | pending (cancel PR) |
-| `block_break_canceled` | `break_block`'s cancel path (Fabric `PlayerBlockBreakEvents.CANCELED`) | listen | pending (cancel PR) |
+| `attack_block` | `left_click_block` (`PlayerInteractEvent.LeftClickBlock`) | cancel | wired |
+| `use_entity` | `entity_interact` (`PlayerInteractEvent.EntityInteract`) | cancel | wired |
+| `block_break_canceled` | `break_block`'s cancel path (Fabric `PlayerBlockBreakEvents.CANCELED`) | listen | wired |
 | `entity_unload` | `entity_leave_level` (`EntityLeaveLevelEvent`) | listen | wired |
-| `living_allow_damage` | `living_incoming_damage` (`LivingIncomingDamageEvent`) | cancel | pending (cancel PR) |
+| `living_allow_damage` | `living_incoming_damage` (`LivingIncomingDamageEvent`) | cancel | wired |
 | `living_after_damage` | `living_damage_post` (`LivingDamageEvent.Post`) | listen | wired |
 | `player_respawn` | `player_respawned` (`PlayerEvent.PlayerRespawnEvent`) | listen | wired |
 | `player_copy` | `player_clone` (`PlayerEvent.Clone`) | listen | wired |
@@ -55,18 +55,24 @@ hook for it. *can't map* — the mod API has a hook, but this mod cannot reach i
 | `client_register_gui_layers` | `register_gui_layers` (`RegisterGuiLayersEvent`) | collect | can't map: registration context, no client jar runtime |
 | `client_item_tooltip` | `item_tooltip` (`ItemTooltipEvent`) | collect | can't map: no client jar runtime |
 
-**This PR wires 18** (the five M2a lifecycle/command rows and 13 listen-only events); the ten
-cancellable rows follow in the next PR, then read: 28 wired, 2 missing on fork, 11 can't map.
+**Counts: 28 wired, 2 missing on fork, 11 can't map.** The five M2a lifecycle/command rows are
+included; M2c adds 23 (13 listen-only, 10 cancellable).
 
 ## How a wired event reaches a Java listener
 
 The mod builds one `EventFiring` per hook call and runs every jar's recorded listeners of that
 event against it, in registration order, so a Fabric `false`/`InteractionResult` or a NeoForge
-`setCanceled(true)` carries from one listener to the next as the loaders deliver it. Every event
-wired here is listen-only: every listener runs and nothing comes back. The ten cancellable events
-(the two click hooks, item use, block break and its `CANCELED`, block and entity attack, living
-death and damage, entity join) follow in the next PR, carrying the firing's `Flow::Cancel` and the
-`InteractionResult` that cancelled it.
+`setCanceled(true)` carries from one listener to the next as the loaders deliver it. What a
+listener may cancel, and what it may answer, is the hook's contract:
+
+- **Cancel** (`break_block`, `left_click_block`, `right_click_block`, `right_click_item`,
+  `attack_entity`, `entity_interact`, `living_death`, `living_incoming_damage`,
+  `entity_join_level`): the `Flow::Cancel` return is the firing's cancellation. `break_block` and
+  the two click hooks also fire the Fabric `InteractionResult` that cancelled them: `SUCCESS`,
+  `SUCCESS_SERVER`, `CONSUME` and `FAIL` become the mod API's `NativeInteractionResult`; a
+  NeoForge cancellation with no result stays `PASS`, the hook's documented default.
+- **Listen** (`server_tick`, the level ticks, the level and player lifecycle events,
+  `living_damage_post`, `entity_leave_level`): every listener runs; nothing comes back.
 
 ## Arguments
 
@@ -91,17 +97,24 @@ but no level, so a listener that ignores its `Level` still cancels the break.
 
 ## The in-game proof
 
-`tools/java_mod_fixture.py --kind hooks` builds a jar whose tick and join listeners print, and the
-run's log shows the forwarded events and the report's totals:
+`tools/java_mod_fixture.py --kind hooks` builds a jar whose listeners print, and the run's log
+shows the forwarded events:
 
 ```
 Horizon Java: m2c_fixture: m2c: joined Player89790
 Horizon Java: player_join (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
 Horizon Java: m2c_fixture: m2c: 100 server ticks
+Horizon Java: m2c_fixture: m2c: kept stone at -7,65,0
+Horizon Java: block_break_before (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
+Horizon Java: m2c_fixture: m2c: break canceled at -7,65,0
+Horizon Java: block_break_canceled (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
 ```
 
-The stopped report's row is `"callbacks": {"failed": 0, "ran": 254, "unknown_host_call_count": 0}`
-over the run (one join plus the ticks).
+`horizon-ctl … break -7 65 0` on the stone answers `{"block":"minecraft:stone",
+"block_before":"minecraft:stone"}` and `block -7 65 0` still reports the stone. Replacing it with
+dirt and breaking it answers `{"block":"minecraft:air","block_before":"minecraft:dirt"}`, so the
+cancel is scoped to the block the listener named. The jar's report row carries `callbacks.ran`,
+`callbacks.failed` and `callbacks.unknown_host_call_count` over every event.
 
 ## Fork seams
 
