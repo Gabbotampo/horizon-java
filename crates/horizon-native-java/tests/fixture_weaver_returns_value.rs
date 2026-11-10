@@ -864,7 +864,14 @@ fn the_weave_cli_adds_the_synthetic_class_to_the_jar() {
 
     let mut archive = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
     let names = (0..archive.len())
-        .map(|index| archive.by_index(index).unwrap().name().to_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .unwrap()
+                .name()
+                .unwrap()
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     assert!(
         names.contains(&format!("{CALLBACK_INFO}.class")),

@@ -292,8 +292,10 @@ pub struct CommandSource {
     pub level: u8,
     /// The player, when a player runs it.
     pub player: Option<u128>,
-    /// Dimension id of `getLevel`.
-    pub dimension: String,
+    /// Dimension id `getLevel` answers, or `None` when the source's level is unknown: a player
+    /// whose dimension the host cannot read. `getLevel` then goes through the unknown-host-call
+    /// path instead of answering a wrong level.
+    pub dimension: Option<String>,
 }
 
 /// One parsed argument value, as the game resolved it.
@@ -1538,7 +1540,6 @@ impl StdHost {
                 .player
                 .map(|uuid| marker(format!("game/player/{uuid:032x}")))
         };
-        let level_marker = || marker(format!("game/level/{}", source.dimension));
         let first = args.first();
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("permissions", _) => Ok(marker(format!("brigadier/permission-set/{}", source.level))),
@@ -1548,7 +1549,12 @@ impl StdHost {
                 Ok(Value::Int(i32::from(i32::from(source.level) >= wanted)))
             }
             ("getServer", _) => Ok(marker("game/server".into())),
-            ("getLevel", _) => Ok(level_marker()),
+            // A source whose level is unknown (a player: no mod API dimension read) refuses the
+            // same way any unmodelled host call does, and the call is counted.
+            ("getLevel", _) => match source.dimension.as_deref() {
+                Some(dimension) => Ok(marker(format!("game/level/{dimension}"))),
+                None => self.unknown_host_call(r),
+            },
             ("isPlayer", "()Z") => Ok(Value::Int(i32::from(source.player.is_some()))),
             ("isSilent", "()Z") => Ok(Value::Int(0)),
             ("getPlayer" | "getEntity", _) => Ok(player().unwrap_or(Value::Ref(None))),
@@ -1820,7 +1826,7 @@ impl NativeJar {
         let marks = host.brigadier_log_marks();
         let strict = std::mem::replace(&mut host.strict_unknown_host_calls, true);
         let context = EventContext {
-            level: sources.first().map(|s| s.dimension.clone()),
+            level: sources.first().and_then(|s| s.dimension.clone()),
             player: sources.first().and_then(|s| s.player),
             ..EventContext::default()
         };
@@ -1893,8 +1899,8 @@ impl NativeJar {
             players: vec![FacadePlayer {
                 uuid: PROBE_PLAYER,
                 name: "Player".into(),
-                level: "minecraft:overworld".into(),
-                entity_id: 0,
+                level: Some("minecraft:overworld".into()),
+                entity_id: Some(0),
             }],
             ..EventFacade::default()
         });
@@ -1903,7 +1909,7 @@ impl NativeJar {
                 name: "Player".into(),
                 level,
                 player: Some(PROBE_PLAYER),
-                dimension: "minecraft:overworld".into(),
+                dimension: Some("minecraft:overworld".into()),
             };
             if self.check_requirement(requirement, &source, Arc::clone(&facade), host, budget)? {
                 return Ok(level);
@@ -2073,6 +2079,54 @@ mod tests {
             &marker(DISPATCHER.into()),
             std::slice::from_ref(builder),
         )
+    }
+
+    /// `getLevel` answers the source's own dimension when the host knows it, and refuses through
+    /// the unknown-host-call path when it does not: a player whose dimension no mod API read gives.
+    fn get_level(
+        host: &mut StdHost,
+        jar: &NativeJar,
+        dimension: Option<&str>,
+    ) -> (Result<Value, NativeError>, usize) {
+        let source = CommandSource {
+            name: "Ana".into(),
+            level: 0,
+            player: Some(7),
+            dimension: dimension.map(str::to_owned),
+        };
+        let before = host.unknown_host_call_count();
+        let call = MethodRef {
+            owner: "net/minecraft/commands/CommandSourceStack".into(),
+            name: "getLevel".into(),
+            descriptor: "()Lnet/minecraft/server/level/ServerLevel;".into(),
+        };
+        let (result, _) = jar.with_command_execution(
+            host,
+            Arc::new(EventFacade::default()),
+            None,
+            vec![source],
+            |_jar, host| {
+                host.brigadier_call(&call, &marker("brigadier/source/0".into()), &[])
+                    .expect("modelled")
+            },
+        );
+        (result, host.unknown_host_call_count() - before)
+    }
+
+    #[test]
+    fn a_known_source_level_answers_and_an_unknown_one_refuses() {
+        let jar = NativeJar::from_classes(std::iter::empty());
+        let mut host = StdHost::new();
+        let (console, calls) = get_level(&mut host, &jar, Some("minecraft:overworld"));
+        assert_eq!(
+            console.unwrap(),
+            marker("game/level/minecraft:overworld".into())
+        );
+        assert_eq!(calls, 0);
+
+        let (player, calls) = get_level(&mut host, &jar, None);
+        assert!(matches!(player, Err(NativeError::UnknownHostCall(_))));
+        assert_eq!(calls, 1);
     }
 
     #[test]

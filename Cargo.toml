@@ -1,11 +1,15 @@
 [workspace]
 members = ["crates/horizon-native-java", "crates/horizon-jvm"]
+# `mod/` is a Horizon native mod: one flat crate with its own dependency rules (Horizon's
+# Cargo.lock), built by the game's launcher rather than by this workspace. Excluding it keeps it
+# out of this workspace's formatting, lints and dependency resolution.
+exclude = ["mod"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.88"
 
 # Ports mirror vanilla's Java signatures, index loops and nested generic types
 # one to one so they can be checked against the decompiled sources.
