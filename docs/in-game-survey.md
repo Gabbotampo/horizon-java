@@ -326,3 +326,18 @@ Jars now run dependencies before dependents (`cupboard` before `structureessenti
 `collective` before `stackrefill`), and the missing-dependency refusal names every absent id.
 Host-provided ids (`minecraft`, `java`, `fabricloader`, `fabric-api`, `neoforge`, `forge`) are not
 required to be jars.
+
+## Follow-up: player identity reads
+
+Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`).
+`player_logged_out` fires after the server removed the player from its list, so the façade had no
+record to answer from even though the firing carries the player's UUID.
+
+| jar | before | after |
+|---|---|---|
+| `baguettelib` | `player_leave` listener failed: `ServerPlayer#getUUID()` | no `getUUID` failure; the listener now proceeds to its next read, `ServerPlayer#level()` (`arismoko/horizon#2747`), and still fails on that counted read |
+| `carryon` | 725 failed tick callbacks, all `Player#getData(Supplier)` | 707 failed tick callbacks on the same call, still counted |
+
+`PlayerRef` at the pin exposes only `entity()` and `uuid()`, so only the UUID is answered; the
+name, dimension and attachment reads keep their counted-refusal path. The attachment design note
+is in `docs/mod-plan.md`.

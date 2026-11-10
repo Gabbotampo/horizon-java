@@ -1462,10 +1462,19 @@ impl StdHost {
                 }
             }
             Facade::Player(uuid) => {
+                // Identity comes from the firing's `PlayerRef`, which carries
+                // the UUID even after the player left the listed players: a
+                // `player_logged_out` listener hears about a player the server
+                // has already removed (`Hooks::player_logged_out`). Reading a
+                // name still needs the listed record, and a dimension is not
+                // part of `PlayerRef` at the pinned mod API (`arismoko/horizon#2747`).
+                match (name, returns) {
+                    ("getUUID", _) => return uuid_value(&uuid_text(*uuid)).ok(),
+                    ("getStringUUID", _) => return Some(marker(uuid_text(*uuid))),
+                    _ => {}
+                }
                 let p = player(*uuid)?;
                 match (name, returns) {
-                    ("getUUID", _) => uuid_value(&uuid_text(*uuid)).ok(),
-                    ("getStringUUID", _) => Some(marker(uuid_text(*uuid))),
                     ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
                     ("getId", "I") => Some(Value::Int(p.entity_id?)),
@@ -2516,6 +2525,57 @@ mod tests {
             mask | event.bit()
         });
         assert_eq!(mask.count_ones() as usize, GameEvent::ALL.len());
+    }
+
+    /// `PlayerRef` carries a player's UUID even when the server has already
+    /// removed them from its player list, which is the moment
+    /// `player_logged_out` fires (baguettelib reads `getUUID` there). A name
+    /// read has no `PlayerRef` source and still refuses; the dimension read
+    /// (`arismoko/horizon#2747`) is deliberately not answered.
+    #[test]
+    fn a_leaving_player_answers_its_uuid_and_refuses_its_name() {
+        let call = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let alex = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128;
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::PlayerLeave,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(alex),
+                ..EventContext::default()
+            },
+        )));
+        let player = player_marker(alex);
+        let uuid = host
+            .game_event_call(
+                &call(
+                    "net/minecraft/server/level/ServerPlayer",
+                    "getUUID",
+                    "()Ljava/util/UUID;",
+                ),
+                &player,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            uuid,
+            Value::Ref(Some("uuid/01234567-89ab-cdef-fedc-ba9876543210".into()))
+        );
+        let name = host.game_event_call(
+            &call(
+                "net/minecraft/server/level/ServerPlayer",
+                "getName",
+                "()Lnet/minecraft/network/chat/Component;",
+            ),
+            &player,
+            &[],
+        );
+        assert!(matches!(name, Some(Err(NativeError::UnknownHostCall(_)))));
     }
 
     /// A firing that names the block and the position lets a block-break
