@@ -47,10 +47,9 @@ Per batch:
 5. Results come from `<game-dir>/config/horizon_java/java-runtime.json` (written at server start and
    rewritten at `server_stopping` with the callback/command totals) and the game log.
 
-Verdicts are the mod's own: `ran-clean` = every entrypoint stage ran with zero unmodelled host
-calls; `ran-hollow` = every stage ran with at least one; `ran-partial` = at least one stage ran and
-at least one failed, so the running stages' listeners stay active and `reason` names the failures;
-`refused` = the jar could not run, or every stage failed, and `reason` says why.
+Verdicts are the mod's own, unchanged: `ran-clean` = the entrypoints ran with zero unmodelled host
+calls; `ran-hollow` = they ran with at least one; `refused` = the jar could not run and `reason`
+says why.
 
 ## The sample
 
@@ -309,35 +308,6 @@ python3 tools/bake.py --probe /tmp/target/debug/horizon-native-java --game-dir /
 
 The batch driver written for this survey is `tools/in_game_survey.py`; it takes the game, the
 control tool, the probe and the jars, and writes one JSON per batch plus the reports and logs.
-
-## Follow-up at the `cf0113879e` pin: entrypoint order
-
-Re-measured 11 November 2026 on the game built from `arismoko/horizon`
-`cf0113879ebee600bff86070466f75b2db90b40a` (unmodified; the log's own line is `Horizon 0.1.0`),
-the pin `mod/horizon-mod.toml` now records; resources were prepared from the same checkout.
-Fabric's `Hooks.startServer` invokes the `main` entrypoint stage and then `server`
-(`Hooks.startClient`: `main`, then `client`), but `load_jar` stopped at the first kind that
-declared anything.
-
-| jar | before | after |
-|---|---|---|
-| `entity-view-distance` | refused: `Metadata("malformed java/util/Iterator marker (at eu/pb4/entityviewdistance/EVDMod#onInitialize +17)")` | **ran-partial**, 2 host calls: `main` failed, `server` ran; the row's `reason` names the failed stage. It is not clean: a real Fabric loader would have thrown |
-| `krypton` | ran-hollow 3, 7 host calls (main only) | ran-hollow 3, 10 host calls (`server` ran too; `main`'s 3 unknowns remain) |
-| `ResourcefulLib` | ran-hollow 2, 16 host calls (main only) | ran-hollow 2, 20 host calls (`server` ran too) |
-
-The two hollow rows are unchanged because Fabric really does run `main` on a server; what changed
-is that the side's own entrypoint runs after it. The departure from Fabric: this path records a
-failed stage and continues, while Fabric throws after the `main` stage; the jar is refused only
-when every stage failed, and a jar with any failed stage is `ran-partial`, never clean.
-
-The run's own summary line read `1 jar(s) ...: 0 ran-clean, 0 ran-hollow, 1 ran-partial,
-0 refused`, and the row's `reason` was `entrypoint(s) failed:
-eu.pb4.entityviewdistance.EVDMod: Metadata("malformed java/util/Iterator marker ...")`.
-
-**Interpreter bug for the next batch:** `entity-view-distance`'s `main` fails on
-`Metadata("malformed java/util/Iterator marker (at .../EVDMod#onInitialize +17)")`. That is this
-interpreter refusing the jar's iterator construction, not a mod error; it should become `ran-clean`
-once the marker is modelled and the stage runs.
 
 ## Follow-up: cross-jar linking
 

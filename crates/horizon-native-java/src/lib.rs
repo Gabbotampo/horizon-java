@@ -18,6 +18,7 @@ mod block_item_id;
 pub mod brigadier;
 mod class_init;
 pub mod client_surface;
+mod collection_base;
 mod collection_callback;
 mod color_collection;
 mod commons_io;
@@ -47,16 +48,18 @@ mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
 mod neoforge_loader;
+mod nested_jars;
 mod night_config;
+mod references;
 mod reflect_constructors;
 mod reflect_enum;
 mod reflect_generic;
 mod reflect_names;
+mod registry_contents;
 mod stack_walk;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
-pub mod verdict;
 pub mod weaver;
 
 pub use facade_server::{GameRuleValue, ServerFacts};
@@ -2408,6 +2411,12 @@ pub struct StdHost {
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
     locales: BTreeMap<String, (String, String)>,
+    /// The server levels this invocation has heard about, in the order the
+    /// firings named them ([`events::StdHost::note_firing_levels`]).
+    levels: Vec<events::FacadeLevel>,
+    /// The referent of every `java.lang.ref.Reference` a jar built, keyed by
+    /// its object marker ([`references`]).
+    references: BTreeMap<String, Value>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
@@ -2516,6 +2525,8 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             locales: BTreeMap::new(),
+            levels: Vec::new(),
+            references: BTreeMap::new(),
             iterators: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
@@ -2775,7 +2786,16 @@ impl StdHost {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
-        Arc::make_mut(&mut self.linked_classes).link_jar(id, jar)
+        let id = id.into();
+        let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
+        // A loader also puts the linked jar's bundled jars
+        // (`META-INF/jars/*.jar`) on the class path: a dependency such as
+        // `libjf` keeps its classes there, and its dependents call them.
+        for (entry, nested) in nested_jars::parsed(jar) {
+            let _ =
+                Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
+        }
+        Ok(added)
     }
 
     /// [`Self::link_jar`] for a caller that already parsed the library's
@@ -4217,6 +4237,19 @@ impl Host for StdHost {
                 self.next_fabric_event = self.next_fabric_event.saturating_add(1);
                 Ok(Value::Ref(Some(marker)))
             }
+            // Fabric's per-registry entry-added event: `event(registry)` names
+            // the one event for that registry (the loader keeps a map of them;
+            // this host names the registry in the marker). The game does not
+            // fire it here, so a listener on it is recorded as an event the
+            // game never fires rather than invented.
+            (
+                "net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback",
+                "event",
+                "(Lnet/minecraft/core/Registry;)Lnet/fabricmc/fabric/api/event/Event;",
+            ) => Ok(Value::Ref(Some(format!(
+                "fabric-event/net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback.event/{}",
+                expect_string(Self::argument(r, args, 0)?)
+            )))),
             ("java/lang/Integer", "parseInt", "(Ljava/lang/String;I)I") => {
                 let text = expect_string(Self::argument(r, args, 0)?);
                 let radix = expect_int(r, Self::argument(r, args, 1)?)?;
@@ -5286,6 +5319,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = self.reference_member(r, Some(receiver), args) {
             return value;
         }
         if let Some(value) = self.locale_member(r, Some(receiver), args) {
@@ -8090,6 +8126,20 @@ impl Host for StdHost {
                 "key",
                 "()Lnet/minecraft/resources/ResourceKey;",
             ) if expect_string(receiver).starts_with("registry/") => Ok(receiver.clone()),
+            // `Registry.iterator()` walks the values registered in the
+            // registry. The host holds the entries the jar registered
+            // (`registry_contents`), not the game's own: the game's entries
+            // have no objects to hand out.
+            (owner, "iterator", "()Ljava/util/Iterator;")
+                if registry_contents::is_registry_owner(owner)
+                    && expect_string(receiver).starts_with("registry/") =>
+            {
+                let values = registry_contents::values(self, expect_string(receiver));
+                let marker = format!("iterator/{}", self.next_iterator);
+                self.next_iterator = self.next_iterator.saturating_add(1);
+                self.iterators.insert(marker.clone(), (values, 0));
+                Ok(Value::Ref(Some(marker)))
+            }
             (
                 "net/minecraft/resources/ResourceKey",
                 "identifier" | "location",
@@ -15561,6 +15611,10 @@ impl NativeJar {
                 seeded += 1;
             }
         }
+        // A jar's bundled libraries are on its class path in a real loader
+        // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
+        // is linked, so a bundled class is not a missing class here.
+        let _nested = nested_jars::link_nested_jars(&mut host, self);
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
                 .fabric_version
@@ -24244,6 +24298,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_map_compute(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_collection_default(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
