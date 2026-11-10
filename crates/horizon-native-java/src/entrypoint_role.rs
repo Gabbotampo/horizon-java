@@ -18,11 +18,12 @@
 
 use crate::{Entrypoint, NativeJar};
 
-/// The entrypoint kinds Fabric Loader runs on a client, in the order the
-/// native path tries them.
-const FABRIC_CLIENT_KINDS: &[&str] = &["client", "main"];
-/// The entrypoint kinds Fabric Loader runs on a dedicated server.
-const FABRIC_SERVER_KINDS: &[&str] = &["server", "main"];
+/// The entrypoint kinds Fabric Loader runs on a client, in the order it runs
+/// them: `Hooks.startClient` invokes `main`, then `client`.
+const FABRIC_CLIENT_KINDS: &[&str] = &["main", "client"];
+/// The entrypoint kinds Fabric Loader runs on a dedicated server, in the order
+/// it runs them: `Hooks.startServer` invokes `main`, then `server`.
+const FABRIC_SERVER_KINDS: &[&str] = &["main", "server"];
 /// A NeoForge (or legacy Forge) jar's only entrypoint kind: its `@Mod` classes,
 /// constructed on both sides.
 const NEOFORGE_KINDS: &[&str] = &["neoforge"];
@@ -48,14 +49,22 @@ impl NativeJar {
         }
     }
 
-    /// The first of [`Self::role_entrypoint_kinds`] that declares entrypoints,
-    /// with every entrypoint of that kind, or `None` when the jar runs nothing
-    /// in this role.
-    pub fn role_entrypoints(&self, client: bool) -> Option<(&'static str, Vec<Entrypoint>)> {
-        self.role_entrypoint_kinds(client).iter().find_map(|kind| {
-            let entries = self.discover_entrypoints(kind);
-            (!entries.is_empty()).then_some((*kind, entries))
-        })
+    /// Every entrypoint this jar runs for a role, in loader order, each paired
+    /// with the kind that names it. Empty when the jar runs nothing in this
+    /// role.
+    ///
+    /// Fabric runs both stages, not the first one that declares anything: a
+    /// server jar with `main` and `server` entrypoints runs `main` first and
+    /// `server` after it.
+    pub fn role_entrypoints(&self, client: bool) -> Vec<(&'static str, Entrypoint)> {
+        self.role_entrypoint_kinds(client)
+            .iter()
+            .flat_map(|kind| {
+                self.discover_entrypoints(kind)
+                    .into_iter()
+                    .map(move |entry| (*kind, entry))
+            })
+            .collect()
     }
 }
 
@@ -109,6 +118,53 @@ mod tests {
         out
     }
 
+    /// A class file `demo/NeoClient` whose `@Mod(value = "demo", dist =
+    /// [Dist.CLIENT])` is the shape javap shows for fzzy_config's client
+    /// class. The `dist` element is an array of enum constants, not strings.
+    fn client_only_neoforge_mod_class() -> Vec<u8> {
+        fn u2(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn utf8(out: &mut Vec<u8>, value: &str) {
+            out.push(1);
+            u2(out, value.len() as u16);
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
+        u2(&mut out, 12); // pool slots 1..=11
+        utf8(&mut out, "demo/NeoClient"); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2 Class
+        utf8(&mut out, "java/lang/Object"); // 3
+        out.extend_from_slice(&[7, 0, 3]); // 4 Class
+        utf8(&mut out, "Lnet/neoforged/fml/common/Mod;"); // 5
+        utf8(&mut out, "RuntimeVisibleAnnotations"); // 6
+        utf8(&mut out, "value"); // 7
+        utf8(&mut out, "demo"); // 8
+        utf8(&mut out, "dist"); // 9
+        utf8(&mut out, "Lnet/neoforged/api/distmarker/Dist;"); // 10
+        utf8(&mut out, "CLIENT"); // 11
+        // public class, this #2, super #4, no interfaces, fields or methods.
+        out.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0]);
+        // One RuntimeVisibleAnnotations attribute.
+        u2(&mut out, 1);
+        u2(&mut out, 6);
+        let mut annotations = Vec::new();
+        u2(&mut annotations, 1); // one annotation
+        u2(&mut annotations, 5); // type
+        u2(&mut annotations, 2); // two pairs
+        u2(&mut annotations, 7); // value =
+        annotations.extend_from_slice(&[b's', 0, 8]);
+        u2(&mut annotations, 9); // dist =
+        annotations.push(b'[');
+        u2(&mut annotations, 1); // one enum element
+        annotations.push(b'e');
+        u2(&mut annotations, 10);
+        u2(&mut annotations, 11);
+        out.extend_from_slice(&(annotations.len() as u32).to_be_bytes());
+        out.extend_from_slice(&annotations);
+        out
+    }
+
     const UNIVERSAL_FABRIC_JSON: &[u8] = br#"{"schemaVersion":1,"id":"demo","version":"1",
         "entrypoints":{"client":["demo.ClientInit"]}}"#;
     const NEOFORGE_TOML: &[u8] = br#"modLoader = "javafml"
@@ -135,10 +191,11 @@ version = "1"
             !jar.discover_entrypoints("neoforge").is_empty(),
             "the fixture's @Mod class must be discoverable for this test to mean anything"
         );
-        assert_eq!(jar.role_entrypoints(false), None);
-        let (kind, entries) = jar.role_entrypoints(true).unwrap();
-        assert_eq!(kind, "client");
-        assert_eq!(entries[0].class, "demo.ClientInit");
+        assert!(jar.role_entrypoints(false).is_empty());
+        let entries = jar.role_entrypoints(true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "client");
+        assert_eq!(entries[0].1.class, "demo.ClientInit");
     }
 
     #[test]
@@ -149,26 +206,73 @@ version = "1"
             ("demo/NeoMod.class", &class),
         ]);
         for client in [false, true] {
-            let (kind, entries) = jar.role_entrypoints(client).unwrap();
-            assert_eq!(kind, "neoforge");
-            assert_eq!(entries[0].class, "demo.NeoMod");
+            let entries = jar.role_entrypoints(client);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, "neoforge");
+            assert_eq!(entries[0].1.class, "demo.NeoMod");
         }
     }
 
     #[test]
-    fn a_fabric_server_prefers_server_then_main() {
+    fn a_client_only_mod_class_never_reaches_the_server_role() {
+        // FML constructs a `@Mod(dist = Dist.CLIENT)` class only on a client;
+        // fzzy_config's client class carries this shape and must not run on a
+        // server.
+        let class = client_only_neoforge_mod_class();
+        let jar = jar(&[
+            ("META-INF/neoforge.mods.toml", NEOFORGE_TOML),
+            ("demo/NeoClient.class", &class),
+        ]);
+        assert_eq!(
+            jar.discover_entrypoints_on("neoforge", "SERVER").len(),
+            0,
+            "a CLIENT-only @Mod class must be filtered out of the server role"
+        );
+        let client = jar.discover_entrypoints_on("neoforge", "CLIENT");
+        assert_eq!(client.len(), 1);
+        assert_eq!(client[0].class, "demo.NeoClient");
+    }
+
+    #[test]
+    fn a_fabric_server_runs_main_then_server() {
+        // Fabric's Hooks.startServer invokes `main` and then `server`
+        // (Hooks.startClient invokes `main` and then `client`); the native role
+        // must run both stages in that order, not stop at the first.
         let jar = jar(&[(
             "fabric.mod.json",
             br#"{"schemaVersion":1,"id":"demo","version":"1",
                 "entrypoints":{"main":["demo.Main"],"server":["demo.Server"],"client":["demo.Client"]}}"#,
         )]);
-        assert_eq!(jar.role_entrypoints(false).unwrap().0, "server");
-        assert_eq!(jar.role_entrypoints(true).unwrap().0, "client");
+        let server: Vec<_> = jar
+            .role_entrypoints(false)
+            .into_iter()
+            .map(|(kind, entry)| (kind, entry.class))
+            .collect();
+        assert_eq!(
+            server,
+            [
+                ("main", "demo.Main".to_owned()),
+                ("server", "demo.Server".to_owned())
+            ]
+        );
+        let client: Vec<_> = jar
+            .role_entrypoints(true)
+            .into_iter()
+            .map(|(kind, entry)| (kind, entry.class))
+            .collect();
+        assert_eq!(
+            client,
+            [
+                ("main", "demo.Main".to_owned()),
+                ("client", "demo.Client".to_owned())
+            ]
+        );
         let main_only = self::jar(&[(
             "fabric.mod.json",
             br#"{"schemaVersion":1,"id":"demo","version":"1","entrypoints":{"main":["demo.Main"]}}"#,
         )]);
-        assert_eq!(main_only.role_entrypoints(false).unwrap().0, "main");
-        assert_eq!(main_only.role_entrypoints(true).unwrap().0, "main");
+        assert_eq!(main_only.role_entrypoints(false).len(), 1);
+        assert_eq!(main_only.role_entrypoints(false)[0].0, "main");
+        assert_eq!(main_only.role_entrypoints(true).len(), 1);
     }
 }

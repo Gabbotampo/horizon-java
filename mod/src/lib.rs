@@ -108,10 +108,6 @@ const SCHEMA: u64 = 1;
 const JAR_BUDGET: Duration = Duration::from_secs(30);
 /// The line every log entry starts with, so one `grep` finds all of them.
 const LOG: &str = "Horizon Java";
-/// The entrypoint kinds a server runs, in the order the probe picks them: Fabric's common
-/// `main`, NeoForge's `server`, then the class a NeoForge jar discovers by annotation.
-const SERVER_KINDS: [&str; 3] = ["main", "server", "neoforge"];
-
 /// The mod's state. The content hooks run the jars once per process, before any server exists;
 /// every later hook reuses what they recorded, and a second server this process hosts only resets
 /// the per-server state.
@@ -1434,10 +1430,15 @@ impl std::fmt::Display for JarRow {
     }
 }
 
-/// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
-/// game behind it. Anything the runtime does not model is counted by the host, which is what
-/// `ran-hollow` means. The host is returned because the listeners it recorded need it for the
-/// rest of the server's life.
+/// Loads one jar the way a server would: every server-side entrypoint the real loader runs, in
+/// the loader's order, in its own host, with no game behind it. Anything the runtime does not
+/// model is counted by the host, which is what `ran-hollow` means. The host is returned because
+/// the listeners it recorded need it for the rest of the server's life.
+///
+/// Fabric runs `main` and then `server` (Hooks.startServer), so a jar that has both runs both.
+/// A failing stage is recorded and the remaining stages still run: the failure is a limit of
+/// this interpreter, not a reason to drop an entrypoint the jar ships for the server. The jar is
+/// refused only when every stage failed; a partial failure is named in the row's `reason`.
 fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
     let stem = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
     let jar = match runtime::NativeJar::from_bytes(bytes) {
@@ -1455,32 +1456,27 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
         .clone()
         .or_else(|| jar.neoforge_id.clone())
         .unwrap_or_else(|| stem.clone());
-    let Some(kind) = SERVER_KINDS
-        .into_iter()
-        .find(|kind| !jar.discover_entrypoints(kind).is_empty())
-    else {
+    let entrypoints = jar.role_entrypoints(false);
+    if entrypoints.is_empty() {
         let reason = if jar.discover_entrypoints("client").is_empty() {
             "no main, server or neoforge entrypoint"
         } else {
             "client-only entrypoint: a server never runs it"
         };
         return Err(JarRow::refused(&file, id, reason.to_owned()));
-    };
-    let entrypoints = jar.discover_entrypoints(kind);
-    if let Some(entry) = entrypoints.iter().find(|entry| entry.adapter.is_some()) {
-        return Err(JarRow::refused(
-            &file,
-            id,
-            format!(
-                "{}: entrypoint adapter {} is not supported by the native path",
-                entry.class,
-                entry.adapter.as_deref().unwrap_or_default()
-            ),
-        ));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
     let mut calls = 0;
-    for entry in &entrypoints {
+    let mut ran = 0;
+    let mut failures = Vec::new();
+    for (kind, entry) in &entrypoints {
+        if let Some(adapter) = entry.adapter.as_deref() {
+            failures.push(format!(
+                "{}: entrypoint adapter {adapter} is not supported by the native path",
+                entry.class
+            ));
+            continue;
+        }
         let outcome = jar.execute_with_budget(
             &entry.class,
             entry.method.as_deref(),
@@ -1489,28 +1485,31 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
             &runtime::ExecutionBudget::within(JAR_BUDGET),
         );
         match outcome {
-            Ok(report) => calls += report.calls,
-            Err(error) => {
-                let unknown = host.unknown_host_call_count();
-                return Err(JarRow {
-                    file,
-                    id,
-                    verdict: "refused",
-                    host_calls: calls,
-                    unknown_host_calls: unknown,
-                    reason: Some(format!("{}: {error}", entry.class)),
-                    callbacks_ran: 0,
-                    callbacks_failed: 0,
-                    callback_unknown_host_calls: 0,
-                    commands_ran: 0,
-                    commands_refused: 0,
-                    command_unknown_host_calls: 0,
-                    content_blocks: 0,
-                    content_items: 0,
-                    content_skipped: BTreeMap::new(),
-                });
+            Ok(report) => {
+                calls += report.calls;
+                ran += 1;
             }
+            Err(error) => failures.push(format!("{}: {error}", entry.class)),
         }
+    }
+    if ran == 0 {
+        return Err(JarRow {
+            file,
+            id,
+            verdict: "refused",
+            host_calls: calls,
+            unknown_host_calls: host.unknown_host_call_count(),
+            reason: Some(failures.join("; ")),
+            callbacks_ran: 0,
+            callbacks_failed: 0,
+            callback_unknown_host_calls: 0,
+            commands_ran: 0,
+            commands_refused: 0,
+            command_unknown_host_calls: 0,
+            content_blocks: 0,
+            content_items: 0,
+            content_skipped: BTreeMap::new(),
+        });
     }
     let unknown = host.unknown_host_call_count();
     let listeners = host.game_listeners(&jar, true).listeners;
@@ -1525,7 +1524,8 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
             },
             host_calls: calls,
             unknown_host_calls: unknown,
-            reason: None,
+            reason: (!failures.is_empty())
+                .then(|| format!("entrypoint(s) failed: {}", failures.join("; "))),
             callbacks_ran: 0,
             callbacks_failed: 0,
             callback_unknown_host_calls: 0,
