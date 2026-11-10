@@ -14114,7 +14114,10 @@ impl NativeJar {
             let mut e = zip
                 .by_index(i)
                 .map_err(|e| NativeError::Zip(e.to_string()))?;
-            let name = e.name().map_err(|e| NativeError::Zip(e.to_string()))?.into_owned();
+            let name = e
+                .name()
+                .map_err(|e| NativeError::Zip(e.to_string()))?
+                .into_owned();
             if !name.ends_with('/') && !name.ends_with(".class") {
                 resources
                     .entry(name.clone())
