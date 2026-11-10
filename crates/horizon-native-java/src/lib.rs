@@ -19,6 +19,7 @@ pub mod brigadier;
 mod class_init;
 pub mod client_surface;
 mod color_collection;
+mod commons_io;
 mod declarations_content;
 mod dfu_pair;
 mod entrypoint_role;
@@ -27,6 +28,7 @@ mod fabric_registry;
 mod facade_saved_data;
 mod facade_server;
 mod facade_text;
+mod game_codecs;
 mod game_hooks;
 mod guava_model;
 mod heap;
@@ -40,6 +42,8 @@ mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
+mod neoforge_loader;
+mod night_config;
 mod reflect_constructors;
 mod reflect_enum;
 mod reflect_generic;
@@ -2057,6 +2061,12 @@ pub trait Host {
         Vec::new()
     }
 
+    /// Text a jar wrote to `System.out`. The bounded host keeps it in memory for the length of
+    /// one invocation; a host that shows the jar's output (the game's mod) keeps it across calls
+    /// and reads it back through its own accessor. Hosts that do not model a console keep the
+    /// default and lose only the text.
+    fn write_console(&mut self, _text: &str) {}
+
     /// The text a bounded input-stream marker exposes, when the host holds it.
     ///
     /// The interpreter models `java.io` readers itself; a stream the host
@@ -2330,10 +2340,16 @@ pub struct StdHost {
     current_time_millis: i32,
     mods: BTreeMap<String, String>,
     environment_type: String,
+    /// The game version a caller seeded for `ModList` and `DetectedVersion`.
+    /// `None` keeps both questions unanswered instead of inventing a release.
+    game_version: Option<String>,
     development_environment: bool,
     calls: Vec<MethodRef>,
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
+    /// Text the jar wrote to `System.out`, kept for callers that show it (the game's mod). The
+    /// interpreter's own `io_writers` sink lives for one invocation; this one outlives them.
+    console_out: String,
     registrations: Vec<RegistryEntry>,
     /// Registry keys (`registry/id`) whose declaration was inferred from the
     /// builder calls a registration's value carries. An explicit adapter may
@@ -2462,10 +2478,12 @@ impl StdHost {
             current_time_millis: 0,
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
+            game_version: None,
             development_environment: false,
             calls: Vec::new(),
             invocations: Vec::new(),
             posted_events: Vec::new(),
+            console_out: String::new(),
             registrations: Vec::new(),
             inferred_declarations: BTreeSet::new(),
             content_builders: Default::default(),
@@ -2528,7 +2546,15 @@ impl StdHost {
         self.unknown_host_calls.values().sum()
     }
 
-    fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+    /// The text the jar wrote to `System.out` since the last call, and forget
+    /// it. A real `PrintStream` writes to the process console; the bounded
+    /// host keeps it in memory, so a caller that shows the jar's output (the
+    /// game's mod) takes it here instead of losing it.
+    pub fn take_stdout(&mut self) -> String {
+        std::mem::take(&mut self.console_out)
+    }
+
+    pub(crate) fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
         if self.unknown_host_calls.len() < 64 || self.unknown_host_calls.contains_key(&key) {
             *self.unknown_host_calls.entry(key).or_default() += 1;
@@ -2822,6 +2848,14 @@ impl StdHost {
         self
     }
 
+    /// Seed the game version `ModList`'s `minecraft` container and the
+    /// game's `DetectedVersion` answer. Without it the host leaves both
+    /// questions empty rather than inventing a release.
+    pub fn with_game_version(mut self, game_version: impl Into<String>) -> Self {
+        self.game_version = Some(game_version.into());
+        self
+    }
+
     /// Set Fabric's development-environment marker returned by
     /// `isDevelopmentEnvironment`.
     pub fn with_development_environment(mut self, development_environment: bool) -> Self {
@@ -2871,7 +2905,12 @@ impl StdHost {
                 for (key, value) in additions {
                     let key = Value::Ref(Some(key));
                     let value = Value::Ref(Some(value));
-                    match values.chunks_exact_mut(2).find(|pair| pair[0] == key) {
+                    match values
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .find(|pair| pair[0] == key)
+                    {
                         Some(pair) => pair[1] = value,
                         None => values.extend([key, value]),
                     }
@@ -2885,7 +2924,9 @@ impl StdHost {
                     .get(marker)
                     .and_then(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .find(|pair| pair[0] == key)
                             .map(|pair| pair[1].clone())
                     })
@@ -2900,7 +2941,9 @@ impl StdHost {
                     .get(marker)
                     .and_then(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .find(|pair| pair[0] == key)
                             .map(|pair| pair[1].clone())
                     })
@@ -2914,7 +2957,7 @@ impl StdHost {
                     .mutable_collections
                     .entry(marker.to_owned())
                     .or_default();
-                for pair in values.chunks_exact_mut(2) {
+                for pair in values.as_chunks_mut::<2>().0 {
                     if pair[0] == key {
                         return Ok(Some(std::mem::replace(&mut pair[1], value)));
                     }
@@ -2928,7 +2971,9 @@ impl StdHost {
                     .get(marker)
                     .map(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|pair| pair[0].clone())
                             .collect::<Vec<_>>()
                     })
@@ -3713,6 +3758,10 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    fn write_console(&mut self, text: &str) {
+        self.console_out.push_str(text);
+    }
+
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
@@ -3811,6 +3860,10 @@ impl Host for StdHost {
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
+        // NeoForge's side, path and mod-container constants.
+        if let Some(value) = self.neoforge_loader_static(r) {
+            return Ok(value);
+        }
         // `MixinEnvironment.Side` constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_static(r) {
             return Ok(value);
@@ -3909,6 +3962,16 @@ impl Host for StdHost {
                 }
                 .into(),
             ))),
+            // The standard streams. They are real `PrintStream`s over the
+            // process's stdout/stderr; the bounded host has no console, so the
+            // text lands in the same in-memory sink a modelled writer uses.
+            // A mod's `println` then runs instead of dereferencing a null.
+            ("java/lang/System", "out", "Ljava/io/PrintStream;") => {
+                Ok(Value::Ref(Some("system-out".into())))
+            }
+            ("java/lang/System", "err", "Ljava/io/PrintStream;") => {
+                Ok(Value::Ref(Some("system-err".into())))
+            }
             // `Long.MAX_VALUE`/`MIN_VALUE` are the long bounds a mod compares
             // timers and ids against; a neutral `0` would silently truncate
             // every comparison to "less than max".
@@ -3997,6 +4060,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(value) = self.neoforge_loader_call(r, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.payload_type_registry_call(r, None, args) {
             return Ok(value);
         }
@@ -5215,6 +5281,10 @@ impl Host for StdHost {
         {
             return Ok(Value::Ref(Some(name.to_owned())));
         }
+        // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
+        if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
+            return Ok(value);
+        }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
             return value;
@@ -5871,10 +5941,10 @@ impl Host for StdHost {
                 }
                 return Ok(Value::Void);
             }
-            if r.owner == "java/util/Properties" {
-                if let Some(value) = self.properties_member(r, marker, args)? {
-                    return Ok(value);
-                }
+            if r.owner == "java/util/Properties"
+                && let Some(value) = self.properties_member(r, marker, args)?
+            {
+                return Ok(value);
             }
             match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
                 (owner, "<init>", "(Ljava/util/Map;)V") if is_map_owner(owner) => {
@@ -6201,7 +6271,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         return Ok(values[index * 2 + 1].clone());
                     }
                     let computed = match function {
@@ -6229,7 +6304,9 @@ impl Host for StdHost {
                     let function = Self::argument(r, args, 1)?.clone();
                     let current = self.mutable_collections.get(marker).and_then(|values| {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .find(|pair| pair[0] == key)
                             .map(|pair| pair[1].clone())
                     });
@@ -6250,7 +6327,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         if matches!(computed, Value::Ref(None)) {
                             values.drain(index * 2..index * 2 + 2);
                             return Ok(Value::Ref(None));
@@ -6265,7 +6347,9 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|pair| [pair[0].clone(), pair[1].clone()])
                         .collect::<Vec<_>>();
                     for [key, value] in entries {
@@ -6293,7 +6377,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         let current = values[index * 2 + 1].clone();
                         let merged = self.invoke_instance(
                             &MethodRef {
@@ -6331,7 +6420,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == key)
+                    {
                         return Ok(values[index * 2 + 1].clone());
                     }
                     values.extend([key, value]);
@@ -6346,7 +6440,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| &pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| &pair[0] == key)
+                    {
                         return Ok(std::mem::replace(&mut values[index * 2 + 1], value));
                     }
                     return Ok(Value::Ref(None));
@@ -6362,7 +6461,9 @@ impl Host for StdHost {
                         .entry(marker.to_owned())
                         .or_default();
                     if let Some(index) = values
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .position(|pair| &pair[0] == key && &pair[1] == old)
                     {
                         values[index * 2 + 1] = new;
@@ -6378,7 +6479,9 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|pair| [pair[0].clone(), pair[1].clone()])
                         .collect::<Vec<_>>();
                     let mut replacements = Vec::with_capacity(entries.len());
@@ -6419,7 +6522,7 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    for pair in values.chunks_exact_mut(2) {
+                    for pair in values.as_chunks_mut::<2>().0 {
                         if pair[0] == key {
                             return Ok(std::mem::replace(&mut pair[1], value));
                         }
@@ -6430,15 +6533,15 @@ impl Host for StdHost {
                 (owner, "putAll", "(Ljava/util/Map;)V") if is_map_owner(owner) => {
                     let source = Self::argument(r, args, 0)?;
                     let entries = host_collection_values(self, source)?;
-                    let mut pairs = entries.chunks_exact(2);
+                    let (pairs, remainder) = entries.as_chunks::<2>();
                     let mut updates = Vec::new();
-                    for pair in &mut pairs {
+                    for pair in pairs {
                         updates.push((
                             parse_collection_value(&pair[0])?,
                             parse_collection_value(&pair[1])?,
                         ));
                     }
-                    if !pairs.remainder().is_empty() {
+                    if !remainder.is_empty() {
                         return Err(NativeError::Metadata(
                             "map marker contains an odd number of entries".into(),
                         ));
@@ -6448,7 +6551,11 @@ impl Host for StdHost {
                         .entry(marker.to_owned())
                         .or_default();
                     for (key, value) in updates {
-                        if let Some(index) = values.chunks_exact(2).position(|pair| pair[0] == key)
+                        if let Some(index) = values
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .position(|pair| pair[0] == key)
                         {
                             values[index * 2 + 1] = value;
                         } else {
@@ -6467,7 +6574,9 @@ impl Host for StdHost {
                         .entry(marker.to_owned())
                         .or_default();
                     if let Some(index) = values
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .position(|pair| &pair[0] == key && &pair[1] == expected)
                     {
                         let index = index * 2;
@@ -6484,7 +6593,12 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if let Some(index) = values.chunks_exact(2).position(|pair| &pair[0] == key) {
+                    if let Some(index) = values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| &pair[0] == key)
+                    {
                         let index = index * 2;
                         values.remove(index);
                         return Ok(values.remove(index));
@@ -6885,8 +6999,10 @@ impl Host for StdHost {
             (owner, "get", "(Ljava/lang/Object;)Ljava/lang/Object;") if is_map_owner(owner) => {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 let values = host_collection_values(self, receiver)?;
-                let mut pairs = values.chunks_exact(2);
-                Ok(pairs
+                Ok(values
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .find(|pair| pair[0] == needle)
                     .map(|pair| parse_collection_value(&pair[1]))
                     .transpose()?
@@ -6898,8 +7014,12 @@ impl Host for StdHost {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 let fallback = Self::argument(r, args, 1)?.clone();
                 let values = host_collection_values(self, receiver)?;
-                let mut pairs = values.chunks_exact(2);
-                if let Some(pair) = pairs.find(|pair| pair[0] == needle) {
+                if let Some(pair) = values
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .find(|pair| pair[0] == needle)
+                {
                     parse_collection_value(&pair[1])
                 } else {
                     Ok(fallback)
@@ -6909,7 +7029,9 @@ impl Host for StdHost {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .any(|pair| pair[0] == needle) as i32,
                 ))
             }
@@ -6917,14 +7039,18 @@ impl Host for StdHost {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .any(|pair| pair[1] == needle) as i32,
                 ))
             }
             (owner, "entrySet", "()Ljava/util/Set;") if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
                 let entries = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| {
                         let key = parse_collection_value(&pair[0])?;
                         let value = parse_collection_value(&pair[1])?;
@@ -6942,7 +7068,9 @@ impl Host for StdHost {
             ) if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
                 let keys = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| parse_collection_value(&pair[0]))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(collection_value("set", &keys))
@@ -6950,7 +7078,9 @@ impl Host for StdHost {
             (owner, "values", "()Ljava/util/Collection;") if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
                 let values = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| parse_collection_value(&pair[1]))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(collection_value("list", &values))
@@ -8062,7 +8192,9 @@ impl Host for StdHost {
                     Value::Ref(Some(id)) => id,
                     _ => return Ok(Value::Int(0)),
                 };
-                Ok(Value::Int(self.mods.contains_key(id) as i32))
+                Ok(Value::Int(
+                    (self.mods.contains_key(id) || is_always_loaded_mod(id)) as i32,
+                ))
             }
             (
                 "net/neoforged/fml/ModList" | "net/minecraftforge/fml/ModList",
@@ -8073,7 +8205,7 @@ impl Host for StdHost {
                     Value::Ref(Some(id)) => id,
                     _ => return Ok(Value::Ref(None)),
                 };
-                Ok(Value::Ref(self.mods.get(id).map(|version| {
+                Ok(Value::Ref(self.neoforge_mod_version(id).map(|version| {
                     format!("neoforge-mod-container/{id}/{version}")
                 })))
             }
@@ -8378,6 +8510,7 @@ impl Host for StdHost {
             }
             (
                 "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/neoforged/neoforge/registries/DeferredRegister$DataComponents"
                 | "net/minecraftforge/registries/DeferredRegister",
                 "register",
                 descriptor,
@@ -8560,7 +8693,8 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(format!("optional/resource-key/{key}"))))
             }
             (
-                "net/neoforged/neoforge/registries/DeferredRegister",
+                "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/neoforged/neoforge/registries/DeferredRegister$DataComponents",
                 "register",
                 "(Lnet/neoforged/bus/api/IEventBus;)V",
             ) => Ok(Value::Void),
@@ -9992,6 +10126,15 @@ fn value_text(value: &Value) -> String {
             if let Some(value) = value.strip_prefix("boolean:") {
                 return value.to_owned();
             }
+            // A marker whose Java `toString` is its payload: string
+            // concatenation goes through `String.valueOf`, not the modelled
+            // instance method.
+            if let Some(value) = value.strip_prefix("regex-pattern/") {
+                return value.to_owned();
+            }
+            if let Some(value) = value.strip_prefix("watch-kind/") {
+                return value.to_owned();
+            }
             value.clone()
         }
         Value::Ref(None) => "null".into(),
@@ -10402,7 +10545,7 @@ fn format_integer_us(value: i64) -> String {
     let digits = value.unsigned_abs().to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
-        if index != 0 && (digits.len() - index) % 3 == 0 {
+        if index != 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);
@@ -14114,16 +14257,27 @@ impl NativeJar {
     /// read because its NeoForge/Forge entrypoint is only in a class
     /// annotation.
     pub fn from_path_metadata(path: &Path) -> Result<Self, NativeError> {
-        Self::read(path, false)
+        let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
+        Self::read(file, false)
     }
 
     pub fn from_path(path: &Path) -> Result<Self, NativeError> {
-        Self::read(path, true)
+        let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
+        Self::read(file, true)
     }
 
-    fn read(path: &Path, parse_classes: bool) -> Result<Self, NativeError> {
-        let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        let mut zip = zip::ZipArchive::new(file).map_err(|e| NativeError::Zip(e.to_string()))?;
+    /// Reads a jar this process already holds in memory, the way [`Self::from_path`] reads one
+    /// from disk. A host that hands a mod its files as bytes (Horizon's `Host::config_files`)
+    /// runs them without staging a copy on the file system first.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeError> {
+        Self::read(std::io::Cursor::new(bytes), true)
+    }
+
+    fn read<R: std::io::Read + std::io::Seek>(
+        source: R,
+        parse_classes: bool,
+    ) -> Result<Self, NativeError> {
+        let mut zip = zip::ZipArchive::new(source).map_err(|e| NativeError::Zip(e.to_string()))?;
         let mut classes = Vec::new();
         let mut resources = BTreeMap::new();
         let mut resource_bytes = BTreeMap::new();
@@ -14138,7 +14292,10 @@ impl NativeJar {
             let mut e = zip
                 .by_index(i)
                 .map_err(|e| NativeError::Zip(e.to_string()))?;
-            let name = e.name().to_owned();
+            let name = e
+                .name()
+                .map_err(|e| NativeError::Zip(e.to_string()))?
+                .into_owned();
             if !name.ends_with('/') && !name.ends_with(".class") {
                 resources
                     .entry(name.clone())
@@ -14217,10 +14374,14 @@ impl NativeJar {
                     }
                     class_annotation_warnings.push(warning);
                 }
+                // A real `@Mod` member is a class annotation, not any copy
+                // of its descriptor in the constant pool: Kotlin's `Metadata`
+                // keeps every type it mentions as a string, so a pool scan
+                // made a Kotlin type-alias facade a NeoForge mod class.
                 if class
-                    .pool
+                    .annotations
                     .iter()
-                    .any(|constant| matches!(constant, Cp::Utf8(value) if is_mod_annotation(value)))
+                    .any(|annotation| is_mod_annotation(&annotation.descriptor))
                 {
                     neoforge_entrypoints.push(class.name.clone());
                 }
@@ -15269,6 +15430,17 @@ impl NativeJar {
     /// that execute a jar should run all of them rather than silently
     /// dropping everything after the first declaration.
     pub fn discover_entrypoints(&self, kind: &str) -> Vec<Entrypoint> {
+        self.discover_entrypoints_on(kind, "BOTH")
+    }
+
+    /// [`Self::discover_entrypoints`] for one physical side.
+    ///
+    /// NeoForge's `@Mod` declares `dist`: a class limited to `CLIENT` never
+    /// loads on a dedicated server, and one limited to `DEDICATED_SERVER`
+    /// never loads on a client. `side` is `CLIENT` or `SERVER`; any other
+    /// value keeps the side-independent answer, as does a class without a
+    /// `dist` member.
+    pub fn discover_entrypoints_on(&self, kind: &str, side: &str) -> Vec<Entrypoint> {
         if let Some(entries) = self.fabric_entrypoints.get(kind) {
             return entries
                 .iter()
@@ -15290,6 +15462,7 @@ impl NativeJar {
             return self
                 .neoforge_entrypoints
                 .iter()
+                .filter(|class| self.neoforge_entrypoint_runs_on(class, side))
                 .map(|class| Entrypoint {
                     class: class.replace('/', "."),
                     method: None,
@@ -15298,6 +15471,40 @@ impl NativeJar {
                 .collect();
         }
         Vec::new()
+    }
+
+    /// Whether one discovered `@Mod` class loads on `side`.
+    ///
+    /// The annotation's `dist` member is an array of `Dist` constants; a
+    /// class without one loads on both sides. Only the two names FML matches
+    /// count, so an unreadable value keeps the class rather than dropping a
+    /// real entrypoint.
+    fn neoforge_entrypoint_runs_on(&self, class: &str, side: &str) -> bool {
+        if !matches!(side, "CLIENT" | "SERVER") {
+            return true;
+        }
+        let Some(file) = self.classes.get(class) else {
+            return true;
+        };
+        let Some(annotation) = file
+            .annotations
+            .iter()
+            .find(|annotation| is_mod_annotation(&annotation.descriptor))
+        else {
+            return true;
+        };
+        let Some(AnnotationValue::Array(values)) = annotation.values.get("dist") else {
+            return true;
+        };
+        let wanted = if side == "CLIENT" {
+            "CLIENT"
+        } else {
+            "DEDICATED_SERVER"
+        };
+        values.iter().any(|value| match value {
+            AnnotationValue::String(value) => value.rsplit('.').next() == Some(wanted),
+            _ => false,
+        })
     }
 
     /// The adapter the jar's metadata declared for `class` under `kind`.
@@ -18268,7 +18475,7 @@ fn gson_json_array<H: Host>(host: &H, values: &[String]) -> Result<String, Nativ
 }
 
 fn gson_json_object<H: Host>(host: &H, values: &[String]) -> Result<String, NativeError> {
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         return Err(NativeError::Metadata(
             "native map marker has an odd value count".into(),
         ));
@@ -20207,6 +20414,39 @@ impl<H: Host> Runtime<'_, H> {
                 .and_then(|value| self.array(value).ok())
                 .cloned()
                 .unwrap_or_default();
+            // Constructors are not inherited, so a class the jar declares
+            // answers exactly the constructors it holds; a lookup the JVM
+            // would refuse raises `NoSuchMethodException` and the caller's
+            // `catch` can take its fallback. A class outside the jar keeps
+            // the nominal lookup.
+            if self.class(class).is_some() {
+                let mut wanted = String::from("(");
+                for parameter in &parameter_types {
+                    let Some(descriptor) = class_descriptor(parameter) else {
+                        return Ok(Some(Value::Ref(Some(format!(
+                            "reflect-constructor/{class}#"
+                        )))));
+                    };
+                    wanted.push_str(&descriptor);
+                }
+                wanted.push_str(")V");
+                let declared = self.class(class).is_some_and(|file| {
+                    file.methods.iter().any(|method| {
+                        method.name == "<init>"
+                            && method.descriptor == wanted
+                            && (r.name == "getDeclaredConstructor" || method.access & 1 != 0)
+                    })
+                });
+                if !declared {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NoSuchMethodException".into(),
+                        message: Some(format!("{class}.<init>{wanted}")),
+                        frame: None,
+                    });
+                }
+                let marker = format!("reflect-constructor/{class}#{wanted}");
+                return Ok(Some(Value::Ref(Some(marker))));
+            }
             let marker = self
                 .reflected_descriptor(class, "<init>", &parameter_types)
                 .map_or_else(
@@ -20415,9 +20655,23 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 self.array(invocation_args)?.clone()
             };
-            let class_file = self
-                .class(owner)
-                .ok_or_else(|| NativeError::MissingMethod(format!("{owner}#{name}")))?;
+            let Some(class_file) = self.class(owner) else {
+                // A loader method the host models has no classfile in the
+                // jar. Dispatch the exact signature the lookup selected;
+                // anything else keeps the old refusal instead of a neutral
+                // answer to a call nobody modelled.
+                if let Some(descriptor) =
+                    neoforge_loader::reflected_static_descriptor(owner, name, invocation_args.len())
+                {
+                    let target = MethodRef {
+                        owner: owner.to_owned(),
+                        name: name.to_owned(),
+                        descriptor: descriptor.to_owned(),
+                    };
+                    return Ok(Some(self.host.invoke(&target, &invocation_args)?));
+                }
+                return Err(NativeError::MissingMethod(format!("{owner}#{name}")));
+            };
             let target = class_file
                 .methods
                 .iter()
@@ -20625,6 +20879,10 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // A game codec factory whose result a class only stores.
+        if let Some(value) = self.invoke_game_codec_factory(r) {
+            return Ok(Some(value));
+        }
         // A value-component builder is a fluent game object. Bootstrap code
         // only needs the builder to exist (`Objects.requireNonNull` refuses a
         // null one) and every setter to answer itself; the steps it takes are
@@ -20769,6 +21027,12 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(path) = self.io_paths.get(marker) {
             return Some(format!("file:{path}"));
         }
+        // The standard streams exist before any writer is opened: a writer
+        // block only runs for a marker that already has a sink, and nothing
+        // constructs `System.out`.
+        if marker == "system-out" || marker == "system-err" {
+            return Some(format!("mem:{marker}"));
+        }
         let key = format!("mem:{marker}");
         self.io_writers.contains_key(&key).then_some(key)
     }
@@ -20797,6 +21061,9 @@ impl<H: Host> Runtime<'_, H> {
         let Some(key) = self.io_sink_key(marker) else {
             return;
         };
+        if key == "mem:system-out" {
+            self.host.write_console(text);
+        }
         self.io_writers.entry(key).or_default().push_str(text);
     }
 
@@ -21194,7 +21461,8 @@ impl<H: Host> Runtime<'_, H> {
             | "java/io/FileWriter"
             | "java/io/OutputStreamWriter"
             | "java/io/StringWriter"
-            | "java/io/PrintWriter" => {
+            | "java/io/PrintWriter"
+            | "java/io/PrintStream" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
@@ -23892,10 +24160,10 @@ impl<H: Host> Runtime<'_, H> {
                         desc,
                         at,
                     )?;
-                    if outcome == AnchorOutcome::Normal {
-                        if let Some(key) = instance_field_key(&receiver, &r) {
-                            self.fields.insert(key, value);
-                        }
+                    if outcome == AnchorOutcome::Normal
+                        && let Some(key) = instance_field_key(&receiver, &r)
+                    {
+                        self.fields.insert(key, value);
                     }
                 }
                 0xb6..=0xb9 => {
@@ -23990,9 +24258,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.invoke_gson(&r, receiver.as_ref(), &args)? {
                         value
-                    } else if let Some(value) =
-                        self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_reflect_method(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_stack_walker(&r, receiver.as_ref(), &args))
@@ -25723,13 +25992,13 @@ fn parse_neoforge_metadata(
     let mut client_side_only = false;
     let mut flush = |dependency: &mut Option<String>, required_flag: &mut bool| {
         if *required_flag {
-            if let Some(id) = dependency.take() {
-                if !matches!(
+            if let Some(id) = dependency.take()
+                && !matches!(
                     id.as_str(),
                     "minecraft" | "neoforge" | "forge" | "java" | "fabricloader"
-                ) {
-                    required.push(id);
-                }
+                )
+            {
+                required.push(id);
             }
         } else {
             dependency.take();
@@ -27083,17 +27352,16 @@ fn modify_variable_plan_reason(
     }
     // A target class the jar owns must actually declare the method, so an
     // otherwise-plausible local hook never attaches to a typo.
-    if let Some(target_class) = jar.classes.get(&plan.target.owner) {
-        if !plan.target.descriptor.is_empty()
-            && target_class
-                .method(&plan.target.name, &plan.target.descriptor)
-                .is_none()
-        {
-            return Some(format!(
-                "target {}{} is not declared by {}",
-                plan.target.name, plan.target.descriptor, plan.target.owner
-            ));
-        }
+    if let Some(target_class) = jar.classes.get(&plan.target.owner)
+        && !plan.target.descriptor.is_empty()
+        && target_class
+            .method(&plan.target.name, &plan.target.descriptor)
+            .is_none()
+    {
+        return Some(format!(
+            "target {}{} is not declared by {}",
+            plan.target.name, plan.target.descriptor, plan.target.owner
+        ));
     }
     plan.at = anchor.anchor.clone();
     None
@@ -28092,6 +28360,55 @@ mod tests {
         assert_eq!(woven.fabric_entrypoints, jar.fabric_entrypoints);
         assert_eq!(woven.resources, jar.resources);
         assert_eq!(woven.resource_bytes, jar.resource_bytes);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn from_bytes_reads_a_jar_held_in_memory_like_from_path_reads_one_on_disk() {
+        // A jar assembled by a `ZipWriter` over memory: the same bytes a host
+        // hands a mod through `Host::config_files` instead of a file.
+        let class = weavable_class_bytes("demo/T");
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(
+            br#"{"id":"memory","version":"3.1","depends":{"dep":"*"},"entrypoints":{"main":["demo.T"]}}"#,
+        )
+        .unwrap();
+        zip.start_file("assets/demo.txt", options).unwrap();
+        zip.write_all(b"payload").unwrap();
+        zip.start_file("demo/T.class", options).unwrap();
+        zip.write_all(&class).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+
+        let root = std::env::temp_dir().join(format!(
+            "horizon-native-java-from-bytes-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("memory.jar");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let memory = NativeJar::from_bytes(&bytes).unwrap();
+        let disk = NativeJar::from_path(&path).unwrap();
+        assert_eq!(memory.fabric_id.as_deref(), Some("memory"));
+        assert_eq!(memory.fabric_version.as_deref(), Some("3.1"));
+        assert_eq!(memory.required_mods, disk.required_mods);
+        assert_eq!(memory.fabric_entrypoints, disk.fabric_entrypoints);
+        assert_eq!(memory.resources, disk.resources);
+        assert_eq!(memory.resource_bytes, disk.resource_bytes);
+        assert_eq!(memory.classes.len(), disk.classes.len());
+        // The parsed class is the same one from either source, so the same
+        // entrypoint executes identically.
+        assert_eq!(memory.classes["demo/T"].write().unwrap(), class);
+        assert_eq!(
+            memory.discover_entrypoints("main"),
+            disk.discover_entrypoints("main")
+        );
+        // Bytes that are not a zip are refused, not silently empty.
+        let error = NativeJar::from_bytes(b"not a jar").unwrap_err();
+        assert!(matches!(error, NativeError::Zip(_)), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
 

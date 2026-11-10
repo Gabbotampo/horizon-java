@@ -85,24 +85,27 @@ mod tests {
         jar
     }
 
-    /// A class file `demo/NeoMod` whose constant pool names NeoForge's `@Mod`
-    /// annotation, which is what discovery keys a `@Mod` class on.
+    /// A class file `demo/NeoMod` that carries NeoForge's `@Mod` annotation,
+    /// which is what discovery keys a `@Mod` class on. A descriptor string in
+    /// the pool alone is not an annotation (Kotlin's `Metadata` keeps one).
     fn neoforge_mod_class() -> Vec<u8> {
         fn utf8(out: &mut Vec<u8>, value: &str) {
             out.push(1);
             out.extend_from_slice(&(value.len() as u16).to_be_bytes());
             out.extend_from_slice(value.as_bytes());
         }
-        // magic, version 52, five pool slots (1..=5).
-        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 6];
+        // magic, version 52, six pool slots (1..=6).
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 7];
         utf8(&mut out, "demo/NeoMod");
         out.extend_from_slice(&[7, 0, 1]);
         utf8(&mut out, "java/lang/Object");
         out.extend_from_slice(&[7, 0, 3]);
         utf8(&mut out, "Lnet/neoforged/fml/common/Mod;");
-        // public class, this #2, super #4, no interfaces, fields, methods or
-        // attributes.
-        out.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
+        utf8(&mut out, "RuntimeVisibleAnnotations");
+        // public class, this #2, super #4, no interfaces, fields or methods,
+        // one `@Mod` annotation with no members.
+        out.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1]);
+        out.extend_from_slice(&[0, 6, 0, 0, 0, 6, 0, 1, 0, 5, 0, 0]);
         out
     }
 

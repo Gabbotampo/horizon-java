@@ -724,7 +724,7 @@ fn classes_of(path: &Path) -> Vec<ClassFile> {
     let mut classes = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
-        let name = entry.name().to_owned();
+        let name = entry.name().unwrap().into_owned();
         if !name.ends_with(".class")
             || name.ends_with("module-info.class")
             || name.starts_with("META-INF/versions/")

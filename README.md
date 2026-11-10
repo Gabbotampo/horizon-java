@@ -65,6 +65,7 @@ measured but not gated. See the status page for per-row detail and repro command
 ```
 crates/horizon-native-java/   the no-JVM interpreter, metadata reader, Mixin plan/weave
 crates/horizon-jvm/           the optional JNI reference runner (Fabric Knot / NeoForge FML)
+mod/                          the Horizon native mod that runs the runtime inside the game
 native-hooks.json             the hook-point census the native crate's tests pin against
 tools/                        corpus drivers and the vendored `lab` helpers they use
 tools/real_mod_fixtures/      committed ledgers, score history and the NeoForge corpus lock
@@ -86,6 +87,51 @@ Rust tests that compile fixtures need `javac`/`jar`; tests that read a real mod 
 Minecraft/loader install skip when the corresponding files or environment variables
 (`HORIZON_JAVA_CORPUS_DIR`, `HORIZON_MINECRAFT_JAR`, `FABRIC_LOADER_JAR`, `NEOFORGE_SERVER_DIR`,
 ... ) are absent. No test downloads a jar.
+
+## Mod
+
+`mod/` is a Horizon **native mod** (`docs/mod-plan.md`): the first way this runtime runs inside the
+game instead of in the probe. It implements the game's typed `Hooks` from the mod API on
+[arismoko/horizon](https://github.com/arismoko/horizon) (crate `horizon-mod-api`, library
+`mod_api`), pinned to commit `c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac` in `mod/horizon-mod.toml`.
+
+What it does today:
+
+- **M0, the shell.** `server_about_to_start` and `client_setup` log one line each, and the server
+  start writes this mod's report, `config/horizon_java/java-runtime.json`, through the mod API's own
+  config service (`Host::config_files`). With no jars to run it is `{"schema":1,"jars":[]}`.
+- **M1, run jars.** Every `.jar` in `config/horizon_java/java-mods/` is read as bytes through the
+  same service and run at `server_about_to_start` with its own `StdHost`. One log line per jar and
+  one row in the report: the id, `ran-clean` / `ran-hollow` / `refused`, the host-call and
+  unknown-host-call counts, and the refusal reason.
+- **M2, game hooks.** Each jar's runtime (heap, statics and recorded listeners) stays alive for the
+  server, and this mod's `server_about_to_start` / `server_starting` / `server_started` /
+  `server_stopping` / `server_stopped` hooks fire the Fabric `ServerLifecycleEvents` and NeoForge
+  `ServerStartingEvent`/`ServerStartedEvent`/`ServerStoppingEvent` listeners the entrypoints
+  registered. Java commands from Fabric's `CommandRegistrationCallback` (NeoForge's
+  `RegisterCommandsEvent`) become typed mod API commands; running one calls its Java
+  `Command.run` and sends the reply through the mod API's command-source feedback. Literal,
+  `word`/`text` and `integer` nodes only: anything else is refused by name and logged.
+
+A native mod is one flat crate, so the runtime is copied into `mod/src/runtime/` by
+`tools/vendor.py` (which rewrites `crate::` to `crate::runtime::` and records a SHA-256 per file in
+`mod/vendor.lock`). The copy is committed, so a clean clone builds, and it carries the runtime commit
+the lock records: `python3 tools/vendor.py --check-lock` always fails on a hand edit to it, while
+`--check` (the mod is current with the runtime source) is required of a PR that touches `mod/` and is
+run by CI only for those. A mod PR refreshes the copy with `python3 tools/vendor.py`.
+
+```sh
+python3 tools/vendor.py             # after changing crates/horizon-native-java
+python3 tools/java_mod_fixture.py --out DIR                 # milestone 1's jar
+python3 tools/java_mod_fixture.py --kind lifecycle --out DIR # SERVER_STARTED/STOPPING lines
+python3 tools/java_mod_fixture.py --kind command --out DIR   # /javahello [name]
+```
+
+The documented build is Horizon's launcher (`horizon-launcher native-build mod/ --server-output OUT
+--trust-native-code`); it needs an installed, prepared Horizon version to reuse the game's files
+from, so `docs/mod-plan.md` records both that and the equivalent staged build it was proved with,
+the exact run commands, the game log lines, and the next milestones (game bindings over the mod
+API's hooks, then registries, then mixins as hook rows).
 
 ## Corpus tools
 
@@ -109,9 +155,10 @@ Horizon's full harness library.
 
 ## Game-side integration
 
-The Horizon-side integration (the `horizon-client` mod host, its registries and its hook sites)
-lives in the Horizon repository, not here, and is being redesigned against the Horizon mod API.
-The docs in this repository still name those game paths; their header explains where they point.
+The game side lives in the Horizon repository, not here: its registries, its hook sites and the mod
+API `mod/` implements. `docs/mod-plan.md` says which parts of it the mod uses today and which are
+next; the older docs in this repository still name Horizon's pre-mod-API paths, and their header
+explains where those point.
 
 ## Licence
 
