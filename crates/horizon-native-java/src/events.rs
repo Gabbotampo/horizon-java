@@ -1038,8 +1038,11 @@ pub struct EventContext {
     pub block: Option<String>,
     /// The face clicked (`[0, 1, 0]` is the top).
     pub face: Option<[i32; 3]>,
-    /// The off hand acts (the main hand otherwise).
-    pub off_hand: bool,
+    /// The hand that acted: `Some(false)` the main hand, `Some(true)` the off hand.
+    /// `None` when the hook does not name it or the two hands cannot be told
+    /// apart: the Java argument is then a marker whose reads are counted
+    /// unknowns (the listener still runs).
+    pub off_hand: Option<bool>,
     /// `AFTER_RESPAWN`/`COPY_FROM`'s `alive` (back from the End, not a
     /// death); `AFTER_DAMAGE`'s `blocked`.
     pub flag: bool,
@@ -1367,6 +1370,12 @@ impl StdHost {
                 _ => None,
             };
         }
+        // An argument the hook does not give reaches the listener as `game/unknown/<what>`:
+        // a read is counted in the jar's unknown-host calls and answered neutrally, so the
+        // callback keeps running instead of losing the rest of its work to one missing value.
+        if text.starts_with("game/unknown/") {
+            return Some(self.unknown_host_call(r));
+        }
         let answer = self.facade_answer(&kind, r, args);
         Some(answer.ok_or_else(|| NativeError::UnknownHostCall(r.clone())))
     }
@@ -1486,14 +1495,7 @@ impl StdHost {
                     .pos
                     .as_ref()
                     .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}"))),
-                ("getHand", _) => Some(marker(format!(
-                    "enum/net/minecraft/world/InteractionHand/{}",
-                    if context.off_hand {
-                        "OFF_HAND"
-                    } else {
-                        "MAIN_HAND"
-                    }
-                ))),
+                ("getHand", _) => Some(hand_marker(context.off_hand)),
                 ("getState", _) => context.block.as_deref().map(block_state_marker),
                 ("getEntity" | "getPlayer" | "player" | "entity", _) => context_subject(&context),
                 ("getSource" | "source", _) => context
@@ -1994,6 +1996,18 @@ fn subscriber_client_only(annotation: &crate::Annotation) -> bool {
     !dists.is_empty() && dists.iter().all(|dist| dist.ends_with(".CLIENT"))
 }
 
+/// The `InteractionHand` argument a firing names, or a marker whose every read
+/// is counted as an unknown host call when the hook does not say which hand acted.
+fn hand_marker(off_hand: Option<bool>) -> Value {
+    match off_hand {
+        Some(off) => marker(format!(
+            "enum/net/minecraft/world/InteractionHand/{}",
+            if off { "OFF_HAND" } else { "MAIN_HAND" }
+        )),
+        None => marker("game/unknown/hand".into()),
+    }
+}
+
 /// The Fabric argument list of `shape` for this firing.
 fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, NativeError> {
     let context = &firing.context;
@@ -2031,14 +2045,7 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             context.damage.as_deref().unwrap_or("minecraft:generic")
         ))
     };
-    let hand = || {
-        let hand = if context.off_hand {
-            "OFF_HAND"
-        } else {
-            "MAIN_HAND"
-        };
-        marker(format!("enum/net/minecraft/world/InteractionHand/{hand}"))
-    };
+    let hand = || hand_marker(context.off_hand);
     let opaque = |what: &str| marker(format!("game/{what}/0"));
     // `block-pos/x,y,z`, the host's block position value (`getX`...).
     let pos = || {
@@ -2576,21 +2583,24 @@ mod tests {
                 .unwrap();
             assert_eq!(answer, Value::Int(expected), "{name}");
         }
-        // An argument the hook does not give refuses instead of answering.
+        // An argument the hook does not give answers neutrally and is counted, so one missing
+        // value does not fail the rest of the listener.
         let missing = marker("game/unknown/level".into());
-        let refused = host.game_event_call(
-            &call(
-                "net/minecraft/server/level/ServerLevel",
-                "getGameTime",
-                "()J",
-            ),
-            &missing,
-            &[],
-        );
-        assert!(
-            matches!(refused, Some(Err(NativeError::UnknownHostCall(_)))),
-            "{refused:?}"
-        );
+        let before = host.unknown_host_call_count();
+        let answered = host
+            .game_event_call(
+                &call(
+                    "net/minecraft/server/level/ServerLevel",
+                    "getGameTime",
+                    "()J",
+                ),
+                &missing,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(answered, Value::Long(0));
+        assert_eq!(host.unknown_host_call_count(), before + 1);
     }
 
     /// A click's or an attack's entity argument is the target, not the acting player: vanilla's
@@ -2608,7 +2618,7 @@ mod tests {
                     kind: "minecraft:cow".into(),
                     level: None,
                 }),
-                off_hand: true,
+                off_hand: Some(true),
                 ..EventContext::default()
             },
         );
@@ -2619,5 +2629,43 @@ mod tests {
             marker("enum/net/minecraft/world/InteractionHand/OFF_HAND".into())
         );
         assert_eq!(args[3], marker("game/entity/42".into()));
+    }
+
+    /// A firing that does not know which hand acted passes a hand marker no read answers:
+    /// the read is counted as an unknown host call and the listener keeps running.
+    #[test]
+    fn an_unknown_hand_is_passed_through_and_its_reads_are_counted() {
+        let firing = EventFiring::new(
+            GameEvent::UseEntity,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(7),
+                entity: Some(FacadeEntity {
+                    id: 42,
+                    kind: "minecraft:cow".into(),
+                    level: None,
+                }),
+                off_hand: None,
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AttackEntity, &firing).unwrap();
+        assert_eq!(args[2], marker("game/unknown/hand".into()));
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(firing));
+        let before = host.unknown_host_call_count();
+        let read = host
+            .game_event_call(
+                &MethodRef {
+                    owner: "net/minecraft/world/InteractionHand".into(),
+                    name: "name".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                },
+                &args[2],
+                &[],
+            )
+            .unwrap();
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(host.unknown_host_call_count(), before + 1);
     }
 }
