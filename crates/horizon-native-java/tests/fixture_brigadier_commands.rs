@@ -286,8 +286,8 @@ fn facade() -> Arc<EventFacade> {
         players: vec![FacadePlayer {
             uuid: ANA,
             name: "Ana".into(),
-            level: "minecraft:overworld".into(),
-            entity_id: 7,
+            level: Some("minecraft:overworld".into()),
+            entity_id: Some(7),
         }],
         ..EventFacade::default()
     })

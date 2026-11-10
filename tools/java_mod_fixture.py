@@ -64,6 +64,39 @@ public final class ServerLifecycleEvents {
 """,
 }
 
+# The server tick, player join and block break callbacks milestone 2c fires from the game's hooks.
+HOOK_STUBS: dict[str, str] = {
+    "net/fabricmc/fabric/api/event/lifecycle/v1/ServerTickEvents.java": """
+package net.fabricmc.fabric.api.event.lifecycle.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.server.MinecraftServer;
+public final class ServerTickEvents {
+    public static final Event<StartTick> START_SERVER_TICK = null;
+    public interface StartTick { void onStartTick(MinecraftServer server); }
+}
+""",
+    "net/fabricmc/fabric/api/entity/event/v1/ServerPlayerEvents.java": """
+package net.fabricmc.fabric.api.entity.event.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.server.level.ServerPlayer;
+public final class ServerPlayerEvents {
+    public static final Event<Join> JOIN = null;
+    public interface Join { void onJoin(ServerPlayer player); }
+}
+""",
+    "net/minecraft/server/level/ServerPlayer.java": """
+package net.minecraft.server.level;
+import net.minecraft.world.entity.player.Player;
+public class ServerPlayer extends Player {
+    public String getScoreboardName() { return null; }
+}
+""",
+    "net/minecraft/world/entity/player/Player.java": """
+package net.minecraft.world.entity.player;
+public class Player {}
+""",
+}
+
 COMMAND_STUBS: dict[str, str] = {
     "net/fabricmc/fabric/api/command/v2/CommandRegistrationCallback.java": """
 package net.fabricmc.fabric.api.command.v2;
@@ -258,6 +291,35 @@ public final class HelloCommand {
                 return 1;
             }));
         });
+    }
+}
+""",
+    },
+    "hooks": {
+        "id": "m2c_fixture",
+        "entry": "m2cfixture.Events",
+        "jar": "m2c_fixture.jar",
+        "stubs": HOOK_STUBS,
+        "source": """
+package m2cfixture;
+
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+
+public final class Events {
+    private static int ticks;
+
+    public void onInitialize() {
+        // Count server ticks here and say so once, so a bounded run shows the
+        // tick hook firing every tick without a line for each one.
+        ServerTickEvents.START_SERVER_TICK.register(server -> {
+            ticks++;
+            if (ticks == 100) {
+                System.out.println("m2c: 100 server ticks");
+            }
+        });
+        ServerPlayerEvents.JOIN.register(player ->
+            System.out.println("m2c: joined " + player.getScoreboardName()));
     }
 }
 """,
