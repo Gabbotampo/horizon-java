@@ -18,6 +18,14 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // NightConfig's read-with-default (`night_config.rs`).
+        if let Some(value) = night_config::invoke(r, args) {
+            return Ok(Some(value));
+        }
+        // Commons IO text files behind the host's virtual file table.
+        if let Some(value) = self.invoke_commons_io(r, args)? {
+            return Ok(Some(value));
+        }
         // A config library's defaults (`client_config.rs`).
         if let Some(value) = self.invoke_config_library(r, receiver, args)? {
             return Ok(Some(value));
