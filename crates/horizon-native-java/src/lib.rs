@@ -27,6 +27,7 @@ mod fabric_registry;
 mod facade_saved_data;
 mod facade_server;
 mod facade_text;
+mod game_codecs;
 mod game_hooks;
 mod guava_model;
 mod heap;
@@ -20558,6 +20559,10 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // A game codec factory whose result a class only stores.
+        if let Some(value) = self.invoke_game_codec_factory(r) {
+            return Ok(Some(value));
+        }
         // A value-component builder is a fluent game object. Bootstrap code
         // only needs the builder to exist (`Objects.requireNonNull` refuses a
         // null one) and every setter to answer itself; the steps it takes are
