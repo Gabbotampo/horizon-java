@@ -18,6 +18,20 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // NightConfig's read-with-default (`night_config.rs`).
+        if let Some(value) = night_config::invoke(r, args) {
+            return Ok(Some(value));
+        }
+        // Netty's platform probe. The host reports `os.name=Linux`, so the
+        // three predicates are that platform's answers (the same ones
+        // `System.getProperty("os.name")` implies).
+        if let Some(value) = netty_platform_static(r) {
+            return Ok(Some(value));
+        }
+        // Commons IO text files behind the host's virtual file table.
+        if let Some(value) = self.invoke_commons_io(r, args)? {
+            return Ok(Some(value));
+        }
         // A config library's defaults (`client_config.rs`).
         if let Some(value) = self.invoke_config_library(r, receiver, args)? {
             return Ok(Some(value));
@@ -1421,3 +1435,17 @@ fn stack_trace_element(class: &str, method: &str) -> Value {
 /// Where `ModContainer.getRootPaths()` puts each mod's root in the virtual
 /// filesystem.
 pub(super) const MOD_ROOT_PREFIX: &str = "/horizon/mods/";
+
+/// Netty's OS predicates, answered for the platform the host reports
+/// (`os.name=Linux`). `PlatformDependent` caches these statics on the JVM, so
+/// one answer per name is all a caller can observe.
+fn netty_platform_static(r: &MethodRef) -> Option<Value> {
+    if r.owner != "io/netty/util/internal/PlatformDependent" {
+        return None;
+    }
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("isOsx", "()Z") | ("isWindows", "()Z") => Some(Value::Int(0)),
+        ("isLinux", "()Z") => Some(Value::Int(1)),
+        _ => None,
+    }
+}

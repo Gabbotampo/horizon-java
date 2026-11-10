@@ -286,8 +286,8 @@ fn facade() -> Arc<EventFacade> {
         players: vec![FacadePlayer {
             uuid: ANA,
             name: "Ana".into(),
-            level: "minecraft:overworld".into(),
-            entity_id: 7,
+            level: Some("minecraft:overworld".into()),
+            entity_id: Some(7),
         }],
         ..EventFacade::default()
     })
@@ -298,7 +298,7 @@ fn source(level: u8, player: Option<u128>) -> CommandSource {
         name: if player.is_some() { "Ana" } else { "Server" }.into(),
         level,
         player,
-        dimension: "minecraft:overworld".into(),
+        dimension: Some("minecraft:overworld".into()),
     }
 }
 

@@ -179,6 +179,15 @@ impl<H: Host> Runtime<'_, H> {
             | "com/google/common/collect/Multimap"
             | "com/google/common/collect/SetMultimap"
             | "com/google/common/collect/ListMultimap" => self.invoke_multimap(r, receiver, args),
+            // `Maps.newConcurrentMap()` is a mutable map. The bounded runtime
+            // is single-threaded, so the host's ordinary map marker is the
+            // same object graph; concurrency has no second thread to serve.
+            "com/google/common/collect/Maps"
+                if r.name == "newConcurrentMap"
+                    && r.descriptor == "()Ljava/util/concurrent/ConcurrentMap;" =>
+            {
+                Ok(Some(collection_value("map", &[])))
+            }
             _ => Ok(None),
         }
     }
@@ -217,7 +226,7 @@ impl<H: Host> Runtime<'_, H> {
             }
             return Ok(Some(collection_value("set", &unique)));
         }
-        if values.len() % 2 != 0 {
+        if !values.len().is_multiple_of(2) {
             return Ok(None);
         }
         let bimap = r.owner == "com/google/common/collect/ImmutableBiMap";

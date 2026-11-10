@@ -6193,19 +6193,18 @@ fn weave_anchor_inject(
         if let AnchorHitKind::Field {
             access, descriptor, ..
         } = &hit.kind
+            && access.is_put()
         {
-            if access.is_put() {
-                let mut base = target_arguments.clone();
-                base.push(descriptor.clone());
-                if let Ok(shape) = callback_shape_for(
-                    target,
-                    &base,
-                    &callback.descriptor,
-                    &format!("@Inject at {}", request.site.label()),
-                    true,
-                ) {
-                    valued = Some((shape, descriptor.clone()));
-                }
+            let mut base = target_arguments.clone();
+            base.push(descriptor.clone());
+            if let Ok(shape) = callback_shape_for(
+                target,
+                &base,
+                &callback.descriptor,
+                &format!("@Inject at {}", request.site.label()),
+                true,
+            ) {
+                valued = Some((shape, descriptor.clone()));
             }
         }
         let (shape, value_descriptor) = match valued {
