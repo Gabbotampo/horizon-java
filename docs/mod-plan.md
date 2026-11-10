@@ -8,13 +8,14 @@ the probe. It is built against the game-side mod API on
 Nothing in `crates/horizon-native-java` or `crates/horizon-jvm` moves or changes shape for this:
 the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod is one flat crate.
 
-## What M0 to M2 do
+## What M0 to M3 do
 
 | Milestone | Behaviour |
 |---|---|
 | **M0, the shell** | `Hooks::server_about_to_start` and `Hooks::client_setup` log one line each. The server start writes this mod's report, `config/horizon_java/java-runtime.json`, through the mod API's own config service (`Host::config_files`), so the game files it under `config/` beside every other mod's. With no jars it is `{"schema":1,"jars":[]}`. |
-| **M1, run jars** | At `server_about_to_start`, every `.jar` in `config/horizon_java/java-mods/` is read as bytes through `config_files`, loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `refused`, its host-call and unknown-host-call counts, and the refusal reason. |
+| **M1, run jars** | Every `.jar` in `config/horizon_java/java-mods/` is read as bytes (at `server_about_to_start` until M3 moved the read to the content phase, with `std::fs`; see M3), loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `refused`, its host-call and unknown-host-call counts, and the refusal reason. |
 | **M2a, lifecycle** | Each jar's `StdHost` (heap, statics, recorded listeners) is kept for the server's life. `server_about_to_start` fires the Fabric `SERVER_STARTING` and NeoForge `ServerAboutToStartEvent` listeners, `server_starting` the NeoForge `ServerStartingEvent` ones, `server_started` the Fabric `SERVER_STARTED` and NeoForge `ServerStartedEvent` ones, and `server_stopping`/`server_stopped` their own. Each hook logs callbacks run/failed and unmodelled host calls; every row's `callbacks` object totals them; a jar's `System.out` lines reach the game log with its id. |
+| **M3, content** | The jars now run at the game's **Registration** phase, before any resource or world loads and while the content root can still grow, instead of at `server_about_to_start`. Each `RegistryDeclaration::{Item, Block}` the runtime recorded becomes a native content declaration (`Hooks::blocks`/`items`, NeoForge's `RegisterEvent`): an item keeps the template and the properties the content vocabulary carries, and a block brings its block item. The game joins them under the jar's namespace, so `/give`, `setblock` and the inventory see `<jar id>:<path>`. A jar's own assets, lang and loot need the bake route in [m3-content-design.md](m3-content-design.md). |
 | **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text` and `integer` nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 
 The verdicts are the ones the corpus ledgers already use:
@@ -83,6 +84,50 @@ Named here, not just in comments:
   audience.
 - **A jar's command set is fixed at registration.** `Commands::refresh_commands` re-offers the same
   usages: no Java API here re-runs a registration callback with a different set.
+
+## M3 proof
+
+With `m3_fixture.jar` (built by `tools/java_mod_fixture.py --kind content`) in
+`config/horizon_java/java-mods/`, one integrated-server run shows the jars run before content is
+built and both declarations reach the game:
+
+```
+Horizon Java: m3_fixture.jar (m3_fixture) ran-clean (9 host calls, 0 unknown host calls)
+Horizon Java: content: 1 block declaration(s) from 1 jar(s)
+Horizon Java: content: 1 item declaration(s) from 1 jar(s)
+Horizon: content from 2 mod(s) in .horizon-cache/mod-content/<stamp>
+Horizon Java 0.1.0: server about to start (dedicated=false); 1 jar(s) in config/horizon_java/java-mods: 1 ran-clean, 0 ran-hollow, 0 refused; report in config/horizon_java/java-runtime.json
+```
+
+The fixture registers `m3_fixture:ruby` (a plain `Item`, template `minecraft:stick`) and
+`m3_fixture:ruby_block` (a plain `Block`, template `minecraft:stone`) through
+`Registry.register(Registries.ITEM|BLOCK, ...)`. `horizon-ctl` then answers:
+
+```
+give m3_fixture:ruby 5          {"given":5,"ok":true}
+give m3_fixture:ruby_block 4    {"given":4,"ok":true}
+inventory                       counts {"m3_fixture:ruby":5,"m3_fixture:ruby_block":4}
+command "/setblock -1 69 4 m3_fixture:ruby_block"   Changed the block at -1, 69, 4
+block -1 69 4                   {"block":"m3_fixture:ruby_block","state":"m3_fixture:ruby_block"}
+```
+
+Both draw with the template's art — the runtime sets the item's `minecraft:item_model` to the
+template (the stick and stone textures in the hotbar), and the block renders as stone — so no art
+is needed for the proof. The stopped report's row is
+`{"content":{"blocks":1,"items":1},"verdict":"ran-clean","host_calls":9,"unknown_host_call_count":0, ...}`.
+
+### Departures from the Java behaviour
+
+- **The jars run at the content phase, not per server.** The entrypoints now run once per process,
+  at Registration, so their content exists in the same start; M2's listeners still fire at their
+  server hooks. A second world this process hosts reuses the jars and resets only the per-server
+  counters.
+- **The jar is run as a server on both sides.** Content ids must match between a client and a
+  dedicated server, so the pass uses one `SERVER` environment rather than running the common
+  entrypoint twice with side-dependent results.
+- **Jars are read with `std::fs`, not `config_files`.** The scoped config service first exists in
+  Config, after Registration; `config/horizon_java/java-mods` is the mod's own folder and the game
+  folder is the process's working directory. The report still goes through `config_files`.
 
 ## Fork seams needed
 
@@ -267,8 +312,10 @@ Horizon Java: client_only_demo.jar (client_only_demo) refused (0 host calls, 0 u
    `ServerHost`/`ClientHost`, so a jar's registrations and listeners reach the world. Each hook that
    maps to a game hook site is one hook row in `[inject]`-free form: `Hooks` methods the mod
    implements and forwards to the runtime's event table.
-2. **Registries.** Blocks, items and mob effects a jar registers become real ones through the mod
-   API's registry declarations, so a Java mod's content appears in the world.
+2. **Content assets.** Blocks and items a jar registers are in the world (M3), but the jar's own
+   models, textures, lang, loot and recipes are not: a bake writes them into a content `.hmod`
+   beside the declarations ([m3-content-design.md](m3-content-design.md)). Mob effects, entity
+   types and menus still have no native declaration hook.
 3. **Mixins as hook rows** rather than a weaver: bind the plans the runtime discovers to the game's
    named hook sites, as `docs/modding/src/how-to/native-mods/011-named-hook-points.md` describes,
    and leave the bounded weaver for jars that need their own classes rewritten.

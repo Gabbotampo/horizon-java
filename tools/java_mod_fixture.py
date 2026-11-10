@@ -14,7 +14,9 @@ on ``PATH`` and zips it with Fabric metadata.
 one (the definition of ``ran-clean`` in the mod's report). ``lifecycle`` registers Fabric
 ``SERVER_STARTED`` and ``SERVER_STOPPING`` listeners that print a line, which milestone 2a shows
 in the game log. ``command`` registers ``/javahello [name]`` through Fabric's
-``CommandRegistrationCallback``, which milestone 2b runs in the game.
+``CommandRegistrationCallback``, which milestone 2b runs in the game. ``content`` registers one
+plain item and one plain block, which milestone 3 turns into game content (the runtime infers a
+``minecraft:stick`` item and a ``minecraft:stone`` block).
 
 The loader and game classes are compiled as stubs so ``javac`` accepts the mod, but only the
 mod's own classes go into the jar: the native host answers the API classes, exactly as it does
@@ -168,6 +170,50 @@ public class MutableComponent implements Component {}
 """,
 }
 
+CONTENT_STUBS: dict[str, str] = {
+    "net/minecraft/core/Registry.java": """
+package net.minecraft.core;
+public interface Registry<T> {
+    static <V, T extends V> T register(Registry<V> registry,
+        net.minecraft.resources.Identifier location, T value) { return value; }
+}
+""",
+    "net/minecraft/core/registries/Registries.java": """
+package net.minecraft.core.registries;
+public final class Registries {
+    public static final net.minecraft.core.Registry<net.minecraft.world.item.Item> ITEM = null;
+    public static final net.minecraft.core.Registry<net.minecraft.world.level.block.Block> BLOCK = null;
+}
+""",
+    "net/minecraft/resources/Identifier.java": """
+package net.minecraft.resources;
+public final class Identifier {
+    public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; }
+}
+""",
+    "net/minecraft/world/item/Item.java": """
+package net.minecraft.world.item;
+public class Item {
+    public Item(Item.Properties properties) {}
+    public static class Properties {}
+}
+""",
+    "net/minecraft/world/level/block/state/BlockBehaviour.java": """
+package net.minecraft.world.level.block.state;
+public class BlockBehaviour {
+    public static class Properties {
+        public static BlockBehaviour.Properties of() { return null; }
+    }
+}
+""",
+    "net/minecraft/world/level/block/Block.java": """
+package net.minecraft.world.level.block;
+public class Block {
+    public Block(net.minecraft.world.level.block.state.BlockBehaviour.Properties properties) {}
+}
+""",
+}
+
 # The mod id, entrypoint class and jar name per fixture; the mod's log line names the id.
 FIXTURES: dict[str, dict[str, str]] = {
     "m0": {
@@ -217,6 +263,36 @@ public final class Lifecycle {
             System.out.println("m2a: SERVER_STARTED ran"));
         ServerLifecycleEvents.SERVER_STOPPING.register(server ->
             System.out.println("m2a: SERVER_STOPPING ran"));
+    }
+}
+""",
+    },
+    "content": {
+        "id": "m3_fixture",
+        "entry": "m3fixture.Content",
+        "jar": "m3_fixture.jar",
+        "stubs": CONTENT_STUBS,
+        "source": """
+package m3fixture;
+
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+
+public final class Content {
+    public void onInitialize() {
+        // Milestone 3: one plain item and one plain block, each registered the way a real mod
+        // registers content. The native runtime infers the declaration from the constructor's
+        // property chain and the bridge turns it into the game's content.
+        Registry.register(Registries.ITEM,
+            Identifier.fromNamespaceAndPath("m3_fixture", "ruby"),
+            new Item(new Item.Properties()));
+        Registry.register(Registries.BLOCK,
+            Identifier.fromNamespaceAndPath("m3_fixture", "ruby_block"),
+            new Block(BlockBehaviour.Properties.of()));
     }
 }
 """,

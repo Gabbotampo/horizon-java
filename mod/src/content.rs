@@ -1,0 +1,287 @@
+//! Milestone 3: a jar's recorded registrations become content before the game freezes its
+//! registries.
+//!
+//! The game asks native mods for blocks and items at the **Registration** phase
+//! (`mod_api::Hooks::blocks`/`items`, NeoForge's `RegisterEvent`), before any resource or world
+//! loads and while the content root can still grow. M1 ran jars at `server_about_to_start`, which
+//! is too late for that, so the jars run here instead: once per process, in this module, and the
+//! remaining hooks fire the listeners they registered.
+//!
+//! Reading the jars needs the game's `config/` folder, and the scoped config service
+//! (`Host::config_files`) first exists in the Config phase. This module reads
+//! `config/horizon_java/java-mods` with `std::fs` instead: the game folder is the process's working
+//! directory (`--game-dir` is a `set_current_dir`), and native mods are trusted code. The report
+//! still goes through the config service, where it exists.
+//!
+//! Transcription is deliberately narrow. Only `RegistryDeclaration::{Block, Item}` has a content
+//! field for what the runtime recorded, and only the property keys
+//! `item_declaration_properties`/`block_declaration_properties` already translated (the host keeps
+//! the rest). Anything else stays in the jar's row and is named in `docs/m3-content-design.md`,
+//! not guessed into content.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
+
+use crate::runtime;
+use crate::{JARS, LOG, State, load_jar};
+
+impl State {
+    /// Runs every jar once, the first time content is asked for, and keeps its runtime for the
+    /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
+    /// the two hooks one pass.
+    pub(crate) fn ensure_loaded(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        for (file, bytes) in read_jar_files() {
+            match load_jar(file, &bytes) {
+                Ok(loaded) => {
+                    log::info!("{LOG}: {}", loaded.row);
+                    self.jars.push(loaded);
+                }
+                Err(row) => {
+                    log::info!("{LOG}: {row}");
+                    self.refused.push(row);
+                }
+            }
+        }
+    }
+}
+
+/// Pushes one `content::Block` per typed block declaration. A block keeps the runtime's inferred
+/// template (`minecraft:stone`) and the properties the content vocabulary has a key for; its item
+/// comes with it (`item: true`).
+pub(crate) fn declare_blocks(
+    state: &mut State,
+    context: &RegistrationContext,
+    event: &mut BlocksEvent<'_>,
+) {
+    state.ensure_loaded();
+    let mut declared = BTreeSet::new();
+    let mut count = 0;
+    for jar in &mut state.jars {
+        for entry in jar.host.registrations() {
+            let Some(runtime::RegistryDeclaration::Block {
+                template,
+                properties,
+                item,
+            }) = &entry.declaration
+            else {
+                continue;
+            };
+            if !usable_id(&entry.id) {
+                log::warn!(
+                    "{LOG}: {}: block {} is not an id this mod can declare; left out",
+                    jar.row.id,
+                    entry.id
+                );
+                continue;
+            }
+            if !declared.insert(entry.id.clone()) {
+                log::warn!(
+                    "{LOG}: {}: block {} is declared more than once; only the first is used",
+                    jar.row.id,
+                    entry.id
+                );
+                continue;
+            }
+            // Push the default before naming a field: the element type is the event's, so this
+            // module never has to spell `horizon_mod_package::content::Block`, a crate a native
+            // mod may not depend on (docs/m3-content-design.md, seam 1).
+            event.blocks.push(Default::default());
+            let block = event.blocks.last_mut().expect("just pushed");
+            block.id = entry.id.clone();
+            block.template = template.clone();
+            block.item = *item;
+            if let Some(value) = properties.get("hardness").and_then(|v| v.parse().ok()) {
+                block.properties.hardness = Some(value);
+            }
+            if let Some(value) = properties
+                .get("explosion_resistance")
+                .and_then(|v| v.parse().ok())
+            {
+                block.properties.explosion_resistance = Some(value);
+            }
+            if let Some(value) = properties.get("friction").and_then(|v| v.parse().ok()) {
+                block.properties.friction = Some(value);
+            }
+            block.properties.requires_tool =
+                properties.get("requires_tool").map(|value| value == "true");
+            // A content package of the same namespace supplies the block item's own model; with
+            // none, the item keeps the template's so the block has the template's look.
+            if !owns_assets(context, &entry.id) {
+                block.components.insert(
+                    "minecraft:item_model".to_owned(),
+                    serde_json::Value::String(template.clone()),
+                );
+            }
+            jar.row.content_blocks += 1;
+            count += 1;
+        }
+    }
+    log::info!(
+        "{LOG}: content: {count} block declaration(s) from {} jar(s)",
+        state.jars.len()
+    );
+}
+
+/// Pushes one `content::Item` per typed item declaration, except the ones a declared block already
+/// gives its own id. The template and the keys `item_declaration_properties` exports carry over.
+pub(crate) fn declare_items(
+    state: &mut State,
+    context: &RegistrationContext,
+    event: &mut ItemsEvent<'_>,
+) {
+    state.ensure_loaded();
+    let block_items = block_item_ids(state);
+    let mut declared = BTreeSet::new();
+    let mut count = 0;
+    for jar in &mut state.jars {
+        for entry in jar.host.registrations() {
+            let Some(runtime::RegistryDeclaration::Item {
+                template,
+                properties,
+            }) = &entry.declaration
+            else {
+                continue;
+            };
+            if !usable_id(&entry.id) {
+                log::warn!(
+                    "{LOG}: {}: item {} is not an id this mod can declare; left out",
+                    jar.row.id,
+                    entry.id
+                );
+                continue;
+            }
+            if block_items.contains(&entry.id) {
+                // A block's item is declared with the block (`item: true`); declaring the same id
+                // again refuses the whole namespace at the content root.
+                continue;
+            }
+            if !declared.insert(entry.id.clone()) {
+                log::warn!(
+                    "{LOG}: {}: item {} is declared more than once; only the first is used",
+                    jar.row.id,
+                    entry.id
+                );
+                continue;
+            }
+            event.items.push(Default::default());
+            let item = event.items.last_mut().expect("just pushed");
+            item.id = entry.id.clone();
+            item.template = template.clone();
+            item.max_stack_size = properties
+                .get("max_stack_size")
+                .and_then(|value| value.parse().ok())
+                .filter(|size| (1..=99).contains(size));
+            if let Some(rarity) = properties.get("rarity") {
+                item.rarity =
+                    serde_json::from_value(serde_json::Value::String(rarity.clone())).ok();
+            }
+            item.crafting_remainder = properties.get("crafting_remainder").cloned();
+            // The content plan renames the template's `minecraft:item_model` to the new id, and
+            // nothing then defines that id. A content package of the same namespace (the bake in
+            // docs/m3-content-design.md) supplies the real definition; without one, keep the
+            // template's model so the item draws with the vanilla art.
+            if !owns_assets(context, &entry.id) {
+                item.components.insert(
+                    "minecraft:item_model".to_owned(),
+                    serde_json::Value::String(template.clone()),
+                );
+            }
+            jar.row.content_items += 1;
+            count += 1;
+        }
+    }
+    log::info!(
+        "{LOG}: content: {count} item declaration(s) from {} jar(s)",
+        state.jars.len()
+    );
+}
+
+/// Whether an installed content package owns the id's namespace, and so supplies that content's
+/// assets (models, item definitions, textures). A runtime declaration then leaves the template's
+/// `minecraft:item_model` alone; the package's files decide what is drawn.
+fn owns_assets(context: &RegistrationContext, id: &str) -> bool {
+    let Some((namespace, _)) = id.split_once(':') else {
+        return false;
+    };
+    context.mods().iter().any(|package| {
+        package.kind() == PackageKind::Content
+            && package.namespaces().any(|owned| owned == namespace)
+    })
+}
+
+/// The ids of blocks that bring their own item, so the item registry's own row for that id is not
+/// a second declaration.
+fn block_item_ids(state: &State) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for jar in &state.jars {
+        for entry in jar.host.registrations() {
+            if let Some(runtime::RegistryDeclaration::Block { item: true, .. }) = &entry.declaration
+                && usable_id(&entry.id)
+            {
+                ids.insert(entry.id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// A content id this bridge may declare: `namespace:path` in the characters a content namespace
+/// and path accept (`Content::namespaced_id`). `minecraft:` is vanilla's and is never redefined by
+/// a mod; registering one is recorded in the jar's row, but not declared as content.
+fn usable_id(id: &str) -> bool {
+    let Some((namespace, path)) = id.split_once(':') else {
+        return false;
+    };
+    let ok = |byte: u8, extra: &[u8]| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || extra.contains(&byte)
+    };
+    !namespace.is_empty()
+        && namespace != "minecraft"
+        && !path.is_empty()
+        && namespace.bytes().all(|b| ok(b, b"_.-"))
+        && path.bytes().all(|b| ok(b, b"_./-"))
+}
+
+/// The jars under the game's `config/horizon_java/java-mods/`, sorted by file name so one run's
+/// report reads the same as the next. An absent folder is no jars; an unreadable one is a warning,
+/// not a failed start.
+fn read_jar_files() -> Vec<(String, Vec<u8>)> {
+    let Ok(game_dir) = std::env::current_dir() else {
+        log::warn!("{LOG}: the game folder is unknown; no jars are read");
+        return Vec::new();
+    };
+    let folder = game_dir.join("config").join(JARS);
+    let entries = match std::fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            log::warn!("{LOG}: config/{JARS} could not be listed: {error}");
+            return Vec::new();
+        }
+    };
+    let mut files: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jar").then(|| (name, entry.path()))
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+        .into_iter()
+        .filter_map(|(name, path)| match std::fs::read(&path) {
+            Ok(bytes) => Some((name, bytes)),
+            Err(error) => {
+                log::warn!("{LOG}: config/{JARS}/{name} could not be read: {error}");
+                None
+            }
+        })
+        .collect()
+}
