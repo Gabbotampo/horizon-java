@@ -166,15 +166,35 @@ below do not touch any of those surfaces: the JDK batch adds only `java.io.File`
 
 ## After the fixes
 
-| Corpus | Jars | `ran-clean` | `ran-hollow` | `refused` | `skipped` | Unknown calls |
-|---|---:|---:|---:|---:|---:|---:|
-| wide (`corpus-xl`) | 223 | 34 | 72 | 10 | 107 | 1,273 |
-| mega (500 unique) | 500 | 73 | 144 | 35 | 248 | 11,018 |
-| NeoForge 26.3 | 85 | 24 | 34 | 27 | 0 | 693 |
+Four batches landed against this table. Each was measured on its own branch (from the
+same `784429b` base) with the command above, so the per-batch delta is what that batch
+alone moved; the cumulative row is the three branches merged and probed once. A jar
+counts as fixed only when its row moves to `ran-clean`, not when its call count drops.
 
-The "after" measurement is appended by each fix batch as it lands: a jar counts as
-fixed only when its row moves from `ran-hollow` to `ran-clean`, not when its call count
-drops.
+| Batch | Corpus | `ran-clean` | `ran-hollow` | `refused` | Unknown calls |
+|---|---|---:|---:|---:|---:|
+| JDK statics (#16: `File`, `System`, `Runtime`, `Pattern`, watch service) | wide | 34 → 48 | 72 → 58 | 10 → 10 | 1,273 → 1,211 |
+| | mega | 73 → 81 | 144 → 136 | 35 → 35 | 11,018 → 10,962 |
+| | NeoForge | 24 → 26 | 34 → 32 | 27 → 27 | 693 → 620 |
+| NeoForge loader statics (#17: `EVENT_BUS`, config, `FMLLoader`, registries) | wide | 34 → 35 | 72 → 71 | 10 → 10 | 1,273 → 1,262 |
+| | mega | 73 → 74 | 144 → 143 | 35 → 35 | 11,018 → 10,999 |
+| | NeoForge | 24 → 34 | 34 → 25 | 27 → 26 | 693 → 640 |
+| Platform libraries (#18: `ResourceLoader`, `Maps`, `PlatformDependent`) | wide | 34 → 36 | 72 → 70 | 10 → 10 | 1,273 → 1,268 |
+| | mega | 73 → 75 | 144 → 142 | 35 → 35 | 11,018 → 11,013 |
+| | NeoForge | 24 → 24 | 34 → 34 | 27 → 27 | 693 → 693 |
+| **All three merged** | wide | **34 → 51** | 72 → 55 | 10 → 10 | **1,273 → 1,195** |
+| | mega | **73 → 84** | 144 → 133 | 35 → 35 | **11,018 → 10,938** |
+| | NeoForge | **24 → 37** | 34 → 22 | **27 → 26** | **693 → 567** |
+
+41 jars move from `ran-hollow` to `ran-clean`: 24 from the JDK statics, 12 from the
+loader batch, 4 from the platform libraries, and voicechat from the JDK and loader
+batches together. PuzzlesLib stops being refused (its old `NeoForge.EVENT_BUS` NPE) and
+runs hollow with 18 calls. No jar regresses and none newly refuses. Total unknown calls:
+12,984 → 12,700.
+
+What is left is the game-bound list above — `StreamCodec`/`ByteBufCodecs` and
+`CustomPacketPayload` still dominate the remaining `ran-hollow` rows (33 jars on one
+`composite` overload), and they need the game host, not a guessed codec.
 
 ## Known limits of this census
 
