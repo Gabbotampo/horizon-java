@@ -139,12 +139,14 @@ Horizon Java: living_after_death (dedicated=false): 1 callback(s) ran, 0 failed,
 ```
 
 The clicks are vanilla's two hand attempts (a held stone in the main hand, the empty off hand), and
-the stack reads tell them apart. With two empty hands the fixture logs neither name and instead
-shows the read counted:
+the stack reads tell them apart. With both hands empty the fixture logs no hand name and
+shows each read counted, on each of the two firings:
 
 ```
-Horizon Java: m2d_fixture: m2d: interact hand=? id=254
-Horizon Java: use_entity (dedicated=false): 1 callback(s) ran, 0 failed, 2 unknown host call(s)
+Horizon Java: m2d_fixture: m2d: interact hand=null id=271
+Horizon Java: use_entity (dedicated=false): 1 callback(s) ran, 0 failed, 1 unknown host call(s)
+Horizon Java: m2d_fixture: m2d: interact hand=null id=271
+Horizon Java: use_entity (dedicated=false): 1 callback(s) ran, 0 failed, 1 unknown host call(s)
 ```
 
 
