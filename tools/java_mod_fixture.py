@@ -84,6 +84,32 @@ public final class ServerPlayerEvents {
     public interface Join { void onJoin(ServerPlayer player); }
 }
 """,
+    "net/fabricmc/fabric/api/event/player/PlayerBlockBreakEvents.java": """
+package net.fabricmc.fabric.api.event.player;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+public final class PlayerBlockBreakEvents {
+    public static final Event<BeforeBlockBreak> BEFORE = null;
+    public static final Event<AfterBlockBreak> AFTER = null;
+    public static final Event<CanceledBlockBreak> CANCELED = null;
+    public interface BeforeBlockBreak {
+        boolean beforeBlockBreak(Level world, Player player, BlockPos pos, BlockState state,
+            BlockEntity entity);
+    }
+    public interface AfterBlockBreak {
+        void afterBlockBreak(Level world, Player player, BlockPos pos, BlockState state,
+            BlockEntity entity);
+    }
+    public interface CanceledBlockBreak {
+        void onBlockBreakCanceled(Level world, Player player, BlockPos pos, BlockState state,
+            BlockEntity entity);
+    }
+}
+""",
     "net/minecraft/server/level/ServerPlayer.java": """
 package net.minecraft.server.level;
 import net.minecraft.world.entity.player.Player;
@@ -94,6 +120,39 @@ public class ServerPlayer extends Player {
     "net/minecraft/world/entity/player/Player.java": """
 package net.minecraft.world.entity.player;
 public class Player {}
+""",
+    "net/minecraft/world/level/Level.java": """
+package net.minecraft.world.level;
+public class Level {}
+""",
+    "net/minecraft/core/BlockPos.java": """
+package net.minecraft.core;
+public class BlockPos {
+    public int getX() { return 0; }
+    public int getY() { return 0; }
+    public int getZ() { return 0; }
+}
+""",
+    "net/minecraft/world/level/block/Block.java": """
+package net.minecraft.world.level.block;
+public class Block {}
+""",
+    "net/minecraft/world/level/block/Blocks.java": """
+package net.minecraft.world.level.block;
+public final class Blocks {
+    public static final Block STONE = null;
+}
+""",
+    "net/minecraft/world/level/block/state/BlockState.java": """
+package net.minecraft.world.level.block.state;
+import net.minecraft.world.level.block.Block;
+public class BlockState {
+    public boolean is(Block block) { return false; }
+}
+""",
+    "net/minecraft/world/level/block/entity/BlockEntity.java": """
+package net.minecraft.world.level.block.entity;
+public class BlockEntity {}
 """,
 }
 
@@ -305,6 +364,8 @@ package m2cfixture;
 
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.minecraft.world.level.block.Blocks;
 
 public final class Events {
     private static int ticks;
@@ -320,6 +381,23 @@ public final class Events {
         });
         ServerPlayerEvents.JOIN.register(player ->
             System.out.println("m2c: joined " + player.getScoreboardName()));
+        // Keep stone: the cancelled break leaves the block where it was.
+        PlayerBlockBreakEvents.BEFORE.register((world, player, pos, state, entity) -> {
+            if (state.is(Blocks.STONE)) {
+                System.out.println("m2c: kept stone at " + pos.getX() + "," + pos.getY()
+                    + "," + pos.getZ());
+                return false;
+            }
+            return true;
+        });
+        PlayerBlockBreakEvents.CANCELED.register((world, player, pos, state, entity) ->
+            System.out.println("m2c: break canceled at " + pos.getX() + "," + pos.getY()
+                + "," + pos.getZ()));
+        // Fabric's AFTER has no mod API hook yet (docs/mod-hooks.md), so this
+        // listener is recorded but the mod never fires it.
+        PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, entity) ->
+            System.out.println("m2c: broke a block at " + pos.getX() + "," + pos.getY()
+                + "," + pos.getZ()));
     }
 }
 """,

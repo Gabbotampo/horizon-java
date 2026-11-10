@@ -95,6 +95,9 @@ class JavaModFixtureTests(unittest.TestCase):
         # The tick, join and break callbacks milestone 2c forwards from the game's hooks.
         self.assertEqual(events.get("server_tick_start"), 1)
         self.assertEqual(events.get("player_join"), 1)
+        self.assertEqual(events.get("block_break_before"), 1)
+        self.assertEqual(events.get("block_break_canceled"), 1)
+        self.assertEqual(events.get("block_break_after"), 1)
 
     def test_the_command_fixture_registers_javahello_with_an_optional_name(self):
         self.require_tools()
