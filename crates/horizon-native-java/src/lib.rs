@@ -22,6 +22,7 @@ mod color_collection;
 mod commons_io;
 pub mod content;
 mod declarations_content;
+pub mod dependencies;
 mod dfu_pair;
 mod entrypoint_role;
 pub mod events;

@@ -309,6 +309,24 @@ python3 tools/bake.py --probe /tmp/target/debug/horizon-native-java --game-dir /
 The batch driver written for this survey is `tools/in_game_survey.py`; it takes the game, the
 control tool, the probe and the jars, and writes one JSON per batch plus the reports and logs.
 
+## Follow-up: cross-jar linking
+
+Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`), with
+both jars of each pair in `config/horizon_java/java-mods/`. Before, each jar had its own host and
+the declared dependency was unreachable.
+
+| jar(s) | before | after |
+|---|---|---|
+| `structureessentials` with `cupboard` | ran-hollow 1 | **ran-clean**, 0 unknown |
+| `stackrefill` with `collective` | ran-hollow 1 | **ran-clean**, 0 unknown |
+| `stackrefill` alone | ran-hollow 1 (dependency absent, silently) | **refused**: `requires collective (not in horizon_java/java-mods)` |
+| `collective` | ran-hollow 67 | ran-hollow 67 (unchanged; it is the dependency) |
+
+Jars now run dependencies before dependents (`cupboard` before `structureessentials`,
+`collective` before `stackrefill`), and the missing-dependency refusal names every absent id.
+Host-provided ids (`minecraft`, `java`, `fabricloader`, `fabric-api`, `neoforge`, `forge`) are not
+required to be jars.
+
 ## Follow-up: client `@Mod` classes on a server
 
 Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`).

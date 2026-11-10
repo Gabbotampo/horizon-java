@@ -153,7 +153,7 @@ struct Fired {
 /// empty jar, which is what milestone 1 did.
 struct LoadedJar {
     row: JarRow,
-    jar: NativeJar,
+    jar: Arc<NativeJar>,
     host: StdHost,
     listeners: Vec<GameListener>,
     /// Commands the jar registered through the Brigadier façade, translated once.
@@ -1434,27 +1434,24 @@ impl std::fmt::Display for JarRow {
     }
 }
 
-/// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
-/// game behind it. Anything the runtime does not model is counted by the host, which is what
-/// `ran-hollow` means. The host is returned because the listeners it recorded need it for the
-/// rest of the server's life.
-fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
-    let stem = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
-    let jar = match runtime::NativeJar::from_bytes(bytes) {
-        Ok(jar) => jar,
-        Err(error) => {
-            return Err(JarRow::refused(
-                &file,
-                stem,
-                format!("not a readable jar: {error}"),
-            ));
-        }
-    };
-    let id = jar
-        .fabric_id
+/// The mod id a row names the jar by: its Fabric or NeoForge id, else its file stem.
+pub(crate) fn jar_id(jar: &NativeJar, file: &str) -> String {
+    jar.fabric_id
         .clone()
         .or_else(|| jar.neoforge_id.clone())
-        .unwrap_or_else(|| stem.clone());
+        .unwrap_or_else(|| file.strip_suffix(".jar").unwrap_or(file).to_owned())
+}
+
+/// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
+/// game behind it, and with the sibling jars it declares on that host's class path. Anything the
+/// runtime does not model is counted by the host, which is what `ran-hollow` means. The host is
+/// returned because the listeners it recorded need it for the rest of the server's life.
+fn load_jar(
+    file: String,
+    jar: Arc<NativeJar>,
+    links: &[(String, Arc<NativeJar>)],
+) -> Result<LoadedJar, JarRow> {
+    let id = jar_id(&jar, &file);
     let Some(kind) = SERVER_KINDS
         .into_iter()
         .find(|kind| !jar.discover_entrypoints_on(kind, "SERVER").is_empty())
@@ -1479,6 +1476,15 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
         ));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+    for (link, dependency) in links {
+        if let Err(error) = host.link_jar(link.clone(), dependency) {
+            return Err(JarRow::refused(
+                &file,
+                id,
+                format!("linking {link} failed: {error}"),
+            ));
+        }
+    }
     let mut calls = 0;
     for entry in &entrypoints {
         let outcome = jar.execute_with_budget(
