@@ -117,6 +117,8 @@ public final class Main {
         Probe.check("opened", first != null);
         String jdk = new String(first.readAllBytes(), StandardCharsets.UTF_8);
         Probe.check("jdk", "print('hi')\n".equals(jdk));
+        byte[] latin = { (byte) 0x63, (byte) 0xe9 };
+        Probe.check("latin1", "c\u00e9".equals(new String(latin, StandardCharsets.ISO_8859_1)));
     }
 }
 "#,
@@ -133,6 +135,10 @@ public final class Main {
         .unwrap();
     assert_eq!(
         checks(&host),
-        BTreeMap::from([("jdk".to_owned(), true), ("opened".to_owned(), true),])
+        BTreeMap::from([
+            ("jdk".to_owned(), true),
+            ("latin1".to_owned(), true),
+            ("opened".to_owned(), true),
+        ])
     );
 }
