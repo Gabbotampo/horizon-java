@@ -132,29 +132,27 @@ is needed for the proof. The stopped report's row is
 
 ## Fork seams needed
 
-- **A player's dimension for command sources.** `CommandSourceStack.getLevel()` has no mod API read
-  to answer it: `PlayerRef` exposes identity, permission and messages but no level. Fabric/NeoForge
-  mods read it in command bodies; today every player source answers the overworld.
-- **`living_after_death`.** The runtime records Fabric `ServerLivingEntityEvents.AFTER_DEATH`, which
-  has no NeoForge counterpart event; `living_death` is NeoForge's `LivingDeathEvent`, before the
-  death. Add a listen-only hook at `LivingEntity.die`'s return.
-- **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; `break_block`
-  is NeoForge's `BreakBlockEvent`, before the block goes. Add a listen-only hook after the block
-  and its drops are gone.
-- **A dimension on the block and entity action hooks.** `break_block`, `left_click_block`,
-  `attack_entity` and `entity_interact` do not name the level (or, for the entity hooks, the acting
-  player), but a Fabric `Level` argument needs it. Add `dimension: &str` (and the acting
-  `player: u128`) to those events; today the callback gets a marker whose level calls are counted
-  unknowns.
-- **An item's id from an `ItemStack`/`ItemKey`.** Hooks give an `ItemStack` but no read turns its
-  key back into `minecraft:diamond`; the Java callback's item, and a NeoForge `getItemStack()`,
-  cannot be filled. Add `Host::item_id(ItemKey) -> Option<&str>`.
-- **The hand on `entity_interact`.** The hook fires once per hand but the event carries no `hand`,
-  so the Java callback always sees the main hand. Add `hand: Hand` to the event.
+- **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; NeoForge has
+  no counterpart (`BreakBlockEvent` is before the block goes). `break_block` fires before the block
+  is destroyed, so there is no moment to fire the Fabric listener from. Add a listen-only hook
+  after the block and its drops are gone.
+- **The hand on `entity_interact` (#2797).** The hook's contract says `self.hand` and it fires once
+  per hand, but the game's `native_entity_interact(entity, kind, stack, claimed)` in
+  `crates/horizon-client/src/game/native_hooks/base.rs` never takes a hand, so the event cannot
+  carry one. The mod names the hand from its stack when exactly one hand holds it, and leaves it
+  unknown (a counted unknown read) when both hands agree, two empty hands included. Filed as
+  `arismoko/horizon#2797`; the fix is to pass `hand: Hand` through that call and its event.
+- **A player's level (#2747).** `PlayerRef` names a player's identity, permission and messages, and
+  `host.players().acting_player()` names the player a block or entity hook is about, but no read
+  gives the level that player stands in. So `CommandSourceStack.getLevel()` and the `Level`
+  argument of Fabric's `AttackBlockCallback`, `UseEntityCallback`, `PlayerBlockBreakEvents` and
+  NeoForge's `BreakBlockEvent`/`AttackEntityEvent`/`PlayerInteractEvent` cannot be filled: each call
+  that needs it is counted as an unknown host call instead of answering the overworld. Filed as
+  `arismoko/horizon#2747`; the acting player itself is already carried (M2c).
 
 ## Pinned fork commit
 
-The mod targets **`arismoko/horizon` at `c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac`** (2026-11-10),
+The mod targets **`arismoko/horizon` at `1376e3bcb68b771373ea75637b0201381ccfa6bd`** (2026-11-10),
 recorded in `mod/horizon-mod.toml`'s `[native] horizon` and in `mod/Cargo.toml`'s
 `horizon-mod-api` dependency. Why that commit and not `main`'s head:
 
@@ -166,6 +164,22 @@ recorded in `mod/horizon-mod.toml`'s `[native] horizon` and in `mod/Cargo.toml`'
 - a native mod pins one exact revision on purpose (Horizon's own
   `docs/modding/src/how-to/native-mods/005-native-mod-source-revisions.md`): hooks, host methods and
   their call sites are the game's source, and a later game may not build the mod unchanged.
+
+This commit replaced `c4bcfcca5e` (2026-11-07) to pick up our own merged fork changes:
+
+- #2591, typed `level_tick_pre`/`level_tick_post` events on `HostSide`/`LevelRef`;
+- #2592, the `living_death_post` hook at the end of `LivingEntity.die`;
+- #2626, the load-owned registry key tables (`item_keys`, `item_id`).
+
+The API also moved between the two commits, and the mod follows it: `NativeCommand`,
+`NativeAuthority` and `NativeInteractionResult` are `Command`, `Authority` and `InteractionResult`;
+`BreakBlockEvent.state` is a `BlockState`; a level tick's `LevelRef` names its dimension; and
+`Text::translate` takes the argument list by value.
+
+**Next pin bump.** Fork main has since moved the mod API sources into a new `horizon-mod-vocab`
+crate (`a5ca9a72fd`, after `1376e3bcb6`). This pin does not follow that move; the next bump rewrites
+the mod's `mod_api` imports against the new crate first, so the source move and the behaviour
+changes of that bump land in separate reviewable steps.
 
 The game version is pinned beside it as `game = "26.3"`, and `mixins` at the fork's
 `MIXINS_REV` (`5a64af938ec86b00d53d16a408aabc0038fb3e57`) because the manifest requires all three.

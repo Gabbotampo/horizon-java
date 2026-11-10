@@ -58,7 +58,7 @@
 //!
 //! At `register_commands` the recorded Fabric `CommandRegistrationCallback` (and NeoForge
 //! `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and this
-//! mod translates the literals and the string/integer argument nodes into [`NativeCommand`] usages.
+//! mod translates the literals and the string/integer argument nodes into [`Command`] usages.
 //! `run_mod_command` maps the game's typed invocation back onto the runtime's parsed command, runs
 //! the Java `Command.run` callback with a `CommandSourceStack` façade, and sends what it replied
 //! through `Commands::feedback` (or to the player it named). A node whose argument type, redirect or
@@ -71,12 +71,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mod_api::{
-    AttackEntityEvent, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, EntityInteractEvent,
-    EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host, HostSide, ItemsEvent,
-    LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelTickPostEvent,
-    LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent,
-    LivingIncomingDamageEvent, NativeAuthority, NativeCommand, NativeInteractionResult,
+    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath,
+    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
+    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
+    LevelLoadEvent, LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
+    LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
     PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
     PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
     RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
@@ -157,7 +157,7 @@ struct LoadedJar {
     listeners: Vec<GameListener>,
     /// Commands the jar registered through the Brigadier façade, translated once.
     commands: Vec<JavaCommand>,
-    native_commands: Vec<NativeCommand>,
+    native_commands: Vec<Command>,
     commands_registered: bool,
 }
 
@@ -465,15 +465,15 @@ impl Hooks for HorizonJava {
         };
         let tick_count = event.context.tick.get().min(i32::MAX as u64) as i32;
         self.lock().tick_count = tick_count;
-        let dedicated = event.context.authority == NativeAuthority::DedicatedServer;
+        let dedicated = event.context.authority == Authority::DedicatedServer;
         self.fire_event(game, dedicated, EventContext::default(), |_| true);
     }
 
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Pre`).
-    fn level_tick_pre(&self, _host: &mut dyn ServerHost, event: &mut LevelTickPreEvent<'_>) {
+    fn level_tick_pre(&self, _host: HostSide<'_>, event: &mut LevelTickPreEvent) {
         let context = EventContext {
-            level: Some(event.dimension.to_owned()),
+            level: Some(event.level.dimension_id().to_owned()),
             ..EventContext::default()
         };
         self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
@@ -483,9 +483,9 @@ impl Hooks for HorizonJava {
 
     /// A server level's tick ends (Fabric's `END_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Post`).
-    fn level_tick_post(&self, _host: &mut dyn ServerHost, event: &mut LevelTickPostEvent<'_>) {
+    fn level_tick_post(&self, _host: HostSide<'_>, event: &mut LevelTickPostEvent) {
         let context = EventContext {
-            level: Some(event.dimension.to_owned()),
+            level: Some(event.level.dimension_id().to_owned()),
             ..EventContext::default()
         };
         self.fire_event(GameEvent::LevelTickEnd, self.dedicated(), context, |_| true);
@@ -680,7 +680,7 @@ impl Hooks for HorizonJava {
             player: Some(click.player),
             pos: Some(click.pos),
             face: Some(click.hit.face),
-            off_hand: click.hand == Hand::Off,
+            off_hand: Some(click.hand == Hand::Off),
             ..EventContext::default()
         };
         let fired = self.fire_event(GameEvent::UseBlock, self.dedicated(), context, |_| true);
@@ -703,7 +703,7 @@ impl Hooks for HorizonJava {
             level: Some(dimension_id(click.dimension).to_owned()),
             player: Some(click.player),
             pos: Some(click.pos),
-            off_hand: click.hand == Hand::Off,
+            off_hand: Some(click.hand == Hand::Off),
             ..EventContext::default()
         };
         let fired = self.fire_event(GameEvent::UseItem, self.dedicated(), context, |_| true);
@@ -744,6 +744,10 @@ impl Hooks for HorizonJava {
     ) -> Flow {
         let context = EventContext {
             player: self.acting_player(host),
+            // The hook fires once per hand with that hand's stack (Fabric's `UseEntityCallback`
+            // carries the `InteractionHand`); the pin's event names the stack, not the hand, so
+            // which of the acting player's hands holds it is what tells them apart.
+            off_hand: self.acting_hand(host, event.stack).map(|hand| hand == Hand::Off),
             entity: Some(FacadeEntity {
                 id: event.entity,
                 kind: event.kind.to_owned(),
@@ -757,6 +761,28 @@ impl Hooks for HorizonJava {
         } else {
             Flow::Continue
         }
+    }
+
+    /// A living entity's death has finished (Fabric's `ServerLivingEntityEvents.AFTER_DEATH`): the
+    /// loot, experience and death message went out. The runtime's `living_after_death` event; a
+    /// death `living_death` cancelled never reaches it.
+    fn living_death_post(&self, _host: &mut dyn ServerHost, event: &mut LivingDeathPostEvent<'_>) {
+        let context = EventContext {
+            entity: Some(FacadeEntity {
+                id: event.entity as i32,
+                // The hook names the dead entity and the killing blow, not its type.
+                kind: String::new(),
+                level: None,
+            }),
+            damage: Some(event.damage_type.to_owned()),
+            ..EventContext::default()
+        };
+        self.fire_event(
+            GameEvent::LivingAfterDeath,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A living entity is about to die (Fabric's `ServerLivingEntityEvents.ALLOW_DEATH`, NeoForge's
@@ -849,6 +875,18 @@ impl Hooks for HorizonJava {
 }
 
 impl HorizonJava {
+    /// Which hand the acting player used: the event's `stack` is the held stack of that hand, so
+    /// it matches exactly one of the player's two hands. `None` when it matches both or neither —
+    /// two identical stacks, the common both-empty case included — because the hook does not carry
+    /// the hand (`arismoko/horizon#2797`) and a guess here would be a confident wrong answer.
+    fn acting_hand(&self, host: &dyn ServerHost, stack: Option<&ItemStack>) -> Option<Hand> {
+        let player = host.players().acting_player()?;
+        let living = host.living(player.entity())?;
+        let main = living.hand_item(host, Hand::Main);
+        let off = living.hand_item(host, Hand::Off);
+        one_hand(stack, main.as_ref(), off.as_ref())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -942,7 +980,7 @@ impl HorizonJava {
         &self,
         host: &dyn ServerHost,
         pos: [i32; 3],
-        state: mod_api::BlockStateId,
+        state: mod_api::BlockState,
         face: Option<[i32; 3]>,
         off_hand: Option<bool>,
     ) -> EventContext {
@@ -954,9 +992,24 @@ impl HorizonJava {
             pos: Some(pos),
             block,
             face,
-            off_hand: off_hand.unwrap_or(false),
+            off_hand,
             ..EventContext::default()
         }
+    }
+}
+
+/// The hand `held` names among the two, or `None` when it names both or neither: the hook's
+/// stack is the acting hand's, so exactly one hand holding it is the only conclusive answer.
+fn one_hand<T: PartialEq>(held: Option<&T>, main: Option<&T>, off: Option<&T>) -> Option<Hand> {
+    let holds = |hand: Option<&T>| match (held, hand) {
+        (Some(held), Some(hand)) => held == hand,
+        (Some(_), None) => false,
+        (None, hand) => hand.is_none(),
+    };
+    match (holds(main), holds(off)) {
+        (true, false) => Some(Hand::Main),
+        (false, true) => Some(Hand::Off),
+        _ => None,
     }
 }
 
@@ -967,13 +1020,13 @@ fn dimension_id(dimension: LevelDimension) -> &'static str {
 
 /// The `InteractionResult` a Fabric listener returned, as the mod API's own result. A NeoForge
 /// listener that cancelled without a result keeps `PASS`, the default the hook documents.
-fn interaction_result(result: Option<&str>) -> NativeInteractionResult {
+fn interaction_result(result: Option<&str>) -> InteractionResult {
     match result {
-        Some("SUCCESS") => NativeInteractionResult::Success,
-        Some("SUCCESS_SERVER") => NativeInteractionResult::SuccessServer,
-        Some("CONSUME") => NativeInteractionResult::Consume,
-        Some("FAIL") => NativeInteractionResult::Fail,
-        _ => NativeInteractionResult::Pass,
+        Some("SUCCESS") => InteractionResult::Success,
+        Some("SUCCESS_SERVER") => InteractionResult::SuccessServer,
+        Some("CONSUME") => InteractionResult::Consume,
+        Some("FAIL") => InteractionResult::Fail,
+        _ => InteractionResult::Pass,
     }
 }
 
@@ -1024,7 +1077,7 @@ fn log_stdout(id: &str, host: &mut StdHost) {
 /// Answers a command the bridge could not map with the jar's own failure text.
 fn refuse(host: &mut dyn ServerHost, usage: &str, reason: String) -> Flow {
     log::warn!("{LOG}: /{usage} not run: {reason}");
-    host.commands().feedback(Text::literal(format!(
+    let _ = host.commands().feedback(Text::literal(format!(
         "java command /{usage} could not run: {reason}"
     )));
     Flow::Cancel
@@ -1044,11 +1097,11 @@ fn deliver(
         let text = mod_text(&message.text);
         if let MessageKind::Player(uuid) = message.kind {
             if let Some(player) = host.player(uuid) {
-                player.tell(host, text);
+                let _ = player.tell(host, text);
                 continue;
             }
         }
-        host.commands().feedback(text);
+        let _ = host.commands().feedback(text);
     }
     match outcome {
         CommandOutcome::Returned(result) => log::info!(
@@ -1056,13 +1109,14 @@ fn deliver(
             messages.len()
         ),
         CommandOutcome::Syntax(text) => {
-            host.commands().feedback(mod_text(&text));
+            let _ = host.commands().feedback(mod_text(&text));
             log::warn!("{LOG}: {id}: /{usage} had a syntax error");
         }
         CommandOutcome::Refused(reason) => {
             log::warn!("{LOG}: {id}: /{usage} refused: {reason}");
-            host.commands()
-                .feedback(Text::translate("command.failed", &[]));
+            let _ = host
+                .commands()
+                .feedback(Text::translate("command.failed", Vec::new()));
         }
     }
 }
@@ -1071,7 +1125,7 @@ fn deliver(
 /// JSON is flattened to its plain text, which the runtime already carries beside it.
 fn mod_text(text: &CommandText) -> Text {
     if text.translate {
-        Text::translate(&text.text, &[])
+        Text::translate(&text.text, Vec::new())
     } else {
         Text::literal(text.text.clone())
     }
@@ -1106,7 +1160,7 @@ fn runtime_source(source: &CommandSource, host: &dyn Host) -> RuntimeSource {
 }
 
 /// Walks the Brigadier tree the jar's registration callback built and turns every executable
-/// literal path into a [`NativeCommand`] and a [`JavaCommand`]. A node this bridge cannot carry is
+/// literal path into a [`Command`] and a [`JavaCommand`]. A node this bridge cannot carry is
 /// left out with a log line naming it.
 struct Translator<'a> {
     jar: &'a NativeJar,
@@ -1114,7 +1168,7 @@ struct Translator<'a> {
     tree: brigadier::CommandTree,
     budget: ExecutionBudget,
     id: &'a str,
-    native: Vec<NativeCommand>,
+    native: Vec<Command>,
     commands: Vec<JavaCommand>,
     refused: usize,
 }
@@ -1123,7 +1177,7 @@ fn translate_commands(
     jar: &NativeJar,
     host: &mut StdHost,
     id: &str,
-) -> (Vec<NativeCommand>, Vec<JavaCommand>, usize) {
+) -> (Vec<Command>, Vec<JavaCommand>, usize) {
     let tree = host.command_tree();
     let mut translator = Translator {
         jar,
@@ -1246,9 +1300,9 @@ impl Translator<'_> {
         }
         let usage = usage(path, arguments);
         let command = if level == 0 {
-            NativeCommand::new(&usage)
+            Command::new(&usage)
         } else {
-            NativeCommand::op(&usage, level)
+            Command::op(&usage, level)
         };
         self.native.push(command);
         self.commands.push(JavaCommand {
@@ -1493,4 +1547,29 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
     bytes.push(b'\n');
     host.config_files().write(&path, &bytes)?;
     Ok(format!("config/{REPORT}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
+    /// (two empty hands included), so the hand is unknown rather than guessed.
+    #[test]
+    fn the_acting_hand_is_named_only_when_one_hand_holds_the_stack() {
+        assert_eq!(
+            one_hand(Some(&"stick"), Some(&"stick"), Some(&"paper")),
+            Some(Hand::Main)
+        );
+        assert_eq!(
+            one_hand(Some(&"paper"), Some(&"stick"), Some(&"paper")),
+            Some(Hand::Off)
+        );
+        assert_eq!(one_hand::<&str>(None, Some(&"stick"), None), Some(Hand::Off));
+        assert_eq!(one_hand::<&str>(None, None, None), None);
+        assert_eq!(
+            one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
+            None
+        );
+    }
 }

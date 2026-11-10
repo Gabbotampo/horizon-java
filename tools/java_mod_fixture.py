@@ -478,6 +478,92 @@ public final class Events {
 }
 """,
     },
+    # Milestone 2d: the death-after hook, and the hand an entity click carries.
+    "m2d": {
+        "id": "m2d_fixture",
+        "entry": "m2dfixture.Events",
+        "jar": "m2d_fixture.jar",
+        "stubs": {
+            **HOOK_STUBS,
+            "net/fabricmc/fabric/api/entity/event/v1/ServerLivingEntityEvents.java": """
+package net.fabricmc.fabric.api.entity.event.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.LivingEntity;
+public final class ServerLivingEntityEvents {
+    public static final Event<AfterDeath> AFTER_DEATH = null;
+    public interface AfterDeath { void afterDeath(LivingEntity entity, DamageSource source); }
+}
+""",
+            "net/fabricmc/fabric/api/event/player/UseEntityCallback.java": """
+package net.fabricmc.fabric.api.event.player;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.EntityHitResult;
+public final class UseEntityCallback {
+    public static final Event<UseEntity> EVENT = null;
+    public interface UseEntity {
+        InteractionResult interact(Player player, Level world, InteractionHand hand, Entity entity,
+            EntityHitResult hit);
+    }
+}
+""",
+            "net/minecraft/world/InteractionHand.java": """
+package net.minecraft.world;
+public enum InteractionHand { MAIN_HAND, OFF_HAND }
+""",
+            "net/minecraft/world/InteractionResult.java": """
+package net.minecraft.world;
+public class InteractionResult {
+    public static final InteractionResult PASS = null;
+}
+""",
+            "net/minecraft/world/entity/Entity.java": """
+package net.minecraft.world.entity;
+public class Entity {
+    public int getId() { return 0; }
+}
+""",
+            "net/minecraft/world/entity/LivingEntity.java": """
+package net.minecraft.world.entity;
+public class LivingEntity extends Entity {}
+""",
+            "net/minecraft/world/damagesource/DamageSource.java": """
+package net.minecraft.world.damagesource;
+public class DamageSource {}
+""",
+            "net/minecraft/world/phys/EntityHitResult.java": """
+package net.minecraft.world.phys;
+public class EntityHitResult {}
+""",
+        },
+        "source": """
+package m2dfixture;
+
+import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.event.player.UseEntityCallback;
+import net.minecraft.world.InteractionResult;
+
+public final class Events {
+    public void onInitialize() {
+        // Fabric's AFTER_DEATH: the mob's id after its loot and death message.
+        ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) ->
+            System.out.println("m2d: after death id=" + entity.getId()));
+        // Read the hand: a named hand answers its name; an unknown one is counted by the
+        // runtime and the listener still runs (the name reads as null).
+        UseEntityCallback.EVENT.register((player, world, hand, entity, hit) -> {
+            System.out.println("m2d: interact hand=" + hand.name()
+                + " id=" + entity.getId());
+            return InteractionResult.PASS;
+        });
+    }
+}
+""",
+    },
 }
 
 # Kept for callers that imported milestone 1's names.

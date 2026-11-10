@@ -93,7 +93,7 @@ Minecraft/loader install skip when the corresponding files or environment variab
 `mod/` is a Horizon **native mod** (`docs/mod-plan.md`): the first way this runtime runs inside the
 game instead of in the probe. It implements the game's typed `Hooks` from the mod API on
 [arismoko/horizon](https://github.com/arismoko/horizon) (crate `horizon-mod-api`, library
-`mod_api`), pinned to commit `c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac` in `mod/horizon-mod.toml`.
+`mod_api`), pinned to commit `1376e3bcb68b771373ea75637b0201381ccfa6bd` in `mod/horizon-mod.toml`.
 
 What it does today:
 
@@ -125,6 +125,8 @@ python3 tools/vendor.py             # after changing crates/horizon-native-java
 python3 tools/java_mod_fixture.py --out DIR                 # milestone 1's jar
 python3 tools/java_mod_fixture.py --kind lifecycle --out DIR # SERVER_STARTED/STOPPING lines
 python3 tools/java_mod_fixture.py --kind command --out DIR   # /javahello [name]
+python3 tools/java_mod_fixture.py --kind hooks --out DIR     # the M2c event listeners
+python3 tools/java_mod_fixture.py --kind m2d --out DIR       # AFTER_DEATH and a click's hand
 ```
 
 The documented build is Horizon's launcher (`horizon-launcher native-build mod/ --server-output OUT

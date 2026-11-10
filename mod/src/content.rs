@@ -119,10 +119,10 @@ pub(crate) fn declare_blocks(
             // A content package of the same namespace supplies the block item's own model; with
             // none, the item keeps the template's so the block has the template's look.
             if !owns_assets(context, &entry.id) {
-                block.components.insert(
+                block.components.push((
                     "minecraft:item_model".to_owned(),
-                    serde_json::Value::String(template.clone()),
-                );
+                    Some(mod_api::Tag::String(template.as_str().into())),
+                ));
             }
             jar.row.content_blocks += 1;
             count += 1;
@@ -183,20 +183,25 @@ pub(crate) fn declare_items(
                 .get("max_stack_size")
                 .and_then(|value| value.parse().ok())
                 .filter(|size| (1..=99).contains(size));
-            if let Some(rarity) = properties.get("rarity") {
-                item.rarity =
-                    serde_json::from_value(serde_json::Value::String(rarity.clone())).ok();
-            }
+            item.rarity = properties
+                .get("rarity")
+                .and_then(|rarity| match rarity.to_ascii_lowercase().as_str() {
+                    "common" => Some(mod_api::Rarity::Common),
+                    "uncommon" => Some(mod_api::Rarity::Uncommon),
+                    "rare" => Some(mod_api::Rarity::Rare),
+                    "epic" => Some(mod_api::Rarity::Epic),
+                    _ => None,
+                });
             item.crafting_remainder = properties.get("crafting_remainder").cloned();
             // The content plan renames the template's `minecraft:item_model` to the new id, and
             // nothing then defines that id. A content package of the same namespace (the bake in
             // docs/m3-content-design.md) supplies the real definition; without one, keep the
             // template's model so the item draws with the vanilla art.
             if !owns_assets(context, &entry.id) {
-                item.components.insert(
+                item.components.push((
                     "minecraft:item_model".to_owned(),
-                    serde_json::Value::String(template.clone()),
-                );
+                    Some(mod_api::Tag::String(template.as_str().into())),
+                ));
             }
             jar.row.content_items += 1;
             count += 1;
