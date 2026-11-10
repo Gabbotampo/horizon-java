@@ -96,6 +96,28 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             .iter()
             .find(|(field, _)| *field == name)
             .map(|(_, canonical)| charset_value(canonical)),
+        // The host reports `os.name=Linux` and models a JVM on that platform,
+        // so `java.io.File`'s platform constants are that platform's: `/`, `:`
+        // and their chars. They are read as `File.separator`/`separatorChar`
+        // and, at high frequency, by path normalisers that translate a
+        // separator char.
+        "java/io/File" => match name {
+            "separator" => Some(Value::Ref(Some("/".into()))),
+            "pathSeparator" => Some(Value::Ref(Some(":".into()))),
+            "separatorChar" => Some(Value::Int('/' as i32)),
+            "pathSeparatorChar" => Some(Value::Int(':' as i32)),
+            _ => None,
+        },
+        // A `WatchEvent.Kind` is only ever a token handed back to `register`
+        // or compared with `==` against the event a key reports. The marker
+        // keeps its enum name so `name()`/`toString` agree; the watch-service
+        // model below never produces an event, so none is ever compared.
+        "java/nio/file/StandardWatchEventKinds" => match name {
+            "ENTRY_CREATE" | "ENTRY_DELETE" | "ENTRY_MODIFY" | "OVERFLOW" => {
+                Some(Value::Ref(Some(format!("watch-kind/{name}"))))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -219,6 +241,28 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
                 ""
             })))
         }
+        // The single runtime object. `availableProcessors` and the memory
+        // reads already answer on it (a single-threaded bounded runtime is one
+        // processor); only the static factory was missing, so a mod sizing a
+        // pool from it read a null and stopped.
+        ("java/lang/Runtime", "getRuntime", "()Ljava/lang/Runtime;") => {
+            Some(Ok(Value::Ref(Some("runtime/bootstrap".into()))))
+        }
+        // `Pattern.compile(text)` keeps the text as an opaque pattern; the
+        // matching methods are not modelled here, so a matcher call stays a
+        // counted unknown. Departure from the JVM: the syntax is NOT checked
+        // (the runtime has no regex engine), so text Java would reject with
+        // `PatternSyntaxException` compiles here. For valid text this matches
+        // the JVM: the caller stores the pattern and only a matcher needs it.
+        ("java/util/regex/Pattern", "compile", "(Ljava/lang/String;)Ljava/util/regex/Pattern;") => {
+            let pattern = expect_string(args.first()?);
+            Some(Ok(Value::Ref(Some(format!("regex-pattern/{pattern}")))))
+        }
+        // The default filesystem. Opening a watch service over it is modelled
+        // below; no call here touches the host's disk.
+        ("java/nio/file/FileSystems", "getDefault", "()Ljava/nio/file/FileSystem;") => {
+            Some(Ok(Value::Ref(Some("file-system/default".into()))))
+        }
         ("kotlin/jvm/internal/Intrinsics", name, descriptor)
             if crate::return_desc(descriptor) == "V" =>
         {
@@ -325,6 +369,63 @@ pub(crate) fn instance_call(
             }
             _ => None,
         };
+    }
+    if let Some(pattern) = marker.strip_prefix("regex-pattern/") {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            ("pattern" | "toString", "()Ljava/lang/String;") => {
+                Some(Ok(Value::Ref(Some(pattern.to_owned()))))
+            }
+            _ => None,
+        };
+    }
+    if marker == "file-system/default" {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            ("newWatchService", "()Ljava/nio/file/WatchService;") => {
+                Some(Ok(Value::Ref(Some("watch-service/default".into()))))
+            }
+            ("getSeparator", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some("/".into())))),
+            _ => None,
+        };
+    }
+    if marker == "watch-service/default" {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            // The virtual filesystem has no external writer, so no event is
+            // ever pending; `poll` answering null is the JVM's "nothing
+            // happened yet", not an invented event. `take` would block the
+            // single thread for ever, so it stays unmodelled and counted.
+            ("poll", "()Ljava/nio/file/WatchKey;") => Some(Ok(Value::Ref(None))),
+            ("poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;") => {
+                Some(Ok(Value::Ref(None)))
+            }
+            ("close", "()V") => Some(Ok(Value::Void)),
+            _ => None,
+        };
+    }
+    if marker.starts_with("watch-key/") {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            ("pollEvents", "()Ljava/util/List;") => Some(Ok(Value::Ref(Some("list".into())))),
+            // A key with no pending events is still valid, so `reset` reports
+            // true and the mod keeps polling. `cancel` has no state to clear
+            // and `isValid` keeps answering true afterwards; a mod that
+            // cancels and then polls is outside the modelled surface.
+            ("reset" | "isValid", "()Z") => Some(Ok(Value::Int(1))),
+            ("cancel", "()V") => Some(Ok(Value::Void)),
+            _ => None,
+        };
+    }
+    if let Some(kind) = marker.strip_prefix("watch-kind/") {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            ("name" | "toString", "()Ljava/lang/String;") => {
+                Some(Ok(Value::Ref(Some(kind.to_owned()))))
+            }
+            _ => None,
+        };
+    }
+    // `Path.register(service, kinds...)`: the key names the watched path. The
+    // game never changes a file behind the mod's back, so the key will never
+    // report an event.
+    if r.owner == "java/nio/file/Path" && r.name == "register" {
+        return Some(Ok(Value::Ref(Some(format!("watch-key/{marker}")))));
     }
     None
 }
