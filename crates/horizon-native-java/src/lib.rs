@@ -20219,6 +20219,39 @@ impl<H: Host> Runtime<'_, H> {
                 .and_then(|value| self.array(value).ok())
                 .cloned()
                 .unwrap_or_default();
+            // Constructors are not inherited, so a class the jar declares
+            // answers exactly the constructors it holds; a lookup the JVM
+            // would refuse raises `NoSuchMethodException` and the caller's
+            // `catch` can take its fallback. A class outside the jar keeps
+            // the nominal lookup.
+            if self.class(class).is_some() {
+                let mut wanted = String::from("(");
+                for parameter in &parameter_types {
+                    let Some(descriptor) = class_descriptor(parameter) else {
+                        return Ok(Some(Value::Ref(Some(format!(
+                            "reflect-constructor/{class}#"
+                        )))));
+                    };
+                    wanted.push_str(&descriptor);
+                }
+                wanted.push_str(")V");
+                let declared = self.class(class).is_some_and(|file| {
+                    file.methods.iter().any(|method| {
+                        method.name == "<init>"
+                            && method.descriptor == wanted
+                            && (r.name == "getDeclaredConstructor" || method.access & 1 != 0)
+                    })
+                });
+                if !declared {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NoSuchMethodException".into(),
+                        message: Some(format!("{class}.<init>{wanted}")),
+                        frame: None,
+                    });
+                }
+                let marker = format!("reflect-constructor/{class}#{wanted}");
+                return Ok(Some(Value::Ref(Some(marker))));
+            }
             let marker = self
                 .reflected_descriptor(class, "<init>", &parameter_types)
                 .map_or_else(
@@ -24020,9 +24053,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.invoke_gson(&r, receiver.as_ref(), &args)? {
                         value
-                    } else if let Some(value) =
-                        self.invoke_reflect_method(&r, receiver.as_ref(), &args)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_reflect_method(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_stack_walker(&r, receiver.as_ref(), &args))
