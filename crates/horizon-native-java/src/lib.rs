@@ -14150,10 +14150,14 @@ impl NativeJar {
                     }
                     class_annotation_warnings.push(warning);
                 }
+                // A real `@Mod` member is a class annotation, not any copy
+                // of its descriptor in the constant pool: Kotlin's `Metadata`
+                // keeps every type it mentions as a string, so a pool scan
+                // made a Kotlin type-alias facade a NeoForge mod class.
                 if class
-                    .pool
+                    .annotations
                     .iter()
-                    .any(|constant| matches!(constant, Cp::Utf8(value) if is_mod_annotation(value)))
+                    .any(|annotation| is_mod_annotation(&annotation.descriptor))
                 {
                     neoforge_entrypoints.push(class.name.clone());
                 }
@@ -15202,6 +15206,17 @@ impl NativeJar {
     /// that execute a jar should run all of them rather than silently
     /// dropping everything after the first declaration.
     pub fn discover_entrypoints(&self, kind: &str) -> Vec<Entrypoint> {
+        self.discover_entrypoints_on(kind, "BOTH")
+    }
+
+    /// [`Self::discover_entrypoints`] for one physical side.
+    ///
+    /// NeoForge's `@Mod` declares `dist`: a class limited to `CLIENT` never
+    /// loads on a dedicated server, and one limited to `DEDICATED_SERVER`
+    /// never loads on a client. `side` is `CLIENT` or `SERVER`; any other
+    /// value keeps the side-independent answer, as does a class without a
+    /// `dist` member.
+    pub fn discover_entrypoints_on(&self, kind: &str, side: &str) -> Vec<Entrypoint> {
         if let Some(entries) = self.fabric_entrypoints.get(kind) {
             return entries
                 .iter()
@@ -15223,6 +15238,7 @@ impl NativeJar {
             return self
                 .neoforge_entrypoints
                 .iter()
+                .filter(|class| self.neoforge_entrypoint_runs_on(class, side))
                 .map(|class| Entrypoint {
                     class: class.replace('/', "."),
                     method: None,
@@ -15231,6 +15247,40 @@ impl NativeJar {
                 .collect();
         }
         Vec::new()
+    }
+
+    /// Whether one discovered `@Mod` class loads on `side`.
+    ///
+    /// The annotation's `dist` member is an array of `Dist` constants; a
+    /// class without one loads on both sides. Only the two names FML matches
+    /// count, so an unreadable value keeps the class rather than dropping a
+    /// real entrypoint.
+    fn neoforge_entrypoint_runs_on(&self, class: &str, side: &str) -> bool {
+        if !matches!(side, "CLIENT" | "SERVER") {
+            return true;
+        }
+        let Some(file) = self.classes.get(class) else {
+            return true;
+        };
+        let Some(annotation) = file
+            .annotations
+            .iter()
+            .find(|annotation| is_mod_annotation(&annotation.descriptor))
+        else {
+            return true;
+        };
+        let Some(AnnotationValue::Array(values)) = annotation.values.get("dist") else {
+            return true;
+        };
+        let wanted = if side == "CLIENT" {
+            "CLIENT"
+        } else {
+            "DEDICATED_SERVER"
+        };
+        values.iter().any(|value| match value {
+            AnnotationValue::String(value) => value.rsplit('.').next() == Some(wanted),
+            _ => false,
+        })
     }
 
     /// The adapter the jar's metadata declared for `class` under `kind`.
