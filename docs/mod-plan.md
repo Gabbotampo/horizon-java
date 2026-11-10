@@ -38,7 +38,7 @@ and `m2b_fixture.jar` in `config/horizon_java/java-mods/`, one integrated-server
 Horizon Java: m2a_fixture: m2a: SERVER_STARTED ran
 Horizon Java: server_started (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
 Horizon Java: m2b_fixture: command registration: 1 callback(s) ran, 0 failed
-Horizon Java: m2b_fixture: 2 command usage(s) translated, 0 refused
+Horizon Java: m2b_fixture: 3 command usage(s) translated, 0 refused
 Horizon Java: m2b_fixture: /javahello <name:word> ran (returned 1, 1 message(s))
 Horizon Java: m2a_fixture: m2a: SERVER_STOPPING ran
 Horizon Java: server_stopping (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
@@ -46,6 +46,16 @@ Horizon Java: server_stopping (dedicated=false): 1 callback(s) ran, 0 failed, 0 
 
 `horizon-ctl … command "/javahello Viola"` answers `{"chat":["Hello, Viola!"]}`, and the stopped
 report's `callbacks` for `m2a_fixture` is `{"ran":2,"failed":0,"unknown_host_call_count":0}`.
+
+The fixture also registers `/javawhere`, whose body reads `getLevel()`. Run as a player it refuses:
+
+```
+Horizon Java: m2b_fixture: /javawhere refused: unknown native host call net/minecraft/commands/CommandSourceStack#getLevel()Lnet/minecraft/server/level/ServerLevel;
+```
+
+and the player sees vanilla's `command.failed`; the row's `commands` object records it:
+`{"ran":1,"refused":1,"unknown_host_call_count":1}`. The call is on the command's path (the
+runtime's strict mode during a command), not silently converted into an overworld level.
 
 ### Departures from the Java behaviour
 
@@ -59,9 +69,12 @@ Named here, not just in comments:
 - **Command sources that are not players run as the console.** The mod API's `CommandSource` has a
   block/cart/function origin, but the runtime's `CommandSourceStack` façade has one non-player
   shape, so `getTextName()` is `Server` for all of them. The origin's permission level is kept.
-- **A player source's level is the overworld.** No mod API read gives a `PlayerRef`'s dimension
-  (see [Fork seams needed](#fork-seams-needed)), so `getLevel()` in a Java command answers the
-  overworld even when the player is elsewhere.
+- **A player source's level is unknown until the fork adds a dimension read.** No mod API read
+  gives a `PlayerRef`'s dimension (see [Fork seams needed](#fork-seams-needed)), so a player
+  source's `CommandSourceStack.getLevel()` goes through the runtime's unknown-host-call path: the
+  call is counted in the command's report and the command fails visibly rather than quietly acting
+  on the overworld while the player stands in the Nether. Console and other non-player sources keep
+  the overworld, which is vanilla's server-console source level, not a guess.
 - **Styled component replies lose their style.** The runtime hands back plain text beside a
   component JSON; `Text` here is a literal or a translation key, so colours, siblings and
   translation arguments are dropped (`Hello, <name>!` is unaffected).

@@ -2557,7 +2557,7 @@ impl StdHost {
         std::mem::take(&mut self.console_out)
     }
 
-    fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+    pub(crate) fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
         if self.unknown_host_calls.len() < 64 || self.unknown_host_calls.contains_key(&key) {
             *self.unknown_host_calls.entry(key).or_default() += 1;

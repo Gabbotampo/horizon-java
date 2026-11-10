@@ -362,6 +362,7 @@ impl Hooks for HorizonJava {
                 source,
                 arguments,
             };
+            let before = loaded.host.unknown_host_call_count();
             let run = loaded.jar.run_command(
                 &command.run,
                 &invocation,
@@ -369,6 +370,12 @@ impl Hooks for HorizonJava {
                 &mut loaded.host,
                 &ExecutionBudget::within(JAR_BUDGET),
             );
+            let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
+            loaded.row.command_unknown_host_calls += unknown;
+            match &run.outcome {
+                CommandOutcome::Refused(_) => loaded.row.commands_refused += 1,
+                _ => loaded.row.commands_ran += 1,
+            }
             log_stdout(&loaded.row.id, &mut loaded.host);
             deliver(
                 host,
@@ -561,9 +568,16 @@ fn mod_text(text: &CommandText) -> Text {
     }
 }
 
-/// The runtime's view of the command source. Every non-player source runs as the console (the
-/// façade has no separate block, cart or function origin); the level is the overworld because a
-/// player's dimension is not a mod API read.
+/// The runtime's view of the command source.
+///
+/// Every non-player source runs as the console (the façade has no separate block, cart or
+/// function origin). Its level is the overworld, which is vanilla's server-console source level:
+/// correct, not a guess.
+///
+/// A player's dimension is no mod API read (the fork seam in `docs/mod-plan.md`), so a player
+/// source's level is unknown. `CommandSourceStack.getLevel()` then goes through the runtime's
+/// unknown-host-call path — counted and failing the command visibly — instead of quietly acting on
+/// the overworld while the player stands in the Nether.
 fn runtime_source(source: &CommandSource, host: &dyn Host) -> RuntimeSource {
     let level = source.permission().level();
     match source {
@@ -571,13 +585,13 @@ fn runtime_source(source: &CommandSource, host: &dyn Host) -> RuntimeSource {
             name: player.name(host).unwrap_or_else(|| "Player".to_owned()),
             level,
             player: Some(player.uuid()),
-            dimension: "minecraft:overworld".to_owned(),
+            dimension: None,
         },
         _ => RuntimeSource {
             name: "Server".to_owned(),
             level,
             player: None,
-            dimension: "minecraft:overworld".to_owned(),
+            dimension: Some("minecraft:overworld".to_owned()),
         },
     }
 }
@@ -760,6 +774,11 @@ struct JarRow {
     callbacks_ran: usize,
     callbacks_failed: usize,
     callback_unknown_host_calls: usize,
+    /// Commands that ran or were refused, and the unmodelled host calls their bodies made (a
+    /// player source's `getLevel()`, for one).
+    commands_ran: usize,
+    commands_refused: usize,
+    command_unknown_host_calls: usize,
 }
 
 impl JarRow {
@@ -774,6 +793,9 @@ impl JarRow {
             callbacks_ran: 0,
             callbacks_failed: 0,
             callback_unknown_host_calls: 0,
+            commands_ran: 0,
+            commands_refused: 0,
+            command_unknown_host_calls: 0,
         }
     }
 
@@ -789,6 +811,11 @@ impl JarRow {
                 "ran": self.callbacks_ran,
                 "failed": self.callbacks_failed,
                 "unknown_host_call_count": self.callback_unknown_host_calls,
+            },
+            "commands": {
+                "ran": self.commands_ran,
+                "refused": self.commands_refused,
+                "unknown_host_call_count": self.command_unknown_host_calls,
             },
         })
     }
@@ -913,6 +940,9 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
                     callbacks_ran: 0,
                     callbacks_failed: 0,
                     callback_unknown_host_calls: 0,
+                    commands_ran: 0,
+                    commands_refused: 0,
+                    command_unknown_host_calls: 0,
                 });
             }
         }
@@ -934,6 +964,9 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
             callbacks_ran: 0,
             callbacks_failed: 0,
             callback_unknown_host_calls: 0,
+            commands_ran: 0,
+            commands_refused: 0,
+            command_unknown_host_calls: 0,
         },
         jar,
         host,

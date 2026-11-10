@@ -92,10 +92,12 @@ class JavaModFixtureTests(unittest.TestCase):
             report = probe(build("command", Path(scratch)))
         self.assertEqual(report["status"], "ok")
         commands = report["commands"]
-        self.assertEqual(commands["roots"], ["javahello"])
-        # `javahello` and `javahello <name>` both execute.
-        self.assertEqual(commands["executable"], 2)
-        self.assertEqual(commands["samples"], ["javahello", "javahello test"])
+        self.assertEqual(commands["roots"], ["javahello", "javawhere"])
+        # `javahello`, `javahello <name>` and `javawhere` execute.
+        self.assertEqual(commands["executable"], 3)
+        self.assertEqual(
+            commands["samples"], ["javahello", "javawhere", "javahello test"]
+        )
 
 
 if __name__ == "__main__":
