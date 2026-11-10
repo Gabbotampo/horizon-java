@@ -646,16 +646,20 @@ fn main() -> ExitCode {
             adapter: None,
         }]
     } else {
+        // A NeoForge `@Mod` class can be limited to one physical side; the
+        // probe runs the client role only when asked for `client`, and every
+        // other role is a server, as the dedicated-server ledger is.
+        let side = if kind == "client" { "CLIENT" } else { "SERVER" };
         let selected_kind = match requested_kind.as_deref() {
             Some(_) => Some(kind.clone()),
             None => ["main", "client", "server", "neoforge"]
                 .into_iter()
-                .find(|candidate| !jar.discover_entrypoints(candidate).is_empty())
+                .find(|candidate| !jar.discover_entrypoints_on(candidate, side).is_empty())
                 .map(str::to_owned),
         };
         if let Some(selected_kind) = selected_kind {
             kind = selected_kind.clone();
-            jar.discover_entrypoints(&selected_kind)
+            jar.discover_entrypoints_on(&selected_kind, side)
         } else {
             Vec::new()
         }
