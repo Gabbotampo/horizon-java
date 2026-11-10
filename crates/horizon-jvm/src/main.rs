@@ -9359,7 +9359,7 @@ config="demo.mixins.json""#,
         .collect();
         let resolved: Vec<String> = absolutize_launch_args(args, Path::new("/work"))
             .into_iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
+            .map(|arg| arg.to_string_lossy().replace('\\', "/"))
             .collect();
         assert_eq!(
             resolved,
