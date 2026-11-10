@@ -18,6 +18,7 @@ mod block_item_id;
 pub mod brigadier;
 mod class_init;
 pub mod client_surface;
+mod collection_callback;
 mod color_collection;
 mod commons_io;
 pub mod content;
@@ -36,6 +37,7 @@ mod guava_model;
 mod heap;
 mod hook_shapes;
 mod java_regex;
+mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
 mod jdk_stream;
@@ -2058,6 +2060,11 @@ pub trait Host {
         None
     }
 
+    /// Replace the elements of a mutable collection marker. The host's table
+    /// is the only place a collection the interpreter mutated lasts, so a host
+    /// that keeps no collection state has nothing to replace.
+    fn replace_mutable_collection(&mut self, _value: &Value, _values: Vec<Value>) {}
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -2397,6 +2404,10 @@ pub struct StdHost {
     saved_data: facade_saved_data::SavedDataState,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
+    /// (language, country) of every `java.util.Locale` a jar constructed,
+    /// keyed by its object marker. The static constants (`Locale.US`) need no
+    /// row: their marker already spells the pair.
+    locales: BTreeMap<String, (String, String)>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
@@ -2504,6 +2515,7 @@ impl StdHost {
             saved_data: facade_saved_data::SavedDataState::default(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
+            locales: BTreeMap::new(),
             iterators: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
@@ -3793,6 +3805,12 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<String>> {
         self.mutable_values(value)
+    }
+
+    fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
+        if let Some(marker) = expect_ref(value) {
+            self.mutable_collections.insert(marker.to_owned(), values);
+        }
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -5270,6 +5288,12 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
             return value;
         }
+        if let Some(value) = self.locale_member(r, Some(receiver), args) {
+            return value;
+        }
+        if let Some(value) = self.thread_identity(r, Some(receiver)) {
+            return value;
+        }
         if let Some(value) = dfu_pair::instance_call(r, receiver, args) {
             return value;
         }
@@ -6079,16 +6103,13 @@ impl Host for StdHost {
                     return Ok(Value::Int(1));
                 }
                 (owner, "add", "(ILjava/lang/Object;)V") if is_list_like_owner(owner) => {
-                    let index = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
-                        .map_err(|_| NativeError::Metadata("list index is negative".into()))?;
+                    let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let value = Self::argument(r, args, 1)?.clone();
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if index > values.len() {
-                        return Err(NativeError::Metadata("list index is out of bounds".into()));
-                    }
+                    let index = checked_list_insert(at, values.len())?;
                     values.insert(index, value);
                     return Ok(Value::Void);
                 }
@@ -6106,8 +6127,7 @@ impl Host for StdHost {
                     return Ok(Value::Int(changed as i32));
                 }
                 (owner, "addAll", "(ILjava/util/Collection;)Z") if is_list_like_owner(owner) => {
-                    let index = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
-                        .map_err(|_| NativeError::Metadata("list index is negative".into()))?;
+                    let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let source = Self::argument(r, args, 1)?;
                     let additions = host_collection_values(self, source)?
                         .into_iter()
@@ -6117,9 +6137,7 @@ impl Host for StdHost {
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if index > values.len() {
-                        return Err(NativeError::Metadata("list index is out of bounds".into()));
-                    }
+                    let index = checked_list_insert(at, values.len())?;
                     let changed = !additions.is_empty();
                     values.splice(index..index, additions);
                     return Ok(Value::Int(changed as i32));
@@ -6127,28 +6145,22 @@ impl Host for StdHost {
                 (owner, "set", "(ILjava/lang/Object;)Ljava/lang/Object;")
                     if is_list_like_owner(owner) =>
                 {
-                    let index = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
-                        .map_err(|_| NativeError::Metadata("list index is negative".into()))?;
+                    let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let value = Self::argument(r, args, 1)?.clone();
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    let slot = values.get_mut(index).ok_or_else(|| {
-                        NativeError::Metadata("list index is out of bounds".into())
-                    })?;
-                    return Ok(std::mem::replace(slot, value));
+                    let index = checked_list_index(at, values.len())?;
+                    return Ok(std::mem::replace(&mut values[index], value));
                 }
                 (owner, "remove", "(I)Ljava/lang/Object;") if is_list_like_owner(owner) => {
-                    let index = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
-                        .map_err(|_| NativeError::Metadata("list index is negative".into()))?;
+                    let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
-                    if index >= values.len() {
-                        return Err(NativeError::Metadata("list index is out of bounds".into()));
-                    }
+                    let index = checked_list_index(at, values.len())?;
                     return Ok(values.remove(index));
                 }
                 (owner, "remove", "(Ljava/lang/Object;)Z") if is_list_like_owner(owner) => {
@@ -6958,16 +6970,10 @@ impl Host for StdHost {
                 ))
             }
             (owner, "get", "(I)Ljava/lang/Object;") if is_list_like_owner(owner) => {
-                let index = expect_int(r, Self::argument(r, args, 0)?)?;
-                let index = usize::try_from(index)
-                    .map_err(|_| NativeError::Metadata("list index is negative".into()))?;
-                Ok(parse_collection_value(
-                    host_collection_values(self, receiver)?
-                        .get(index)
-                        .ok_or_else(|| {
-                            NativeError::Metadata("list index is out of bounds".into())
-                        })?,
-                )?)
+                let at = expect_int(r, Self::argument(r, args, 0)?)?;
+                let values = host_collection_values(self, receiver)?;
+                let index = checked_list_index(at, values.len())?;
+                Ok(parse_collection_value(&values[index])?)
             }
             (owner, "get", "(Ljava/lang/Object;)Ljava/lang/Object;") if is_map_owner(owner) => {
                 let needle = collection_item_marker(Self::argument(r, args, 0)?);
@@ -10953,6 +10959,38 @@ fn property_unescape(text: &str) -> String {
         }
     }
     value
+}
+
+/// The JDK's range check for a list read, write or removal.
+///
+/// `ArrayList.get`/`set`/`remove(int)` call `Objects.checkIndex`, which throws
+/// `IndexOutOfBoundsException("Index <i> out of bounds for length <n>")` — a
+/// catchable exception, not a runtime diagnostic (verified on the JDK: see
+/// `list_bounds_raise_the_jdks_index_exception`).
+fn checked_list_index(index: i32, length: usize) -> Result<usize, NativeError> {
+    usize::try_from(index)
+        .ok()
+        .filter(|index| *index < length)
+        .ok_or_else(|| NativeError::UncaughtException {
+            class: "java/lang/IndexOutOfBoundsException".into(),
+            message: Some(format!("Index {index} out of bounds for length {length}")),
+            frame: None,
+        })
+}
+
+/// The JDK's range check for a list insertion (`add(index, e)`,
+/// `addAll(index, c)`): `ArrayList.rangeCheckForAdd` throws
+/// `IndexOutOfBoundsException("Index: <i>, Size: <n>")`. An index equal to the
+/// length is allowed (it appends).
+fn checked_list_insert(index: i32, length: usize) -> Result<usize, NativeError> {
+    usize::try_from(index)
+        .ok()
+        .filter(|index| *index <= length)
+        .ok_or_else(|| NativeError::UncaughtException {
+            class: "java/lang/IndexOutOfBoundsException".into(),
+            message: Some(format!("Index: {index}, Size: {length}")),
+            frame: None,
+        })
 }
 
 fn collection_values(value: &Value) -> Result<Vec<String>, NativeError> {
@@ -24206,6 +24244,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_map_compute(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_collection_callback(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
