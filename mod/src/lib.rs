@@ -43,6 +43,16 @@
 //! Each hook logs how many callbacks ran, how many failed, and how many leaned on a host call the
 //! runtime does not model; a jar's `System.out` lines land in the game log with the jar's id.
 //!
+//! # Milestone 2b: Java commands
+//!
+//! At `register_commands` the recorded Fabric `CommandRegistrationCallback` (and NeoForge
+//! `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and this
+//! mod translates the literals and the string/integer argument nodes into [`NativeCommand`] usages.
+//! `run_mod_command` maps the game's typed invocation back onto the runtime's parsed command, runs
+//! the Java `Command.run` callback with a `CommandSourceStack` façade, and sends what it replied
+//! through `Commands::feedback` (or to the player it named). A node whose argument type, redirect or
+//! requirement this bridge cannot carry is refused by name and left out, never guessed.
+//!
 //! Jars are run one at a time, so a jar cannot link against its neighbours yet: cross-jar classes
 //! are a later milestone ([docs/mod-plan.md](../../docs/mod-plan.md)).
 
@@ -50,9 +60,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mod_api::{
-    ClientHost, ClientSetupEvent, ConfigEntryKind, ConfigFileError, ConfigPath, Hooks, Host,
-    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
-    ServerStoppedEvent, ServerStoppingEvent,
+    ClientHost, ClientSetupEvent, CommandArgumentValue, CommandSource, ConfigEntryKind,
+    ConfigFileError, ConfigPath, Flow, Hooks, Host, NativeCommand, RegisterCommandsEvent,
+    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
+    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, Text,
+};
+use runtime::brigadier::{
+    self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
+    CommandSource as RuntimeSource, CommandText, MessageKind, NodeKind, Requirement,
 };
 use runtime::events::{EventContext, EventFacade, EventFiring, GameEvent, GameListener};
 use runtime::{ExecutionBudget, NativeJar, StdHost};
@@ -98,6 +113,59 @@ struct LoadedJar {
     jar: NativeJar,
     host: StdHost,
     listeners: Vec<GameListener>,
+    /// Commands the jar registered through the Brigadier façade, translated once.
+    commands: Vec<JavaCommand>,
+    native_commands: Vec<NativeCommand>,
+    commands_registered: bool,
+}
+
+/// One Java command this bridge can run: its usage, the literal path that selects it, the
+/// arguments it takes, and the `Command.run` callback marker.
+#[derive(Clone)]
+struct JavaCommand {
+    usage: String,
+    literals: Vec<String>,
+    arguments: Vec<(String, JavaArgument)>,
+    run: runtime::Value,
+}
+
+/// The argument kinds this bridge carries, and the usage spelling each one gets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaArgument {
+    Word,
+    Text,
+    Integer,
+}
+
+impl JavaArgument {
+    fn usage_kind(self) -> &'static str {
+        match self {
+            Self::Word => "word",
+            Self::Text => "text",
+            Self::Integer => "integer",
+        }
+    }
+
+    /// The kinds the runtime's façade records that this bridge carries. Everything else is
+    /// refused by name rather than approximated.
+    fn from_kind(kind: &ArgumentKind) -> Option<Self> {
+        match kind {
+            ArgumentKind::Word | ArgumentKind::Quoted => Some(Self::Word),
+            ArgumentKind::Greedy => Some(Self::Text),
+            ArgumentKind::Integer { .. } => Some(Self::Integer),
+            _ => None,
+        }
+    }
+
+    fn describe(kind: &ArgumentKind) -> String {
+        match kind {
+            ArgumentKind::Word => "word".to_owned(),
+            ArgumentKind::Quoted => "quoted string".to_owned(),
+            ArgumentKind::Greedy => "greedy string".to_owned(),
+            ArgumentKind::Integer { .. } => "integer".to_owned(),
+            other => format!("{other:?}"),
+        }
+    }
 }
 
 #[mod_api::horizon_mod]
@@ -188,6 +256,134 @@ impl Hooks for HorizonJava {
     fn server_stopped(&self, _host: &mut dyn ServerHost, event: &mut ServerStoppedEvent) {
         self.fire(GameEvent::ServerStopped, event.dedicated, |_| true);
         *self.lock() = State::default();
+    }
+
+    /// One jar changed its commands (`Commands::refresh_commands`): the Java registrations cannot
+    /// change at runtime, so the same set is offered again.
+    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+        let mut state = self.lock();
+        for loaded in &mut state.jars {
+            if !loaded.commands_registered {
+                loaded.commands_registered = true;
+                let (ran, failed) = fire_listeners(
+                    &loaded.jar,
+                    &mut loaded.host,
+                    &loaded.listeners,
+                    GameEvent::RegisterCommands,
+                    true,
+                    |_| true,
+                );
+                log::info!(
+                    "{LOG}: {}: command registration: {ran} callback(s) ran, {failed} failed",
+                    loaded.row.id
+                );
+                let (native, commands, refused) =
+                    translate_commands(&loaded.jar, &mut loaded.host, &loaded.row.id);
+                log::info!(
+                    "{LOG}: {}: {} command usage(s) translated, {} refused",
+                    loaded.row.id,
+                    native.len(),
+                    refused,
+                );
+                log_stdout(&loaded.row.id, &mut loaded.host);
+                loaded.native_commands = native;
+                loaded.commands = commands;
+            }
+            event
+                .commands
+                .extend(loaded.native_commands.iter().cloned());
+        }
+    }
+
+    /// A player (or the console) ran a command this mod registered. The typed invocation is
+    /// mapped back onto the runtime's parsed command, the Java callback runs, and what it replied
+    /// goes back through the command source's own feedback.
+    fn run_mod_command(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut RunModCommandEvent<'_>,
+    ) -> Flow {
+        let mut state = self.lock();
+        for loaded in &mut state.jars {
+            // One Java literal path can have several executable usages: the bare command and
+            // each deeper argument node. The invocation carries the arguments it parsed, so the
+            // usage that declares exactly those (the deepest one) is the one the Java callback
+            // belongs to.
+            let Some(command) = loaded
+                .commands
+                .iter()
+                .filter(|command| command.literals == event.command.literals)
+                .filter(|command| {
+                    command
+                        .arguments
+                        .iter()
+                        .all(|(name, _)| event.command.argument(name).is_some())
+                })
+                .max_by_key(|command| command.arguments.len())
+                .cloned()
+            else {
+                continue;
+            };
+            let mut arguments = Vec::new();
+            let mut words = command.literals.clone();
+            for (name, kind) in &command.arguments {
+                match (kind, event.command.argument(name)) {
+                    (
+                        JavaArgument::Word | JavaArgument::Text,
+                        Some(CommandArgumentValue::String(text)),
+                    ) => {
+                        arguments
+                            .push((name.clone(), brigadier::CommandArgument::Str(text.clone())));
+                        words.push(text.clone());
+                    }
+                    (JavaArgument::Integer, Some(CommandArgumentValue::Integer(value))) => {
+                        arguments.push((name.clone(), brigadier::CommandArgument::Int(*value)));
+                        words.push(value.to_string());
+                    }
+                    (_, Some(_)) => {
+                        return refuse(
+                            host,
+                            &command.usage,
+                            format!("argument '{name}' is not the kind this bridge carries"),
+                        );
+                    }
+                    (_, None) => {
+                        return refuse(
+                            host,
+                            &command.usage,
+                            format!("argument '{name}' is missing"),
+                        );
+                    }
+                }
+            }
+            let source = runtime_source(&event.source, host);
+            let invocation = RuntimeInvocation {
+                input: words.join(" "),
+                source,
+                arguments,
+            };
+            let run = loaded.jar.run_command(
+                &command.run,
+                &invocation,
+                Arc::new(EventFacade::default()),
+                &mut loaded.host,
+                &ExecutionBudget::within(JAR_BUDGET),
+            );
+            log_stdout(&loaded.row.id, &mut loaded.host);
+            deliver(
+                host,
+                &loaded.row.id,
+                &command.usage,
+                run.outcome.clone(),
+                &run.messages,
+            );
+            return Flow::Cancel;
+        }
+        log::warn!(
+            "{LOG}: /{} was not registered by a Java jar",
+            event.command.literals.join(" ")
+        );
+        Flow::Continue
     }
 
     /// The client finished its first load (NeoForge's `FMLClientSetupEvent`), once per process.
@@ -307,6 +503,247 @@ fn log_stdout(id: &str, host: &mut StdHost) {
             log::info!("{LOG}: {id}: {}", line.trim_end());
         }
     }
+}
+
+/// Answers a command the bridge could not map with the jar's own failure text.
+fn refuse(host: &mut dyn ServerHost, usage: &str, reason: String) -> Flow {
+    log::warn!("{LOG}: /{usage} not run: {reason}");
+    host.commands().feedback(Text::literal(format!(
+        "java command /{usage} could not run: {reason}"
+    )));
+    Flow::Cancel
+}
+
+/// Puts a finished Java command's replies where a mod command's feedback goes: the originating
+/// source for `sendSuccess`/`sendFailure`/`sendSystemMessage`, a named player for a direct
+/// `ServerPlayer.sendSystemMessage`.
+fn deliver(
+    host: &mut dyn ServerHost,
+    id: &str,
+    usage: &str,
+    outcome: CommandOutcome,
+    messages: &[CommandMessage],
+) {
+    for message in messages {
+        let text = mod_text(&message.text);
+        if let MessageKind::Player(uuid) = message.kind {
+            if let Some(player) = host.player(uuid) {
+                player.tell(host, text);
+                continue;
+            }
+        }
+        host.commands().feedback(text);
+    }
+    match outcome {
+        CommandOutcome::Returned(result) => log::info!(
+            "{LOG}: {id}: /{usage} ran (returned {result}, {} message(s))",
+            messages.len()
+        ),
+        CommandOutcome::Syntax(text) => {
+            host.commands().feedback(mod_text(&text));
+            log::warn!("{LOG}: {id}: /{usage} had a syntax error");
+        }
+        CommandOutcome::Refused(reason) => {
+            log::warn!("{LOG}: {id}: /{usage} refused: {reason}");
+            host.commands()
+                .feedback(Text::translate("command.failed", &[]));
+        }
+    }
+}
+
+/// A command text as the mod API's component. A translation key stays a key; styled component
+/// JSON is flattened to its plain text, which the runtime already carries beside it.
+fn mod_text(text: &CommandText) -> Text {
+    if text.translate {
+        Text::translate(&text.text, &[])
+    } else {
+        Text::literal(text.text.clone())
+    }
+}
+
+/// The runtime's view of the command source. Every non-player source runs as the console (the
+/// façade has no separate block, cart or function origin); the level is the overworld because a
+/// player's dimension is not a mod API read.
+fn runtime_source(source: &CommandSource, host: &dyn Host) -> RuntimeSource {
+    let level = source.permission().level();
+    match source {
+        CommandSource::Player { player, .. } => RuntimeSource {
+            name: player.name(host).unwrap_or_else(|| "Player".to_owned()),
+            level,
+            player: Some(player.uuid()),
+            dimension: "minecraft:overworld".to_owned(),
+        },
+        _ => RuntimeSource {
+            name: "Server".to_owned(),
+            level,
+            player: None,
+            dimension: "minecraft:overworld".to_owned(),
+        },
+    }
+}
+
+/// Walks the Brigadier tree the jar's registration callback built and turns every executable
+/// literal path into a [`NativeCommand`] and a [`JavaCommand`]. A node this bridge cannot carry is
+/// left out with a log line naming it.
+struct Translator<'a> {
+    jar: &'a NativeJar,
+    host: &'a mut StdHost,
+    tree: brigadier::CommandTree,
+    budget: ExecutionBudget,
+    id: &'a str,
+    native: Vec<NativeCommand>,
+    commands: Vec<JavaCommand>,
+    refused: usize,
+}
+
+fn translate_commands(
+    jar: &NativeJar,
+    host: &mut StdHost,
+    id: &str,
+) -> (Vec<NativeCommand>, Vec<JavaCommand>, usize) {
+    let tree = host.command_tree();
+    let mut translator = Translator {
+        jar,
+        host,
+        tree,
+        budget: ExecutionBudget::within(JAR_BUDGET),
+        id,
+        native: Vec::new(),
+        commands: Vec::new(),
+        refused: 0,
+    };
+    let roots: Vec<usize> = translator.tree.roots().map(|(id, _)| id).collect();
+    for root in roots {
+        translator.walk(root, &mut Vec::new(), &mut Vec::new(), 0);
+    }
+    let Translator {
+        native,
+        commands,
+        refused,
+        ..
+    } = translator;
+    (native, commands, refused)
+}
+
+impl Translator<'_> {
+    fn walk(
+        &mut self,
+        node_id: usize,
+        path: &mut Vec<String>,
+        arguments: &mut Vec<(String, JavaArgument)>,
+        level: u8,
+    ) {
+        let Some(node) = self.tree.nodes.get(node_id).cloned() else {
+            return;
+        };
+        let mut level = level;
+        if let Some(requirement) = &node.requirement {
+            match requirement {
+                Requirement::Level(node_level) => level = level.max((*node_level).min(4)),
+                Requirement::Predicate(_) => {
+                    match self
+                        .jar
+                        .requirement_level(requirement, true, self.host, &self.budget)
+                    {
+                        Ok(node_level) => level = level.max(node_level.min(4)),
+                        Err(error) => {
+                            log::warn!(
+                                "{LOG}: {}: /{} needs a permission predicate this bridge cannot evaluate ({error}); the usage is left out",
+                                self.id,
+                                usage(path, arguments),
+                            );
+                            self.refused += 1;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if node.redirect.is_some() || node.modifier {
+            log::warn!(
+                "{LOG}: {}: /{} redirects or forks its source; the usage is left out",
+                self.id,
+                usage(path, arguments),
+            );
+            self.refused += 1;
+            return;
+        }
+        match &node.kind {
+            NodeKind::Root => {
+                let children = node.children.clone();
+                for child in children {
+                    self.walk(child, path, arguments, level);
+                }
+            }
+            NodeKind::Literal(name) => {
+                path.push(name.clone());
+                if let Some(run) = node.command.clone() {
+                    self.finish(run, path, arguments, level);
+                }
+                let children = node.children.clone();
+                for child in children {
+                    self.walk(child, path, arguments, level);
+                }
+                path.pop();
+            }
+            NodeKind::Argument { name, kind } => {
+                let Some(kind) = JavaArgument::from_kind(kind) else {
+                    log::warn!(
+                        "{LOG}: {}: /{} takes a {} argument '{}', which this bridge does not carry; the usage is left out",
+                        self.id,
+                        usage(path, arguments),
+                        JavaArgument::describe(kind),
+                        name,
+                    );
+                    self.refused += 1;
+                    return;
+                };
+                arguments.push((name.clone(), kind));
+                if let Some(run) = node.command.clone() {
+                    self.finish(run, path, arguments, level);
+                }
+                let children = node.children.clone();
+                for child in children {
+                    self.walk(child, path, arguments, level);
+                }
+                arguments.pop();
+            }
+        }
+    }
+
+    fn finish(
+        &mut self,
+        run: runtime::Value,
+        path: &[String],
+        arguments: &[(String, JavaArgument)],
+        level: u8,
+    ) {
+        if path.is_empty() {
+            return;
+        }
+        let usage = usage(path, arguments);
+        let command = if level == 0 {
+            NativeCommand::new(&usage)
+        } else {
+            NativeCommand::op(&usage, level)
+        };
+        self.native.push(command);
+        self.commands.push(JavaCommand {
+            usage,
+            literals: path.to_vec(),
+            arguments: arguments.to_vec(),
+            run,
+        });
+    }
+}
+
+/// The usage spelling of one literal path and its arguments (`hello <name:word>`).
+fn usage(path: &[String], arguments: &[(String, JavaArgument)]) -> String {
+    let mut usage = path.join(" ");
+    for (name, kind) in arguments {
+        usage.push_str(&format!(" <{name}:{}>", kind.usage_kind()));
+    }
+    usage
 }
 
 /// One jar's outcome, the row the report holds and the line the log gets.
@@ -501,6 +938,9 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
         jar,
         host,
         listeners,
+        commands: Vec::new(),
+        native_commands: Vec::new(),
+        commands_registered: false,
     })
 }
 

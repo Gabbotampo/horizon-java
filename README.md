@@ -103,7 +103,15 @@ What it does today:
 - **M1, run jars.** Every `.jar` in `config/horizon_java/java-mods/` is read as bytes through the
   same service and run at `server_about_to_start` with its own `StdHost`. One log line per jar and
   one row in the report: the id, `ran-clean` / `ran-hollow` / `refused`, the host-call and
-  unknown-host-call counts, and the refusal reason. No game bindings yet.
+  unknown-host-call counts, and the refusal reason.
+- **M2, game hooks.** Each jar's runtime (heap, statics and recorded listeners) stays alive for the
+  server, and this mod's `server_about_to_start` / `server_starting` / `server_started` /
+  `server_stopping` / `server_stopped` hooks fire the Fabric `ServerLifecycleEvents` and NeoForge
+  `ServerStartingEvent`/`ServerStartedEvent`/`ServerStoppingEvent` listeners the entrypoints
+  registered. Java commands from Fabric's `CommandRegistrationCallback` (NeoForge's
+  `RegisterCommandsEvent`) become typed mod API commands; running one calls its Java
+  `Command.run` and sends the reply through the mod API's command-source feedback. Literal,
+  `word`/`text` and `integer` nodes only: anything else is refused by name and logged.
 
 A native mod is one flat crate, so the runtime is copied into `mod/src/runtime/` by
 `tools/vendor.py` (which rewrites `crate::` to `crate::runtime::` and records a SHA-256 per file in
@@ -114,7 +122,9 @@ run by CI only for those. A mod PR refreshes the copy with `python3 tools/vendor
 
 ```sh
 python3 tools/vendor.py             # after changing crates/horizon-native-java
-python3 tools/java_mod_fixture.py --out DIR   # a tiny Fabric jar for the proof, never committed
+python3 tools/java_mod_fixture.py --out DIR                 # milestone 1's jar
+python3 tools/java_mod_fixture.py --kind lifecycle --out DIR # SERVER_STARTED/STOPPING lines
+python3 tools/java_mod_fixture.py --kind command --out DIR   # /javahello [name]
 ```
 
 The documented build is Horizon's launcher (`horizon-launcher native-build mod/ --server-output OUT

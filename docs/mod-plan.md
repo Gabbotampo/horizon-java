@@ -8,12 +8,14 @@ the probe. It is built against the game-side mod API on
 Nothing in `crates/horizon-native-java` or `crates/horizon-jvm` moves or changes shape for this:
 the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod is one flat crate.
 
-## What M0 and M1 do
+## What M0 to M2 do
 
 | Milestone | Behaviour |
 |---|---|
 | **M0, the shell** | `Hooks::server_about_to_start` and `Hooks::client_setup` log one line each. The server start writes this mod's report, `config/horizon_java/java-runtime.json`, through the mod API's own config service (`Host::config_files`), so the game files it under `config/` beside every other mod's. With no jars it is `{"schema":1,"jars":[]}`. |
-| **M1, run jars** | At `server_about_to_start`, every `.jar` in `config/horizon_java/java-mods/` is read as bytes through `config_files`, loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `refused`, its host-call and unknown-host-call counts, and the refusal reason. No game bindings yet: an unmodelled host call is counted, not answered by the world. |
+| **M1, run jars** | At `server_about_to_start`, every `.jar` in `config/horizon_java/java-mods/` is read as bytes through `config_files`, loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `refused`, its host-call and unknown-host-call counts, and the refusal reason. |
+| **M2a, lifecycle** | Each jar's `StdHost` (heap, statics, recorded listeners) is kept for the server's life. `server_about_to_start` fires the Fabric `SERVER_STARTING` and NeoForge `ServerAboutToStartEvent` listeners, `server_starting` the NeoForge `ServerStartingEvent` ones, `server_started` the Fabric `SERVER_STARTED` and NeoForge `ServerStartedEvent` ones, and `server_stopping`/`server_stopped` their own. Each hook logs callbacks run/failed and unmodelled host calls; every row's `callbacks` object totals them; a jar's `System.out` lines reach the game log with its id. |
+| **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text` and `integer` nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 
 The verdicts are the ones the corpus ledgers already use:
 
@@ -25,6 +27,55 @@ The verdicts are the ones the corpus ledgers already use:
 
 Jars run one at a time, so a jar cannot link against its neighbours yet: cross-jar classes are a
 later milestone.
+
+## M2 proofs
+
+The fixture jars are built by `tools/java_mod_fixture.py` and never committed. With `m2a_fixture.jar`
+and `m2b_fixture.jar` in `config/horizon_java/java-mods/`, one integrated-server run shows (from
+`horizon-ctl`'s log for the run):
+
+```
+Horizon Java: m2a_fixture: m2a: SERVER_STARTED ran
+Horizon Java: server_started (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
+Horizon Java: m2b_fixture: command registration: 1 callback(s) ran, 0 failed
+Horizon Java: m2b_fixture: 2 command usage(s) translated, 0 refused
+Horizon Java: m2b_fixture: /javahello <name:word> ran (returned 1, 1 message(s))
+Horizon Java: m2a_fixture: m2a: SERVER_STOPPING ran
+Horizon Java: server_stopping (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
+```
+
+`horizon-ctl … command "/javahello Viola"` answers `{"chat":["Hello, Viola!"]}`, and the stopped
+report's `callbacks` for `m2a_fixture` is `{"ran":2,"failed":0,"unknown_host_call_count":0}`.
+
+### Departures from the Java behaviour
+
+Named here, not just in comments:
+
+- **Split `server_started`.** The runtime records Fabric `SERVER_STARTED`, NeoForge
+  `ServerStartingEvent` and NeoForge `ServerStartedEvent` on one event; the mod splits it by the
+  listener's recorded source so each runs at its own mod API hook (`server_starting` or
+  `server_started`). Without the split the NeoForge `ServerStartingEvent` listeners would run one
+  hook late.
+- **Command sources that are not players run as the console.** The mod API's `CommandSource` has a
+  block/cart/function origin, but the runtime's `CommandSourceStack` façade has one non-player
+  shape, so `getTextName()` is `Server` for all of them. The origin's permission level is kept.
+- **A player source's level is the overworld.** No mod API read gives a `PlayerRef`'s dimension
+  (see [Fork seams needed](#fork-seams-needed)), so `getLevel()` in a Java command answers the
+  overworld even when the player is elsewhere.
+- **Styled component replies lose their style.** The runtime hands back plain text beside a
+  component JSON; `Text` here is a literal or a translation key, so colours, siblings and
+  translation arguments are dropped (`Hello, <name>!` is unaffected).
+- **`sendSuccess(supplier, broadcast)` sends one feedback line** through `Commands::feedback`,
+  which follows vanilla's source rules; the explicit broadcast flag is not carried onto a second
+  audience.
+- **A jar's command set is fixed at registration.** `Commands::refresh_commands` re-offers the same
+  usages: no Java API here re-runs a registration callback with a different set.
+
+## Fork seams needed
+
+- **A player's dimension for command sources.** `CommandSourceStack.getLevel()` has no mod API read
+  to answer it: `PlayerRef` exposes identity, permission and messages but no level. Fabric/NeoForge
+  mods read it in command bodies; today every player source answers the overworld.
 
 ## Pinned fork commit
 
