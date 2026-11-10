@@ -112,6 +112,21 @@ class JavaModFixtureTests(unittest.TestCase):
             commands["samples"], ["javahello", "javawhere", "javahello test"]
         )
 
+    def test_the_content_fixture_registers_a_typed_item_and_block(self):
+        self.require_tools()
+        with tempfile.TemporaryDirectory() as scratch:
+            report = probe(build("content", Path(scratch)))
+        self.assertEqual(report["status"], "ok")
+        # The ids and registries are the fixture's own (m3fixture.Content): the runtime records
+        # this jar's two Registry.register calls, and both carry a typed declaration the bridge can
+        # transcribe.
+        rows = {(row["registry"], row["id"]): row for row in report["registrations"]}
+        self.assertIn(("minecraft:item", "m3_fixture:ruby"), rows)
+        self.assertIn(("minecraft:block", "m3_fixture:ruby_block"), rows)
+        self.assertTrue(rows[("minecraft:item", "m3_fixture:ruby")]["typed"])
+        self.assertTrue(rows[("minecraft:block", "m3_fixture:ruby_block")]["typed"])
+        self.assertEqual(report["unknown_host_call_count"], 0, report["unknown_host_calls"])
+
 
 if __name__ == "__main__":
     unittest.main()

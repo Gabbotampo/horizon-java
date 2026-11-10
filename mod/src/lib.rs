@@ -17,10 +17,11 @@
 //!
 //! # Milestone 1: run jars inside the game
 //!
-//! Every `.jar` in `config/horizon_java/java-mods/` is read as bytes through the same service,
-//! loaded by the runtime from memory, and run with its own [`StdHost`]: no game bindings yet, so
-//! a call the runtime does not model is counted, not answered by the world. Each jar logs one
-//! line and gets one row in the report:
+//! Every `.jar` in `config/horizon_java/java-mods/` is read as bytes, loaded by the runtime from
+//! memory, and run with its own [`StdHost`]: no game bindings yet, so a call the runtime does not
+//! model is counted, not answered by the world. (Milestone 3 moved the read before the content
+//! phase, where `config_files` does not exist yet; [`content`] explains why it is `std::fs`.)
+//! Each jar logs one line and gets one row in the report:
 //!
 //! * `ran-clean`: the jar's server entrypoints ran and no host call was unmodelled;
 //! * `ran-hollow`: they ran, but at least one host call was answered neutrally (`unknown_host_call_count`);
@@ -43,6 +44,16 @@
 //! Each hook logs how many callbacks ran, how many failed, and how many leaned on a host call the
 //! runtime does not model; a jar's `System.out` lines land in the game log with the jar's id.
 //!
+//! # Milestone 3: a jar's items and blocks
+//!
+//! `blocks` and `items` are asked once, at the game's Registration phase and before any resource
+//! loads, so that is where the jars now run ([`content`]). Each typed `RegistryDeclaration` the
+//! runtime recorded becomes a native content declaration: an item keeps its inferred template and
+//! the properties the content vocabulary carries, and a block brings its block item. The game's
+//! content root joins them under the jar's namespace, so `/give` and the inventory see
+//! `<jar id>:<path>`. Jar assets, models, lang and loot stay outside this pass, as
+//! `docs/m3-content-design.md` maps.
+//!
 //! # Milestone 2b: Java commands
 //!
 //! At `register_commands` the recorded Fabric `CommandRegistrationCallback` (and NeoForge
@@ -60,16 +71,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mod_api::{
-    AttackEntityEvent, Authority, BreakBlockEvent, ClientHost, ClientSetupEvent, Command,
-    CommandArgumentValue, CommandSource, ConfigEntryKind, ConfigFileError, ConfigPath,
+    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath,
     EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
-    HostSide, InteractionResult, ItemStack, LeftClickBlockEvent, LevelDimension, LevelLoadEvent,
-    LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
-    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
-    PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRespawnedEvent,
-    RegisterCommandsEvent, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
-    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
+    LevelLoadEvent, LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
+    LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
+    PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
+    PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
+    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -81,6 +93,7 @@ use runtime::events::{
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
 
+mod content;
 mod runtime;
 
 /// This mod's report, in its own `config/horizon_java/` folder.
@@ -98,8 +111,9 @@ const LOG: &str = "Horizon Java";
 /// `main`, NeoForge's `server`, then the class a NeoForge jar discovers by annotation.
 const SERVER_KINDS: [&str; 3] = ["main", "server", "neoforge"];
 
-/// The mod's state. `server_about_to_start` runs once per server the window hosts, so every jar's
-/// runtime is rebuilt there; the hooks after it fire the listeners those entrypoints registered.
+/// The mod's state. The content hooks run the jars once per process, before any server exists;
+/// every later hook reuses what they recorded, and a second server this process hosts only resets
+/// the per-server state.
 #[derive(Default)]
 pub struct HorizonJava {
     state: Mutex<State>,
@@ -111,6 +125,9 @@ struct State {
     jars: Vec<LoadedJar>,
     /// Jars that could not run, kept for the report.
     refused: Vec<JarRow>,
+    /// Whether the jars have been read and run this process. The content hooks run once, before
+    /// the server exists; the server hooks reuse what they recorded.
+    loaded: bool,
     /// Players whose join this mod heard, as much of them as the hook gave:
     /// a Java player marker answers its name and UUID, and refuses the level
     /// and entity id it does not know.
@@ -195,6 +212,21 @@ impl JavaArgument {
 
 #[mod_api::horizon_mod]
 impl Hooks for HorizonJava {
+    /// The content root still accepts native block declarations here, at the Registration phase
+    /// and before any resource loads (NeoForge's `RegisterEvent` drained from
+    /// `DeferredRegister.Blocks`). This is the one moment a jar's registrations can become content
+    /// in the same start, so the first content question is also where the jars run.
+    fn blocks(&self, context: &RegistrationContext, event: &mut BlocksEvent<'_>) {
+        let mut state = self.lock();
+        content::declare_blocks(&mut state, context, event);
+    }
+
+    /// The item counterpart of [`Self::blocks`](Hooks::blocks) (`DeferredRegister.Items`).
+    fn items(&self, context: &RegistrationContext, event: &mut ItemsEvent<'_>) {
+        let mut state = self.lock();
+        content::declare_items(&mut state, context, event);
+    }
+
     /// The server is about to open its worlds (NeoForge's `ServerAboutToStartEvent`). Nothing of
     /// the world is loaded yet, and both server paths have read the mods' configs by now, so this
     /// is the earliest moment the mod's own `config/` files can be read or written.
@@ -203,24 +235,14 @@ impl Hooks for HorizonJava {
         host: &mut dyn ServerHost,
         event: &mut ServerAboutToStartEvent,
     ) {
-        let jars = read_jars(host);
+        // The content hooks normally ran before any server; a game that never asked them still
+        // gets milestone 1's rows, just without content.
+        self.ensure_jars();
         let mut state = self.lock();
-        *state = State {
-            dedicated: event.dedicated,
-            ..State::default()
-        };
-        for (file, bytes) in jars {
-            match load_jar(file, &bytes) {
-                Ok(loaded) => {
-                    log::info!("{LOG}: {}", loaded.row);
-                    state.jars.push(loaded);
-                }
-                Err(row) => {
-                    log::info!("{LOG}: {row}");
-                    state.refused.push(row);
-                }
-            }
-        }
+        state.dedicated = event.dedicated;
+        state.players.clear();
+        state.tick_count = 0;
+        state.reset_server();
         let count = |verdict: &str| {
             state
                 .jars
@@ -280,10 +302,10 @@ impl Hooks for HorizonJava {
     }
 
     /// Teardown is over (Fabric's `SERVER_STOPPED`, NeoForge's `ServerStoppedEvent`). The jar
-    /// state is dropped once its last listeners have run.
+    /// state stays: the entrypoints ran at the content phase, and the next world this process
+    /// hosts reuses it.
     fn server_stopped(&self, _host: &mut dyn ServerHost, event: &mut ServerStoppedEvent) {
         self.fire(GameEvent::ServerStopped, event.dedicated, |_| true);
-        *self.lock() = State::default();
     }
 
     /// One jar changed its commands (`Commands::refresh_commands`): the Java registrations cannot
@@ -454,12 +476,9 @@ impl Hooks for HorizonJava {
             level: Some(event.level.dimension_id().to_owned()),
             ..EventContext::default()
         };
-        self.fire_event(
-            GameEvent::LevelTickStart,
-            self.dedicated(),
-            context,
-            |_| true,
-        );
+        self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
+            true
+        });
     }
 
     /// A server level's tick ends (Fabric's `END_LEVEL_TICK`, NeoForge's
@@ -532,7 +551,9 @@ impl Hooks for HorizonJava {
             player: Some(event.player),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::PlayerRespawn, self.dedicated(), context, |_| true);
+        self.fire_event(GameEvent::PlayerRespawn, self.dedicated(), context, |_| {
+            true
+        });
     }
 
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
@@ -614,13 +635,7 @@ impl Hooks for HorizonJava {
     /// A player broke the block at `pos` (Fabric's `PlayerBlockBreakEvents.BEFORE`, NeoForge's
     /// `BreakBlockEvent`). A cancel keeps the block, and the Fabric `CANCELED` listeners hear it.
     fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
-        let context = self.block_context(
-            host,
-            event.pos,
-            event.state,
-            None,
-            None,
-        );
+        let context = self.block_context(host, event.pos, event.state, None, None);
         let fired = self.fire_event(
             GameEvent::BlockBreakBefore,
             self.dedicated(),
@@ -644,12 +659,7 @@ impl Hooks for HorizonJava {
     /// `PlayerInteractEvent.LeftClickBlock`).
     fn left_click_block(&self, host: &mut dyn ServerHost, event: &mut LeftClickBlockEvent) -> Flow {
         let context = self.block_context(host, event.pos, event.state, Some(event.face), None);
-        let fired = self.fire_event(
-            GameEvent::AttackBlock,
-            self.dedicated(),
-            context,
-            |_| true,
-        );
+        let fired = self.fire_event(GameEvent::AttackBlock, self.dedicated(), context, |_| true);
         if fired.cancelled {
             Flow::Cancel
         } else {
@@ -717,12 +727,7 @@ impl Hooks for HorizonJava {
             }),
             ..EventContext::default()
         };
-        let fired = self.fire_event(
-            GameEvent::AttackEntity,
-            self.dedicated(),
-            context,
-            |_| true,
-        );
+        let fired = self.fire_event(GameEvent::AttackEntity, self.dedicated(), context, |_| true);
         if fired.cancelled {
             Flow::Cancel
         } else {
@@ -888,6 +893,11 @@ impl HorizonJava {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Runs the jars if the content phase has not done so yet.
+    fn ensure_jars(&self) {
+        self.lock().ensure_loaded();
+    }
+
     /// Fires one runtime event to every jar's recorded listeners, and says what happened.
     fn fire(&self, event: GameEvent, dedicated: bool, wanted: impl Fn(&GameListener) -> bool) {
         self.fire_event(event, dedicated, EventContext::default(), wanted);
@@ -925,10 +935,7 @@ impl HorizonJava {
                 &mut firing,
                 &wanted,
             );
-            let jar_unknown = loaded
-                .host
-                .unknown_host_call_count()
-                .saturating_sub(before);
+            let jar_unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             log_stdout(&id, &mut loaded.host);
             loaded.row.callbacks_ran += jar_ran;
             loaded.row.callbacks_failed += jar_failed;
@@ -1038,12 +1045,7 @@ fn run_listeners(
         .iter()
         .filter(|listener| listener.event == event && wanted(listener))
     {
-        match jar.run_game_listener(
-            listener,
-            firing,
-            host,
-            &ExecutionBudget::within(JAR_BUDGET),
-        ) {
+        match jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET)) {
             Ok(run) => {
                 ran += usize::from(run.ran);
                 if run.stop {
@@ -1321,6 +1323,21 @@ fn usage(path: &[String], arguments: &[(String, JavaArgument)]) -> String {
     usage
 }
 
+impl State {
+    /// Counters are per server: the jars ran once at the content phase, and a second world this
+    /// process hosts starts its own report with zero callbacks and commands.
+    fn reset_server(&mut self) {
+        for jar in &mut self.jars {
+            jar.row.callbacks_ran = 0;
+            jar.row.callbacks_failed = 0;
+            jar.row.callback_unknown_host_calls = 0;
+            jar.row.commands_ran = 0;
+            jar.row.commands_refused = 0;
+            jar.row.command_unknown_host_calls = 0;
+        }
+    }
+}
+
 /// One jar's outcome, the row the report holds and the line the log gets.
 struct JarRow {
     file: String,
@@ -1340,6 +1357,10 @@ struct JarRow {
     commands_ran: usize,
     commands_refused: usize,
     command_unknown_host_calls: usize,
+    /// Content declarations this jar contributed to the game (milestone 3). Zero for a refused
+    /// jar, and for a jar whose registrations the content vocabulary cannot carry.
+    content_blocks: usize,
+    content_items: usize,
 }
 
 impl JarRow {
@@ -1357,6 +1378,8 @@ impl JarRow {
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            content_blocks: 0,
+            content_items: 0,
         }
     }
 
@@ -1378,6 +1401,10 @@ impl JarRow {
                 "refused": self.commands_refused,
                 "unknown_host_call_count": self.command_unknown_host_calls,
             },
+            "content": {
+                "blocks": self.content_blocks,
+                "items": self.content_items,
+            },
         })
     }
 }
@@ -1394,43 +1421,6 @@ impl std::fmt::Display for JarRow {
         }
         f.write_str(")")
     }
-}
-
-/// The jars to run: every file named `*.jar` in `config/horizon_java/java-mods/`, sorted by name
-/// so one run's report reads the same as the next. An absent folder is no jars, which is the
-/// state a fresh install is in; an unreadable one is a warning, not a failed server start.
-fn read_jars(host: &dyn Host) -> Vec<(String, Vec<u8>)> {
-    let files = host.config_files();
-    let Ok(folder) = ConfigPath::new(JARS) else {
-        return Vec::new();
-    };
-    let entries = match files.list(&folder) {
-        Ok(entries) => entries,
-        Err(ConfigFileError::NotFound) => return Vec::new(),
-        Err(error) => {
-            log::warn!("{LOG}: config/{JARS} could not be listed: {error}");
-            return Vec::new();
-        }
-    };
-    let mut jars = entries
-        .into_iter()
-        .filter(|entry| entry.stat.kind == ConfigEntryKind::File && entry.name.ends_with(".jar"))
-        .filter_map(|entry| {
-            let path = ConfigPath::new(&format!("{JARS}/{}", entry.name)).ok()?;
-            match files.read(&path) {
-                Ok(bytes) => Some((entry.name, bytes)),
-                Err(error) => {
-                    log::warn!(
-                        "{LOG}: config/{JARS}/{} could not be read: {error}",
-                        entry.name
-                    );
-                    None
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    jars.sort_by(|a, b| a.0.cmp(&b.0));
-    jars
 }
 
 /// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
@@ -1504,6 +1494,8 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
                     commands_ran: 0,
                     commands_refused: 0,
                     command_unknown_host_calls: 0,
+                    content_blocks: 0,
+                    content_items: 0,
                 });
             }
         }
@@ -1528,6 +1520,8 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            content_blocks: 0,
+            content_items: 0,
         },
         jar,
         host,
