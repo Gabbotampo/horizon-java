@@ -153,7 +153,7 @@ struct Fired {
 /// empty jar, which is what milestone 1 did.
 struct LoadedJar {
     row: JarRow,
-    jar: NativeJar,
+    jar: Arc<NativeJar>,
     host: StdHost,
     listeners: Vec<GameListener>,
     /// Commands the jar registered through the Brigadier façade, translated once.
@@ -1435,32 +1435,31 @@ impl std::fmt::Display for JarRow {
     }
 }
 
+/// The mod id a row names the jar by: its Fabric or NeoForge id, else its file stem.
+pub(crate) fn jar_id(jar: &NativeJar, file: &str) -> String {
+    jar.fabric_id
+        .clone()
+        .or_else(|| jar.neoforge_id.clone())
+        .unwrap_or_else(|| file.strip_suffix(".jar").unwrap_or(file).to_owned())
+}
+
 /// Loads one jar the way a server would: every server-side entrypoint the real loader runs, in
-/// the loader's order, in its own host, with no game behind it. Anything the runtime does not
-/// model is counted by the host, which is what `ran-hollow` means. The host is returned because
-/// the listeners it recorded need it for the rest of the server's life.
+/// the loader's order, in its own host, with the sibling jars it declares on that host's class
+/// path. Anything the runtime does not model is counted by the host, which is what `ran-hollow`
+/// means. The host is returned because the listeners it recorded need it for the rest of the
+/// server's life.
 ///
 /// Fabric runs `main` and then `server` (Hooks.startServer), so a jar that has both runs both.
 /// A failing stage is recorded and the remaining stages still run: the failure is a limit of
 /// this interpreter, not a reason to drop an entrypoint the jar ships for the server. The jar is
-/// refused only when every stage failed; a partial failure is named in the row's `reason`.
-fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
-    let stem = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
-    let jar = match runtime::NativeJar::from_bytes(bytes) {
-        Ok(jar) => jar,
-        Err(error) => {
-            return Err(JarRow::refused(
-                &file,
-                stem,
-                format!("not a readable jar: {error}"),
-            ));
-        }
-    };
-    let id = jar
-        .fabric_id
-        .clone()
-        .or_else(|| jar.neoforge_id.clone())
-        .unwrap_or_else(|| stem.clone());
+/// refused only when every stage failed; a partial run is `ran-partial` and its `reason` names
+/// the failed stages.
+fn load_jar(
+    file: String,
+    jar: Arc<NativeJar>,
+    links: &[(String, Arc<NativeJar>)],
+) -> Result<LoadedJar, JarRow> {
+    let id = jar_id(&jar, &file);
     let entrypoints = jar.role_entrypoints(false);
     if entrypoints.is_empty() {
         let reason = if jar.discover_entrypoints("client").is_empty() {
@@ -1471,6 +1470,15 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
         return Err(JarRow::refused(&file, id, reason.to_owned()));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+    for (link, dependency) in links {
+        if let Err(error) = host.link_jar(link.clone(), dependency) {
+            return Err(JarRow::refused(
+                &file,
+                id,
+                format!("linking {link} failed: {error}"),
+            ));
+        }
+    }
     let mut calls = 0;
     let mut ran = 0;
     let mut failures = Vec::new();

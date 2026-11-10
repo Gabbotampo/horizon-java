@@ -339,6 +339,39 @@ eu.pb4.entityviewdistance.EVDMod: Metadata("malformed java/util/Iterator marker 
 interpreter refusing the jar's iterator construction, not a mod error; it should become `ran-clean`
 once the marker is modelled and the stage runs.
 
+## Follow-up: cross-jar linking
+
+Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`), with
+both jars of each pair in `config/horizon_java/java-mods/`. Before, each jar had its own host and
+the declared dependency was unreachable.
+
+| jar(s) | before | after |
+|---|---|---|
+| `structureessentials` with `cupboard` | ran-hollow 1 | **ran-clean**, 0 unknown |
+| `stackrefill` with `collective` | ran-hollow 1 | **ran-clean**, 0 unknown |
+| `stackrefill` alone | ran-hollow 1 (dependency absent, silently) | **refused**: `requires collective (not in horizon_java/java-mods)` |
+| `collective` | ran-hollow 67 | ran-hollow 67 (unchanged; it is the dependency) |
+
+Jars now run dependencies before dependents (`cupboard` before `structureessentials`,
+`collective` before `stackrefill`), and the missing-dependency refusal names every absent id.
+Host-provided ids (`minecraft`, `java`, `fabricloader`, `fabric-api`, `neoforge`, `forge`) are not
+required to be jars.
+
+## Follow-up: client `@Mod` classes on a server
+
+Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`).
+NeoForge constructs a `@Mod(dist = Dist.CLIENT)` class only on a client, and the probe's
+`discover_entrypoints_on("neoforge", "SERVER")` always skipped it; the game used the side-agnostic
+discovery and ran it.
+
+| jar | before | after |
+|---|---|---|
+| `fzzy_config` | refused: `me.fzzyhmstrs.fzzy_config.FzzyConfigNeoForgeClient: Metadata("malformed java/lang/Boolean marker ...")` | **ran-clean**, 0 unknown host calls |
+
+The fixture in `entrypoint_role.rs` pins the annotation shape javap shows
+(`dist = [Lnet/neoforged/api/distmarker/Dist;.CLIENT]`) and asserts the SERVER discovery drops it
+while the CLIENT discovery keeps it.
+
 ## Follow-up: player identity reads
 
 Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`).

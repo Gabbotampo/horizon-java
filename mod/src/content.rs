@@ -21,11 +21,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
 
 use crate::runtime;
-use crate::{JARS, LOG, State, load_jar};
+use crate::{JARS, JarRow, LOG, State, jar_id, load_jar};
 
 /// This mod's manifest id (`mod/horizon-mod.toml`): the package whose namespaces the game's
 /// declaration fence checks.
@@ -51,8 +52,54 @@ impl State {
             return;
         }
         self.loaded = true;
+        // Parse every jar before running any: a declared dependency is a sibling
+        // jar's metadata, so the graph is only knowable once the whole folder
+        // has been read.
+        let mut parsed: Vec<(String, Arc<runtime::NativeJar>)> = Vec::new();
         for (file, bytes) in read() {
-            match load_jar(file, &bytes) {
+            match runtime::NativeJar::from_bytes(&bytes) {
+                Ok(jar) => parsed.push((file, Arc::new(jar))),
+                Err(error) => {
+                    let id = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
+                    let row = JarRow::refused(
+                        &file,
+                        id,
+                        format!("not a readable jar: {error}"),
+                    );
+                    log::info!("{LOG}: {row}");
+                    self.refused.push(row);
+                }
+            }
+        }
+        let refs: Vec<(&str, &runtime::NativeJar)> = parsed
+            .iter()
+            .map(|(file, jar)| (file.as_str(), jar.as_ref()))
+            .collect();
+        let plan = runtime::dependencies::plan(&refs);
+        for &index in &plan.order {
+            let (file, jar) = parsed[index].clone();
+            if let Some(missing) = plan.missing.get(&index) {
+                let row = JarRow::refused(
+                    &file,
+                    jar_id(&jar, &file),
+                    format!(
+                        "requires {} (not in {JARS})",
+                        missing.join(", ")
+                    ),
+                );
+                log::info!("{LOG}: {row}");
+                self.refused.push(row);
+                continue;
+            }
+            let links: Vec<_> = plan
+                .links_for(index)
+                .iter()
+                .map(|&dependency| {
+                    let (file, jar) = &parsed[dependency];
+                    (file.clone(), Arc::clone(jar))
+                })
+                .collect();
+            match load_jar(file, jar, &links) {
                 Ok(loaded) => {
                     log::info!("{LOG}: {}", loaded.row);
                     self.jars.push(loaded);

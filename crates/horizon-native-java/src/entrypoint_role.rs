@@ -55,12 +55,15 @@ impl NativeJar {
     ///
     /// Fabric runs both stages, not the first one that declares anything: a
     /// server jar with `main` and `server` entrypoints runs `main` first and
-    /// `server` after it.
+    /// `server` after it. Discovery uses the role's physical side, so a
+    /// NeoForge `@Mod(dist = Dist.CLIENT)` class (fzzy_config's shape) never
+    /// reaches the server: FML constructs it only on a client.
     pub fn role_entrypoints(&self, client: bool) -> Vec<(&'static str, Entrypoint)> {
+        let side = if client { "CLIENT" } else { "SERVER" };
         self.role_entrypoint_kinds(client)
             .iter()
             .flat_map(|kind| {
-                self.discover_entrypoints(kind)
+                self.discover_entrypoints_on(kind, side)
                     .into_iter()
                     .map(move |entry| (*kind, entry))
             })
@@ -231,6 +234,8 @@ version = "1"
         let client = jar.discover_entrypoints_on("neoforge", "CLIENT");
         assert_eq!(client.len(), 1);
         assert_eq!(client[0].class, "demo.NeoClient");
+        assert!(jar.role_entrypoints(false).is_empty());
+        assert_eq!(jar.role_entrypoints(true)[0].1.class, "demo.NeoClient");
     }
 
     #[test]
