@@ -54,12 +54,22 @@ A native mod cannot have a path dependency, so `crates/horizon-native-java/src` 
 `mod/src/runtime/`:
 
 ```sh
-python3 tools/vendor.py            # write mod/src/runtime and mod/vendor.lock
-python3 tools/vendor.py --check    # fail on any drift (tests/test_vendor_mod.py runs this)
+python3 tools/vendor.py             # write mod/src/runtime and mod/vendor.lock
+python3 tools/vendor.py --check-lock  # the copy is what mod/vendor.lock says (no hand edits)
+python3 tools/vendor.py --check       # ...and it matches the runtime source as it is now
 ```
 
-- **Vendored files are committed.** A clean clone builds the mod with no generation step; `--check`
-  keeps the copy honest, and the test proves a one-byte edit fails it.
+- **The mod carries the runtime commit `mod/vendor.lock` records**, not whatever the runtime says on
+  every later commit. The two checks say which is which, so a runtime PR is not taxed:
+  - `--check-lock` always applies (the Python tests run it, and so CI): it fails on a hand edit to
+    `mod/src/runtime/`, never because the runtime crate changed.
+  - `--check` is required of a PR that changes `mod/**` or `tools/vendor.py`; CI runs it only for
+    those (`.github/workflows/ci.yml` diffs the PR's changed files against its base) and on `main`
+    as a non-blocking warning. **Refresh in a mod PR, and before a mod release, by re-running
+    `python3 tools/vendor.py`.**
+- **Vendored files are committed.** A clean clone builds the mod with no generation step, and
+  `tests/test_vendor_mod.py` proves a one-byte edit fails `--check-lock` while a runtime-only change
+  fails only `--check`.
 - `lib.rs` becomes `runtime/mod.rs` and every `crate::` path becomes `crate::runtime::`, because the
   runtime is no longer a crate root but a module of the mod's crate.
 - `main.rs` (the command-line probe) is not vendored.
@@ -182,9 +192,9 @@ Horizon Java: client_only_demo.jar (client_only_demo) refused (0 host calls, 0 u
   `Compiled native mods cannot be loaded: horizon_java 0.1.0: ...: No such file or directory`.
   The launcher writes that folder, so a hand build has to copy it.
 - **`capabilities` cannot be empty.** `Manifest::parse` requires exactly `["registries"]` for every
-  mod today, so `mod/horizon-mod.toml` declares it although M0/M1 register nothing. A purely
-  behavioural mod with no registries has no manifest spelling yet; that is a candidate mod-API
-  issue.
+  mod today, so `mod/horizon-mod.toml` declares it although M0/M1 register nothing (the manifest
+  comment says so). A purely behavioural mod with no registries has no spelling yet: a **candidate
+  issue for the fork**, not something this repository can fix.
 
 ## Next milestones
 

@@ -107,8 +107,10 @@ What it does today:
 
 A native mod is one flat crate, so the runtime is copied into `mod/src/runtime/` by
 `tools/vendor.py` (which rewrites `crate::` to `crate::runtime::` and records a SHA-256 per file in
-`mod/vendor.lock`). The copy is committed, so a clean clone builds; `python3 tools/vendor.py --check`
-fails on any drift, and `tests/test_vendor_mod.py` proves a one-byte edit is caught.
+`mod/vendor.lock`). The copy is committed, so a clean clone builds, and it carries the runtime commit
+the lock records: `python3 tools/vendor.py --check-lock` always fails on a hand edit to it, while
+`--check` (the mod is current with the runtime source) is required of a PR that touches `mod/` and is
+run by CI only for those. A mod PR refreshes the copy with `python3 tools/vendor.py`.
 
 ```sh
 python3 tools/vendor.py             # after changing crates/horizon-native-java

@@ -6,8 +6,10 @@ authors = []
 # The content API line this mod does not use; every manifest names it.
 api = "0.2"
 side = "both"
-# The one capability the manifest format declares today (the game requires exactly this list).
-# M0/M1 register nothing yet; games bindings and registries are later milestones.
+# M0/M1 register nothing, but the game's manifest parser requires exactly this list today: an
+# empty `capabilities` is rejected with "a content mod has capabilities = [\"registries\"]"
+# (horizon-mod-package `Manifest::parse`), so a purely behavioural mod has no spelling yet.
+# Candidate issue for the fork; game bindings and registries are later milestones here.
 capabilities = ["registries"]
 
 [native]
