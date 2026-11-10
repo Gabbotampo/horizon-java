@@ -91,6 +91,12 @@ Named here, not just in comments:
   no counterpart (`BreakBlockEvent` is before the block goes). `break_block` fires before the block
   is destroyed, so there is no moment to fire the Fabric listener from. Add a listen-only hook
   after the block and its drops are gone.
+- **The hand on `entity_interact` (#2797).** The hook's contract says `self.hand` and it fires once
+  per hand, but the game's `native_entity_interact(entity, kind, stack, claimed)` in
+  `crates/horizon-client/src/game/native_hooks/base.rs` never takes a hand, so the event cannot
+  carry one. The mod names the hand from its stack when exactly one hand holds it, and leaves it
+  unknown (a counted unknown read) when both hands agree, two empty hands included. Filed as
+  `arismoko/horizon#2797`; the fix is to pass `hand: Hand` through that call and its event.
 - **A player's level (#2747).** `PlayerRef` names a player's identity, permission and messages, and
   `host.players().acting_player()` names the player a block or entity hook is about, but no read
   gives the level that player stands in. So `CommandSourceStack.getLevel()` and the `Level`
@@ -124,6 +130,11 @@ The API also moved between the two commits, and the mod follows it: `NativeComma
 `NativeAuthority` and `NativeInteractionResult` are `Command`, `Authority` and `InteractionResult`;
 `BreakBlockEvent.state` is a `BlockState`; a level tick's `LevelRef` names its dimension; and
 `Text::translate` takes the argument list by value.
+
+**Next pin bump.** Fork main has since moved the mod API sources into a new `horizon-mod-vocab`
+crate (`a5ca9a72fd`, after `1376e3bcb6`). This pin does not follow that move; the next bump rewrites
+the mod's `mod_api` imports against the new crate first, so the source move and the behaviour
+changes of that bump land in separate reviewable steps.
 
 The game version is pinned beside it as `game = "26.3"`, and `mixins` at the fork's
 `MIXINS_REV` (`5a64af938ec86b00d53d16a408aabc0038fb3e57`) because the manifest requires all three.

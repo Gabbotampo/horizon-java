@@ -670,7 +670,7 @@ impl Hooks for HorizonJava {
             player: Some(click.player),
             pos: Some(click.pos),
             face: Some(click.hit.face),
-            off_hand: click.hand == Hand::Off,
+            off_hand: Some(click.hand == Hand::Off),
             ..EventContext::default()
         };
         let fired = self.fire_event(GameEvent::UseBlock, self.dedicated(), context, |_| true);
@@ -693,7 +693,7 @@ impl Hooks for HorizonJava {
             level: Some(dimension_id(click.dimension).to_owned()),
             player: Some(click.player),
             pos: Some(click.pos),
-            off_hand: click.hand == Hand::Off,
+            off_hand: Some(click.hand == Hand::Off),
             ..EventContext::default()
         };
         let fired = self.fire_event(GameEvent::UseItem, self.dedicated(), context, |_| true);
@@ -742,7 +742,7 @@ impl Hooks for HorizonJava {
             // The hook fires once per hand with that hand's stack (Fabric's `UseEntityCallback`
             // carries the `InteractionHand`); the pin's event names the stack, not the hand, so
             // which of the acting player's hands holds it is what tells them apart.
-            off_hand: matches!(self.acting_hand(host, event.stack), Some(Hand::Off)),
+            off_hand: self.acting_hand(host, event.stack).map(|hand| hand == Hand::Off),
             entity: Some(FacadeEntity {
                 id: event.entity,
                 kind: event.kind.to_owned(),
@@ -871,23 +871,15 @@ impl Hooks for HorizonJava {
 
 impl HorizonJava {
     /// Which hand the acting player used: the event's `stack` is the held stack of that hand, so
-    /// it matches exactly one of the player's two hands. When both hold the same stack (both
-    /// empty counts) vanilla tries the main hand first, which is what `None` means to the caller.
+    /// it matches exactly one of the player's two hands. `None` when it matches both or neither —
+    /// two identical stacks, the common both-empty case included — because the hook does not carry
+    /// the hand (`arismoko/horizon#2797`) and a guess here would be a confident wrong answer.
     fn acting_hand(&self, host: &dyn ServerHost, stack: Option<&ItemStack>) -> Option<Hand> {
         let player = host.players().acting_player()?;
         let living = host.living(player.entity())?;
         let main = living.hand_item(host, Hand::Main);
         let off = living.hand_item(host, Hand::Off);
-        let holds = |hand: &Option<ItemStack>| match (stack, hand.as_ref()) {
-            (Some(held), Some(hand)) => held == hand,
-            (Some(_), None) => false,
-            (None, hand) => hand.is_none(),
-        };
-        match (holds(&main), holds(&off)) {
-            (true, false) => Some(Hand::Main),
-            (false, true) => Some(Hand::Off),
-            _ => None,
-        }
+        one_hand(stack, main.as_ref(), off.as_ref())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -993,9 +985,24 @@ impl HorizonJava {
             pos: Some(pos),
             block,
             face,
-            off_hand: off_hand.unwrap_or(false),
+            off_hand,
             ..EventContext::default()
         }
+    }
+}
+
+/// The hand `held` names among the two, or `None` when it names both or neither: the hook's
+/// stack is the acting hand's, so exactly one hand holding it is the only conclusive answer.
+fn one_hand<T: PartialEq>(held: Option<&T>, main: Option<&T>, off: Option<&T>) -> Option<Hand> {
+    let holds = |hand: Option<&T>| match (held, hand) {
+        (Some(held), Some(hand)) => held == hand,
+        (Some(_), None) => false,
+        (None, hand) => hand.is_none(),
+    };
+    match (holds(main), holds(off)) {
+        (true, false) => Some(Hand::Main),
+        (false, true) => Some(Hand::Off),
+        _ => None,
     }
 }
 
@@ -1546,4 +1553,29 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
     bytes.push(b'\n');
     host.config_files().write(&path, &bytes)?;
     Ok(format!("config/{REPORT}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
+    /// (two empty hands included), so the hand is unknown rather than guessed.
+    #[test]
+    fn the_acting_hand_is_named_only_when_one_hand_holds_the_stack() {
+        assert_eq!(
+            one_hand(Some(&"stick"), Some(&"stick"), Some(&"paper")),
+            Some(Hand::Main)
+        );
+        assert_eq!(
+            one_hand(Some(&"paper"), Some(&"stick"), Some(&"paper")),
+            Some(Hand::Off)
+        );
+        assert_eq!(one_hand::<&str>(None, Some(&"stick"), None), Some(Hand::Off));
+        assert_eq!(one_hand::<&str>(None, None, None), None);
+        assert_eq!(
+            one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
+            None
+        );
+    }
 }

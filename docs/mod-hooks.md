@@ -90,13 +90,13 @@ but no level, so a listener that ignores its `Level` still cancels the break.
 
 - **`break_block` does not carry `exp_to_drop`.** The runtime's `BlockBreakBefore` has no
   experience model; the hook's `exp_to_drop` is left `None`, so vanilla samples experience.
-- **`entity_interact`'s hand is read from the held stack.** `entity_interact` fires once per hand
-  and names the stack in that hand (`self.hand` in its contract), but the pin's event carries the
-  stack and not the hand. The mod compares the stack with the acting player's two hands
-  (`LivingRef::hand_item`): a stack only one hand holds names that hand. When both hands hold the
-  same stack — both empty counts — the Java callback gets the main hand, vanilla's first attempt.
-  This is a read, not a guess, but an off-hand click with two identical stacks is indistinguishable
-  from a main-hand one to this hook.
+- **`entity_interact`'s hand is unknown when the two hands agree.** The hook fires once per hand
+  and its contract says `self.hand`, but the pin's event carries the stack and not the hand
+  (`arismoko/horizon#2797`). The mod compares the stack with the acting player's two hands
+  (`LivingRef::hand_item`): a stack exactly one hand holds names that hand. When both hands hold
+  the same stack — two empty hands included — the hand is not inferred and not guessed: the Java
+  callback's `InteractionHand` argument is an unknown marker whose reads are counted in that jar's
+  `callbacks.unknown_host_call_count`, and the listener keeps running.
 - **A player who joins has a name and UUID, not a level or entity id.** The join hook gives those
   two facts; `getId()` and `level()` refuse (and are counted) until the fork reads them.
 - **The tick events log only when something went wrong.** Twenty firings a second would drown the
@@ -138,8 +138,15 @@ Horizon Java: m2d_fixture: m2d: after death id=254
 Horizon Java: living_after_death (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
 ```
 
-Both clicks are vanilla's two attempts (`MAIN_HAND` with the held stack, then `OFF_HAND` with the
-empty one), and the stack reads tell them apart.
+The clicks are vanilla's two hand attempts (a held stone in the main hand, the empty off hand), and
+the stack reads tell them apart. With two empty hands the fixture logs neither name and instead
+shows the read counted:
+
+```
+Horizon Java: m2d_fixture: m2d: interact hand=? id=254
+Horizon Java: use_entity (dedicated=false): 1 callback(s) ran, 0 failed, 2 unknown host call(s)
+```
+
 
 ## Fork seams
 

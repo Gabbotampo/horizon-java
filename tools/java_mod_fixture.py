@@ -470,7 +470,6 @@ package m2dfixture;
 
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.player.UseEntityCallback;
-import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 
 public final class Events {
@@ -478,10 +477,10 @@ public final class Events {
         // Fabric's AFTER_DEATH: the mob's id after its loot and death message.
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) ->
             System.out.println("m2d: after death id=" + entity.getId()));
-        // The hand the click carried; compare the enum, which is all a listener needs.
+        // Read the hand: a named hand answers its name; an unknown one is counted by the
+        // runtime and the listener still runs (the name reads as null).
         UseEntityCallback.EVENT.register((player, world, hand, entity, hit) -> {
-            System.out.println("m2d: interact hand="
-                + (hand == InteractionHand.MAIN_HAND ? "MAIN_HAND" : "OFF_HAND")
+            System.out.println("m2d: interact hand=" + hand.name()
                 + " id=" + entity.getId());
             return InteractionResult.PASS;
         });
