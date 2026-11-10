@@ -1454,7 +1454,7 @@ fn load_jar(
     let id = jar_id(&jar, &file);
     let Some(kind) = SERVER_KINDS
         .into_iter()
-        .find(|kind| !jar.discover_entrypoints(kind).is_empty())
+        .find(|kind| !jar.discover_entrypoints_on(kind, "SERVER").is_empty())
     else {
         let reason = if jar.discover_entrypoints("client").is_empty() {
             "no main, server or neoforge entrypoint"
@@ -1463,7 +1463,7 @@ fn load_jar(
         };
         return Err(JarRow::refused(&file, id, reason.to_owned()));
     };
-    let entrypoints = jar.discover_entrypoints(kind);
+    let entrypoints = jar.discover_entrypoints_on(kind, "SERVER");
     if let Some(entry) = entrypoints.iter().find(|entry| entry.adapter.is_some()) {
         return Err(JarRow::refused(
             &file,

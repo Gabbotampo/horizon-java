@@ -327,6 +327,21 @@ Jars now run dependencies before dependents (`cupboard` before `structureessenti
 Host-provided ids (`minecraft`, `java`, `fabricloader`, `fabric-api`, `neoforge`, `forge`) are not
 required to be jars.
 
+## Follow-up: client `@Mod` classes on a server
+
+Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`).
+NeoForge constructs a `@Mod(dist = Dist.CLIENT)` class only on a client, and the probe's
+`discover_entrypoints_on("neoforge", "SERVER")` always skipped it; the game used the side-agnostic
+discovery and ran it.
+
+| jar | before | after |
+|---|---|---|
+| `fzzy_config` | refused: `me.fzzyhmstrs.fzzy_config.FzzyConfigNeoForgeClient: Metadata("malformed java/lang/Boolean marker ...")` | **ran-clean**, 0 unknown host calls |
+
+The fixture in `entrypoint_role.rs` pins the annotation shape javap shows
+(`dist = [Lnet/neoforged/api/distmarker/Dist;.CLIENT]`) and asserts the SERVER discovery drops it
+while the CLIENT discovery keeps it.
+
 ## Follow-up: player identity reads
 
 Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`).
