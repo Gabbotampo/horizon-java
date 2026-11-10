@@ -2016,6 +2016,15 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             .map_or_else(|| missing("player"), player_marker)
     };
     let subject = || context_subject(context).unwrap_or_else(|| missing("entity"));
+    // The entity a click or an attack is aimed at: `subject()` is the player when the firing
+    // names one, which is the acting player, not the target.
+    let target = || {
+        context
+            .entity
+            .as_ref()
+            .map(|entity| marker(format!("game/entity/{}", entity.id)))
+            .unwrap_or_else(|| missing("entity"))
+    };
     let damage = || {
         marker(format!(
             "game/damage/{}",
@@ -2115,7 +2124,7 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             level(),
         ],
         Shape::UseItem => vec![player(), level(), hand()],
-        Shape::AttackEntity => vec![player(), level(), hand(), subject(), opaque("entity-hit")],
+        Shape::AttackEntity => vec![player(), level(), hand(), target(), opaque("entity-hit")],
         Shape::Commands => {
             let selection = if firing.facade.dedicated {
                 "DEDICATED"
@@ -2582,5 +2591,33 @@ mod tests {
             matches!(refused, Some(Err(NativeError::UnknownHostCall(_)))),
             "{refused:?}"
         );
+    }
+
+    /// A click's or an attack's entity argument is the target, not the acting player: vanilla's
+    /// `Entity` parameter is what the callback calls `getId`/`level` on.
+    #[test]
+    fn attack_entity_arguments_name_the_target_entity() {
+        let alex = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let firing = EventFiring::new(
+            GameEvent::UseEntity,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(alex),
+                entity: Some(FacadeEntity {
+                    id: 42,
+                    kind: "minecraft:cow".into(),
+                    level: None,
+                }),
+                off_hand: true,
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AttackEntity, &firing).unwrap();
+        assert_eq!(args[0], player_marker(alex));
+        assert_eq!(
+            args[2],
+            marker("enum/net/minecraft/world/InteractionHand/OFF_HAND".into())
+        );
+        assert_eq!(args[3], marker("game/entity/42".into()));
     }
 }
