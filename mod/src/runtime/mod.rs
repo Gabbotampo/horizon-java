@@ -3932,6 +3932,16 @@ impl Host for StdHost {
                 }
                 .into(),
             ))),
+            // The standard streams. They are real `PrintStream`s over the
+            // process's stdout/stderr; the bounded host has no console, so the
+            // text lands in the same in-memory sink a modelled writer uses.
+            // A mod's `println` then runs instead of dereferencing a null.
+            ("java/lang/System", "out", "Ljava/io/PrintStream;") => {
+                Ok(Value::Ref(Some("system-out".into())))
+            }
+            ("java/lang/System", "err", "Ljava/io/PrintStream;") => {
+                Ok(Value::Ref(Some("system-err".into())))
+            }
             // `Long.MAX_VALUE`/`MIN_VALUE` are the long bounds a mod compares
             // timers and ids against; a neutral `0` would silently truncate
             // every comparison to "less than max".
@@ -8380,6 +8390,7 @@ impl Host for StdHost {
             }
             (
                 "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/neoforged/neoforge/registries/DeferredRegister$DataComponents"
                 | "net/minecraftforge/registries/DeferredRegister",
                 "register",
                 descriptor,
@@ -8562,7 +8573,8 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(format!("optional/resource-key/{key}"))))
             }
             (
-                "net/neoforged/neoforge/registries/DeferredRegister",
+                "net/neoforged/neoforge/registries/DeferredRegister"
+                | "net/neoforged/neoforge/registries/DeferredRegister$DataComponents",
                 "register",
                 "(Lnet/neoforged/bus/api/IEventBus;)V",
             ) => Ok(Value::Void),
@@ -9955,6 +9967,15 @@ fn value_text(value: &Value) -> String {
                 return value.to_owned();
             }
             if let Some(value) = value.strip_prefix("boolean:") {
+                return value.to_owned();
+            }
+            // A marker whose Java `toString` is its payload: string
+            // concatenation goes through `String.valueOf`, not the modelled
+            // instance method.
+            if let Some(value) = value.strip_prefix("regex-pattern/") {
+                return value.to_owned();
+            }
+            if let Some(value) = value.strip_prefix("watch-kind/") {
                 return value.to_owned();
             }
             value.clone()
@@ -20849,6 +20870,12 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(path) = self.io_paths.get(marker) {
             return Some(format!("file:{path}"));
         }
+        // The standard streams exist before any writer is opened: a writer
+        // block only runs for a marker that already has a sink, and nothing
+        // constructs `System.out`.
+        if marker == "system-out" || marker == "system-err" {
+            return Some(format!("mem:{marker}"));
+        }
         let key = format!("mem:{marker}");
         self.io_writers.contains_key(&key).then_some(key)
     }
@@ -21274,7 +21301,8 @@ impl<H: Host> Runtime<'_, H> {
             | "java/io/FileWriter"
             | "java/io/OutputStreamWriter"
             | "java/io/StringWriter"
-            | "java/io/PrintWriter" => {
+            | "java/io/PrintWriter"
+            | "java/io/PrintStream" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };

@@ -8,7 +8,7 @@
 //! seeded. A question outside that set is left to the rest of the dispatch
 //! chain, which still reports and refuses it.
 
-use crate::runtime::{MethodRef, StdHost, Value, is_always_loaded_mod};
+use crate::runtime::{MethodRef, StdHost, Value, expect_ref, expect_string, is_always_loaded_mod};
 
 /// `FMLEnvironment.dist` and `FMLEnvironment.getDist` answer one of these.
 const CLIENT: &str = "dist/CLIENT";
@@ -77,12 +77,65 @@ impl StdHost {
             ) => {
                 fml_path_root(name).map(|path| Value::Ref(Some(format!("fml-path/{name}/{path}"))))
             }
+            // The loader's one game bus. `IEventBus.addListener`/`register`
+            // are already modelled over the marker, so a mod that subscribes
+            // here reaches the same recorded listeners as one that takes its
+            // bus from `getModEventBus()`.
+            (
+                "net/neoforged/neoforge/common/NeoForge",
+                "EVENT_BUS",
+                "Lnet/neoforged/bus/api/IEventBus;",
+            ) => Some(Value::Ref(Some("net/neoforged/bus/api/IEventBus".into()))),
+            (
+                "net/minecraftforge/common/MinecraftForge",
+                "EVENT_BUS",
+                "Lnet/minecraftforge/eventbus/api/IEventBus;",
+            ) => Some(Value::Ref(Some(
+                "net/minecraftforge/eventbus/api/IEventBus".into(),
+            ))),
+            // `ModConfig.Type` is a six-constant enum the loader itself
+            // defines. A config registration passes it straight back to the
+            // loader, and a `getType() ==` comparison uses reference equality,
+            // so one stable marker per constant is the whole value.
+            (
+                "net/neoforged/fml/config/ModConfig$Type",
+                name @ ("CLIENT" | "SERVER" | "COMMON" | "STARTUP" | "LOCAL" | "SYNCED"),
+                "Lnet/neoforged/fml/config/ModConfig$Type;",
+            ) => Some(Value::Ref(Some(format!("fml-config-type/{name}")))),
+            // The loader's config tracker. It holds no config here: no
+            // `registerConfig` reached a load, so its three maps are empty
+            // rather than null (a null map is an NPE in the port's getters).
+            (
+                "net/neoforged/fml/config/ConfigTracker",
+                "INSTANCE",
+                "Lnet/neoforged/fml/config/ConfigTracker;",
+            ) => Some(Value::Ref(Some("fml-config-tracker".into()))),
+            (
+                "net/neoforged/fml/config/ConfigTracker",
+                "configsByMod" | "fileMap",
+                "Ljava/util/concurrent/ConcurrentHashMap;"
+                | "Ljava/util/Map;"
+                | "Ljava/util/concurrent/ConcurrentMap;",
+            ) => Some(Value::Ref(Some("map".into()))),
+            (
+                "net/neoforged/fml/config/ConfigTracker",
+                "configSets",
+                "Ljava/util/EnumMap;" | "Ljava/util/Map;" | "Ljava/util/Set;",
+            ) => Some(Value::Ref(Some("set".into()))),
+            // NeoForge's own registries. The attachment registry is a real
+            // registry the loader creates, and its id is the one the mod's
+            // rows use.
+            (
+                "net/neoforged/neoforge/registries/NeoForgeRegistries",
+                "ATTACHMENT_TYPES",
+                "Lnet/minecraft/core/Registry;",
+            ) => Some(Value::Ref(Some("registry/neoforge:attachment_type".into()))),
             _ => None,
         }
     }
 
     /// The loader's static methods: a call with no receiver in the jar.
-    pub(super) fn neoforge_loader_call(&mut self, r: &MethodRef, _args: &[Value]) -> Option<Value> {
+    pub(super) fn neoforge_loader_call(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
         let server = self.environment_type == "SERVER";
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             (
@@ -95,6 +148,26 @@ impl StdHost {
             }
             ("net/neoforged/fml/ModList", "get", "()Lnet/neoforged/fml/ModList;") => {
                 Some(Value::Ref(Some("neoforge-mod-list".into())))
+            }
+            // `FMLLoader.getCurrent()` is the loader instance the mod asks for
+            // its own file record; the mod list hangs off it.
+            (
+                "net/neoforged/fml/loading/FMLLoader",
+                "getCurrent",
+                "()Lnet/neoforged/fml/loading/FMLLoader;",
+            ) => Some(Value::Ref(Some("fml-loader".into()))),
+            (
+                "net/neoforged/neoforge/registries/DeferredRegister",
+                "createDataComponents",
+                "(Lnet/minecraft/resources/ResourceKey;Ljava/lang/String;)Lnet/neoforged/neoforge/registries/DeferredRegister$DataComponents;",
+            ) => {
+                let namespace = args
+                    .get(1)
+                    .and_then(expect_ref)
+                    .map_or("default", String::as_str);
+                Some(Value::Ref(Some(format!(
+                    "deferred-register/data-component-type/{namespace}"
+                ))))
             }
             // The real game reports the running client's own version; the
             // host answers the version it was seeded with, and nothing when
@@ -120,7 +193,7 @@ impl StdHost {
         &mut self,
         r: &MethodRef,
         receiver: &Value,
-        _args: &[Value],
+        args: &[Value],
     ) -> Option<Value> {
         let marker = match receiver {
             Value::Ref(Some(marker)) => marker.as_str(),
@@ -181,6 +254,56 @@ impl StdHost {
             ("net/minecraft/WorldVersion", "name" | "getName", "()Ljava/lang/String;") => {
                 Some(Value::Ref(Some(world_version(marker)?.to_owned())))
             }
+            (
+                "net/neoforged/fml/loading/FMLLoader",
+                "getLoadingModList",
+                "()Lnet/neoforged/fml/loading/LoadingModList;",
+            ) => Some(Value::Ref(Some("fml-loading-mod-list".into()))),
+            (
+                "net/neoforged/fml/loading/FMLLoader",
+                "getDist",
+                "()Lnet/neoforged/api/distmarker/Dist;",
+            ) => Some(dist_value(self.environment_type == "SERVER")),
+            // A mod asks the loader for its own file record to read back the
+            // version it was discovered with. An id the loader does not hold
+            // answers null, exactly as FML's `getModFileById` does.
+            (
+                "net/neoforged/fml/loading/LoadingModList",
+                "getModFileById",
+                "(Ljava/lang/String;)Lnet/neoforged/fml/loading/moddiscovery/ModFileInfo;",
+            ) => {
+                let id = args.first().map(expect_string).unwrap_or_default();
+                Some(match self.neoforge_mod_version(id) {
+                    Some(_) => Value::Ref(Some(format!("mod-file-info/{id}"))),
+                    None => Value::Ref(None),
+                })
+            }
+            (
+                "net/neoforged/fml/loading/moddiscovery/ModFileInfo",
+                "versionString",
+                "()Ljava/lang/String;",
+            ) => {
+                let id = marker.strip_prefix("mod-file-info/")?;
+                Some(Value::Ref(Some(
+                    self.neoforge_mod_version(id)
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                )))
+            }
+            // A config registration hands the loader a spec to load from the
+            // config directory. The bounded host has no loader-managed config
+            // file, so the call is accepted and the spec's own values keep
+            // answering their defaults; the tracker stays empty.
+            (
+                "net/neoforged/fml/ModContainer",
+                "registerConfig",
+                "(Lnet/neoforged/fml/config/ModConfig$Type;Lnet/neoforged/fml/config/IConfigSpec;)V",
+            )
+            | (
+                "net/neoforged/fml/ModContainer",
+                "registerExtensionPoint",
+                "(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V",
+            ) => Some(Value::Void),
             _ => None,
         }
     }
