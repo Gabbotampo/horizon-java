@@ -1,0 +1,22 @@
+id = "horizon_java"
+name = "Horizon Java"
+version = "0.1.0"
+description = "Runs Fabric and NeoForge Java mod jars on Horizon's native, JVM-free bytecode runtime."
+authors = []
+# The content API line this mod does not use; every manifest names it.
+api = "0.2"
+side = "both"
+# M0/M1 register nothing, but the game's manifest parser requires exactly this list today: an
+# empty `capabilities` is rejected with "a content mod has capabilities = [\"registries\"]"
+# (horizon-mod-package `Manifest::parse`), so a purely behavioural mod has no spelling yet.
+# Candidate issue for the fork; game bindings and registries are later milestones here.
+capabilities = ["registries"]
+
+[native]
+# The game and the exact Horizon source revision this mod is built against
+# (docs/modding/src/how-to/native-mods/005-native-mod-source-revisions.md).
+# The launcher rebuilds the game at this commit; `mod/vendor.lock` records the
+# horizon-java commit its runtime was copied from.
+game = "26.3"
+horizon = "c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac"
+mixins = "5a64af938ec86b00d53d16a408aabc0038fb3e57"
