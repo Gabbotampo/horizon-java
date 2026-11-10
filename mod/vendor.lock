@@ -66,9 +66,9 @@
       "source_sha256": "9ac1ffd02a0b043f6034a2386af6a8fbb2c9be4e5f6f586a78e0ad94c694cb66"
     },
     "entrypoint_role.rs": {
-      "sha256": "802cea1fc69bba7fb02672f4cbfee83af3c146f16888d1e67aad6b2a6a017941",
+      "sha256": "fe4a87abfb1668608f17615e4bc9c4eab292a6a83e7c6068d0ac641515f745a8",
       "source": "crates/horizon-native-java/src/entrypoint_role.rs",
-      "source_sha256": "7ee4a0b54e8efaec02e35a0d8e1a63988bf7d67f27edd7ede41209e35e3e5acd"
+      "source_sha256": "4822687cf5027d391d5d110dec2ae3c99e5b2416aaeafd0ee7b5fe9f9518b53b"
     },
     "events.rs": {
       "sha256": "d20f9ad62adaf60687660552382eca3c53ca1de0dfff3673d861fd156cbe1bc5",
