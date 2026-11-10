@@ -71,17 +71,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mod_api::{
-    BlocksEvent, ClientHost, ClientSetupEvent, CommandArgumentValue, CommandSource,
-    ConfigFileError, ConfigPath, Flow, Hooks, Host, ItemsEvent, NativeCommand,
-    RegisterCommandsEvent, RegistrationContext, RunModCommandEvent, ServerAboutToStartEvent,
-    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
-    Text,
+    AttackEntityEvent, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
+    CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, EntityInteractEvent,
+    EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host, HostSide, ItemsEvent,
+    LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelTickPostEvent,
+    LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent,
+    LivingIncomingDamageEvent, NativeAuthority, NativeCommand, NativeInteractionResult,
+    PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
+    PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
+    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
+    ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
     CommandSource as RuntimeSource, CommandText, MessageKind, NodeKind, Requirement,
 };
-use runtime::events::{EventContext, EventFacade, EventFiring, GameEvent, GameListener};
+use runtime::events::{
+    EventContext, EventFacade, EventFiring, FacadeEntity, FacadePlayer, GameEvent, GameListener,
+};
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
 
@@ -105,7 +113,7 @@ const SERVER_KINDS: [&str; 3] = ["main", "server", "neoforge"];
 
 /// The mod's state. The content hooks run the jars once per process, before any server exists;
 /// every later hook reuses what they recorded, and a second server this process hosts only resets
-/// the per-server counters.
+/// the per-server state.
 #[derive(Default)]
 pub struct HorizonJava {
     state: Mutex<State>,
@@ -120,6 +128,23 @@ struct State {
     /// Whether the jars have been read and run this process. The content hooks run once, before
     /// the server exists; the server hooks reuse what they recorded.
     loaded: bool,
+    /// Players whose join this mod heard, as much of them as the hook gave:
+    /// a Java player marker answers its name and UUID, and refuses the level
+    /// and entity id it does not know.
+    players: Vec<FacadePlayer>,
+    /// `MinecraftServer.getTickCount()` as the last server tick reported it.
+    tick_count: i32,
+    /// Whether the open server is a dedicated one, from `server_about_to_start`.
+    dedicated: bool,
+}
+
+/// What one game event's listeners decided, for the hook that fired it.
+#[derive(Default)]
+struct Fired {
+    /// A listener cancelled the vanilla work.
+    cancelled: bool,
+    /// The first non-`PASS` `InteractionResult` a Fabric listener returned.
+    interaction: Option<String>,
 }
 
 /// One jar whose entrypoints ran: its runtime, the host that holds its heap and statics, and every
@@ -214,6 +239,9 @@ impl Hooks for HorizonJava {
         // gets milestone 1's rows, just without content.
         self.ensure_jars();
         let mut state = self.lock();
+        state.dedicated = event.dedicated;
+        state.players.clear();
+        state.tick_count = 0;
         state.reset_server();
         let count = |verdict: &str| {
             state
@@ -284,16 +312,27 @@ impl Hooks for HorizonJava {
     /// change at runtime, so the same set is offered again.
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         let mut state = self.lock();
+        let (dedicated, tick_count, players) =
+            (state.dedicated, state.tick_count, state.players.clone());
         for loaded in &mut state.jars {
             if !loaded.commands_registered {
                 loaded.commands_registered = true;
-                let (ran, failed) = fire_listeners(
+                let mut firing = EventFiring::new(
+                    GameEvent::RegisterCommands,
+                    Arc::new(EventFacade {
+                        dedicated,
+                        tick_count,
+                        players: players.clone(),
+                        ..EventFacade::default()
+                    }),
+                    EventContext::default(),
+                );
+                let (ran, failed) = run_listeners(
                     &loaded.jar,
                     &mut loaded.host,
                     &loaded.listeners,
-                    GameEvent::RegisterCommands,
-                    true,
-                    |_| true,
+                    &mut firing,
+                    &|_| true,
                 );
                 log::info!(
                     "{LOG}: {}: command registration: {ran} callback(s) ran, {failed} failed",
@@ -415,6 +454,392 @@ impl Hooks for HorizonJava {
         Flow::Continue
     }
 
+    /// The authoritative server tick's start and end (Fabric's `ServerTickEvents.START_SERVER_TICK`
+    /// and `END_SERVER_TICK`, NeoForge's `ServerTickEvent.Pre` and `.Post`).
+    fn server_tick(&self, _host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+        let game = match event.phase {
+            ServerTickPhase::ServerTickStart { .. } => GameEvent::ServerTickStart,
+            ServerTickPhase::ServerTickEnd { .. } => GameEvent::ServerTickEnd,
+            // A phase this build does not know: nothing to fire rather than a guess.
+            _ => return,
+        };
+        let tick_count = event.context.tick.get().min(i32::MAX as u64) as i32;
+        self.lock().tick_count = tick_count;
+        let dedicated = event.context.authority == NativeAuthority::DedicatedServer;
+        self.fire_event(game, dedicated, EventContext::default(), |_| true);
+    }
+
+    /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
+    /// `LevelTickEvent.Pre`).
+    fn level_tick_pre(&self, _host: &mut dyn ServerHost, event: &mut LevelTickPreEvent<'_>) {
+        let context = EventContext {
+            level: Some(event.dimension.to_owned()),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
+            true
+        });
+    }
+
+    /// A server level's tick ends (Fabric's `END_LEVEL_TICK`, NeoForge's
+    /// `LevelTickEvent.Post`).
+    fn level_tick_post(&self, _host: &mut dyn ServerHost, event: &mut LevelTickPostEvent<'_>) {
+        let context = EventContext {
+            level: Some(event.dimension.to_owned()),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::LevelTickEnd, self.dedicated(), context, |_| true);
+    }
+
+    /// A server level opened (Fabric's `ServerLevelEvents.LOAD`, NeoForge's `LevelEvent.Load`).
+    fn level_load(&self, _host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+        let context = EventContext {
+            level: Some(event.dimension.to_owned()),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::LevelLoad, self.dedicated(), context, |_| true);
+    }
+
+    /// A server level closed (Fabric's `ServerLevelEvents.UNLOAD`, NeoForge's
+    /// `LevelEvent.Unload`).
+    fn level_unload(&self, _host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
+        let context = EventContext {
+            level: Some(event.dimension.to_owned()),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::LevelUnload, self.dedicated(), context, |_| true);
+    }
+
+    /// A player joined (Fabric's `ServerPlayConnectionEvents.JOIN` and
+    /// `ServerPlayerEvents.JOIN`, NeoForge's `PlayerLoggedInEvent`).
+    fn player_logged_in(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
+        {
+            let mut state = self.lock();
+            state.players.retain(|player| player.uuid != event.player);
+            state.players.push(FacadePlayer {
+                uuid: event.player,
+                name: event.name.to_owned(),
+                level: None,
+                entity_id: None,
+            });
+        }
+        let context = EventContext {
+            player: Some(event.player),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::PlayerJoin, self.dedicated(), context, |_| true);
+    }
+
+    /// A player left (Fabric's `ServerPlayConnectionEvents.DISCONNECT` and
+    /// `ServerPlayerEvents.LEAVE`, NeoForge's `PlayerLoggedOutEvent`). The player is already off
+    /// the list when a listener hears it, as the hook says.
+    fn player_logged_out(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
+        self.lock()
+            .players
+            .retain(|player| player.uuid != event.player);
+        let context = EventContext {
+            player: Some(event.player),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::PlayerLeave, self.dedicated(), context, |_| true);
+    }
+
+    /// A player respawned (Fabric's `ServerPlayerEvents.AFTER_RESPAWN`, NeoForge's
+    /// `PlayerRespawnEvent`).
+    fn player_respawned(&self, _host: &mut dyn ServerHost, event: &mut PlayerRespawnedEvent<'_>) {
+        let context = EventContext {
+            player: Some(event.player),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::PlayerRespawn, self.dedicated(), context, |_| {
+            true
+        });
+    }
+
+    /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
+    /// `PlayerEvent.Clone`); `was_death` says a death caused it.
+    fn player_clone(&self, _host: &mut dyn ServerHost, event: &mut PlayerCloneEvent<'_>) {
+        let context = EventContext {
+            player: Some(event.player),
+            flag: event.was_death,
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::PlayerCopy, self.dedicated(), context, |_| true);
+    }
+
+    /// A player moved to another dimension (Fabric's `AFTER_PLAYER_CHANGE_LEVEL`, NeoForge's
+    /// `PlayerChangedDimensionEvent`).
+    fn player_changed_dimension(
+        &self,
+        _host: &mut dyn ServerHost,
+        event: &mut PlayerChangedDimensionEvent<'_>,
+    ) {
+        let context = EventContext {
+            player: Some(event.player),
+            origin: Some(event.from.to_owned()),
+            level: Some(event.to.to_owned()),
+            ..EventContext::default()
+        };
+        self.fire_event(
+            GameEvent::PlayerChangeLevel,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
+    }
+
+    /// A living entity took damage (Fabric's `ServerLivingEntityEvents.AFTER_DAMAGE`, NeoForge's
+    /// `LivingDamageEvent.Post`).
+    fn living_damage_post(
+        &self,
+        _level: &mut dyn LevelRandomHost,
+        event: &mut LivingDamagePostEvent<'_>,
+    ) {
+        let context = EventContext {
+            entity: Some(FacadeEntity {
+                id: event.entity,
+                kind: event.kind.to_owned(),
+                level: None,
+            }),
+            damage: Some(event.source.damage_type.to_owned()),
+            amount: event.container.health_damage(),
+            ..EventContext::default()
+        };
+        self.fire_event(
+            GameEvent::LivingAfterDamage,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
+    }
+
+    /// An entity left a server level (Fabric's `ServerEntityEvents.ENTITY_UNLOAD`, NeoForge's
+    /// `EntityLeaveLevelEvent`).
+    fn entity_leave_level(
+        &self,
+        _host: &mut dyn ServerHost,
+        event: &mut EntityLeaveLevelEvent<'_>,
+    ) {
+        let context = EventContext {
+            level: Some(event.dimension.to_owned()),
+            entity: Some(FacadeEntity {
+                id: event.entity as i32,
+                kind: event.kind.to_owned(),
+                level: Some(event.dimension.to_owned()),
+            }),
+            ..EventContext::default()
+        };
+        self.fire_event(GameEvent::EntityUnload, self.dedicated(), context, |_| true);
+    }
+
+    /// A player broke the block at `pos` (Fabric's `PlayerBlockBreakEvents.BEFORE`, NeoForge's
+    /// `BreakBlockEvent`). A cancel keeps the block, and the Fabric `CANCELED` listeners hear it.
+    fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
+        let context = self.block_context(host, event.pos, event.state, None, None);
+        let fired = self.fire_event(
+            GameEvent::BlockBreakBefore,
+            self.dedicated(),
+            context.clone(),
+            |_| true,
+        );
+        if fired.cancelled {
+            self.fire_event(
+                GameEvent::BlockBreakCanceled,
+                self.dedicated(),
+                context,
+                |_| true,
+            );
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// A player left-clicked a block (Fabric's `AttackBlockCallback`, NeoForge's
+    /// `PlayerInteractEvent.LeftClickBlock`).
+    fn left_click_block(&self, host: &mut dyn ServerHost, event: &mut LeftClickBlockEvent) -> Flow {
+        let context = self.block_context(host, event.pos, event.state, Some(event.face), None);
+        let fired = self.fire_event(GameEvent::AttackBlock, self.dedicated(), context, |_| true);
+        if fired.cancelled {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// A player right-clicked a block (Fabric's `UseBlockCallback`, NeoForge's
+    /// `PlayerInteractEvent.RightClickBlock`). The Java callback's `InteractionResult` becomes the
+    /// cancellation result, and a NeoForge `setCanceled(true)` keeps the default `PASS`.
+    fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
+        if !matches!(host, HostSide::Server(_)) {
+            return Flow::Continue;
+        }
+        let click = event.click;
+        let context = EventContext {
+            level: Some(dimension_id(click.dimension).to_owned()),
+            player: Some(click.player),
+            pos: Some(click.pos),
+            face: Some(click.hit.face),
+            off_hand: click.hand == Hand::Off,
+            ..EventContext::default()
+        };
+        let fired = self.fire_event(GameEvent::UseBlock, self.dedicated(), context, |_| true);
+        if fired.cancelled {
+            *event.cancellation_result = interaction_result(fired.interaction.as_deref());
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// A player used the item in their hand (Fabric's `UseItemCallback`, NeoForge's
+    /// `PlayerInteractEvent.RightClickItem`).
+    fn right_click_item(&self, host: HostSide<'_>, event: &mut RightClickItemEvent<'_>) -> Flow {
+        if !matches!(host, HostSide::Server(_)) {
+            return Flow::Continue;
+        }
+        let click = event.click;
+        let context = EventContext {
+            level: Some(dimension_id(click.dimension).to_owned()),
+            player: Some(click.player),
+            pos: Some(click.pos),
+            off_hand: click.hand == Hand::Off,
+            ..EventContext::default()
+        };
+        let fired = self.fire_event(GameEvent::UseItem, self.dedicated(), context, |_| true);
+        if fired.cancelled {
+            *event.cancellation_result = interaction_result(fired.interaction.as_deref());
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// A player attacked an entity (Fabric's `AttackEntityCallback`, NeoForge's
+    /// `AttackEntityEvent`).
+    fn attack_entity(&self, host: &mut dyn ServerHost, event: &mut AttackEntityEvent<'_>) -> Flow {
+        let context = EventContext {
+            player: self.acting_player(host),
+            entity: Some(FacadeEntity {
+                id: event.entity,
+                kind: event.kind.to_owned(),
+                level: None,
+            }),
+            ..EventContext::default()
+        };
+        let fired = self.fire_event(GameEvent::AttackEntity, self.dedicated(), context, |_| true);
+        if fired.cancelled {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// A player right-clicked an entity (Fabric's `UseEntityCallback`, NeoForge's
+    /// `PlayerInteractEvent.EntityInteract`).
+    fn entity_interact(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut EntityInteractEvent<'_>,
+    ) -> Flow {
+        let context = EventContext {
+            player: self.acting_player(host),
+            entity: Some(FacadeEntity {
+                id: event.entity,
+                kind: event.kind.to_owned(),
+                level: None,
+            }),
+            ..EventContext::default()
+        };
+        let fired = self.fire_event(GameEvent::UseEntity, self.dedicated(), context, |_| true);
+        if fired.cancelled {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// A living entity is about to die (Fabric's `ServerLivingEntityEvents.ALLOW_DEATH`, NeoForge's
+    /// `LivingDeathEvent`).
+    fn living_death(&self, _host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
+        let context = EventContext {
+            entity: Some(FacadeEntity {
+                id: event.entity as i32,
+                kind: event.kind.to_owned(),
+                level: None,
+            }),
+            damage: Some(event.damage_type.to_owned()),
+            ..EventContext::default()
+        };
+        let fired = self.fire_event(
+            GameEvent::LivingAllowDeath,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
+        if fired.cancelled {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// A living entity is about to be hurt (Fabric's `ServerLivingEntityEvents.ALLOW_DAMAGE`,
+    /// NeoForge's `LivingIncomingDamageEvent`).
+    fn living_incoming_damage(
+        &self,
+        _level: &mut dyn LevelRandomHost,
+        event: &mut LivingIncomingDamageEvent<'_>,
+    ) -> Flow {
+        let context = EventContext {
+            entity: Some(FacadeEntity {
+                id: event.entity,
+                kind: event.kind.to_owned(),
+                level: None,
+            }),
+            damage: Some(event.source.damage_type.to_owned()),
+            amount: event.container.new_damage(),
+            flag: event.container.blocked() > 0.0,
+            ..EventContext::default()
+        };
+        let fired = self.fire_event(
+            GameEvent::LivingAllowDamage,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
+        if fired.cancelled {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// An entity joined a server level (Fabric's `ServerEntityEvents.ENTITY_LOAD`, NeoForge's
+    /// `EntityJoinLevelEvent`). A cancel keeps it out.
+    fn entity_join_level(
+        &self,
+        _host: &mut dyn ServerHost,
+        event: &mut EntityJoinLevelEvent<'_>,
+    ) -> Flow {
+        let context = EventContext {
+            level: Some(event.dimension.to_owned()),
+            entity: Some(FacadeEntity {
+                id: event.entity as i32,
+                kind: event.kind.to_owned(),
+                level: Some(event.dimension.to_owned()),
+            }),
+            flag: event.loaded_from_disk,
+            ..EventContext::default()
+        };
+        let fired = self.fire_event(GameEvent::EntityLoad, self.dedicated(), context, |_| true);
+        if fired.cancelled {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
     /// The client finished its first load (NeoForge's `FMLClientSetupEvent`), once per process.
     /// A dedicated server never fires it. No client jar runs yet, so the hook logs the moment and
     /// nothing else.
@@ -437,19 +862,43 @@ impl HorizonJava {
 
     /// Fires one runtime event to every jar's recorded listeners, and says what happened.
     fn fire(&self, event: GameEvent, dedicated: bool, wanted: impl Fn(&GameListener) -> bool) {
+        self.fire_event(event, dedicated, EventContext::default(), wanted);
+    }
+
+    /// Fires one runtime event with its context to every jar's listeners and returns what they
+    /// decided. One firing is shared by every jar, so a cancellation or an `InteractionResult`
+    /// carries from one jar's listener to the next, as it does between Fabric listeners.
+    ///
+    /// The tick events fire twenty times a second, so their line is written only when a listener
+    /// failed or leaned on an unmodelled host call; the report counts every callback either way.
+    fn fire_event(
+        &self,
+        event: GameEvent,
+        dedicated: bool,
+        context: EventContext,
+        wanted: impl Fn(&GameListener) -> bool,
+    ) -> Fired {
         let mut state = self.lock();
+        let facade = Arc::new(EventFacade {
+            dedicated,
+            tick_count: state.tick_count,
+            players: state.players.clone(),
+            ..EventFacade::default()
+        });
+        let mut firing = EventFiring::new(event, facade, context);
         let (mut ran, mut failed, mut unknown) = (0, 0, 0);
         for loaded in &mut state.jars {
             let id = loaded.row.id.clone();
-            let (jar_ran, jar_failed, jar_unknown) = fire_listeners_with_output(
+            let before = loaded.host.unknown_host_call_count();
+            let (jar_ran, jar_failed) = run_listeners(
                 &loaded.jar,
                 &mut loaded.host,
                 &loaded.listeners,
-                event,
-                dedicated,
+                &mut firing,
                 &wanted,
-                &id,
             );
+            let jar_unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
+            log_stdout(&id, &mut loaded.host);
             loaded.row.callbacks_ran += jar_ran;
             loaded.row.callbacks_failed += jar_failed;
             loaded.row.callback_unknown_host_calls += jar_unknown;
@@ -457,60 +906,93 @@ impl HorizonJava {
             failed += jar_failed;
             unknown += jar_unknown;
         }
-        log::info!(
-            "{LOG}: {} (dedicated={dedicated}): {ran} callback(s) ran, {failed} failed, {unknown} unknown host call(s)",
-            event.name()
+        let quiet = matches!(
+            event,
+            GameEvent::ServerTickStart
+                | GameEvent::ServerTickEnd
+                | GameEvent::LevelTickStart
+                | GameEvent::LevelTickEnd
         );
+        if !quiet || failed > 0 || unknown > 0 {
+            log::info!(
+                "{LOG}: {} (dedicated={dedicated}): {ran} callback(s) ran, {failed} failed, {unknown} unknown host call(s)",
+                event.name()
+            );
+        }
+        Fired {
+            cancelled: firing.cancelled,
+            interaction: firing.interaction.clone(),
+        }
+    }
+
+    /// Whether this server is a dedicated one.
+    fn dedicated(&self) -> bool {
+        self.lock().dedicated
+    }
+
+    /// The player whose action a hook hears, as the mod API's own helpers name them.
+    fn acting_player(&self, host: &dyn ServerHost) -> Option<u128> {
+        host.players().acting_player().map(|player| player.uuid())
+    }
+
+    /// The firing context for a block a player acted on: the acting player, the position, the
+    /// block's id (the runtime's block-state façade names it), and the face when the hook gives
+    /// one.
+    fn block_context(
+        &self,
+        host: &dyn ServerHost,
+        pos: [i32; 3],
+        state: mod_api::BlockStateId,
+        face: Option<[i32; 3]>,
+        off_hand: Option<bool>,
+    ) -> EventContext {
+        let block = host
+            .block_state_string(state)
+            .map(|state| state.split('[').next().unwrap_or_default().to_owned());
+        EventContext {
+            player: self.acting_player(host),
+            pos: Some(pos),
+            block,
+            face,
+            off_hand: off_hand.unwrap_or(false),
+            ..EventContext::default()
+        }
     }
 }
 
-/// Fires the listeners of one event on one jar, drains what they printed, and returns how many
-/// ran, how many failed and how many unmodelled host calls they made.
-fn fire_listeners_with_output(
-    jar: &NativeJar,
-    host: &mut StdHost,
-    listeners: &[GameListener],
-    event: GameEvent,
-    dedicated: bool,
-    wanted: &dyn Fn(&GameListener) -> bool,
-    id: &str,
-) -> (usize, usize, usize) {
-    let before = host.unknown_host_call_count();
-    let (ran, failed) = fire_listeners(jar, host, listeners, event, dedicated, wanted);
-    let unknown = host.unknown_host_call_count().saturating_sub(before);
-    log_stdout(id, host);
-    (ran, failed, unknown)
+/// The dimension id of a hook's `LevelDimension`.
+fn dimension_id(dimension: LevelDimension) -> &'static str {
+    dimension.key().id()
 }
 
-/// Runs the listeners of `event` that `wanted` keeps, in registration order, sharing one firing so
-/// a cancellation carries between them.
-fn fire_listeners(
+/// The `InteractionResult` a Fabric listener returned, as the mod API's own result. A NeoForge
+/// listener that cancelled without a result keeps `PASS`, the default the hook documents.
+fn interaction_result(result: Option<&str>) -> NativeInteractionResult {
+    match result {
+        Some("SUCCESS") => NativeInteractionResult::Success,
+        Some("SUCCESS_SERVER") => NativeInteractionResult::SuccessServer,
+        Some("CONSUME") => NativeInteractionResult::Consume,
+        Some("FAIL") => NativeInteractionResult::Fail,
+        _ => NativeInteractionResult::Pass,
+    }
+}
+
+/// Runs the listeners of this jar that `wanted` keeps, in registration order, against one shared
+/// firing.
+fn run_listeners(
     jar: &NativeJar,
     host: &mut StdHost,
     listeners: &[GameListener],
-    event: GameEvent,
-    dedicated: bool,
-    wanted: impl Fn(&GameListener) -> bool,
+    firing: &mut EventFiring,
+    wanted: &dyn Fn(&GameListener) -> bool,
 ) -> (usize, usize) {
-    let mut firing = EventFiring::new(
-        event,
-        Arc::new(EventFacade {
-            dedicated,
-            ..EventFacade::default()
-        }),
-        EventContext::default(),
-    );
     let (mut ran, mut failed) = (0, 0);
+    let event = firing.event;
     for listener in listeners
         .iter()
         .filter(|listener| listener.event == event && wanted(listener))
     {
-        match jar.run_game_listener(
-            listener,
-            &mut firing,
-            host,
-            &ExecutionBudget::within(JAR_BUDGET),
-        ) {
+        match jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET)) {
             Ok(run) => {
                 ran += usize::from(run.ran);
                 if run.stop {
@@ -890,7 +1372,7 @@ impl std::fmt::Display for JarRow {
 /// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
 /// game behind it. Anything the runtime does not model is counted by the host, which is what
 /// `ran-hollow` means. The host is returned because the listeners it recorded need it for the
-/// rest of the process.
+/// rest of the server's life.
 fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
     let stem = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
     let jar = match runtime::NativeJar::from_bytes(bytes) {

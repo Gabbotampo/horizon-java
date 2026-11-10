@@ -976,9 +976,11 @@ impl GameListeners {
 pub struct FacadePlayer {
     pub uuid: u128,
     pub name: String,
-    /// Dimension id (`minecraft:overworld`).
-    pub level: String,
-    pub entity_id: i32,
+    /// Dimension id (`minecraft:overworld`); `None` when the host hook gives
+    /// no level for the player, so `level()` refuses instead of guessing one.
+    pub level: Option<String>,
+    /// `Entity.getId`; `None` when the host hook does not know it.
+    pub entity_id: Option<i32>,
 }
 
 /// A level as the façade shows it.
@@ -996,7 +998,9 @@ pub struct FacadeEntity {
     pub id: i32,
     /// Entity type id (`minecraft:zombie`).
     pub kind: String,
-    pub level: String,
+    /// Dimension id (`minecraft:overworld`); `None` when the host hook does
+    /// not name the entity's level.
+    pub level: Option<String>,
 }
 
 /// The server state every firing exposes, snapshotted by the game.
@@ -1029,6 +1033,9 @@ pub struct EventContext {
     pub amount: f32,
     /// The block a use, attack or break is about.
     pub pos: Option<[i32; 3]>,
+    /// The block id at `pos` (`minecraft:stone`), for a Fabric block-break
+    /// callback's `BlockState`. `None` when the host hook does not name it.
+    pub block: Option<String>,
     /// The face clicked (`[0, 1, 0]` is the top).
     pub face: Option<[i32; 3]>,
     /// The off hand acts (the main hand otherwise).
@@ -1097,6 +1104,16 @@ fn marker(text: String) -> Value {
 
 fn level_marker(id: &str) -> Value {
     marker(format!("game/level/{id}"))
+}
+
+/// A `BlockState` value for a firing's block: its block id (`minecraft:stone`).
+fn block_state_marker(block: &str) -> Value {
+    marker(format!("game/block-state/{block}"))
+}
+
+/// A `Block` value: a block id (`minecraft:stone`).
+fn block_marker(block: &str) -> Value {
+    marker(format!("game/block/{block}"))
 }
 
 fn player_marker(uuid: u128) -> Value {
@@ -1195,6 +1212,11 @@ impl StdHost {
                 Some(dimension_key("minecraft:the_nether"))
             }
             ("net/minecraft/world/level/Level", "END") => Some(dimension_key("minecraft:the_end")),
+            // `Blocks.STONE` and the other block constants answer in a firing,
+            // with the block id the callback's `BlockState` names.
+            ("net/minecraft/world/level/block/Blocks", name) if self.game_event.is_some() => Some(
+                block_marker(&format!("minecraft:{}", name.to_ascii_lowercase())),
+            ),
             // `handler.player`: an instance field of a host object reaches the
             // host as a static read without its receiver, and only the join
             // and disconnect firings hand a handler out.
@@ -1270,6 +1292,55 @@ impl StdHost {
             return Some(
                 block_hit_answer(hit, r).ok_or_else(|| NativeError::UnknownHostCall(r.clone())),
             );
+        }
+        // A `BlockPos` value: its coordinates, as the host's command sources
+        // answer one.
+        if let Some(coords) = text.strip_prefix("block-pos/") {
+            let [x, y, z] = parse_coords(coords)?;
+            return Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getX", "()I") => Ok(Value::Int(x)),
+                ("getY", "()I") => Ok(Value::Int(y)),
+                ("getZ", "()I") => Ok(Value::Int(z)),
+                ("asLong", "()J") => Ok(Value::Long(block_pos_long(x, y, z))),
+                ("equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(i32::from(
+                    args.first().and_then(expect_ref).is_some_and(|o| o == text),
+                ))),
+                ("hashCode", "()I") => Ok(Value::Int(stable_hash(text))),
+                _ => Err(NativeError::UnknownHostCall(r.clone())),
+            });
+        }
+        // A `BlockState` value: its block, and whether that is the `Block` a
+        // callback names (`state.is(Blocks.STONE)`).
+        if let Some(block) = text.strip_prefix("game/block-state/") {
+            return Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getBlock", "()Lnet/minecraft/world/level/block/Block;") => {
+                    Ok(block_marker(block))
+                }
+                ("is", "(Lnet/minecraft/world/level/block/Block;)Z") => {
+                    let other = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|value| value.strip_prefix("game/block/"));
+                    Ok(Value::Int(i32::from(other == Some(block))))
+                }
+                ("isAir", "()Z") => Ok(Value::Int(i32::from(block == "minecraft:air"))),
+                ("equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(i32::from(
+                    args.first().and_then(expect_ref).is_some_and(|o| o == text),
+                ))),
+                ("hashCode", "()I") => Ok(Value::Int(stable_hash(text))),
+                _ => Err(NativeError::UnknownHostCall(r.clone())),
+            });
+        }
+        // A `Block` value.
+        if let Some(block) = text.strip_prefix("game/block/") {
+            return Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(block.to_owned()))),
+                ("equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(i32::from(
+                    args.first().and_then(expect_ref).is_some_and(|o| o == text),
+                ))),
+                ("hashCode", "()I") => Ok(Value::Int(stable_hash(text))),
+                _ => Err(NativeError::UnknownHostCall(r.clone())),
+            });
         }
         let kind = facade(text)?;
         if matches!(
@@ -1373,7 +1444,7 @@ impl StdHost {
                         let players = facade
                             .players
                             .iter()
-                            .filter(|p| p.level == *id)
+                            .filter(|p| p.level.as_deref() == Some(*id))
                             .map(|p| player_marker(p.uuid))
                             .collect();
                         Some(self.facade_list("level-players", players))
@@ -1388,9 +1459,9 @@ impl StdHost {
                     ("getStringUUID", _) => Some(marker(uuid_text(*uuid))),
                     ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
-                    ("getId", "I") => int(p.entity_id),
+                    ("getId", "I") => Some(Value::Int(p.entity_id?)),
                     ("isAlive", "Z") => flag(true),
-                    ("level" | "serverLevel", _) => Some(level_marker(&p.level)),
+                    ("level" | "serverLevel", _) => p.level.as_deref().map(level_marker),
                     ("getServer", _) => Some(marker(SERVER.into())),
                     _ => None,
                 }
@@ -1404,13 +1475,26 @@ impl StdHost {
                 match (name, returns) {
                     ("getId", "I") => int(entity.id),
                     ("isAlive", "Z") => flag(true),
-                    ("level", _) => Some(level_marker(&entity.level)),
+                    ("level", _) => entity.level.as_deref().map(level_marker),
                     _ => None,
                 }
             }
             Facade::Event => match (name, returns) {
                 ("getServer" | "server", _) => Some(marker(SERVER.into())),
                 ("getLevel" | "level", _) => context.level.as_deref().map(level_marker),
+                ("getPos" | "getClickedPos", _) => context
+                    .pos
+                    .as_ref()
+                    .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}"))),
+                ("getHand", _) => Some(marker(format!(
+                    "enum/net/minecraft/world/InteractionHand/{}",
+                    if context.off_hand {
+                        "OFF_HAND"
+                    } else {
+                        "MAIN_HAND"
+                    }
+                ))),
+                ("getState", _) => context.block.as_deref().map(block_state_marker),
                 ("getEntity" | "getPlayer" | "player" | "entity", _) => context_subject(&context),
                 ("getSource" | "source", _) => context
                     .damage
@@ -1505,6 +1589,20 @@ fn block_hit_answer(hit: &str, r: &MethodRef) -> Option<Value> {
         ("isInside" | "isWorldBorderHit", "Z") => Some(Value::Int(0)),
         _ => None,
     }
+}
+
+/// `x,y,z` as a block position's coordinates.
+fn parse_coords(text: &str) -> Option<[i32; 3]> {
+    let mut parts = text.split(',').map(|value| value.parse::<i32>().ok());
+    Some([parts.next()??, parts.next()??, parts.next()??])
+}
+
+/// `BlockPos.asLong`: `((x & 0x3FFFFFF) << 38) | ((z & 0x3FFFFFF) << 12) | (y & 0xFFF)`.
+fn block_pos_long(x: i32, y: i32, z: i32) -> i64 {
+    let x = i64::from(x) & 0x3FF_FFFF;
+    let y = i64::from(y) & 0xFFF;
+    let z = i64::from(z) & 0x3FF_FFFF;
+    (x << 38) | (z << 12) | y
 }
 
 /// The player or entity marker a firing is about.
@@ -1899,19 +1997,25 @@ fn subscriber_client_only(annotation: &crate::Annotation) -> bool {
 /// The Fabric argument list of `shape` for this firing.
 fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, NativeError> {
     let context = &firing.context;
-    let missing = |what: &str| {
-        NativeError::Metadata(format!("{} fired without its {what}", firing.event.name()))
-    };
+    // An argument the host hook does not give still reaches the callback as a
+    // marker whose every member refuses: the callback runs, and each call that
+    // needs the argument is counted as an unknown host call instead of failing
+    // the whole listener or inventing a value.
+    let missing = |what: &str| marker(format!("game/unknown/{what}"));
     let server = || marker(SERVER.into());
     let level = || {
         context
             .level
             .as_deref()
             .map(level_marker)
-            .ok_or_else(|| missing("level"))
+            .unwrap_or_else(|| missing("level"))
     };
-    let player = || context.player.ok_or_else(|| missing("player"));
-    let subject = || context_subject(context).ok_or_else(|| missing("entity"));
+    let player = || {
+        context
+            .player
+            .map_or_else(|| missing("player"), player_marker)
+    };
+    let subject = || context_subject(context).unwrap_or_else(|| missing("entity"));
     let damage = || {
         marker(format!(
             "game/damage/{}",
@@ -1932,7 +2036,14 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
         context
             .pos
             .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}")))
-            .ok_or_else(|| missing("block position"))
+            .unwrap_or_else(|| missing("block position"))
+    };
+    let block_state = || {
+        context
+            .block
+            .as_deref()
+            .map(block_state_marker)
+            .unwrap_or_else(|| missing("block state"))
     };
     let face = match context.face {
         Some([0, -1, 0]) => "DOWN",
@@ -1945,54 +2056,44 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
     let direction = || marker(format!("enum/net/minecraft/core/Direction/{face}"));
     Ok(match shape {
         Shape::Server => vec![server()],
-        Shape::Level => vec![level()?],
-        Shape::ServerLevel => vec![server(), level()?],
+        Shape::Level => vec![level()],
+        Shape::ServerLevel => vec![server(), level()],
         Shape::Join => {
-            let uuid = player()?;
-            vec![
-                marker(format!("game/connection/{uuid:032x}")),
-                marker(format!("game/packet-sender/{uuid:032x}")),
-                server(),
-            ]
+            let connection = context.player.map_or_else(
+                || missing("connection"),
+                |uuid| marker(format!("game/connection/{uuid:032x}")),
+            );
+            let sender = context.player.map_or_else(
+                || missing("packet sender"),
+                |uuid| marker(format!("game/packet-sender/{uuid:032x}")),
+            );
+            vec![connection, sender, server()]
         }
         Shape::Disconnect => vec![
-            marker(format!("game/connection/{:032x}", player()?)),
+            context.player.map_or_else(
+                || missing("connection"),
+                |uuid| marker(format!("game/connection/{uuid:032x}")),
+            ),
             server(),
         ],
-        Shape::Player => vec![player_marker(player()?)],
-        Shape::EntityLevel => vec![subject()?, level()?],
-        Shape::EntityDamageAmount => vec![
-            subject()?,
-            damage(),
-            Value::Float(f64::from(context.amount)),
-        ],
-        Shape::EntityDamage => vec![subject()?, damage()],
-        Shape::BlockBreak => vec![
-            level()?,
-            player_marker(player()?),
-            pos()?,
-            opaque("block-state"),
-            Value::Ref(None),
-        ],
+        Shape::Player => vec![player()],
+        Shape::EntityLevel => vec![subject(), level()],
+        Shape::EntityDamageAmount => {
+            vec![subject(), damage(), Value::Float(f64::from(context.amount))]
+        }
+        Shape::EntityDamage => vec![subject(), damage()],
+        Shape::BlockBreak => vec![level(), player(), pos(), block_state(), Value::Ref(None)],
         Shape::UseBlock => {
             // The hit result names its block and face: `game/block-hit/x,y,z/UP`.
-            let [x, y, z] = context.pos.ok_or_else(|| missing("block position"))?;
-            vec![
-                player_marker(player()?),
-                level()?,
-                hand(),
-                marker(format!("game/block-hit/{x},{y},{z}/{face}")),
-            ]
+            let hit = context.pos.map_or_else(
+                || missing("block hit"),
+                |[x, y, z]| marker(format!("game/block-hit/{x},{y},{z}/{face}")),
+            );
+            vec![player(), level(), hand(), hit]
         }
-        Shape::AttackBlock => vec![
-            player_marker(player()?),
-            level()?,
-            hand(),
-            pos()?,
-            direction(),
-        ],
+        Shape::AttackBlock => vec![player(), level(), hand(), pos(), direction()],
         Shape::AfterDamage => vec![
-            subject()?,
+            subject(),
             damage(),
             Value::Float(f64::from(context.amount)),
             Value::Float(f64::from(context.amount)),
@@ -2001,26 +2102,20 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
         // Horizon keeps one player across a respawn: the old and the new
         // player are the same marker.
         Shape::PlayerPair => {
-            let player = player_marker(player()?);
+            let player = player();
             vec![player.clone(), player, Value::Int(i32::from(context.flag))]
         }
         Shape::ChangeLevel => vec![
-            player_marker(player()?),
+            player(),
             context
                 .origin
                 .as_deref()
                 .map(level_marker)
-                .ok_or_else(|| missing("origin level"))?,
-            level()?,
+                .unwrap_or_else(|| missing("origin level")),
+            level(),
         ],
-        Shape::UseItem => vec![player_marker(player()?), level()?, hand()],
-        Shape::AttackEntity => vec![
-            player_marker(player()?),
-            level()?,
-            hand(),
-            subject()?,
-            opaque("entity-hit"),
-        ],
+        Shape::UseItem => vec![player(), level(), hand()],
+        Shape::AttackEntity => vec![player(), level(), hand(), subject(), opaque("entity-hit")],
         Shape::Commands => {
             let selection = if firing.facade.dedicated {
                 "DEDICATED"
@@ -2222,8 +2317,8 @@ mod tests {
             players: vec![FacadePlayer {
                 uuid: alex,
                 name: "Alex".into(),
-                level: "minecraft:overworld".into(),
-                entity_id: 7,
+                level: Some("minecraft:overworld".into()),
+                entity_id: Some(7),
             }],
             server: Arc::new(ServerFacts {
                 world_dir: Some("/horizon/game/world".into()),
@@ -2405,5 +2500,87 @@ mod tests {
             mask | event.bit()
         });
         assert_eq!(mask.count_ones() as usize, GameEvent::ALL.len());
+    }
+
+    /// A firing that names the block and the position lets a block-break
+    /// callback read both: `Blocks.STONE` is the state's block, and the
+    /// position's coordinates come back. An argument the firing does not give
+    /// is a marker whose members refuse, counted as unknown calls.
+    #[test]
+    fn a_block_break_firing_answers_the_block_and_the_position() {
+        let call = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::BlockBreakBefore,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                pos: Some([1, 2, 3]),
+                block: Some("minecraft:stone".into()),
+                ..EventContext::default()
+            },
+        )));
+        let stone = host
+            .game_event_static(&call(
+                "net/minecraft/world/level/block/Blocks",
+                "STONE",
+                "Lnet/minecraft/world/level/block/Block;",
+            ))
+            .unwrap();
+        assert_eq!(stone, block_marker("minecraft:stone"));
+        let state = block_state_marker("minecraft:stone");
+        let is = host
+            .game_event_call(
+                &call(
+                    "net/minecraft/world/level/block/state/BlockState",
+                    "is",
+                    "(Lnet/minecraft/world/level/block/Block;)Z",
+                ),
+                &state,
+                &[stone],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(is, Value::Int(1));
+        let dirt = block_marker("minecraft:dirt");
+        let is_dirt = host
+            .game_event_call(
+                &call(
+                    "net/minecraft/world/level/block/state/BlockState",
+                    "is",
+                    "(Lnet/minecraft/world/level/block/Block;)Z",
+                ),
+                &state,
+                &[dirt],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(is_dirt, Value::Int(0));
+        let pos = marker("block-pos/1,2,3".into());
+        for (name, expected) in [("getX", 1), ("getY", 2), ("getZ", 3)] {
+            let answer = host
+                .game_event_call(&call("net/minecraft/core/BlockPos", name, "()I"), &pos, &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(answer, Value::Int(expected), "{name}");
+        }
+        // An argument the hook does not give refuses instead of answering.
+        let missing = marker("game/unknown/level".into());
+        let refused = host.game_event_call(
+            &call(
+                "net/minecraft/server/level/ServerLevel",
+                "getGameTime",
+                "()J",
+            ),
+            &missing,
+            &[],
+        );
+        assert!(
+            matches!(refused, Some(Err(NativeError::UnknownHostCall(_)))),
+            "{refused:?}"
+        );
     }
 }

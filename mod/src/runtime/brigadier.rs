@@ -1899,8 +1899,8 @@ impl NativeJar {
             players: vec![FacadePlayer {
                 uuid: PROBE_PLAYER,
                 name: "Player".into(),
-                level: "minecraft:overworld".into(),
-                entity_id: 0,
+                level: Some("minecraft:overworld".into()),
+                entity_id: Some(0),
             }],
             ..EventFacade::default()
         });

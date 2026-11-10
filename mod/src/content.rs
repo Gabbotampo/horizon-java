@@ -32,11 +32,17 @@ impl State {
     /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
     /// the two hooks one pass.
     pub(crate) fn ensure_loaded(&mut self) {
+        self.ensure_loaded_with(read_jar_files);
+    }
+
+    /// [`State::ensure_loaded`] with the folder read injected, so a test can count how often the
+    /// content phase reaches for the jars: blocks and items both ask, but a jar runs once.
+    fn ensure_loaded_with(&mut self, read: impl FnOnce() -> Vec<(String, Vec<u8>)>) {
         if self.loaded {
             return;
         }
         self.loaded = true;
-        for (file, bytes) in read_jar_files() {
+        for (file, bytes) in read() {
             match load_jar(file, &bytes) {
                 Ok(loaded) => {
                     log::info!("{LOG}: {}", loaded.row);
@@ -246,6 +252,49 @@ fn usable_id(id: &str) -> bool {
         && !path.is_empty()
         && namespace.bytes().all(|b| ok(b, b"_.-"))
         && path.bytes().all(|b| ok(b, b"_./-"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The game asks for blocks and items in two hook calls. Each jar's entrypoints must run once:
+    /// a second run would register every listener and command twice and load the jar's classes
+    /// into a second host.
+    #[test]
+    fn the_content_phase_reaches_for_the_jars_once() {
+        let mut state = State::default();
+        let mut reads = 0;
+        state.ensure_loaded_with(|| {
+            reads += 1;
+            Vec::new()
+        });
+        state.ensure_loaded_with(|| {
+            reads += 1;
+            Vec::new()
+        });
+        assert_eq!(reads, 1);
+        assert!(state.loaded);
+    }
+
+    /// A server that opens a second world reuses the jars: its start resets the per-server
+    /// counters, not the content pass.
+    #[test]
+    fn a_second_server_start_does_not_reload_the_jars() {
+        let mut state = State::default();
+        let mut reads = 0;
+        state.ensure_loaded_with(|| {
+            reads += 1;
+            Vec::new()
+        });
+        state.reset_server();
+        state.ensure_loaded_with(|| {
+            reads += 1;
+            Vec::new()
+        });
+        assert_eq!(reads, 1);
+        assert!(state.loaded);
+    }
 }
 
 /// The jars under the game's `config/horizon_java/java-mods/`, sorted by file name so one run's

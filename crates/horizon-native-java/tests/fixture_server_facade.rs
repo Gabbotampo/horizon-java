@@ -257,8 +257,8 @@ fn facade() -> Arc<EventFacade> {
         players: vec![FacadePlayer {
             uuid: ALEX,
             name: "Alex".into(),
-            level: "minecraft:overworld".into(),
-            entity_id: 7,
+            level: Some("minecraft:overworld".into()),
+            entity_id: Some(7),
         }],
         server: Arc::new(ServerFacts {
             registries: BTreeMap::from([(
