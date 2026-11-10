@@ -102,7 +102,7 @@ SAMPLE = [
 
 CORPUS_DIRS = ("neoforge", "corpus-xl", "mega")
 SERVER_KINDS = ("main", "server", "neoforge")
-VERDICT = re.compile(r"\(([^)]+)\) (ran-clean|ran-hollow|refused)")
+VERDICT = re.compile(r"\(([^)]+)\) (ran-clean|ran-hollow|ran-partial|refused)")
 REGISTRATION = re.compile(r"command registration: (\d+) callback\(s\) ran, (\d+) failed")
 USAGES = re.compile(r"(\d+) command usage\(s\) translated, (\d+) refused")
 

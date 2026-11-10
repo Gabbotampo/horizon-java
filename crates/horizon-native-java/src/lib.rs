@@ -54,6 +54,7 @@ mod stack_walk;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
+pub mod verdict;
 pub mod weaver;
 
 pub use facade_server::{GameRuleValue, ServerFacts};
