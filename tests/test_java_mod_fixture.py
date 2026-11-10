@@ -1,10 +1,9 @@
-"""The milestone-1 fixture jar is a `ran-clean` jar by the mod's own definition.
+"""The fixture jars do what the mod's proofs need them to do, by the probe's own reading.
 
-The proof that the mod runs a jar inside the game uses a fixture built by
-`tools/java_mod_fixture.py`. This pins what "ran-clean" means for it against the probe, which
-shares the runtime the mod carries: the entrypoint runs, it makes host calls, and none of them is
-unmodelled. A fixture that stopped exercising the host, or one the runtime started answering
-neutrally, would fail here before anyone reads a game log.
+Milestone 1's jar is `ran-clean` by the mod's definition; milestone 2a's jar records
+`SERVER_STARTED`/`SERVER_STOPPING` listeners and milestone 2b's registers a Brigadier command.
+The probe shares the runtime the mod carries, so it sees the same listeners and tree the game
+will; a fixture that stopped registering them would fail here before anyone reads a game log.
 """
 
 import json
@@ -18,50 +17,85 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def build(kind: str, out: Path) -> Path:
+    built = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "java_mod_fixture.py"),
+            "--kind",
+            kind,
+            "--out",
+            str(out),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+    assert built.returncode == 0, built.stderr
+    return Path(built.stdout.strip().splitlines()[-1])
+
+
+def probe(jar: Path) -> dict:
+    result = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "--quiet",
+            "-p",
+            "horizon-native-java",
+            "--",
+            "--json",
+            str(jar),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=900,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
 class JavaModFixtureTests(unittest.TestCase):
-    def test_the_fixture_runs_without_an_unmodelled_host_call(self):
+    def require_tools(self) -> None:
         missing = [tool for tool in ("javac", "cargo") if shutil.which(tool) is None]
         if missing:
             self.skipTest(f"{', '.join(missing)} required for the fixture run")
-        with tempfile.TemporaryDirectory() as scratch:
-            jar = subprocess.run(
-                [sys.executable, str(ROOT / "tools" / "java_mod_fixture.py"), "--out", scratch],
-                text=True,
-                capture_output=True,
-                timeout=180,
-                check=False,
-            )
-            self.assertEqual(jar.returncode, 0, jar.stderr)
-            path = Path(jar.stdout.strip().splitlines()[-1])
-            self.assertTrue(path.is_file(), f"{path} was not written")
 
-            probe = subprocess.run(
-                [
-                    "cargo",
-                    "run",
-                    "--quiet",
-                    "-p",
-                    "horizon-native-java",
-                    "--",
-                    "--json",
-                    str(path),
-                ],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                timeout=900,
-                check=False,
-            )
-            self.assertEqual(probe.returncode, 0, probe.stderr or probe.stdout)
-            report = json.loads(probe.stdout.strip().splitlines()[-1])
-            self.assertEqual(report["status"], "ok")
-            # Fabric's common entrypoint, which both sides run.
-            self.assertEqual(report["kind"], "main")
-            self.assertEqual(report["entrypoints"], ["m0fixture.Hello"])
-            # The fixture reaches the host (so the row is not a hollow zero) and
-            # every call it makes is modelled (so the mod's verdict is `ran-clean`).
-            self.assertGreater(report["host_calls"], 0)
-            self.assertEqual(report["unknown_host_call_count"], 0, report["unknown_host_calls"])
+    def test_the_fixture_runs_without_an_unmodelled_host_call(self):
+        self.require_tools()
+        with tempfile.TemporaryDirectory() as scratch:
+            report = probe(build("m0", Path(scratch)))
+        self.assertEqual(report["status"], "ok")
+        # Fabric's common entrypoint, which both sides run.
+        self.assertEqual(report["kind"], "main")
+        self.assertEqual(report["entrypoints"], ["m0fixture.Hello"])
+        # The fixture reaches the host (so the row is not a hollow zero) and
+        # every call it makes is modelled (so the mod's verdict is `ran-clean`).
+        self.assertGreater(report["host_calls"], 0)
+        self.assertEqual(report["unknown_host_call_count"], 0, report["unknown_host_calls"])
+
+    def test_the_lifecycle_fixture_registers_the_two_proof_events(self):
+        self.require_tools()
+        with tempfile.TemporaryDirectory() as scratch:
+            report = probe(build("lifecycle", Path(scratch)))
+        self.assertEqual(report["status"], "ok")
+        events = report["game_listeners"]["events"]
+        self.assertEqual(events.get("server_started"), 1)
+        self.assertEqual(events.get("server_stopping"), 1)
+
+    def test_the_command_fixture_registers_javahello_with_an_optional_name(self):
+        self.require_tools()
+        with tempfile.TemporaryDirectory() as scratch:
+            report = probe(build("command", Path(scratch)))
+        self.assertEqual(report["status"], "ok")
+        commands = report["commands"]
+        self.assertEqual(commands["roots"], ["javahello"])
+        # `javahello` and `javahello <name>` both execute.
+        self.assertEqual(commands["executable"], 2)
+        self.assertEqual(commands["samples"], ["javahello", "javahello test"])
 
 
 if __name__ == "__main__":
