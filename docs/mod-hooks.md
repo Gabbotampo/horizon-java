@@ -27,7 +27,7 @@ hook for it. *can't map* — the mod API has a hook, but this mod cannot reach i
 | `player_leave` | `player_logged_out` (`PlayerEvent.PlayerLoggedOutEvent`) | listen | wired |
 | `entity_load` | `entity_join_level` (`EntityJoinLevelEvent`) | cancel | wired |
 | `living_allow_death` | `living_death` (`LivingDeathEvent`) | cancel | wired |
-| `living_after_death` | — (Fabric `ServerLivingEntityEvents.AFTER_DEATH`) | listen | missing on fork |
+| `living_after_death` | `living_death_post` (no NeoForge counterpart; `LivingDeathEvent` fires before the death) | listen | wired |
 | `use_block` | `right_click_block` (`PlayerInteractEvent.RightClickBlock`) | cancel + result | wired |
 | `use_item` | `right_click_item` (`PlayerInteractEvent.RightClickItem`) | cancel + result | wired |
 | `attack_entity` | `attack_entity` (`AttackEntityEvent`) | cancel | wired |
@@ -55,8 +55,9 @@ hook for it. *can't map* — the mod API has a hook, but this mod cannot reach i
 | `client_register_gui_layers` | `register_gui_layers` (`RegisterGuiLayersEvent`) | collect | can't map: registration context, no client jar runtime |
 | `client_item_tooltip` | `item_tooltip` (`ItemTooltipEvent`) | collect | can't map: no client jar runtime |
 
-**Counts: 28 wired, 2 missing on fork, 11 can't map.** The five M2a lifecycle/command rows are
-included; M2c adds 23 (13 listen-only, 10 cancellable).
+**Counts: 29 wired, 1 missing on fork, 11 can't map.** The five M2a lifecycle/command rows are
+included; M2c adds 23 (13 listen-only, 10 cancellable), and `living_after_death` closes one of the
+two gaps M2c left (M2d).
 
 ## How a wired event reaches a Java listener
 
@@ -69,10 +70,11 @@ listener may cancel, and what it may answer, is the hook's contract:
   `attack_entity`, `entity_interact`, `living_death`, `living_incoming_damage`,
   `entity_join_level`): the `Flow::Cancel` return is the firing's cancellation. `break_block` and
   the two click hooks also fire the Fabric `InteractionResult` that cancelled them: `SUCCESS`,
-  `SUCCESS_SERVER`, `CONSUME` and `FAIL` become the mod API's `NativeInteractionResult`; a
+  `SUCCESS_SERVER`, `CONSUME` and `FAIL` become the mod API's `InteractionResult`; a
   NeoForge cancellation with no result stays `PASS`, the hook's documented default.
 - **Listen** (`server_tick`, the level ticks, the level and player lifecycle events,
-  `living_damage_post`, `entity_leave_level`): every listener runs; nothing comes back.
+  `living_damage_post`, `living_death_post`, `entity_leave_level`): every listener runs; nothing
+  comes back.
 
 ## Arguments
 
@@ -88,8 +90,13 @@ but no level, so a listener that ignores its `Level` still cancels the break.
 
 - **`break_block` does not carry `exp_to_drop`.** The runtime's `BlockBreakBefore` has no
   experience model; the hook's `exp_to_drop` is left `None`, so vanilla samples experience.
-- **`entity_interact` runs as the main hand.** The mod API event does not name the hand that
-  clicked; the runtime hands the Java callback the main hand for both hands' callbacks.
+- **`entity_interact`'s hand is read from the held stack.** `entity_interact` fires once per hand
+  and names the stack in that hand (`self.hand` in its contract), but the pin's event carries the
+  stack and not the hand. The mod compares the stack with the acting player's two hands
+  (`LivingRef::hand_item`): a stack only one hand holds names that hand. When both hands hold the
+  same stack — both empty counts — the Java callback gets the main hand, vanilla's first attempt.
+  This is a read, not a guess, but an off-hand click with two identical stacks is indistinguishable
+  from a main-hand one to this hook.
 - **A player who joins has a name and UUID, not a level or entity id.** The join hook gives those
   two facts; `getId()` and `level()` refuse (and are counted) until the fork reads them.
 - **The tick events log only when something went wrong.** Twenty firings a second would drown the
