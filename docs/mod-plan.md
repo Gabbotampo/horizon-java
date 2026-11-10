@@ -18,6 +18,7 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 | **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text` and `integer` nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 | **M2c, game events** | Every other modelled server event reaches its matching mod API hook, moment for moment: server and level ticks, level load/unload, player join/leave/respawn/clone/dimension change, entity join/leave, living damage before/after, item and block use, block and entity attack, and block break (whose cancel also fires Fabric's `CANCELED`). A cancellable hook carries the firing's cancel and, where the hook has one, the Fabric `InteractionResult` back as the hook's cancellation result. The full table, arguments and departures: [docs/mod-hooks.md](mod-hooks.md). |
 | **M3, content** | The jars now run at the game's **Registration** phase, before any resource or world loads and while the content root can still grow, instead of at `server_about_to_start`. Each `RegistryDeclaration::{Item, Block}` the runtime recorded becomes a native content declaration (`Hooks::blocks`/`items`, NeoForge's `RegisterEvent`): an item keeps the template and the properties the content vocabulary carries, and a block brings its block item. The game joins them under the jar's namespace, so `/give`, `setblock` and the inventory see `<jar id>:<path>`. A jar's own assets, lang and loot need the bake route in [m3-content-design.md](m3-content-design.md). |
+| **M3b, baked assets** | An install-time bake (`tools/bake.py`) reads every jar in `config/horizon_java/java-mods/`, keeps the resource kinds a content package accepts, and writes one `.hmod` per namespace into `<game-dir>/horizon-mods/`, turned on in `horizon-mods.txt`. The game loads it as any content mod; the runtime's declarations join the package whose id is their namespace (`mod_content::accept_declared`), so `m3_fixture:ruby` gets the jar's own model, texture, name and block loot instead of the template's. Class files, metadata and unsafe paths never enter the package; everything left out is in `config/horizon_java/bake-report.json` with its reason. The install-time ownership seam this needs is under [Fork seams needed](#fork-seams-needed). |
 
 The verdicts are the ones the corpus ledgers already use:
 
@@ -148,6 +149,26 @@ the game accepts without the fence. Without the skip, one jar with content would
 start, and the M3 proof above would not run at this pin.
 
 ## Fork seams needed
+
+- **A jar's namespace at install time (M3b's bake).** The generated `dispatch_blocks`/`dispatch_items`
+  attribute each declaration with `parts::owned_declaration_id`, which accepts only the declaring
+  mod's manifest id and `namespaces`. A manifest line for the jar's namespace does not help either:
+  the native package's `namespaces` are content claims, so `content::clash` then refuses the baked
+  package of that namespace. A Java jar's namespace is learned when it is installed, not when the
+  native mod is built, so the bridge cannot list it.
+  What the bake needs: a namespace owned by an installed content package counts as owned (the local
+  function above), and the content package's files and the native declaration may share it.
+  *NeoForge/Fabric*: the namespace is chosen by the registering code at runtime — a mod's `modid`
+  is its namespace, its `DeferredRegister.create(..., "m3_fixture")` /
+  `Registry.register(ResourceLocation.fromNamespaceAndPath("m3_fixture", ...))` names it, and
+  `assets/m3_fixture/` is in the same jar; no loader reads a static ownership list.
+- **A namespace a manifest id cannot spell.** A package id is `[a-z0-9_]{1,64}`
+  (`Manifest::parse`), while a namespace is `[a-z0-9_.-]`; a jar that registers in `my-mod` or
+  `my.mod` has no package id its declarations can join by (`accept_declared` matches `m.id == ns`).
+  The bake refuses such a namespace by name instead of writing a package that cannot join.
+  *NeoForge/Fabric*: a mod id may contain `-` and is used as the namespace directly. Fix: a content
+  package may declare an owned namespace that differs from its id, or the join matches
+  `namespaces` rather than `id`.
 
 - **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; NeoForge has
   no counterpart (`BreakBlockEvent` is before the block goes). `break_block` fires before the block
@@ -360,9 +381,9 @@ Horizon Java: client_only_demo.jar (client_only_demo) refused (0 host calls, 0 u
    `ServerHost`/`ClientHost`, so a jar's registrations and listeners reach the world. Each hook that
    maps to a game hook site is one hook row in `[inject]`-free form: `Hooks` methods the mod
    implements and forwards to the runtime's event table.
-2. **Content assets.** Blocks and items a jar registers are in the world (M3), but the jar's own
-   models, textures, lang, loot and recipes are not: a bake writes them into a content `.hmod`
-   beside the declarations ([m3-content-design.md](m3-content-design.md)). Mob effects, entity
+2. **Content assets.** Blocks and items a jar registers are in the world (M3), and its models,
+   textures, lang, loot and recipes now bake into a content `.hmod` beside it (M3b); the runtime
+   declarations join that package once the fork ownership seam above lands. Mob effects, entity
    types and menus still have no native declaration hook.
 3. **Mixins as hook rows** rather than a weaver: bind the plans the runtime discovers to the game's
    named hook sites, as `docs/modding/src/how-to/native-mods/011-named-hook-points.md` describes,
