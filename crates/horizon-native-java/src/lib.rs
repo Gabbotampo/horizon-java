@@ -40,6 +40,7 @@ mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
+mod neoforge_loader;
 mod reflect_constructors;
 mod reflect_enum;
 mod reflect_generic;
@@ -2330,6 +2331,9 @@ pub struct StdHost {
     current_time_millis: i32,
     mods: BTreeMap<String, String>,
     environment_type: String,
+    /// The game version a caller seeded for `ModList` and `DetectedVersion`.
+    /// `None` keeps both questions unanswered instead of inventing a release.
+    game_version: Option<String>,
     development_environment: bool,
     calls: Vec<MethodRef>,
     invocations: Vec<HostInvocation>,
@@ -2462,6 +2466,7 @@ impl StdHost {
             current_time_millis: 0,
             mods: BTreeMap::new(),
             environment_type: "CLIENT".into(),
+            game_version: None,
             development_environment: false,
             calls: Vec::new(),
             invocations: Vec::new(),
@@ -2819,6 +2824,14 @@ impl StdHost {
     /// behavior; server integrations should select `SERVER`.
     pub fn with_environment_type(mut self, environment_type: impl Into<String>) -> Self {
         self.environment_type = environment_type.into();
+        self
+    }
+
+    /// Seed the game version `ModList`'s `minecraft` container and the
+    /// game's `DetectedVersion` answer. Without it the host leaves both
+    /// questions empty rather than inventing a release.
+    pub fn with_game_version(mut self, game_version: impl Into<String>) -> Self {
+        self.game_version = Some(game_version.into());
         self
     }
 
@@ -3811,6 +3824,10 @@ impl Host for StdHost {
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
+        // NeoForge's side, path and mod-container constants.
+        if let Some(value) = self.neoforge_loader_static(r) {
+            return Ok(value);
+        }
         // `MixinEnvironment.Side` constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_static(r) {
             return Ok(value);
@@ -3989,6 +4006,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(value) = self.neoforge_loader_call(r, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.payload_type_registry_call(r, None, args) {
             return Ok(value);
         }
@@ -5185,6 +5205,10 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
+        if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
+            return Ok(value);
+        }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
             return value;
@@ -8032,7 +8056,9 @@ impl Host for StdHost {
                     Value::Ref(Some(id)) => id,
                     _ => return Ok(Value::Int(0)),
                 };
-                Ok(Value::Int(self.mods.contains_key(id) as i32))
+                Ok(Value::Int(
+                    (self.mods.contains_key(id) || is_always_loaded_mod(id)) as i32,
+                ))
             }
             (
                 "net/neoforged/fml/ModList" | "net/minecraftforge/fml/ModList",
@@ -8043,7 +8069,7 @@ impl Host for StdHost {
                     Value::Ref(Some(id)) => id,
                     _ => return Ok(Value::Ref(None)),
                 };
-                Ok(Value::Ref(self.mods.get(id).map(|version| {
+                Ok(Value::Ref(self.neoforge_mod_version(id).map(|version| {
                     format!("neoforge-mod-container/{id}/{version}")
                 })))
             }
@@ -20398,9 +20424,23 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 self.array(invocation_args)?.clone()
             };
-            let class_file = self
-                .class(owner)
-                .ok_or_else(|| NativeError::MissingMethod(format!("{owner}#{name}")))?;
+            let Some(class_file) = self.class(owner) else {
+                // A loader method the host models has no classfile in the
+                // jar. Dispatch the exact signature the lookup selected;
+                // anything else keeps the old refusal instead of a neutral
+                // answer to a call nobody modelled.
+                if let Some(descriptor) =
+                    neoforge_loader::reflected_static_descriptor(owner, name, invocation_args.len())
+                {
+                    let target = MethodRef {
+                        owner: owner.to_owned(),
+                        name: name.to_owned(),
+                        descriptor: descriptor.to_owned(),
+                    };
+                    return Ok(Some(self.host.invoke(&target, &invocation_args)?));
+                }
+                return Err(NativeError::MissingMethod(format!("{owner}#{name}")));
+            };
             let target = class_file
                 .methods
                 .iter()
