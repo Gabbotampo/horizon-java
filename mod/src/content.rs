@@ -19,7 +19,7 @@
 //! the rest). Anything else stays in the jar's row and is named in `docs/m3-content-design.md`,
 //! not guessed into content.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
@@ -27,17 +27,26 @@ use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
 use crate::runtime;
 use crate::{JARS, LOG, State, load_jar};
 
+/// This mod's manifest id (`mod/horizon-mod.toml`): the package whose namespaces the game's
+/// declaration fence checks.
+pub(crate) const MOD_ID: &str = "horizon_java";
+
 impl State {
     /// Runs every jar once, the first time content is asked for, and keeps its runtime for the
     /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
     /// the two hooks one pass.
-    pub(crate) fn ensure_loaded(&mut self) {
-        self.ensure_loaded_with(read_jar_files);
+    pub(crate) fn ensure_loaded(&mut self, context: &RegistrationContext) {
+        let owned = owned_namespaces(context);
+        self.ensure_loaded_with(read_jar_files, &owned);
     }
 
     /// [`State::ensure_loaded`] with the folder read injected, so a test can count how often the
     /// content phase reaches for the jars: blocks and items both ask, but a jar runs once.
-    fn ensure_loaded_with(&mut self, read: impl FnOnce() -> Vec<(String, Vec<u8>)>) {
+    fn ensure_loaded_with(
+        &mut self,
+        read: impl FnOnce() -> Vec<(String, Vec<u8>)>,
+        owned: &[String],
+    ) {
         if self.loaded {
             return;
         }
@@ -54,7 +63,73 @@ impl State {
                 }
             }
         }
+        for jar in &mut self.jars {
+            jar.row.content_skipped = unowned_counts(
+                owned,
+                jar.host
+                    .registrations()
+                    .iter()
+                    .filter_map(|entry| match &entry.declaration {
+                        Some(runtime::RegistryDeclaration::Block { .. }) => {
+                            Some((entry.id.as_str(), true))
+                        }
+                        Some(runtime::RegistryDeclaration::Item { .. }) => {
+                            Some((entry.id.as_str(), false))
+                        }
+                        _ => None,
+                    }),
+            );
+        }
+        for jar in &self.jars {
+            for (namespace, (blocks, items)) in &jar.row.content_skipped {
+                log::info!(
+                    "{LOG}: {}: content: {blocks} block(s), {items} item(s) in namespace \
+                     {namespace} not declared: not owned by {MOD_ID}; run tools/bake.py",
+                    jar.row.file
+                );
+            }
+        }
     }
+}
+
+/// The namespaces this mod may declare content in, exactly as the game's fence checks them
+/// (`horizon-mod-api/src/parts/owned_namespaces.rs`): its own id, then the installed package's
+/// manifest `namespaces`. A jar's namespace is learned at install time, so it is not here unless
+/// the manifest was built with it; its content belongs in a baked content package instead.
+pub(crate) fn owned_namespaces(context: &RegistrationContext) -> Vec<String> {
+    match context.mods().get(MOD_ID) {
+        Some(package) => package.namespaces().map(str::to_owned).collect(),
+        None => vec![MOD_ID.to_owned()],
+    }
+}
+
+/// Whether `id` (`namespace:path`) is in one of `owned`'s namespaces.
+fn owns(owned: &[String], id: &str) -> bool {
+    id.split_once(':')
+        .is_some_and(|(namespace, _)| owned.iter().any(|owned| owned == namespace))
+}
+
+/// The typed declarations `owned` does not cover, per namespace: (blocks, items). The game's
+/// dispatch would refuse every one of them, so none may be pushed; the counts become the jar's
+/// `content.skipped` row and one log line.
+fn unowned_counts<'a>(
+    owned: &[String],
+    declarations: impl Iterator<Item = (&'a str, bool)>,
+) -> BTreeMap<String, (usize, usize)> {
+    let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for (id, block) in declarations {
+        if !usable_id(id) || owns(owned, id) {
+            continue;
+        }
+        let (namespace, _) = id.split_once(':').expect("usable id has a namespace");
+        let entry = counts.entry(namespace.to_owned()).or_default();
+        if block {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    counts
 }
 
 /// Pushes one `content::Block` per typed block declaration. A block keeps the runtime's inferred
@@ -65,7 +140,8 @@ pub(crate) fn declare_blocks(
     context: &RegistrationContext,
     event: &mut BlocksEvent<'_>,
 ) {
-    state.ensure_loaded();
+    state.ensure_loaded(context);
+    let owned = owned_namespaces(context);
     let mut declared = BTreeSet::new();
     let mut count = 0;
     for jar in &mut state.jars {
@@ -84,6 +160,11 @@ pub(crate) fn declare_blocks(
                     jar.row.id,
                     entry.id
                 );
+                continue;
+            }
+            if !owns(&owned, &entry.id) {
+                // The game's declaration fence would refuse it, and a refusal is fatal at start.
+                // It is in the row's `content.skipped`; a baked content package declares it.
                 continue;
             }
             if !declared.insert(entry.id.clone()) {
@@ -141,7 +222,8 @@ pub(crate) fn declare_items(
     context: &RegistrationContext,
     event: &mut ItemsEvent<'_>,
 ) {
-    state.ensure_loaded();
+    state.ensure_loaded(context);
+    let owned = owned_namespaces(context);
     let block_items = block_item_ids(state);
     let mut declared = BTreeSet::new();
     let mut count = 0;
@@ -160,6 +242,11 @@ pub(crate) fn declare_items(
                     jar.row.id,
                     entry.id
                 );
+                continue;
+            }
+            if !owns(&owned, &entry.id) {
+                // See the block counterpart: refused by the game's fence, counted in the row,
+                // and declared by a baked content package instead.
                 continue;
             }
             if block_items.contains(&entry.id) {
@@ -270,14 +357,20 @@ mod tests {
     fn the_content_phase_reaches_for_the_jars_once() {
         let mut state = State::default();
         let mut reads = 0;
-        state.ensure_loaded_with(|| {
-            reads += 1;
-            Vec::new()
-        });
-        state.ensure_loaded_with(|| {
-            reads += 1;
-            Vec::new()
-        });
+        state.ensure_loaded_with(
+            || {
+                reads += 1;
+                Vec::new()
+            },
+            &[],
+        );
+        state.ensure_loaded_with(
+            || {
+                reads += 1;
+                Vec::new()
+            },
+            &[],
+        );
         assert_eq!(reads, 1);
         assert!(state.loaded);
     }
@@ -288,17 +381,57 @@ mod tests {
     fn a_second_server_start_does_not_reload_the_jars() {
         let mut state = State::default();
         let mut reads = 0;
-        state.ensure_loaded_with(|| {
-            reads += 1;
-            Vec::new()
-        });
+        state.ensure_loaded_with(
+            || {
+                reads += 1;
+                Vec::new()
+            },
+            &[],
+        );
         state.reset_server();
-        state.ensure_loaded_with(|| {
-            reads += 1;
-            Vec::new()
-        });
+        state.ensure_loaded_with(
+            || {
+                reads += 1;
+                Vec::new()
+            },
+            &[],
+        );
         assert_eq!(reads, 1);
         assert!(state.loaded);
+    }
+
+    /// The game's fence (`horizon-mod-api/src/parts/owned_namespaces.rs`) lets a native mod
+    /// declare only in its id and its manifest `namespaces`; every other id is a fatal refusal at
+    /// start, so the bridge must filter them before they reach the dispatcher.
+    #[test]
+    fn only_manifest_owned_namespaces_are_declared() {
+        let owned = ["horizon_java".to_owned(), "m3_fixture".to_owned()];
+        assert!(owns(&owned, "horizon_java:thing"));
+        assert!(owns(&owned, "m3_fixture:ruby"));
+        assert!(!owns(&owned, "other_mod:ruby"));
+        assert!(!owns(&owned, "minecraft:stone"));
+        assert!(!owns(&owned, "bare"));
+    }
+
+    /// A jar's own namespace is not in the manifest, so its declarations are skipped and counted
+    /// per namespace; a bare or malformed id is not a declaration this bridge counts either.
+    #[test]
+    fn unowned_declarations_are_counted_per_namespace() {
+        let owned = ["horizon_java".to_owned()];
+        let counts = unowned_counts(
+            &owned,
+            [
+                ("m3_fixture:ruby", false),
+                ("m3_fixture:ruby_block", true),
+                ("m3_fixture:ruby_ore", true),
+                ("horizon_java:own", true),
+                ("minecraft:stone", true),
+                ("bare", false),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("m3_fixture"), Some(&(2, 1)));
     }
 }
 

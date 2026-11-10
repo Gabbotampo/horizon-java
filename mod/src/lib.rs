@@ -67,6 +67,7 @@
 //! Jars are run one at a time, so a jar cannot link against its neighbours yet: cross-jar classes
 //! are a later milestone ([docs/mod-plan.md](../../docs/mod-plan.md)).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -895,7 +896,9 @@ impl HorizonJava {
 
     /// Runs the jars if the content phase has not done so yet.
     fn ensure_jars(&self) {
-        self.lock().ensure_loaded();
+        use mod_api::__private::game::RegistrationContextNew;
+        self.lock()
+            .ensure_loaded(&mod_api::RegistrationContext::new());
     }
 
     /// Fires one runtime event to every jar's recorded listeners, and says what happened.
@@ -1361,6 +1364,10 @@ struct JarRow {
     /// jar, and for a jar whose registrations the content vocabulary cannot carry.
     content_blocks: usize,
     content_items: usize,
+    /// Typed declarations in a namespace the mod does not own, by namespace: (blocks, items).
+    /// The game's declaration fence would refuse them, so they are skipped; a baked content
+    /// package of that namespace declares them instead.
+    content_skipped: BTreeMap<String, (usize, usize)>,
 }
 
 impl JarRow {
@@ -1380,6 +1387,7 @@ impl JarRow {
             command_unknown_host_calls: 0,
             content_blocks: 0,
             content_items: 0,
+            content_skipped: BTreeMap::new(),
         }
     }
 
@@ -1404,6 +1412,9 @@ impl JarRow {
             "content": {
                 "blocks": self.content_blocks,
                 "items": self.content_items,
+                "skipped": self.content_skipped.iter().map(|(namespace, (blocks, items))| {
+                    json!({ "namespace": namespace, "blocks": blocks, "items": items })
+                }).collect::<Vec<_>>(),
             },
         })
     }
@@ -1496,6 +1507,7 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
                     command_unknown_host_calls: 0,
                     content_blocks: 0,
                     content_items: 0,
+                    content_skipped: BTreeMap::new(),
                 });
             }
         }
@@ -1522,6 +1534,7 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
             command_unknown_host_calls: 0,
             content_blocks: 0,
             content_items: 0,
+            content_skipped: BTreeMap::new(),
         },
         jar,
         host,
