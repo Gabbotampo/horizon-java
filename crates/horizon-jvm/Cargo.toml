@@ -3,7 +3,7 @@ name = "horizon-jvm"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-rust-version = "1.86"
+rust-version = "1.88"
 description = "Runs a Java mod on an embedded JVM against a generated Horizon facade (docs/java-mod-compat.md)"
 
 [dependencies]
