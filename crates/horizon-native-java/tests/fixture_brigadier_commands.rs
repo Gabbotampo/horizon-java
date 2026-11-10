@@ -298,7 +298,7 @@ fn source(level: u8, player: Option<u128>) -> CommandSource {
         name: if player.is_some() { "Ana" } else { "Server" }.into(),
         level,
         player,
-        dimension: "minecraft:overworld".into(),
+        dimension: Some("minecraft:overworld".into()),
     }
 }
 

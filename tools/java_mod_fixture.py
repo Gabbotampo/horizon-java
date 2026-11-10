@@ -149,7 +149,12 @@ package net.minecraft.commands;
 public class CommandSourceStack {
     public void sendSuccess(java.util.function.Supplier<net.minecraft.network.chat.Component> supplier,
         boolean broadcast) {}
+    public net.minecraft.server.level.ServerLevel getLevel() { return null; }
 }
+""",
+    "net/minecraft/server/level/ServerLevel.java": """
+package net.minecraft.server.level;
+public class ServerLevel {}
 """,
     "net/minecraft/network/chat/Component.java": """
 package net.minecraft.network.chat;
@@ -244,6 +249,14 @@ public final class HelloCommand {
                             () -> Component.literal("Hello, " + name + "!"), false);
                         return 1;
                     })));
+            // Reads the source's level, which a player source cannot answer (no dimension read):
+            // the command must fail with the unknown host call counted, never act on a guessed
+            // level.
+            dispatcher.register(Commands.literal("javawhere").executes(command -> {
+                Object level = command.getSource().getLevel();
+                command.getSource().sendSuccess(() -> Component.literal("level " + level), false);
+                return 1;
+            }));
         });
     }
 }
