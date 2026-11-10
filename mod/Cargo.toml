@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 # The launcher rewrites this to the staged Horizon source it builds the game from, so the mod
 # always calls the mod API of the exact game revision in `horizon-mod.toml`.
-horizon-mod-api = { git = "https://github.com/arismoko/horizon", rev = "1376e3bcb68b771373ea75637b0201381ccfa6bd" }
+horizon-mod-api = { git = "https://github.com/arismoko/horizon", rev = "cf0113879ebee600bff86070466f75b2db90b40a" }
 # The runtime's two dependencies, pinned to the exact versions in Horizon's `Cargo.lock`
 # (docs/modding/src/how-to/native-mods/016-the-mods-crate.md): a native mod may only use crates
 # the locked game already resolves, at the same version.

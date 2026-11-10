@@ -3,8 +3,9 @@
 The question M3 answers is not *how* a Java `Item` or `Block` becomes content — the runtime already
 records that — but *when*. A Java jar registers content while its entrypoint runs; the game's item and
 block registries are built once, before the first resource or world loads, and never change again in
-that process. This page lists every moment the fork (arismoko/horizon, pinned commit
-`c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac`) lets a mod add an item or block, what the runtime can
+that process. This page lists every moment the fork (arismoko/horizon; written against pinned commit
+`c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac`, the mod now pins `cf0113879ebee600bff86070466f75b2db90b40a`)
+lets a mod add an item or block, what the runtime can
 say about one, and the options for carrying a jar's declarations across that timing gap.
 
 Findings only; the implementation is the second commit on this branch.
