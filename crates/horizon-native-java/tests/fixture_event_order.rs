@@ -280,7 +280,7 @@ fn fabric_phases_order_listeners_and_a_deciding_result_stops_the_rest() {
             player: Some(ALEX),
             pos: Some([1, 70, 2]),
             face: Some([0, 1, 0]),
-            off_hand: true,
+            off_hand: Some(true),
             ..EventContext::default()
         },
     );
