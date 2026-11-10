@@ -6,8 +6,9 @@ authors = []
 # The content API line this mod does not use; every manifest names it.
 api = "0.2"
 side = "both"
-# No registry entries yet: M0/M1 only run jars and write a report.
-capabilities = []
+# The one capability the manifest format declares today (the game requires exactly this list).
+# M0/M1 register nothing yet; games bindings and registries are later milestones.
+capabilities = ["registries"]
 
 [native]
 # The game and the exact Horizon source revision this mod is built against
