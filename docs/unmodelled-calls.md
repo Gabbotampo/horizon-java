@@ -166,7 +166,7 @@ below do not touch any of those surfaces: the JDK batch adds only `java.io.File`
 
 ## After the fixes
 
-Four batches landed against this table. Each was measured on its own branch (from the
+Three batches landed against this table. Each was measured on its own branch (from the
 same `784429b` base) with the command above, so the per-batch delta is what that batch
 alone moved; the cumulative row is the three branches merged and probed once. A jar
 counts as fixed only when its row moves to `ran-clean`, not when its call count drops.
