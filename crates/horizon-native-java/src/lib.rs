@@ -9166,7 +9166,6 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
 
-/// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 /// `Math.max`/`Math.min` on `double` or `float` as Java defines them.
 fn java_float_extremum(left: f64, right: f64, max: bool) -> f64 {
     if left.is_nan() || right.is_nan() {
@@ -9204,6 +9203,7 @@ fn charset_name(field: &str) -> Option<&'static str> {
     })
 }
 
+/// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
     if !matches!(
         owner,
