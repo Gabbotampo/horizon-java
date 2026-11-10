@@ -123,6 +123,24 @@ dirt and breaking it answers `{"block":"minecraft:air","block_before":"minecraft
 cancel is scoped to the block the listener named. The jar's report row carries `callbacks.ran`,
 `callbacks.failed` and `callbacks.unknown_host_call_count` over every event.
 
+`tools/java_mod_fixture.py --kind m2d` adds the two M2d listeners: Fabric's
+`ServerLivingEntityEvents.AFTER_DEATH` prints the dead entity's id, and Fabric's
+`UseEntityCallback` prints the hand and the clicked entity's id. `/execute at @s run summon
+minecraft:cow ~1 ~ ~` then `interact-entity <id>` on it, and `/execute at @s run kill
+@e[type=minecraft:cow,distance=..3,limit=1]`:
+
+```
+Horizon Java: m2d_fixture: m2d: interact hand=MAIN_HAND id=254
+Horizon Java: use_entity (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
+Horizon Java: m2d_fixture: m2d: interact hand=OFF_HAND id=254
+Horizon Java: use_entity (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
+Horizon Java: m2d_fixture: m2d: after death id=254
+Horizon Java: living_after_death (dedicated=false): 1 callback(s) ran, 0 failed, 0 unknown host call(s)
+```
+
+Both clicks are vanilla's two attempts (`MAIN_HAND` with the held stack, then `OFF_HAND` with the
+empty one), and the stack reads tell them apart.
+
 ## Fork seams
 
 The gaps above and the arguments the runtime cannot fill are listed under **Fork seams needed** in

@@ -125,6 +125,8 @@ python3 tools/vendor.py             # after changing crates/horizon-native-java
 python3 tools/java_mod_fixture.py --out DIR                 # milestone 1's jar
 python3 tools/java_mod_fixture.py --kind lifecycle --out DIR # SERVER_STARTED/STOPPING lines
 python3 tools/java_mod_fixture.py --kind command --out DIR   # /javahello [name]
+python3 tools/java_mod_fixture.py --kind hooks --out DIR     # the M2c event listeners
+python3 tools/java_mod_fixture.py --kind m2d --out DIR       # AFTER_DEATH and a click's hand
 ```
 
 The documented build is Horizon's launcher (`horizon-launcher native-build mod/ --server-output OUT
