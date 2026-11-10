@@ -2077,6 +2077,12 @@ pub trait Host {
         None
     }
 
+    /// Whether a game object marker is an instance of `wanted`, when the host
+    /// knows that object's class chain; `None` leaves the interpreter's answer.
+    fn game_instance_of(&self, _marker: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
+
     /// Up to `limit` bytes (all that are left when `None`) of a bounded
     /// input-stream marker the host holds, consumed from the stream.
     ///
@@ -2084,12 +2090,6 @@ pub trait Host {
     /// `readAllBytes` or `read(byte[], int, int)` on a resource stream needs
     /// the exact bytes. An empty answer is end of stream. A host that keeps
     /// no stream table keeps the default.
-    /// Whether a game object marker is an instance of `wanted`, when the host
-    /// knows that object's class chain; `None` leaves the interpreter's answer.
-    fn game_instance_of(&self, _marker: &str, _wanted: &str) -> Option<bool> {
-        None
-    }
-
     fn resource_stream_bytes(&mut self, _marker: &str, _limit: Option<usize>) -> Option<Vec<u8>> {
         None
     }
@@ -2431,6 +2431,10 @@ pub struct StdHost {
     heap: heap::JavaHeap,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
+    /// Game constants read as opaque typed markers (`SoundType.WOOD`): the
+    /// value is modelled only by identity and declared type, so a measurement
+    /// can still see that a jar leaned on unmodelled game state.
+    opaque_game_constants: BTreeMap<String, usize>,
     strict_unknown_host_calls: bool,
     next_lazy_optional: usize,
     next_fabric_event: usize,
@@ -2527,6 +2531,7 @@ impl StdHost {
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             unknown_host_calls: BTreeMap::new(),
+            opaque_game_constants: BTreeMap::new(),
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
             next_fabric_event: 0,
@@ -2559,6 +2564,20 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// The game constants this host answered with an opaque typed marker, and
+    /// how often each was read (`owner#NAME descriptor`, like
+    /// [`Self::unknown_host_calls`]).
+    pub fn opaque_game_constant_reads(&self) -> Vec<(String, usize)> {
+        self.opaque_game_constants
+            .iter()
+            .map(|(field, count)| (field.clone(), *count))
+            .collect()
+    }
+
+    pub fn opaque_game_constant_count(&self) -> usize {
+        self.opaque_game_constants.values().sum()
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -2788,8 +2807,6 @@ impl StdHost {
         Arc::make_mut(&mut self.linked_classes).link_classes(id, classes)
     }
 
-    /// Share one linked table across many hosts (`Self::link_jar` clones it
-    /// per host otherwise, which doubles the class bytes of a whole pack).
     /// Seed each vanilla block's class chain and interfaces (simple names), so
     /// `Blocks.FIRE instanceof FireBlock` answers as in the game.
     pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
@@ -2797,6 +2814,8 @@ impl StdHost {
         self
     }
 
+    /// Share one linked table across many hosts (`Self::link_jar` clones it
+    /// per host otherwise, which doubles the class bytes of a whole pack).
     pub fn with_linked_class_table(mut self, table: Arc<LinkedClassTable>) -> Self {
         self.linked_classes = table;
         self
@@ -3884,11 +3903,17 @@ impl Host for StdHost {
             .game_block_classes
             .get(&format!("minecraft:{}", field.to_ascii_lowercase()))?;
         let simple = wanted.rsplit('/').next().unwrap_or(wanted);
-        Some(
-            wanted == "java/lang/Object"
-                || (wanted.starts_with("net/minecraft/")
-                    && classes.iter().any(|class| class == simple)),
-        )
+        if wanted == "java/lang/Object" || classes.iter().any(|class| class == simple) {
+            return Some(true);
+        }
+        // The seeded chain runs from the block's own class up to `Block` (and
+        // its interfaces), so it can only rule out another class of the block
+        // package; anything else (`BlockBehaviour`, an outside interface)
+        // keeps the interpreter's own answer rather than a confident `false`.
+        let block_class = wanted
+            .strip_prefix("net/minecraft/world/level/block/")
+            .is_some_and(|name| !name.contains('/'));
+        block_class.then_some(false)
     }
 
     fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
@@ -4134,6 +4159,10 @@ impl Host for StdHost {
                     && game_object_type(descriptor).is_some() =>
             {
                 let declared = game_object_type(descriptor).unwrap_or_default();
+                *self
+                    .opaque_game_constants
+                    .entry(format!("{owner}#{name}{descriptor}"))
+                    .or_default() += 1;
                 Ok(Value::Ref(Some(format!("{declared}#{owner}.{name}"))))
             }
             _ => self.unknown_host_call(r),
@@ -9226,7 +9255,6 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
 
-/// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 /// The game class a field descriptor names (`Lnet/minecraft/...;`), if any.
 /// Registries and resource keys are excluded: an unknown one stays null, so a
 /// registration against it is reported rather than recorded against a guess.
@@ -9245,6 +9273,7 @@ fn game_object_type(descriptor: &str) -> Option<&str> {
         })
 }
 
+/// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
     if !matches!(
         owner,
@@ -28309,6 +28338,14 @@ mod tests {
             host.game_instance_of(&marker, "net/minecraft/world/level/block/ChestBlock"),
             Some(false)
         );
+        // Outside the block package the chain can't rule anything out.
+        assert_eq!(
+            host.game_instance_of(
+                &marker,
+                "net/minecraft/world/level/block/state/BlockBehaviour"
+            ),
+            None
+        );
         // An unseeded block keeps the interpreter's own answer.
         assert_eq!(
             host.game_instance_of(
@@ -28353,6 +28390,13 @@ mod tests {
             Some("net/minecraft/world/level/block/Block")
         );
         assert_ne!(fire, first);
+        // Each opaque read is still recorded, so measurements stay honest.
+        assert_eq!(host.opaque_game_constant_count(), 3);
+        assert!(host.opaque_game_constant_reads().contains(&(
+            "net/minecraft/world/level/block/SoundType#WOODLnet/minecraft/world/level/block/SoundType;"
+                .to_owned(),
+            2
+        )));
         // Registries keep their rule: an unknown one stays null.
         let unknown_registry = host
             .get_static(&field(

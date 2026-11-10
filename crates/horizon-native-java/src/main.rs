@@ -586,6 +586,8 @@ fn execution_json(
         "host_calls": calls,
         "unknown_host_call_count": host.unknown_host_call_count(),
         "unknown_host_calls": host.unknown_host_calls(),
+        "opaque_game_constant_count": host.opaque_game_constant_count(),
+        "opaque_game_constant_reads": host.opaque_game_constant_reads(),
         "payload_directions": host
             .payload_registrations()
             .iter()
@@ -1338,10 +1340,24 @@ mod tests {
             method: None,
             adapter: None,
         }];
+        let constant = MethodRef {
+            owner: "net/minecraft/world/level/block/SoundType".into(),
+            name: "WOOD".into(),
+            descriptor: "Lnet/minecraft/world/level/block/SoundType;".into(),
+        };
+        let _ = host.get_static(&constant);
         let report = execution_json("main", &entrypoints, 1, &host, &jar);
         assert_eq!(report["status"], "ok");
         assert_eq!(report["host_calls"], 1);
         assert_eq!(report["unknown_host_call_count"], 1);
+        assert_eq!(report["opaque_game_constant_count"], 1);
+        assert_eq!(
+            report["opaque_game_constant_reads"],
+            serde_json::json!([[
+                "net/minecraft/world/level/block/SoundType#WOODLnet/minecraft/world/level/block/SoundType;",
+                1
+            ]])
+        );
         assert_eq!(
             report["unknown_host_calls"],
             serde_json::json!([["demo/Unmodelled#test()V", 1]])
