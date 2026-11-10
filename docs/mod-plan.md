@@ -15,7 +15,7 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 | Milestone | Behaviour |
 |---|---|
 | **M0, the shell** | `Hooks::server_about_to_start` and `Hooks::client_setup` log one line each. The server start writes this mod's report, `config/horizon_java/java-runtime.json`, through the mod API's own config service (`Host::config_files`), so the game files it under `config/` beside every other mod's. With no jars it is `{"schema":1,"jars":[]}`. |
-| **M1, run jars** | Every `.jar` in `config/horizon_java/java-mods/` is read as bytes (at `server_about_to_start` until M3 moved the read to the content phase, with `std::fs`; see M3), loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `refused`, its host-call and unknown-host-call counts, and the refusal reason. |
+| **M1, run jars** | Every `.jar` in `config/horizon_java/java-mods/` is read as bytes (at `server_about_to_start` until M3 moved the read to the content phase, with `std::fs`; see M3), loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `ran-partial` / `refused`, its host-call and unknown-host-call counts, and the reason a jar was refused or ran partially. |
 | **M2a, lifecycle** | Each jar's `StdHost` (heap, statics, recorded listeners) is kept for the server's life. `server_about_to_start` fires the Fabric `SERVER_STARTING` and NeoForge `ServerAboutToStartEvent` listeners, `server_starting` the NeoForge `ServerStartingEvent` ones, `server_started` the Fabric `SERVER_STARTED` and NeoForge `ServerStartedEvent` ones, and `server_stopping`/`server_stopped` their own. Each hook logs callbacks run/failed and unmodelled host calls; every row's `callbacks` object totals them; a jar's `System.out` lines reach the game log with its id. |
 | **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text` and `integer` nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 | **M2c, game events** | Every other modelled server event reaches its matching mod API hook, moment for moment: server and level ticks, level load/unload, player join/leave/respawn/clone/dimension change, entity join/leave, living damage before/after, item and block use, block and entity attack, and block break (whose cancel also fires Fabric's `CANCELED`). A cancellable hook carries the firing's cancel and, where the hook has one, the Fabric `InteractionResult` back as the hook's cancellation result. The full table, arguments and departures: [docs/mod-hooks.md](mod-hooks.md). |
@@ -24,11 +24,14 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 
 The verdicts are the ones the corpus ledgers already use:
 
-- **`ran-clean`** — the server entrypoints ran and no host call was unmodelled.
-- **`ran-hollow`** — they ran, but at least one host call was answered neutrally
+- **`ran-clean`** — every server entrypoint stage ran and no host call was unmodelled.
+- **`ran-hollow`** — every stage ran, but at least one host call was answered neutrally
   (`unknown_host_call_count`).
+- **`ran-partial`** — at least one stage ran and at least one failed; the listeners the running
+  stages registered stay active, and `reason` names each failed stage and its error. A real loader
+  would have thrown, so this is never counted as clean, whatever its host-call count.
 - **`refused`** — unreadable jar, no server-side entrypoint (a client-only jar is named as such),
-  an unsupported entrypoint adapter, or an entrypoint that failed; `reason` says which.
+  an unsupported entrypoint adapter, or every entrypoint stage failed; `reason` says which.
 
 Jars run one at a time, so a jar cannot link against its neighbours yet: cross-jar classes are a
 later milestone.
@@ -100,7 +103,7 @@ Horizon Java: m3_fixture.jar (m3_fixture) ran-clean (9 host calls, 0 unknown hos
 Horizon Java: content: 1 block declaration(s) from 1 jar(s)
 Horizon Java: content: 1 item declaration(s) from 1 jar(s)
 Horizon: content from 2 mod(s) in .horizon-cache/mod-content/<stamp>
-Horizon Java 0.1.0: server about to start (dedicated=false); 1 jar(s) in config/horizon_java/java-mods: 1 ran-clean, 0 ran-hollow, 0 refused; report in config/horizon_java/java-runtime.json
+Horizon Java 0.1.0: server about to start (dedicated=false); 1 jar(s) in config/horizon_java/java-mods: 1 ran-clean, 0 ran-hollow, 0 ran-partial, 0 refused; report in config/horizon_java/java-runtime.json
 ```
 
 The fixture registers `m3_fixture:ruby` (a plain `Item`, template `minecraft:stick`) and
@@ -476,7 +479,7 @@ M0, an empty `java-mods/`:
 
 ```
 Horizon Java 0.1.0: client setup
-Horizon Java 0.1.0: server about to start (dedicated=false); 0 jar(s) in config/horizon_java/java-mods: 0 ran-clean, 0 ran-hollow, 0 refused; report in config/horizon_java/java-runtime.json
+Horizon Java 0.1.0: server about to start (dedicated=false); 0 jar(s) in config/horizon_java/java-mods: 0 ran-clean, 0 ran-hollow, 0 ran-partial, 0 refused; report in config/horizon_java/java-runtime.json
 ```
 
 and `config/horizon_java/java-runtime.json` is `{"jars": [], "schema": 1}`.
@@ -485,7 +488,7 @@ M1, with the fixture jar:
 
 ```
 Horizon Java: m0_fixture.jar (m0_fixture) ran-clean (11 host calls, 0 unknown host calls)
-Horizon Java 0.1.0: server about to start (dedicated=false); 1 jar(s) in config/horizon_java/java-mods: 1 ran-clean, 0 ran-hollow, 0 refused; report in config/horizon_java/java-runtime.json
+Horizon Java 0.1.0: server about to start (dedicated=false); 1 jar(s) in config/horizon_java/java-mods: 1 ran-clean, 0 ran-hollow, 0 ran-partial, 0 refused; report in config/horizon_java/java-runtime.json
 ```
 
 M1, with a file that is not a jar and a client-only jar:

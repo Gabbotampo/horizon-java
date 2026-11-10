@@ -23,9 +23,13 @@
 //! phase, where `config_files` does not exist yet; [`content`] explains why it is `std::fs`.)
 //! Each jar logs one line and gets one row in the report:
 //!
-//! * `ran-clean`: the jar's server entrypoints ran and no host call was unmodelled;
-//! * `ran-hollow`: they ran, but at least one host call was answered neutrally (`unknown_host_call_count`);
-//! * `refused`: the jar could not be read, has no server-side entrypoint, or an entrypoint failed,
+//! * `ran-clean`: every server entrypoint stage ran and no host call was unmodelled;
+//! * `ran-hollow`: every stage ran, but at least one host call was answered neutrally
+//!   (`unknown_host_call_count`);
+//! * `ran-partial`: at least one stage ran and at least one failed; the listeners the running
+//!   stages registered stay active, and `reason` names every failed stage and its error. A real
+//!   loader would have thrown, so this is never counted as clean;
+//! * `refused`: the jar could not be read, has no server-side entrypoint, or every stage failed,
 //!   and `reason` says which.
 //!
 //! # Milestone 2a: listeners on real server lifecycle events
@@ -252,11 +256,12 @@ impl Hooks for HorizonJava {
         let total = state.jars.len() + state.refused.len();
         match write_report(host, &state) {
             Ok(path) => log::info!(
-                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} refused; report in {path}",
+                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} ran-partial, {} refused; report in {path}",
                 env!("CARGO_PKG_VERSION"),
                 event.dedicated,
                 count("ran-clean"),
                 count("ran-hollow"),
+                count("ran-partial"),
                 count("refused"),
             ),
             Err(error) => log::warn!(
@@ -1341,11 +1346,11 @@ impl State {
 struct JarRow {
     file: String,
     id: String,
-    /// `ran-clean`, `ran-hollow` or `refused`.
+    /// `ran-clean`, `ran-hollow`, `ran-partial` or `refused`.
     verdict: &'static str,
     host_calls: usize,
     unknown_host_calls: usize,
-    /// Reason a refused jar was refused; `None` for one that ran.
+    /// Why a jar was refused or ran partially; `None` for a full run.
     reason: Option<String>,
     /// Server lifecycle callbacks that ran and failed, and the unmodelled host calls they made.
     callbacks_ran: usize,
@@ -1517,11 +1522,7 @@ fn load_jar(file: String, bytes: &[u8]) -> Result<LoadedJar, JarRow> {
         row: JarRow {
             file,
             id,
-            verdict: if unknown == 0 {
-                "ran-clean"
-            } else {
-                "ran-hollow"
-            },
+            verdict: runtime::verdict::verdict(ran, failures.len(), unknown),
             host_calls: calls,
             unknown_host_calls: unknown,
             reason: (!failures.is_empty())

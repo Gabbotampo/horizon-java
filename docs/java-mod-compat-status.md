@@ -439,6 +439,10 @@ counting a refusal:
 - `missing-dependency` (`--with-deps` only): the jar's declared closure needs a mod id no corpus jar provides, so no
   loader would start it either; the ledger does not run it.
 
+The in-game mod's report adds `ran-partial`: at least one entrypoint stage ran and at least one failed, so the
+listeners from the running stages stay active and the row's reason names the failed stages. It is never counted as
+`ran-clean` or `ran-hollow`; the probe and the ledger above do not emit it because they run one stage per invocation.
+
 The default ledger starts one server per jar, so a jar that declares a dependency (archers on `spell_engine`, zoomify
 on YACL) runs without it, which a real loader never does. `--with-deps` runs each jar with its declared closure
 (`fabric.mod.json` `depends`, `mods.toml`/`neoforge.mods.toml` required dependencies, resolved through `provides`
