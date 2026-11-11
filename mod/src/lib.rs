@@ -23,13 +23,9 @@
 //! phase, where `config_files` does not exist yet; [`content`] explains why it is `std::fs`.)
 //! Each jar logs one line and gets one row in the report:
 //!
-//! * `ran-clean`: every server entrypoint stage ran and no host call was unmodelled;
-//! * `ran-hollow`: every stage ran, but at least one host call was answered neutrally
-//!   (`unknown_host_call_count`);
-//! * `ran-partial`: at least one stage ran and at least one failed; the listeners the running
-//!   stages registered stay active, and `reason` names every failed stage and its error. A real
-//!   loader would have thrown, so this is never counted as clean;
-//! * `refused`: the jar could not be read, has no server-side entrypoint, or every stage failed,
+//! * `ran-clean`: the jar's server entrypoints ran and no host call was unmodelled;
+//! * `ran-hollow`: they ran, but at least one host call was answered neutrally (`unknown_host_call_count`);
+//! * `refused`: the jar could not be read, has no server-side entrypoint, or an entrypoint failed,
 //!   and `reason` says which.
 //!
 //! # Milestone 2a: listeners on real server lifecycle events
@@ -78,10 +74,10 @@ use std::time::Duration;
 
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
-    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, EntityInteractEvent,
+    EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host, HostSide,
+    InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension, LevelLoadEvent,
+    LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
     LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
     PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
     PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
@@ -113,6 +109,10 @@ const SCHEMA: u64 = 1;
 const JAR_BUDGET: Duration = Duration::from_secs(30);
 /// The line every log entry starts with, so one `grep` finds all of them.
 const LOG: &str = "Horizon Java";
+/// The entrypoint kinds a server runs, in the order the probe picks them: Fabric's common
+/// `main`, NeoForge's `server`, then the class a NeoForge jar discovers by annotation.
+const SERVER_KINDS: [&str; 3] = ["main", "server", "neoforge"];
+
 /// The mod's state. The content hooks run the jars once per process, before any server exists;
 /// every later hook reuses what they recorded, and a second server this process hosts only resets
 /// the per-server state.
@@ -257,12 +257,11 @@ impl Hooks for HorizonJava {
         let total = state.jars.len() + state.refused.len();
         match write_report(host, &state) {
             Ok(path) => log::info!(
-                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} ran-partial, {} refused; report in {path}",
+                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} refused; report in {path}",
                 env!("CARGO_PKG_VERSION"),
                 event.dedicated,
                 count("ran-clean"),
                 count("ran-hollow"),
-                count("ran-partial"),
                 count("refused"),
             ),
             Err(error) => log::warn!(
@@ -331,6 +330,7 @@ impl Hooks for HorizonJava {
                     EventContext::default(),
                 );
                 let (ran, failed) = run_listeners(
+                    &loaded.row.id,
                     &loaded.jar,
                     &mut loaded.host,
                     &loaded.listeners,
@@ -765,7 +765,9 @@ impl Hooks for HorizonJava {
             // The hook fires once per hand with that hand's stack (Fabric's `UseEntityCallback`
             // carries the `InteractionHand`); the pin's event names the stack, not the hand, so
             // which of the acting player's hands holds it is what tells them apart.
-            off_hand: self.acting_hand(host, event.stack).map(|hand| hand == Hand::Off),
+            off_hand: self
+                .acting_hand(host, event.stack)
+                .map(|hand| hand == Hand::Off),
             entity: Some(FacadeEntity {
                 id: event.entity,
                 kind: event.kind.to_owned(),
@@ -947,8 +949,14 @@ impl HorizonJava {
         let (mut ran, mut failed, mut unknown) = (0, 0, 0);
         for loaded in &mut state.jars {
             let id = loaded.row.id.clone();
+            // Every jar's host hears about the level this firing names, whether or not it has a
+            // listener for the event: `MinecraftServer.getAllLevels()` answers from what the
+            // game announced, and a jar that only listens for `server_started` must still see
+            // the levels loaded before it.
+            loaded.host.note_firing_levels(&firing);
             let before = loaded.host.unknown_host_call_count();
             let (jar_ran, jar_failed) = run_listeners(
+                &id,
                 &loaded.jar,
                 &mut loaded.host,
                 &loaded.listeners,
@@ -1053,6 +1061,7 @@ fn interaction_result(result: Option<&str>) -> InteractionResult {
 /// Runs the listeners of this jar that `wanted` keeps, in registration order, against one shared
 /// firing.
 fn run_listeners(
+    id: &str,
     jar: &NativeJar,
     host: &mut StdHost,
     listeners: &[GameListener],
@@ -1065,17 +1074,9 @@ fn run_listeners(
         .iter()
         .filter(|listener| listener.event == event && wanted(listener))
     {
-        let outcome = caught(
-            &format!("{} listener from {}", id, listener.source),
-            || {
-                jar.run_game_listener(
-                    listener,
-                    firing,
-                    host,
-                    &ExecutionBudget::within(JAR_BUDGET),
-                )
-            },
-        );
+        let outcome = caught(&format!("{} listener from {}", id, listener.source), || {
+            jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET))
+        });
         match outcome {
             Ok(Ok(run)) => {
                 ran += usize::from(run.ran);
@@ -1286,7 +1287,11 @@ impl Translator<'_> {
                 Requirement::Level(node_level) => level = level.max((*node_level).min(4)),
                 Requirement::Predicate(_) => {
                     match caught(
-                        &format!("{} permission predicate for /{}", self.id, usage(path, arguments)),
+                        &format!(
+                            "{} permission predicate for /{}",
+                            self.id,
+                            usage(path, arguments)
+                        ),
                         || {
                             self.jar
                                 .requirement_level(requirement, true, self.host, &self.budget)
@@ -1414,11 +1419,11 @@ impl State {
 struct JarRow {
     file: String,
     id: String,
-    /// `ran-clean`, `ran-hollow`, `ran-partial` or `refused`.
+    /// `ran-clean`, `ran-hollow` or `refused`.
     verdict: &'static str,
     host_calls: usize,
     unknown_host_calls: usize,
-    /// Why a jar was refused or ran partially; `None` for a full run.
+    /// Reason a refused jar was refused; `None` for one that ran.
     reason: Option<String>,
     /// Server lifecycle callbacks that ran and failed, and the unmodelled host calls they made.
     callbacks_ran: usize,
@@ -1511,31 +1516,38 @@ pub(crate) fn jar_id(jar: &NativeJar, file: &str) -> String {
         .unwrap_or_else(|| file.strip_suffix(".jar").unwrap_or(file).to_owned())
 }
 
-/// Loads one jar the way a server would: every server-side entrypoint the real loader runs, in
-/// the loader's order, in its own host, with the sibling jars it declares on that host's class
-/// path. Anything the runtime does not model is counted by the host, which is what `ran-hollow`
-/// means. The host is returned because the listeners it recorded need it for the rest of the
-/// server's life.
-///
-/// Fabric runs `main` and then `server` (Hooks.startServer), so a jar that has both runs both.
-/// A failing stage is recorded and the remaining stages still run: the failure is a limit of
-/// this interpreter, not a reason to drop an entrypoint the jar ships for the server. The jar is
-/// refused only when every stage failed; a partial run is `ran-partial` and its `reason` names
-/// the failed stages.
+/// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
+/// game behind it, and with the sibling jars it declares on that host's class path. Anything the
+/// runtime does not model is counted by the host, which is what `ran-hollow` means. The host is
+/// returned because the listeners it recorded need it for the rest of the server's life.
 fn load_jar(
     file: String,
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
 ) -> Result<LoadedJar, JarRow> {
     let id = jar_id(&jar, &file);
-    let entrypoints = jar.role_entrypoints(false);
-    if entrypoints.is_empty() {
+    let Some(kind) = SERVER_KINDS
+        .into_iter()
+        .find(|kind| !jar.discover_entrypoints_on(kind, "SERVER").is_empty())
+    else {
         let reason = if jar.discover_entrypoints("client").is_empty() {
             "no main, server or neoforge entrypoint"
         } else {
             "client-only entrypoint: a server never runs it"
         };
         return Err(JarRow::refused(&file, id, reason.to_owned()));
+    };
+    let entrypoints = jar.discover_entrypoints_on(kind, "SERVER");
+    if let Some(entry) = entrypoints.iter().find(|entry| entry.adapter.is_some()) {
+        return Err(JarRow::refused(
+            &file,
+            id,
+            format!(
+                "{}: entrypoint adapter {} is not supported by the native path",
+                entry.class,
+                entry.adapter.as_deref().unwrap_or_default()
+            ),
+        ));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
     for (link, dependency) in links {
@@ -1548,16 +1560,7 @@ fn load_jar(
         }
     }
     let mut calls = 0;
-    let mut ran = 0;
-    let mut failures = Vec::new();
-    for (kind, entry) in &entrypoints {
-        if let Some(adapter) = entry.adapter.as_deref() {
-            failures.push(format!(
-                "{}: entrypoint adapter {adapter} is not supported by the native path",
-                entry.class
-            ));
-            continue;
-        }
+    for entry in &entrypoints {
         let outcome = caught(
             &format!("{} entrypoint {} ({kind})", id, entry.class),
             || {
@@ -1570,23 +1573,22 @@ fn load_jar(
                 )
             },
         );
-        match outcome {
+        let failure = match outcome {
             Ok(Ok(report)) => {
                 calls += report.calls;
-                ran += 1;
+                continue;
             }
-            Ok(Err(error)) => failures.push(format!("{}: {error}", entry.class)),
-            Err(panic) => failures.push(format!("{}: panicked: {panic}", entry.class)),
-        }
-    }
-    if ran == 0 {
+            Ok(Err(error)) => format!("{}: {error}", entry.class),
+            Err(panic) => format!("{}: panicked: {panic}", entry.class),
+        };
+        let unknown = host.unknown_host_call_count();
         return Err(JarRow {
             file,
             id,
             verdict: "refused",
             host_calls: calls,
-            unknown_host_calls: host.unknown_host_call_count(),
-            reason: Some(failures.join("; ")),
+            unknown_host_calls: unknown,
+            reason: Some(failure),
             callbacks_ran: 0,
             callbacks_failed: 0,
             callback_unknown_host_calls: 0,
@@ -1604,11 +1606,14 @@ fn load_jar(
         row: JarRow {
             file,
             id,
-            verdict: runtime::verdict::verdict(ran, failures.len(), unknown),
+            verdict: if unknown == 0 {
+                "ran-clean"
+            } else {
+                "ran-hollow"
+            },
             host_calls: calls,
             unknown_host_calls: unknown,
-            reason: (!failures.is_empty())
-                .then(|| format!("entrypoint(s) failed: {}", failures.join("; "))),
+            reason: None,
             callbacks_ran: 0,
             callbacks_failed: 0,
             callback_unknown_host_calls: 0,
@@ -1658,11 +1663,9 @@ mod tests {
             panic!("radix must lie in the range [2, 36]")
         });
         assert_eq!(answer.unwrap_err(), "radix must lie in the range [2, 36]");
-        let answer: Result<(), String> =
-            caught("formatted", || panic!("{} {}", "bad", "value"));
+        let answer: Result<(), String> = caught("formatted", || panic!("{} {}", "bad", "value"));
         assert_eq!(answer.unwrap_err(), "bad value");
-        let answer: Result<(), String> =
-            caught("quiet", || std::panic::panic_any(7_u8));
+        let answer: Result<(), String> = caught("quiet", || std::panic::panic_any(7_u8));
         assert_eq!(answer.unwrap_err(), "panic with a non-string payload");
         assert_eq!(caught("runs", || 7).unwrap(), 7);
     }
@@ -1679,7 +1682,10 @@ mod tests {
             one_hand(Some(&"paper"), Some(&"stick"), Some(&"paper")),
             Some(Hand::Off)
         );
-        assert_eq!(one_hand::<&str>(None, Some(&"stick"), None), Some(Hand::Off));
+        assert_eq!(
+            one_hand::<&str>(None, Some(&"stick"), None),
+            Some(Hand::Off)
+        );
         assert_eq!(one_hand::<&str>(None, None, None), None);
         assert_eq!(
             one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
