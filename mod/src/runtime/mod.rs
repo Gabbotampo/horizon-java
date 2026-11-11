@@ -43,6 +43,7 @@ mod guava_model;
 mod heap;
 mod hook_shapes;
 mod java_identifier;
+mod java_immutable;
 mod java_regex;
 mod java_tostring;
 mod jdk_locale_thread;
@@ -2430,6 +2431,9 @@ pub struct StdHost {
     saved_data: facade_saved_data::SavedDataState,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
+    /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
+    /// for one that owns its elements, `Some(source)` for a view.
+    unmodifiable_collections: BTreeMap<String, Option<String>>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2548,6 +2552,7 @@ impl StdHost {
             saved_data: facade_saved_data::SavedDataState::default(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
+            unmodifiable_collections: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -2814,14 +2819,33 @@ impl StdHost {
     ) -> Result<usize, NativeError> {
         let id = id.into();
         let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
+        self.record_loaded_mod(jar);
         // A loader also puts the linked jar's bundled jars
         // (`META-INF/jars/*.jar`) on the class path: a dependency such as
         // `libjf` keeps its classes there, and its dependents call them.
+        // Fabric loads each of them as a mod of its own.
         for (entry, nested) in nested_jars::parsed(jar) {
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
+            self.record_loaded_mod(&nested);
         }
         Ok(added)
+    }
+
+    /// A jar present beside this one is a loaded mod for `isModLoaded` and
+    /// `ModList.isLoaded`, declared as a dependency or not.
+    fn record_loaded_mod(&mut self, jar: &NativeJar) {
+        if let Some(id) = jar.fabric_id.as_deref().or(jar.neoforge_id.as_deref()) {
+            let version = jar
+                .fabric_version
+                .as_deref()
+                .or(jar.neoforge_version.as_deref());
+            // A declared dependency was seeded as `unknown`; the jar knows.
+            let known = self.mods.entry(id.to_owned()).or_default();
+            if known.is_empty() || known == "unknown" {
+                *known = version.unwrap_or("unknown").to_owned();
+            }
+        }
     }
 
     /// [`Self::link_jar`] for a caller that already parsed the library's
@@ -2926,6 +2950,9 @@ impl StdHost {
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<String>> {
         let marker = expect_ref(receiver)?;
+        if let Some(values) = self.view_values(marker) {
+            return Some(values);
+        }
         self.mutable_collections.get(marker).map(|values| {
             values
                 .iter()
@@ -4126,6 +4153,9 @@ impl Host for StdHost {
         if let Some(value) = self.game_event_invoke(r, args) {
             return value;
         }
+        if let Some(value) = self.unmodifiable_factory(r, args) {
+            return value;
+        }
         if let Some(value) = self.collection_copy_of(r, args) {
             return value;
         }
@@ -4560,7 +4590,7 @@ impl Host for StdHost {
             // registration diagnostics. Keep them as canonical markers so
             // equality/string formatting is deterministic without a JVM.
             ("java/util/UUID", "randomUUID", "()Ljava/util/UUID;") => {
-                Ok(uuid_value("00000000-0000-4000-8000-000000000000")?)
+                Ok(uuid_value(&random_uuid())?)
             }
             ("java/util/UUID", "fromString", "(Ljava/lang/String;)Ljava/util/UUID;") => {
                 Ok(uuid_value(expect_string(Self::argument(r, args, 0)?))?)
@@ -5512,8 +5542,13 @@ impl Host for StdHost {
                 }
                 ("addShutdownHook", "(Ljava/lang/Thread;)V") => Ok(Value::Void),
                 ("removeShutdownHook", "(Ljava/lang/Thread;)Z") => Ok(Value::Int(1)),
-                ("availableProcessors", "()I") => Ok(Value::Int(1)),
-                ("freeMemory" | "totalMemory" | "maxMemory", "()J") => Ok(Value::Long(0)),
+                // The host's own processor count, which is what the JVM reports
+                // (both honour the process's CPU affinity and cgroup quota).
+                ("availableProcessors", "()I") => Ok(Value::Int(
+                    std::thread::available_parallelism().map_or(1, |n| n.get() as i32),
+                )),
+                // There is no Java heap to measure: counted, not invented.
+                ("freeMemory" | "totalMemory" | "maxMemory", "()J") => self.unknown_host_call(r),
                 ("gc", "()V") | ("runFinalization", "()V") => Ok(Value::Void),
                 _ => Err(NativeError::MissingMethod(format!(
                     "java/lang/Runtime#{}{}",
@@ -5953,6 +5988,9 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            if let Some(answer) = self.unmodifiable_member(r, marker, args) {
+                return answer;
+            }
             if r.name == "removeIf"
                 && r.descriptor == "(Ljava/util/function/Predicate;)Z"
                 && !is_map_owner(&r.owner)
@@ -8153,8 +8191,12 @@ impl Host for StdHost {
                 // The loader itself and the game are always loaded; a jar's
                 // platform probe asks for them before it asks for anything the
                 // metadata could name.
+                // Horizon's Fabric API façade stands in for the `fabric-api`
+                // jar wherever it answers a Fabric jar's calls.
+                let fabric_api =
+                    id == "fabric-api" && !self.fabric_entrypoint_containers.is_empty();
                 Ok(Value::Int(
-                    (self.mods.contains_key(id) || is_always_loaded_mod(id)) as i32,
+                    (self.mods.contains_key(id) || is_always_loaded_mod(id) || fabric_api) as i32,
                 ))
             }
             (
@@ -9506,6 +9548,39 @@ fn duration_text(nanos: i128) -> String {
 
 fn saturating_long(value: i128) -> Value {
     Value::Long(value.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+}
+
+/// A version-4 UUID's text, from 122 random bits.
+///
+/// The bits come from `std`'s `RandomState`, whose keys are seeded from the
+/// operating system's RNG, hashed with the time and a process-wide counter,
+/// so every call answers a distinct UUID, as `UUID.randomUUID` does.
+fn random_uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos());
+    let half = |salt: u64| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(salt);
+        hasher.write_u64(count);
+        hasher.write_u128(now);
+        hasher.finish()
+    };
+    let bits = (u128::from(half(1)) << 64) | u128::from(half(2));
+    // Version 4 in bits 76..80, the IETF variant (`10`) in bits 62..64.
+    let bits = (bits & !(0xF << 76) & !(0b11 << 62)) | (0x4 << 76) | (0b10 << 62);
+    let hex = format!("{bits:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 fn uuid_value(text: &str) -> Result<Value, NativeError> {
@@ -11106,7 +11181,10 @@ fn collection_text(host: &mut StdHost, value: &Value) -> Result<String, NativeEr
     let kind = marker.split('/').next().unwrap_or(&marker);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     let class = marker.split_once('#').map(|(class, _)| class);
-    let is_map = kind == "map" || class.is_some_and(is_map_owner);
+    let is_map = kind == "map"
+        || class.is_some_and(|class| {
+            is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
+        });
     // `AbstractCollection.toString`/`AbstractMap.toString`: each element is
     // `String.valueOf(element)`, and the collection itself inside it prints
     // `(this Collection)`/`(this Map)`.
@@ -32251,7 +32329,7 @@ mandatory = true
     }
 
     #[test]
-    fn standard_host_maps_uuid_identity_without_randomness() {
+    fn standard_host_maps_uuid_identity_and_random_v4() {
         let mut host = StdHost::new();
         let from_string = MethodRef {
             owner: "java/util/UUID".into(),
@@ -32315,8 +32393,28 @@ mandatory = true
                 &[],
             )
             .unwrap(),
-            Value::Ref(Some("00000000-0000-4000-8000-000000000000".into()))
+            {
+                // A distinct version-4 UUID per call, as `UUID.randomUUID`.
+                let text = expect_string(&random)
+                    .strip_prefix("uuid/")
+                    .unwrap()
+                    .to_owned();
+                assert_eq!((text.len(), &text[14..15]), (36, "4"));
+                assert!("89ab".contains(&text[19..20]));
+                Value::Ref(Some(text))
+            }
         );
+        let again = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/util/UUID".into(),
+                    name: "randomUUID".into(),
+                    descriptor: "()Ljava/util/UUID;".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        assert_ne!(random, again);
         assert!(
             host.invoke(&from_string, &[Value::Ref(Some("not-a-uuid".into()))],)
                 .is_err()
@@ -33342,17 +33440,39 @@ mandatory = true
             name: "removeIf".into(),
             descriptor: "(Ljava/util/function/Predicate;)Z".into(),
         };
-        assert_eq!(
+        // `List.of` is unmodifiable: the JVM throws before testing anything.
+        assert!(matches!(
             host.invoke_instance(
                 &remove_if,
                 &list,
+                &[Value::Ref(Some("@indy:list-predicate".into()))],
+            ),
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/UnsupportedOperationException"
+        ));
+        // `new ArrayList<>(list).removeIf(...)` removes and reports it.
+        let list_copy = Value::Ref(Some("java/util/ArrayList#copy".into()));
+        host.invoke_instance(
+            &MethodRef {
+                owner: "java/util/ArrayList".into(),
+                name: "<init>".into(),
+                descriptor: "(Ljava/util/Collection;)V".into(),
+            },
+            &list_copy,
+            std::slice::from_ref(&list),
+        )
+        .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &remove_if,
+                &list_copy,
                 &[Value::Ref(Some("@indy:list-predicate".into()))],
             )
             .unwrap(),
             Value::Int(1)
         );
         assert_eq!(
-            host.invoke_instance(&size, &list, &[]).unwrap(),
+            host.invoke_instance(&size, &list_copy, &[]).unwrap(),
             Value::Int(0)
         );
     }
