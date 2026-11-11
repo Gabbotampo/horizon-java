@@ -53,7 +53,8 @@
 //! `blocks` and `items` are asked once, at the game's Registration phase and before any resource
 //! loads, so that is where the jars now run ([`content`]). Each typed `RegistryDeclaration` the
 //! runtime recorded becomes a native content declaration: an item keeps its inferred template and
-//! the properties the content vocabulary carries, and a block brings its block item. The game's
+//! the properties the content vocabulary carries, and a block brings an item only when the jar
+//! registered one (a block does not invent one). The game's
 //! content root joins them under the jar's namespace, so `/give` and the inventory see
 //! `<jar id>:<path>`. Jar assets, models, lang and loot stay outside this pass, as
 //! `docs/m3-content-design.md` maps.
@@ -426,15 +427,30 @@ impl Hooks for HorizonJava {
                 arguments,
             };
             let before = loaded.host.unknown_host_call_count();
-            let run = loaded.jar.run_command(
-                &command.run,
-                &invocation,
-                Arc::new(EventFacade::default()),
-                &mut loaded.host,
-                &ExecutionBudget::within(JAR_BUDGET),
+            let outcome = caught(
+                &format!("{} command /{}", loaded.row.id, command.usage),
+                || {
+                    loaded.jar.run_command(
+                        &command.run,
+                        &invocation,
+                        Arc::new(EventFacade::default()),
+                        &mut loaded.host,
+                        &ExecutionBudget::within(JAR_BUDGET),
+                    )
+                },
             );
             let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             loaded.row.command_unknown_host_calls += unknown;
+            let run = match outcome {
+                Ok(run) => run,
+                Err(panic) => {
+                    // The command ran as far as the panic: a failed command, not a crashed game.
+                    loaded.row.commands_refused += 1;
+                    let usage = command.usage.clone();
+                    log_stdout(&loaded.row.id, &mut loaded.host);
+                    return refuse(host, &usage, format!("the Java command panicked: {panic}"));
+                }
+            };
             match &run.outcome {
                 CommandOutcome::Refused(_) => loaded.row.commands_refused += 1,
                 _ => loaded.row.commands_ran += 1,
@@ -1049,17 +1065,36 @@ fn run_listeners(
         .iter()
         .filter(|listener| listener.event == event && wanted(listener))
     {
-        match jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET)) {
-            Ok(run) => {
+        let outcome = caught(
+            &format!("{} listener from {}", id, listener.source),
+            || {
+                jar.run_game_listener(
+                    listener,
+                    firing,
+                    host,
+                    &ExecutionBudget::within(JAR_BUDGET),
+                )
+            },
+        );
+        match outcome {
+            Ok(Ok(run)) => {
                 ran += usize::from(run.ran);
                 if run.stop {
                     break;
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 failed += 1;
                 log::warn!(
-                    "{LOG}: {} listener from {} failed: {error}",
+                    "{LOG}: {id}: {} listener from {} failed: {error}",
+                    event.name(),
+                    listener.source
+                );
+            }
+            Err(panic) => {
+                failed += 1;
+                log::warn!(
+                    "{LOG}: {id}: {} listener from {} failed: panicked: {panic}",
                     event.name(),
                     listener.source
                 );
@@ -1067,6 +1102,34 @@ fn run_listeners(
         }
     }
     (ran, failed)
+}
+
+/// Runs one Java callback, turning a panic into a named failure.
+///
+/// The interpreter can panic on a value a jar hands it (`Integer.parseInt(s, 40)` on an
+/// unchecked radix, a slice index from malformed bytecode). A Java callback must fail, be counted
+/// in the report and leave the game running: never take the process down. `what` names the
+/// callback (entrypoint, listener or command) in the log line.
+fn caught<T>(what: &str, run: impl FnOnce() -> T) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let reason = panic_message(payload.as_ref());
+            log::warn!("{LOG}: {what} panicked: {reason}");
+            Err(reason)
+        }
+    }
+}
+
+/// A panic payload as text: the message `panic!` carried, or a note that it carried none.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "panic with a non-string payload".to_owned()
+    }
 }
 
 /// Sends the jar's `System.out` to the game log, one line per entry, with the jar's id.
@@ -1222,9 +1285,14 @@ impl Translator<'_> {
             match requirement {
                 Requirement::Level(node_level) => level = level.max((*node_level).min(4)),
                 Requirement::Predicate(_) => {
-                    match self
-                        .jar
-                        .requirement_level(requirement, true, self.host, &self.budget)
+                    match caught(
+                        &format!("{} permission predicate for /{}", self.id, usage(path, arguments)),
+                        || {
+                            self.jar
+                                .requirement_level(requirement, true, self.host, &self.budget)
+                        },
+                    )
+                    .and_then(|answer| answer.map_err(|error| error.to_string()))
                     {
                         Ok(node_level) => level = level.max(node_level.min(4)),
                         Err(error) => {
@@ -1490,19 +1558,25 @@ fn load_jar(
             ));
             continue;
         }
-        let outcome = jar.execute_with_budget(
-            &entry.class,
-            entry.method.as_deref(),
-            kind,
-            &mut host,
-            &runtime::ExecutionBudget::within(JAR_BUDGET),
+        let outcome = caught(
+            &format!("{} entrypoint {} ({kind})", id, entry.class),
+            || {
+                jar.execute_with_budget(
+                    &entry.class,
+                    entry.method.as_deref(),
+                    kind,
+                    &mut host,
+                    &runtime::ExecutionBudget::within(JAR_BUDGET),
+                )
+            },
         );
         match outcome {
-            Ok(report) => {
+            Ok(Ok(report)) => {
                 calls += report.calls;
                 ran += 1;
             }
-            Err(error) => failures.push(format!("{}: {error}", entry.class)),
+            Ok(Err(error)) => failures.push(format!("{}: {error}", entry.class)),
+            Err(panic) => failures.push(format!("{}: panicked: {panic}", entry.class)),
         }
     }
     if ran == 0 {
@@ -1574,6 +1648,24 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic inside a Java callback is a named, counted failure: the game keeps running and
+    /// the report says which callback threw. `Integer.parseInt("1", 40)` is the probe the audit
+    /// used, and it aborts the Rust process without this wrapper.
+    #[test]
+    fn a_panicking_callback_is_a_named_failure_not_a_crash() {
+        let answer: Result<u32, String> = caught("parseInt radix 40", || {
+            panic!("radix must lie in the range [2, 36]")
+        });
+        assert_eq!(answer.unwrap_err(), "radix must lie in the range [2, 36]");
+        let answer: Result<(), String> =
+            caught("formatted", || panic!("{} {}", "bad", "value"));
+        assert_eq!(answer.unwrap_err(), "bad value");
+        let answer: Result<(), String> =
+            caught("quiet", || std::panic::panic_any(7_u8));
+        assert_eq!(answer.unwrap_err(), "panic with a non-string payload");
+        assert_eq!(caught("runs", || 7).unwrap(), 7);
+    }
 
     /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
     /// (two empty hands included), so the hand is unknown rather than guessed.
