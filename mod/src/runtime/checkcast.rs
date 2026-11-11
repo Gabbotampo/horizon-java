@@ -19,6 +19,9 @@
 //!   passing silently.
 //!
 //! Named departures:
+//! - a bare jar class name (how `ServiceLoader` hands out a jar provider) is
+//!   read as an instance of that class, as `instanceof` already reads it; a
+//!   `Class` object of the same name is not told apart;
 //! - the exception message is `class A cannot be cast to class B` without the
 //!   JVM's module/loader clause (`(A is in module java.base of loader
 //!   'bootstrap'; B is in unnamed module of loader 'app')`);
@@ -114,11 +117,28 @@ impl<H: Host> Runtime<'_, H> {
                 _ => (Verdict::Yes, None),
             };
         }
+        // An annotation object reflection handed out implements exactly its
+        // annotation interface.
+        if let Some(annotation) = self.annotations.get(marker) {
+            let class = annotation
+                .descriptor
+                .strip_prefix('L')
+                .and_then(|name| name.strip_suffix(';'))
+                .unwrap_or(&annotation.descriptor);
+            return (
+                self.hierarchy_verdict(class, target, target_is_interface),
+                Some(class.to_owned()),
+            );
+        }
         // A jar (or linked) object, or a jar enum constant marker.
         let object_class = marker
             .strip_prefix("enum/")
             .and_then(|rest| rest.rsplit_once('/').map(|(class, _)| class))
             .or_else(|| marker.split_once('#').map(|(class, _)| class))
+            // A jar provider `ServiceLoader` hands out is its bare class name;
+            // `instanceof` reads such a marker as an instance of that class,
+            // and the cast agrees with it.
+            .or(Some(marker))
             .filter(|class| self.class(class).is_some());
         if let Some(class) = object_class {
             return (
