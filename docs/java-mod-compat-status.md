@@ -33,6 +33,26 @@ it is not `ran-clean` either. Phase 2 starts from phase 1's zero-refusal baselin
 carrying: game-class mixins, event callbacks and the client surface. The design and tier model are
 [java-mod-compat.md](java-mod-compat.md#native-first-strategy-and-tiers).
 
+### Entrypoint census, re-measured (11 November 2026)
+
+The ledgers above run each jar on a real dedicated server; the entrypoint census
+([unmodelled-calls.md](unmodelled-calls.md)) runs the native probe over the same corpora, entrypoints only,
+with every server stage the loader runs (`main`, then `server`) and the game's own verdict. Re-measured at
+`07bd0cf` plus the interpreter-honesty PRs (#37: a call on `null` throws `NullPointerException`, empty optionals
+are objects; #38: bodiless and unmodelled instance calls are counted, no 64-key cap; #41: casts to jar classes,
+`Enum.valueOf` and `Thread.start` are checked or counted), old → new:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
+|---|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 52 → **31** | 53 → 35 | 0 → 8 | 11 → 42 |
+| mega | 86 → **59** | 138 → 68 | 0 → 10 | 28 → 115 |
+| NeoForge 26.3 | 36 → **22** | 21 → 20 | 0 → 0 | 28 → 43 |
+
+The numbers going down is the correct outcome: 62 jars had read `ran-clean` only because the interpreter carried
+on through a call on `null`, answered a bodiless or unmodelled instance call without counting it, or never ran the
+jar's second stage. The newly refused rows stop on a `NullPointerException` on a `null` an unmodelled call answered:
+the runtime stopping where Java would on that `null`, not proof the jar is broken.
+
 ### Coverage of the two gates (8 November 2026, commit `8a3c8dc59`)
 
 The committed ledgers predate the per-run unmodelled-host-call count, so every row that ran reads `ran-hollow` with
