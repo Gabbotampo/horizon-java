@@ -118,6 +118,14 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             }
             _ => None,
         },
+        // `System.Logger.Level`'s constants: the disabled-logger model drops
+        // every message, so the level is only ever handed back to `log` or
+        // compared. The marker carries the enum's own name.
+        "java/lang/System$Logger$Level" => matches!(
+            name,
+            "ALL" | "TRACE" | "DEBUG" | "INFO" | "WARNING" | "ERROR" | "OFF"
+        )
+        .then(|| Value::Ref(Some(format!("enum/java/lang/System$Logger$Level/{name}")))),
         _ => None,
     }
 }
@@ -231,6 +239,15 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         }
         ("java/util/logging/Logger", "getLogger", descriptor)
             if descriptor.ends_with(")Ljava/util/logging/Logger;") =>
+        {
+            Some(Ok(logger_value(&logger_name(args))))
+        }
+        // `System.getLogger(String[, ResourceBundle])`: the JDK's
+        // `System.Logger` is answered by the same disabled-logger model as
+        // `java.util.logging` (the host writes nothing and reports every level
+        // disabled, which is a logger configured to drop the mod's output).
+        ("java/lang/System", "getLogger", descriptor)
+            if descriptor.ends_with(")Ljava/lang/System$Logger;") =>
         {
             Some(Ok(logger_value(&logger_name(args))))
         }
@@ -1621,7 +1638,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
 }
 
 /// `String#hashCode` over UTF-16 code units.
-fn java_string_hash(text: &str) -> i32 {
+pub(crate) fn java_string_hash(text: &str) -> i32 {
     text.encode_utf16().fold(0i32, |hash, unit| {
         hash.wrapping_mul(31).wrapping_add(i32::from(unit))
     })

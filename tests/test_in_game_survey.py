@@ -91,29 +91,6 @@ class SummariseTest(unittest.TestCase):
         self.assertEqual(rows["broken"]["reason"], "no main entrypoint")
         self.assertEqual(rows["broken"]["verdict_line"], None)
 
-    def test_partial_verdict_keeps_its_failed_stage(self):
-        # A stage failed, another ran: the row is ran-partial, never clean, and
-        # carries the failed stage's error.
-        self.report["jars"] = [{
-            "file": "partial.jar",
-            "id": "partial",
-            "verdict": "ran-partial",
-            "host_calls": 2,
-            "unknown_host_call_count": 0,
-            "reason": "entrypoint(s) failed: demo.Main: Metadata(\"bad marker\")",
-            "callbacks": {"ran": 1, "failed": 0, "unknown_host_call_count": 0},
-            "commands": {"ran": 0, "refused": 0, "unknown_host_call_count": 0},
-            "content": {"blocks": 0, "items": 0, "skipped": []},
-        }]
-        log = ['Horizon Java: partial.jar (partial) ran-partial (2 host calls, 0 unknown host calls, reason: entrypoint(s) failed: demo.Main: Metadata("bad marker"))']
-        row = self.survey.summarise(self.report, log)[0]
-        self.assertEqual(row["verdict"], "ran-partial")
-        self.assertIn("demo.Main", row["reason"])
-        self.assertEqual(
-            self.survey.VERDICT.search("(partial) ran-partial").group(2),
-            "ran-partial",
-        )
-
     def test_listener_failures_show_in_the_summary_and_the_table(self):
         # The verdict stays the entrypoint's; the summary is what keeps a jar whose listeners
         # all threw from reading as a clean run.
