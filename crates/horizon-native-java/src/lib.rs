@@ -37,7 +37,9 @@ mod game_hooks;
 mod guava_model;
 mod heap;
 mod hook_shapes;
+mod java_identifier;
 mod java_regex;
+mod java_tostring;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
@@ -2055,6 +2057,16 @@ pub trait Host {
         self.invoke(r, args)
     }
 
+    /// The text `String.valueOf`/`StringBuilder.append(Object)` gives for a
+    /// model object, or `None` when this host models no `toString` for it.
+    ///
+    /// Concatenating an object runs its `toString`; the interpreter's old text
+    /// was the marker itself. A host that models the object answers here so
+    /// `"" + id` and `id.toString()` agree.
+    fn modelled_to_string(&mut self, _value: &Value) -> Option<String> {
+        None
+    }
+
     /// The current elements of a mutable collection marker, when the host
     /// keeps one. Interpreter helpers that need a collection's contents run
     /// through the generic `Host` boundary, so the table is exposed here
@@ -2400,6 +2412,10 @@ pub struct StdHost {
     /// Identifiers retained by `CustomPacketPayload.Type` values created by
     /// the bounded networking façade.
     packet_types: BTreeMap<String, String>,
+    /// The id each `new ResourceLocation(...)` object carries (the class's
+    /// constructors were public before 1.21), by the object's `class#n`
+    /// marker. A constructor answers `void`, so this is where the id lives.
+    identifier_objects: BTreeMap<String, String>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -2520,6 +2536,7 @@ impl StdHost {
             payload_bytes: BTreeMap::new(),
             fabric_entrypoint_containers: Vec::new(),
             packet_types: BTreeMap::new(),
+            identifier_objects: BTreeMap::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             holders: BTreeMap::new(),
@@ -3883,6 +3900,10 @@ impl Host for StdHost {
         name.starts_with("net/fabricmc/") && !self.fabric_entrypoint_containers.is_empty()
     }
 
+    fn modelled_to_string(&mut self, value: &Value) -> Option<String> {
+        crate::java_tostring::modelled(self, value)
+    }
+
     /// The command façade's markers (a source, a node, a builder) answer
     /// `instanceof` for their Brigadier and vanilla types.
     fn host_instance_of(&self, marker: &str, wanted: &str) -> bool {
@@ -4112,6 +4133,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = jdk_model::static_call(r, args) {
+            return value;
+        }
+        if let Some(value) = java_identifier::invoke_static(self, r, args) {
             return value;
         }
         // The game-event façade's statics (`ServerPlayNetworking.canSend`).
@@ -4840,7 +4864,10 @@ impl Host for StdHost {
                 Ok(value.clone())
             }
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(value_text(Self::argument(r, args, 0)?))))
+                // A model object prints its own `toString`, not its marker.
+                let value = Self::argument(r, args, 0)?;
+                let text = self.modelled_to_string(value);
+                Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             ("java/lang/Math", "abs", "(I)I") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -4963,7 +4990,10 @@ impl Host for StdHost {
                     })
             }
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(value_text(Self::argument(r, args, 0)?))))
+                // A model object prints its own `toString`, not its marker.
+                let value = Self::argument(r, args, 0)?;
+                let text = self.modelled_to_string(value);
+                Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             // Chat components are a common loader/bootstrap value (mod
             // names, registration diagnostics, and event messages). Keep the
@@ -5076,30 +5106,6 @@ impl Host for StdHost {
                 "isDirectory" | "isRegularFile" | "isSymbolicLink" | "isExecutable",
                 descriptor,
             ) if descriptor.starts_with("(Ljava/nio/file/Path;") => Ok(Value::Int(0)),
-            (
-                "net/minecraft/resources/Identifier" | "net/minecraft/resources/ResourceLocation",
-                name,
-                descriptor,
-            ) if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                || descriptor.ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-            {
-                let value = match name {
-                    "fromNamespaceAndPath" | "tryBuild" => {
-                        let namespace = args.first().map(expect_string).unwrap_or("minecraft");
-                        let path = args.get(1).map(expect_string).unwrap_or_default();
-                        identifier_value(namespace, path)
-                    }
-                    "withDefaultNamespace" => identifier_value(
-                        "minecraft",
-                        args.first().map(expect_string).unwrap_or_default(),
-                    ),
-                    "parse" | "tryParse" => {
-                        identifier_parse(args.first().map(expect_string).unwrap_or_default())
-                    }
-                    _ => Value::Ref(None),
-                };
-                Ok(value)
-            }
             ("net/minecraft/resources/ResourceKey", "create", descriptor)
                 if descriptor.ends_with("Lnet/minecraft/resources/ResourceKey;") =>
             {
@@ -5319,6 +5325,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = java_identifier::invoke_instance(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.reference_member(r, Some(receiver), args) {
@@ -7376,7 +7385,7 @@ impl Host for StdHost {
                     || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
             {
                 let current = builder_contents(receiver).unwrap_or("");
-                let added = builder_append_text(r, args)?;
+                let added = builder_append_text(self, r, args)?;
                 Ok(Value::Ref(Some(format!("string-builder/{current}{added}"))))
             }
             ("java/lang/StringBuilder", "toString", "()Ljava/lang/String;")
@@ -7701,10 +7710,12 @@ impl Host for StdHost {
             }
             ("java/util/Optional", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(match expect_ref(receiver) {
-                    Some(value) => format!(
-                        "Optional[{}]",
-                        value.strip_prefix("optional/").unwrap_or(value)
-                    ),
+                    Some(value) => {
+                        // The payload keeps a reference's own text (`optional_wrap`).
+                        let payload = value.strip_prefix("optional/").unwrap_or(value);
+                        let payload = Value::Ref(Some(payload.to_owned()));
+                        format!("Optional[{}]", object_text(self, &payload))
+                    }
                     None => "Optional.empty".to_owned(),
                 })))
             }
@@ -7804,7 +7815,7 @@ impl Host for StdHost {
             )),
             ("java/util/OptionalDouble", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(match optional_double_value(receiver) {
-                    Some(value) => format!("OptionalDouble[{}]", value),
+                    Some(value) => format!("OptionalDouble[{}]", format_java_float(value)),
                     None => "OptionalDouble.empty".into(),
                 })))
             }
@@ -8028,89 +8039,6 @@ impl Host for StdHost {
                 expect_ref(receiver).is_some_and(|marker| predicate_marker_value(marker)) as i32,
             )),
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
-            (
-                "net/minecraft/resources/Identifier" | "net/minecraft/resources/ResourceLocation",
-                name,
-                descriptor,
-            ) => {
-                let (namespace, path) = identifier_parts(receiver);
-                match (name, descriptor) {
-                    ("getNamespace", "()Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(namespace.to_owned())))
-                    }
-                    ("getPath", "()Ljava/lang/String;") => Ok(Value::Ref(Some(path.to_owned()))),
-                    ("toString", "()Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(format!("{namespace}:{path}"))))
-                    }
-                    ("toShortString", "()Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(if namespace == "minecraft" {
-                            path.to_owned()
-                        } else {
-                            format!("{namespace}/{path}")
-                        })))
-                    }
-                    ("toLanguageKey", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
-                        "{namespace}.{}",
-                        path.replace('/', ".")
-                    )))),
-                    ("toLanguageKey", "(Ljava/lang/String;)Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(format!(
-                            "{}.{}.{}",
-                            expect_string(Self::argument(r, args, 0)?),
-                            namespace,
-                            path.replace('/', ".")
-                        ))))
-                    }
-                    ("withPrefix", descriptor)
-                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                            || descriptor
-                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-                    {
-                        Ok(identifier_value(
-                            namespace,
-                            &format!("{}{}", expect_string(Self::argument(r, args, 0)?), path),
-                        ))
-                    }
-                    ("withSuffix", descriptor)
-                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                            || descriptor
-                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-                    {
-                        Ok(identifier_value(
-                            namespace,
-                            &format!("{path}{}", expect_string(Self::argument(r, args, 0)?)),
-                        ))
-                    }
-                    ("withPath", descriptor)
-                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                            || descriptor
-                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-                    {
-                        let apply = MethodRef {
-                            owner: "java/util/function/UnaryOperator".into(),
-                            name: "apply".into(),
-                            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
-                        };
-                        let transformed = self.invoke_instance(
-                            &apply,
-                            Self::argument(r, args, 0)?,
-                            &[Value::Ref(Some(path.to_owned()))],
-                        )?;
-                        Ok(identifier_value(namespace, expect_string(&transformed)))
-                    }
-                    ("hashCode", "()I") => {
-                        Ok(Value::Int(stable_hash(&format!("{namespace}:{path}"))))
-                    }
-                    ("equals", "(Ljava/lang/Object;)Z") => {
-                        let (other_namespace, other_path) =
-                            identifier_parts(Self::argument(r, args, 0)?);
-                        Ok(Value::Int(
-                            (namespace == other_namespace && path == other_path) as i32,
-                        ))
-                    }
-                    _ => Ok(Value::default_for(&r.descriptor)),
-                }
-            }
             // A `registry/<id>` marker is both a registry (`BuiltInRegistries.X`)
             // and its key (`Registries.X`), so `registry.key()` is the marker
             // itself and the key's identifier is the registry id. Libraries
@@ -9068,7 +8996,11 @@ fn builder_contents(value: &Value) -> Option<&str> {
     }
 }
 
-fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeError> {
+fn builder_append_text<H: Host>(
+    host: &mut H,
+    r: &MethodRef,
+    args: &[Value],
+) -> Result<String, NativeError> {
     let value = StdHost::argument(r, args, 0)?;
     let text = match r.descriptor.as_str() {
         "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
@@ -9079,10 +9011,11 @@ fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeEr
         },
         "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
         | "(Ljava/lang/Object;)Ljava/lang/StringBuffer;" => match value {
-            // `append(Object)` is `String.valueOf`: a box prints its value.
-            Value::Ref(Some(value)) => {
-                jdk_model::boxed_text(value, "Ljava/lang/Object;").unwrap_or_else(|| value.clone())
-            }
+            // `append(Object)` is `String.valueOf`: an object a model owns
+            // prints its `toString`, and a box prints its value.
+            Value::Ref(Some(value)) => crate::java_tostring::modelled_marker(host, value)
+                .or_else(|| jdk_model::boxed_text(value, "Ljava/lang/Object;"))
+                .unwrap_or_else(|| value.clone()),
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
             Value::Long(value) => value.to_string(),
@@ -11096,28 +11029,51 @@ fn parse_collection_value(value: &str) -> Result<Value, NativeError> {
     parse_value_marker(value)
 }
 
-fn collection_text(host: &StdHost, value: &Value) -> Result<String, NativeError> {
+fn collection_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError> {
     let values = host_collection_values(host, value)?;
-    let marker = expect_string(value);
-    let kind = marker.split('/').next().unwrap_or(marker);
+    let marker = expect_string(value).to_owned();
+    let kind = marker.split('/').next().unwrap_or(&marker);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    let values = values
-        .iter()
-        .map(|value| match parse_collection_value(value) {
-            Ok(Value::Ref(Some(value))) => value,
-            Ok(Value::Ref(None)) => "null".into(),
-            Ok(Value::Int(value)) => value.to_string(),
-            Ok(Value::Long(value)) => value.to_string(),
-            Ok(Value::Float(value)) => format_java_float(value),
-            Ok(Value::Void) => "void".into(),
-            Err(_) => value.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(match kind {
-        "map" => format!("{{{values}}}"),
-        _ => format!("[{values}]"),
+    let class = marker.split_once('#').map(|(class, _)| class);
+    let is_map = kind == "map" || class.is_some_and(is_map_owner);
+    // `AbstractCollection.toString`/`AbstractMap.toString`: each element is
+    // `String.valueOf(element)`, and the collection itself inside it prints
+    // `(this Collection)`/`(this Map)`.
+    let mut texts = Vec::with_capacity(values.len());
+    for element in &values {
+        texts.push(match parse_collection_value(element) {
+            Ok(Value::Ref(Some(inner))) if inner == marker => if is_map {
+                "(this Map)"
+            } else {
+                "(this Collection)"
+            }
+            .to_owned(),
+            Ok(element) => object_text(host, &element),
+            Err(_) => element.clone(),
+        });
+    }
+    Ok(if is_map {
+        let pairs = texts
+            .chunks(2)
+            .map(|pair| pair.join("="))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{{pairs}}}")
+    } else {
+        format!("[{}]", texts.join(", "))
     })
+}
+
+/// `String.valueOf(Object)` of one value a model holds (a collection's
+/// element, an optional's payload): a box prints its value and a model
+/// object its `toString`.
+fn object_text(host: &mut StdHost, value: &Value) -> String {
+    match value {
+        Value::Ref(Some(marker)) => jdk_model::boxed_text(marker, "Ljava/lang/Object;")
+            .or_else(|| host.modelled_to_string(value))
+            .unwrap_or_else(|| marker.clone()),
+        other => value_text(other),
+    }
 }
 
 fn instance_field_key(receiver: &Value, field: &MethodRef) -> Option<String> {
@@ -20993,7 +20949,7 @@ impl<H: Host> Runtime<'_, H> {
                 if descriptor.ends_with(")Ljava/lang/StringBuilder;")
                     || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
             {
-                let added = builder_append_text(r, args)?;
+                let added = builder_append_text(self.host, r, args)?;
                 self.string_builders
                     .entry(marker.to_owned())
                     .or_default()
@@ -24508,6 +24464,16 @@ impl<H: Host> Runtime<'_, H> {
                         let mut captured = captured;
                         for value in &mut captured {
                             if let Some(text) = self.library_to_string(value, class, method)? {
+                                *value = Value::Ref(Some(text));
+                            }
+                        }
+                        // Every other model object prints its own `toString`
+                        // too (`"" + id` is `a:x`, not the id's marker). A
+                        // `String` operand is already its text.
+                        for (value, argument) in captured.iter_mut().zip(&arguments) {
+                            if argument != "Ljava/lang/String;"
+                                && let Some(text) = self.host.modelled_to_string(value)
+                            {
                                 *value = Value::Ref(Some(text));
                             }
                         }
@@ -34855,7 +34821,9 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&short, &id, &[]).unwrap(),
-            Value::Ref(Some("ruby/lamp".into()))
+            // Vanilla's `toShortString` strips the namespace only for
+            // `minecraft`; every other id is its full `namespace:path`.
+            Value::Ref(Some("ruby:lamp".into()))
         );
         let prefixed = MethodRef {
             owner: "net/minecraft/resources/Identifier".into(),
@@ -34890,7 +34858,11 @@ mandatory = true
                 &[Value::Ref(Some("@indy:path-transform".into()))],
             )
             .unwrap();
-        assert_eq!(transformed, Value::Ref(Some("identifier/ruby:lamp".into())));
+        // The operator is a jar lambda the host boundary cannot run; the call
+        // is counted rather than answered with the old id (the earlier
+        // identity answer was a guess).
+        assert_eq!(transformed, Value::Ref(None));
+        assert!(host.unknown_host_call_count() > 0);
         let key_create = MethodRef {
             owner: "net/minecraft/resources/ResourceKey".into(),
             name: "create".into(),
