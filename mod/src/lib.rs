@@ -2007,13 +2007,13 @@ mod tests {
     }
 
     /// A panic inside a Java callback is a named, counted failure: the game keeps running and
-    /// the report says which callback threw.
+    /// the report says which callback threw. `Integer.parseInt("1", 40)` is the probe the audit
+    /// used, and it aborts the Rust process without this wrapper.
     /// One entrypoint class: `public class <name> implements <interface>` with a no-argument
-    /// constructor and `public void <method>()`. With `fails`, the method calls
-    /// `Integer.parseInt("1", 40)`, which the interpreter now rejects with the JVM's
-    /// `NumberFormatException` (it used to panic; the interpreter-panic path is exercised by
-    /// [`tests::a_panicking_callback_is_a_named_failure_not_a_crash`]); otherwise it returns.
-    fn entrypoint_class(name: &str, interface: &str, method: &str, fails: bool) -> Vec<u8> {
+    /// constructor and `public void <method>()`. With `panics`, the method calls
+    /// `Integer.parseInt("1", 40)`, which panics inside the interpreter (`i32::from_str_radix`
+    /// rejects a radix above 36 by panicking); otherwise it just returns.
+    fn entrypoint_class(name: &str, interface: &str, method: &str, panics: bool) -> Vec<u8> {
         fn u2(out: &mut Vec<u8>, value: u16) {
             out.extend_from_slice(&value.to_be_bytes());
         }
@@ -2062,7 +2062,7 @@ mod tests {
         };
         // aload_0; invokespecial Object.<init>; return
         method_info(5, 1, &[0x2A, 0xB7, 0, 8, 0xB1]);
-        if fails {
+        if panics {
             // ldc "1"; bipush 40; invokestatic Integer.parseInt; pop; return
             method_info(10, 2, &[0x12, 14, 0x10, 40, 0xB8, 0, 20, 0x57, 0xB1]);
         } else {
@@ -2074,7 +2074,7 @@ mod tests {
 
     /// A Fabric jar with a `main` stage (class `demo.Main`) and a `server` stage
     /// (`demo.Server`). `None` leaves that class out of the jar, so its stage fails to load;
-    /// `Some(fails)` ships it, failing with an uncaught `NumberFormatException` or running clean.
+    /// `Some(panics)` ships it, panicking or not.
     fn two_stage_jar(main: Option<bool>, server: Option<bool>) -> Arc<NativeJar> {
         use std::io::Write;
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -2102,9 +2102,9 @@ mod tests {
                 ),
             ];
             for (name, interface, method, shipped) in stages {
-                if let Some(fails) = shipped {
+                if let Some(panics) = shipped {
                     zip.start_file(format!("{name}.class"), options).unwrap();
-                    zip.write_all(&entrypoint_class(name, interface, method, fails))
+                    zip.write_all(&entrypoint_class(name, interface, method, panics))
                         .unwrap();
                 }
             }
@@ -2122,11 +2122,10 @@ mod tests {
     }
 
     /// Fabric's `Hooks.startServer` runs `main` and then `server`; the bridge runs both, records
-    /// a failed stage and keeps going, and a stage that throws (a Java exception or an
-    /// interpreter panic, which runs inside the same `caught` wrapper) is that stage failing
-    /// (counted toward `ran-partial`), never a crashed game.
+    /// a failed stage and keeps going, and an interpreter panic in a stage is that stage
+    /// failing (counted toward `ran-partial`), never a crashed game.
     #[test]
-    fn every_server_stage_runs_and_a_failed_stage_is_partial() {
+    fn every_server_stage_runs_and_a_failed_or_panicking_stage_is_partial() {
         // Both stages ship and return: a full, clean run.
         assert_eq!(
             load_verdict(two_stage_jar(Some(false), Some(false))),
@@ -2143,25 +2142,19 @@ mod tests {
         );
         assert!(!reason.contains("demo.Server"), "{reason}");
 
-        // `main` throws inside the interpreter, `server` still runs after it: partial, not a crash.
+        // `main` panics in the interpreter, `server` still runs after it: partial, not a crash.
         let (verdict, reason) = load_verdict(two_stage_jar(Some(true), Some(false)));
         assert_eq!(verdict, "ran-partial");
         let reason = reason.unwrap();
-        assert!(
-            reason.contains("demo.Main: uncaught exception java/lang/NumberFormatException"),
-            "{reason}"
-        );
+        assert!(reason.contains("demo.Main: panicked: "), "{reason}");
         assert!(!reason.contains("demo.Server"), "{reason}");
 
-        // Every stage failed (one missing, one throwing): refused, with both named.
+        // Every stage failed (one missing, one panicking): refused, with both named.
         let (verdict, reason) = load_verdict(two_stage_jar(None, Some(true)));
         assert_eq!(verdict, "refused");
         let reason = reason.unwrap();
         assert!(reason.contains("demo.Main: "), "{reason}");
-        assert!(
-            reason.contains("demo.Server: uncaught exception java/lang/NumberFormatException"),
-            "{reason}"
-        );
+        assert!(reason.contains("demo.Server: panicked: "), "{reason}");
     }
 
     #[test]
