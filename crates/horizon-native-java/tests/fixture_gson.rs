@@ -269,9 +269,11 @@ impl Fixture {
 #[test]
 fn gson_round_trips_primitives_strings_lists_and_maps() {
     let fixture = Fixture::build("round-trip");
+    // `roundTrip` builds a pretty-printing `Gson`; gson-2.14.0 on a real JVM
+    // writes the two documents indented, so the expected text is that output.
     assert_eq!(
         fixture.text("roundTrip"),
-        "42|hello|3|2|2|{\"a\":1,\"b\":\"x\"}|[1,\"two\",[3]]"
+        "42|hello|3|2|2|{\n  \"a\": 1,\n  \"b\": \"x\"\n}|[\n  1,\n  \"two\",\n  [\n    3\n  ]\n]"
     );
 }
 
