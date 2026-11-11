@@ -1572,6 +1572,13 @@ impl StdHost {
                     .as_ref()
                     .map(|damage| marker(format!("game/damage/{damage}"))),
                 ("hasTime", "Z") => flag(true),
+                // NeoForge `PlayerEvent.Clone#isWasDeath`: `ServerPlayer.restoreFrom(old,
+                // keepEverything)` posts `new Clone(this, old, !keepEverything)` (@371-382 of the
+                // 26.3 patched server). The firing's flag is Fabric `COPY_FROM`'s `alive`, which
+                // is that same `keepEverything`, so the answer is its negation. `getOriginal()`
+                // stays unanswered (counted): Horizon keeps one player across the copy and the
+                // game gives no view of the old one (docs/mod-plan.md, "Fork seams needed").
+                ("isWasDeath", "Z") if event == GameEvent::PlayerCopy => flag(!context.flag),
                 ("isCanceled", "Z") => flag(cancelled),
                 ("setCanceled", "V") => {
                     let cancel = matches!(args.first(), Some(Value::Int(v)) if *v != 0);

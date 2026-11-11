@@ -460,7 +460,10 @@ const NEOFORGE_STUBS: &[(&str, &str)] = &[
         "package net.neoforged.neoforge.event.entity.player;\n\
          public class PlayerEvent extends net.neoforged.bus.api.Event {\n\
            public net.minecraft.world.entity.player.Player getEntity() { return null; }\n\
-           public static class PlayerLoggedInEvent extends PlayerEvent {} }",
+           public static class PlayerLoggedInEvent extends PlayerEvent {}\n\
+           public static class Clone extends PlayerEvent {\n\
+             public net.minecraft.world.entity.player.Player getOriginal() { return null; }\n\
+             public boolean isWasDeath() { return false; } } }",
     ),
 ];
 
@@ -587,6 +590,115 @@ fn neoforge_listeners_run_by_event_class_and_honour_set_canceled() {
     assert_eq!(
         static_value(&host, "demo/Logins", "lastLjava/lang/String;"),
         Some(Value::Ref(Some("Alex".into())))
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+const NEOFORGE_CLONE_SUBSCRIBER: &str = r#"
+package demo;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+@EventBusSubscriber(modid = "neo_events") public final class Clones {
+  public static int deaths;
+  public static int returns;
+  public static String copied;
+  @SubscribeEvent public static void onClone(PlayerEvent.Clone event) {
+    if (event.isWasDeath()) deaths++; else returns++;
+    copied = event.getEntity().getScoreboardName();
+  }
+}
+"#;
+
+const NEOFORGE_ORIGINAL_SUBSCRIBER: &str = r#"
+package demo;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+@EventBusSubscriber(modid = "neo_events") public final class Originals {
+  public static String original;
+  @SubscribeEvent public static void onClone(PlayerEvent.Clone event) {
+    original = event.getOriginal().getScoreboardName();
+  }
+}
+"#;
+
+/// NeoForge's `PlayerEvent.Clone`: `ServerPlayer.restoreFrom(old, keepEverything)` posts
+/// `new Clone(this, old, !keepEverything)` (@371-382 of the 26.3 patched server), and
+/// `isWasDeath()` returns that field: true after a death respawn (`keepEverything` false), false
+/// after an End return. The firing carries Fabric `COPY_FROM`'s `alive` (= `keepEverything`) as
+/// its flag, so a death fires with `flag: false`. `getEntity()` is the new player.
+/// `getOriginal()` has no answer (Horizon keeps one player across the copy and the game gives no
+/// view of the old one), so that listener is refused rather than handed the new player.
+#[test]
+fn neoforge_clone_answers_was_death_and_refuses_the_original() {
+    let root = scratch("neoforge-clone");
+    let mut sources = NEOFORGE_STUBS.to_vec();
+    sources.push(("demo/NeoMod.java", NEOFORGE_MOD));
+    sources.push(("demo/Clones.java", NEOFORGE_CLONE_SUBSCRIBER));
+    sources.push(("demo/Originals.java", NEOFORGE_ORIGINAL_SUBSCRIBER));
+    let jar_path = build_jar(
+        &root,
+        &sources,
+        "demo",
+        (
+            "META-INF/neoforge.mods.toml",
+            "modLoader=\"javafml\"\nloaderVersion=\"[1,)\"\nlicense=\"MIT\"\n[[mods]]\nmodId=\"neo_events\"\nversion=\"1.0\"\n",
+        ),
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = StdHost::new();
+    jar.execute("demo.NeoMod", None, "neoforge", &mut host)
+        .unwrap();
+    let found = host.game_listeners(&jar, true);
+    let of = |class: &str| {
+        found
+            .listeners
+            .iter()
+            .find(|l| {
+                l.event == GameEvent::PlayerCopy && format!("{:?}", l.callback).contains(class)
+            })
+            .unwrap_or_else(|| panic!("no PlayerEvent.Clone listener in {class}"))
+            .clone()
+    };
+    let (was_death, original) = (of("demo/Clones"), of("demo/Originals"));
+    let run = |host: &mut StdHost, listener: &GameListener, alive: bool| {
+        let mut firing = EventFiring::new(
+            GameEvent::PlayerCopy,
+            facade(0),
+            EventContext {
+                player: Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
+                flag: alive,
+                ..EventContext::default()
+            },
+        );
+        jar.run_game_listener(listener, &mut firing, host, &ExecutionBudget::UNBOUNDED)
+    };
+
+    // A death respawn, then an End return.
+    run(&mut host, &was_death, false).unwrap();
+    run(&mut host, &was_death, true).unwrap();
+    assert_eq!(
+        static_value(&host, "demo/Clones", "deathsI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Clones", "returnsI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Clones", "copiedLjava/lang/String;"),
+        Some(Value::Ref(Some("Alex".into())))
+    );
+
+    let outcome = run(&mut host, &original, false);
+    assert!(
+        matches!(&outcome, Err(NativeError::UnknownHostCall(r)) if r.name == "getOriginal"),
+        "getOriginal must be refused, got {outcome:?}"
+    );
+    assert_eq!(
+        static_value(&host, "demo/Originals", "originalLjava/lang/String;"),
+        None
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -233,6 +233,44 @@ drops", and it travels through the same bake. Without the package the item is na
   that needs it is counted as an unknown host call instead of answering the overworld. Filed as
   `arismoko/horizon#2747`; the acting player itself is already carried (M2c).
 
+- **The old player on `player_clone`.** Not filed yet; the issue text, in the fork's template:
+
+  > **Ask.** Let a `player_clone` listener read the player as they were before the copy: a
+  > handle (say `event.original`), valid only during the hook, whose reads answer the old player's
+  > state, not the new one's. At minimum its attachments with their pre-copy values (every type,
+  > not only `copy_on_death` ones), its level and position, and its inventory. Done when, on a
+  > death respawn, a listener reads a non-`copy_on_death` attachment's pre-death value and the
+  > death position and dimension from the original while the new player reads its fresh default;
+  > and on an End return the original reads the End and the values from before the copy; native
+  > and wasm.
+  >
+  > **Background.** NeoForge posts `PlayerEvent.Clone(newPlayer, oldPlayer, wasDeath)` from
+  > `ServerPlayer.restoreFrom(old, keepEverything)` (@371-382 of the 26.3 patched server, with
+  > `wasDeath = !keepEverything`); the old `ServerPlayer` is still whole at that moment and keeps
+  > all its attachments. Horizon's `player_clone` (`native_player_clone(player, name, was_death)`,
+  > `crates/horizon-client/src/game/network/lan_actions/respawn.rs:146` and
+  > `game/world/server_travel.rs:557`; unchanged between `cf0113879e` and `d3e649f849`) names one
+  > uuid for both players, and by the time it fires on a death the guest's store has already been
+  > replaced by its `copy_on_death` subset (`respawn.rs:19-25`, `copy_on_death` then
+  > `replace_contents`). So nothing can answer the old player. Example: carryon 2.12.1 (NeoForge
+  > 26.3) `CommonEvents#onClone` calls `getOriginal()` first (@1), then
+  > `PlacementHandler.placeCarriedOnDeath(original, getEntity(), isWasDeath())`, which reads the
+  > original's non-`copyOnDeath` `CarryOnData` attachment and places what the player was carrying
+  > where they died; without it the carried block or entity is lost on death. Horizon Java answers
+  > `getEntity()` and `isWasDeath()` today and refuses `getOriginal()` (a counted unknown host call)
+  > rather than hand back the new player.
+  >
+  > **Hook or handle.** `player_clone` (an original-player view on `PlayerCloneEvent`)
+  >
+  > **NeoForge 26.3 counterpart.** `PlayerEvent.Clone#getOriginal` (posted by
+  > `EventHooks.onPlayerClone` from `ServerPlayer.restoreFrom`); Fabric's
+  > `ServerPlayerEvents.COPY_FROM(oldPlayer, newPlayer, alive)`
+  >
+  > **Who uses it.** Horizon Java (NeoForge `Clone` and Fabric `COPY_FROM` listeners, carryon's
+  > `onClone` first); any mod that moves state from the old player to the new one itself
+  >
+  > **Phase.** Hooks
+
 ### Mod-owned data attachments (`Player#getData`)
 
 > The design for bridging these onto the fork's store is [attachments-design.md](attachments-design.md)

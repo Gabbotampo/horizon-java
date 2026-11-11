@@ -688,6 +688,12 @@ The §5.2 follow-ups on the `after` build, each relaunching a copy of the same w
      bridge holding the runtime's pre-death objects until the Clone listeners have run.
    - Then, from the bytecode reading (not run): `ServerPlayer#level()` (`arismoko/horizon#2747`),
      `ServerLevel#getGameRules()` + `GameRules#get`, and `Inventory#getSelectedSlot`/`setSelectedSlot`.
+
+   *Since:* the runtime answers `PlayerEvent$Clone#isWasDeath()` (the hook's `was_death`, as
+   NeoForge's `restoreFrom` posts it) and `getEntity()` already was. `getOriginal()` stays refused:
+   the fork's hook names one player at pin and fork main alike, and the store is already the
+   `copy_on_death` subset when it fires. The fork issue text is in `docs/mod-plan.md`,
+   "Fork seams needed" ("The old player on `player_clone`"), not filed.
 2. **The 13 entrypoint unknowns** keep carryon `ran-hollow`: NeoForge config
    (`ModConfigSpec$Builder#build`, `ModContainer#registerConfig`), the mod-bus
    `IEventBus#addListener(Consumer)` (the re-survey's cause 2) and `Field#canAccess` in its config
