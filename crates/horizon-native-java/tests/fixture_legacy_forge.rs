@@ -66,7 +66,7 @@ public final class RegistryObject<T> { }
 package net.minecraftforge.registries;
 import java.util.function.Supplier;
 public final class DeferredRegister<T> {
-  public static <T> DeferredRegister<T> create(Object registry, String id) { return null; }
+  public static <T> DeferredRegister<T> create(Object registry, String id) { return new DeferredRegister<>(); }
   public <V extends T> RegistryObject<V> register(String id, Supplier<V> value) { return null; }
 }
 "#,
