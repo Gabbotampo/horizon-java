@@ -79,7 +79,10 @@ fn invoke_executors<H: Host>(
             "newSingleThreadExecutor"
             | "newCachedThreadPool"
             | "newSingleThreadScheduledExecutor"
-            | "newWorkStealingPool",
+            | "newWorkStealingPool"
+            // A virtual thread per task is, for this runtime, the same
+            // single-threaded service; the departure is the one above.
+            | "newVirtualThreadPerTaskExecutor",
             "()Ljava/util/concurrent/ExecutorService;"
             | "()Ljava/util/concurrent/ScheduledExecutorService;",
         ) => pool(),
