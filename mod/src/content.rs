@@ -103,6 +103,17 @@ impl State {
                 }
             }
         }
+        // NeoForge's `RegisterEvent` for `neoforge:attachment_types`: once every entrypoint stage
+        // of every jar has run, in load order (`runtime::neoforge_attachments`).
+        for jar in &mut self.jars {
+            let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
+            for problem in jar.jar.register_attachment_types(&mut jar.host, &budget) {
+                log::warn!(
+                    "{LOG}: {}: attachment type not registered: {problem}",
+                    jar.row.id
+                );
+            }
+        }
         for jar in &mut self.jars {
             let declarations = runtime::content::declarations(jar.host.registrations());
             jar.row.content_skipped = unowned_counts(

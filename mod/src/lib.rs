@@ -77,6 +77,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use attachments::Lifecycle;
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
     Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
@@ -101,6 +102,7 @@ use runtime::events::{
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
 
+mod attachments;
 mod content;
 mod runtime;
 
@@ -280,31 +282,55 @@ impl Hooks for HorizonJava {
         drop(state);
         // Fabric's `SERVER_STARTING` and NeoForge's `ServerAboutToStartEvent` are the runtime's
         // one `server_starting` event, and both belong to this moment: before the worlds load.
-        self.fire(GameEvent::ServerStarting, event.dedicated, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::ServerStarting,
+            event.dedicated,
+            EventContext::default(),
+            |_| true,
+        );
     }
 
     /// Immediately after `server_about_to_start`, before the server accepts play (NeoForge's
     /// `ServerStartingEvent`). The runtime records that event on `server_started` with the
     /// Fabric field; its source keeps the two apart.
-    fn server_starting(&self, _host: &mut dyn ServerHost, event: &mut ServerStartingEvent) {
-        self.fire(GameEvent::ServerStarted, event.dedicated, |listener| {
-            listener.source.ends_with("ServerStartingEvent")
-        });
+    fn server_starting(&self, host: &mut dyn ServerHost, event: &mut ServerStartingEvent) {
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::ServerStarted,
+            event.dedicated,
+            EventContext::default(),
+            |listener| listener.source.ends_with("ServerStartingEvent"),
+        );
     }
 
     /// The worlds are open and the tick loop is about to start (Fabric's `SERVER_STARTED`,
     /// NeoForge's `ServerStartedEvent`).
-    fn server_started(&self, _host: &mut dyn ServerHost, event: &mut ServerStartedEvent) {
-        self.fire(GameEvent::ServerStarted, event.dedicated, |listener| {
-            !listener.source.ends_with("ServerStartingEvent")
-        });
+    fn server_started(&self, host: &mut dyn ServerHost, event: &mut ServerStartedEvent) {
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::ServerStarted,
+            event.dedicated,
+            EventContext::default(),
+            |listener| !listener.source.ends_with("ServerStartingEvent"),
+        );
     }
 
     /// Teardown begins, worlds still loaded and players connected (Fabric's `SERVER_STOPPING`,
     /// NeoForge's `ServerStoppingEvent`). The report is rewritten here with the callback counts,
     /// while the config service is still answering.
     fn server_stopping(&self, host: &mut dyn ServerHost, event: &mut ServerStoppingEvent) {
-        self.fire(GameEvent::ServerStopping, event.dedicated, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::ServerStopping,
+            event.dedicated,
+            EventContext::default(),
+            |_| true,
+        );
         let state = self.lock();
         // One line per jar with the counts the report now holds: the report is the authority, but
         // the log must never make a jar with failing listeners look like a clean one.
@@ -319,8 +345,15 @@ impl Hooks for HorizonJava {
     /// Teardown is over (Fabric's `SERVER_STOPPED`, NeoForge's `ServerStoppedEvent`). The jar
     /// state stays: the entrypoints ran at the content phase, and the next world this process
     /// hosts reuses it.
-    fn server_stopped(&self, _host: &mut dyn ServerHost, event: &mut ServerStoppedEvent) {
-        self.fire(GameEvent::ServerStopped, event.dedicated, |_| true);
+    fn server_stopped(&self, host: &mut dyn ServerHost, event: &mut ServerStoppedEvent) {
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::ServerStopped,
+            event.dedicated,
+            EventContext::default(),
+            |_| true,
+        );
     }
 
     /// One jar changed its commands (`Commands::refresh_commands`): the Java registrations cannot
@@ -446,6 +479,13 @@ impl Hooks for HorizonJava {
                 source,
                 arguments,
             };
+            let opened = attachments::open(
+                host,
+                &loaded.row.id,
+                &loaded.jar,
+                &mut loaded.host,
+                Lifecycle::None,
+            );
             let before = loaded.host.unknown_host_call_count();
             let outcome = caught(
                 &format!("{} command /{}", loaded.row.id, command.usage),
@@ -461,6 +501,14 @@ impl Hooks for HorizonJava {
             );
             let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             loaded.row.command_unknown_host_calls += unknown;
+            attachments::close(
+                host,
+                &loaded.row.id,
+                &loaded.jar,
+                &mut loaded.host,
+                opened,
+                Lifecycle::None,
+            );
             let run = match outcome {
                 Ok(run) => run,
                 Err(panic) => {
@@ -494,7 +542,7 @@ impl Hooks for HorizonJava {
 
     /// The authoritative server tick's start and end (Fabric's `ServerTickEvents.START_SERVER_TICK`
     /// and `END_SERVER_TICK`, NeoForge's `ServerTickEvent.Pre` and `.Post`).
-    fn server_tick(&self, _host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+    fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         let game = match event.phase {
             ServerTickPhase::ServerTickStart { .. } => GameEvent::ServerTickStart,
             ServerTickPhase::ServerTickEnd { .. } => GameEvent::ServerTickEnd,
@@ -504,7 +552,14 @@ impl Hooks for HorizonJava {
         let tick_count = event.context.tick.get().min(i32::MAX as u64) as i32;
         self.lock().tick_count = tick_count;
         let dedicated = event.context.authority == Authority::DedicatedServer;
-        self.fire_event(game, dedicated, EventContext::default(), |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            game,
+            dedicated,
+            EventContext::default(),
+            |_| true,
+        );
     }
 
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
@@ -541,12 +596,19 @@ impl Hooks for HorizonJava {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::LevelLoad, self.dedicated(), context, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::LevelLoad,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A server level closed (Fabric's `ServerLevelEvents.UNLOAD`, NeoForge's
     /// `LevelEvent.Unload`).
-    fn level_unload(&self, _host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
+    fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         self.lock()
             .levels
             .retain(|level| level.id != event.dimension);
@@ -554,7 +616,14 @@ impl Hooks for HorizonJava {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::LevelUnload, self.dedicated(), context, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::LevelUnload,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A player joined (Fabric's `ServerPlayConnectionEvents.JOIN` and
@@ -567,7 +636,14 @@ impl Hooks for HorizonJava {
             player: Some(event.player),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::PlayerJoin, self.dedicated(), context, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::Joined(event.player),
+            GameEvent::PlayerJoin,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A player left (Fabric's `ServerPlayConnectionEvents.DISCONNECT` and
@@ -579,26 +655,45 @@ impl Hooks for HorizonJava {
             player: Some(event.player),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::PlayerLeave, self.dedicated(), context, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::Left(event.player),
+            GameEvent::PlayerLeave,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A player respawned (Fabric's `ServerPlayerEvents.AFTER_RESPAWN`, NeoForge's
     /// `PlayerRespawnEvent`).
-    fn player_respawned(&self, _host: &mut dyn ServerHost, event: &mut PlayerRespawnedEvent<'_>) {
+    fn player_respawned(&self, host: &mut dyn ServerHost, event: &mut PlayerRespawnedEvent<'_>) {
         let context = EventContext {
             player: Some(event.player),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::PlayerRespawn, self.dedicated(), context, |_| {
-            true
-        });
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::Resynced(event.player),
+            GameEvent::PlayerRespawn,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
     /// `PlayerEvent.Clone`); `was_death` says a death caused it.
-    fn player_clone(&self, _host: &mut dyn ServerHost, event: &mut PlayerCloneEvent<'_>) {
+    fn player_clone(&self, host: &mut dyn ServerHost, event: &mut PlayerCloneEvent<'_>) {
         let context = player_clone_context(event);
-        self.fire_event(GameEvent::PlayerCopy, self.dedicated(), context, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::Cloned(event.player, event.was_death),
+            GameEvent::PlayerCopy,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A player moved to another dimension (Fabric's `AFTER_PLAYER_CHANGE_LEVEL`, NeoForge's
@@ -615,7 +710,9 @@ impl Hooks for HorizonJava {
             level: Some(event.to.to_owned()),
             ..EventContext::default()
         };
-        self.fire_event(
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::Resynced(event.player),
             GameEvent::PlayerChangeLevel,
             self.dedicated(),
             context,
@@ -647,11 +744,7 @@ impl Hooks for HorizonJava {
 
     /// An entity left a server level (Fabric's `ServerEntityEvents.ENTITY_UNLOAD`, NeoForge's
     /// `EntityLeaveLevelEvent`).
-    fn entity_leave_level(
-        &self,
-        _host: &mut dyn ServerHost,
-        event: &mut EntityLeaveLevelEvent<'_>,
-    ) {
+    fn entity_leave_level(&self, host: &mut dyn ServerHost, event: &mut EntityLeaveLevelEvent<'_>) {
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             entity: Some(FacadeEntity {
@@ -661,21 +754,32 @@ impl Hooks for HorizonJava {
             }),
             ..EventContext::default()
         };
-        self.fire_event(GameEvent::EntityUnload, self.dedicated(), context, |_| true);
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::EntityUnload,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
     }
 
     /// A player broke the block at `pos` (Fabric's `PlayerBlockBreakEvents.BEFORE`, NeoForge's
     /// `BreakBlockEvent`). A cancel keeps the block, and the Fabric `CANCELED` listeners hear it.
     fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
         let context = self.block_context(host, event.pos, event.state, None, None);
-        let fired = self.fire_event(
+        let fired = self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
             GameEvent::BlockBreakBefore,
             self.dedicated(),
             context.clone(),
             |_| true,
         );
         if fired.cancelled {
-            self.fire_event(
+            self.fire_bridged(
+                Some(&mut *host),
+                Lifecycle::None,
                 GameEvent::BlockBreakCanceled,
                 self.dedicated(),
                 context,
@@ -691,7 +795,14 @@ impl Hooks for HorizonJava {
     /// `PlayerInteractEvent.LeftClickBlock`).
     fn left_click_block(&self, host: &mut dyn ServerHost, event: &mut LeftClickBlockEvent) -> Flow {
         let context = self.block_context(host, event.pos, event.state, Some(event.face), None);
-        let fired = self.fire_event(GameEvent::AttackBlock, self.dedicated(), context, |_| true);
+        let fired = self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::AttackBlock,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
         if fired.cancelled {
             Flow::Cancel
         } else {
@@ -759,7 +870,14 @@ impl Hooks for HorizonJava {
             }),
             ..EventContext::default()
         };
-        let fired = self.fire_event(GameEvent::AttackEntity, self.dedicated(), context, |_| true);
+        let fired = self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::AttackEntity,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
         if fired.cancelled {
             Flow::Cancel
         } else {
@@ -789,7 +907,14 @@ impl Hooks for HorizonJava {
             }),
             ..EventContext::default()
         };
-        let fired = self.fire_event(GameEvent::UseEntity, self.dedicated(), context, |_| true);
+        let fired = self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::UseEntity,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
         if fired.cancelled {
             Flow::Cancel
         } else {
@@ -800,7 +925,7 @@ impl Hooks for HorizonJava {
     /// A living entity's death has finished (Fabric's `ServerLivingEntityEvents.AFTER_DEATH`): the
     /// loot, experience and death message went out. The runtime's `living_after_death` event; a
     /// death `living_death` cancelled never reaches it.
-    fn living_death_post(&self, _host: &mut dyn ServerHost, event: &mut LivingDeathPostEvent<'_>) {
+    fn living_death_post(&self, host: &mut dyn ServerHost, event: &mut LivingDeathPostEvent<'_>) {
         let context = EventContext {
             entity: Some(FacadeEntity {
                 id: event.entity as i32,
@@ -811,7 +936,9 @@ impl Hooks for HorizonJava {
             damage: Some(event.damage_type.to_owned()),
             ..EventContext::default()
         };
-        self.fire_event(
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
             GameEvent::LivingAfterDeath,
             self.dedicated(),
             context,
@@ -821,7 +948,7 @@ impl Hooks for HorizonJava {
 
     /// A living entity is about to die (Fabric's `ServerLivingEntityEvents.ALLOW_DEATH`, NeoForge's
     /// `LivingDeathEvent`).
-    fn living_death(&self, _host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
+    fn living_death(&self, host: &mut dyn ServerHost, event: &mut LivingDeathEvent<'_>) -> Flow {
         let context = EventContext {
             entity: Some(FacadeEntity {
                 id: event.entity as i32,
@@ -831,7 +958,9 @@ impl Hooks for HorizonJava {
             damage: Some(event.damage_type.to_owned()),
             ..EventContext::default()
         };
-        let fired = self.fire_event(
+        let fired = self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
             GameEvent::LivingAllowDeath,
             self.dedicated(),
             context,
@@ -879,7 +1008,7 @@ impl Hooks for HorizonJava {
     /// `EntityJoinLevelEvent`). A cancel keeps it out.
     fn entity_join_level(
         &self,
-        _host: &mut dyn ServerHost,
+        host: &mut dyn ServerHost,
         event: &mut EntityJoinLevelEvent<'_>,
     ) -> Flow {
         let context = EventContext {
@@ -892,7 +1021,14 @@ impl Hooks for HorizonJava {
             flag: event.loaded_from_disk,
             ..EventContext::default()
         };
-        let fired = self.fire_event(GameEvent::EntityLoad, self.dedicated(), context, |_| true);
+        let fired = self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::EntityLoad,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
         if fired.cancelled {
             Flow::Cancel
         } else {
@@ -934,11 +1070,6 @@ impl HorizonJava {
             .ensure_loaded(&mod_api::RegistrationContext::new());
     }
 
-    /// Fires one runtime event to every jar's recorded listeners, and says what happened.
-    fn fire(&self, event: GameEvent, dedicated: bool, wanted: impl Fn(&GameListener) -> bool) {
-        self.fire_event(event, dedicated, EventContext::default(), wanted);
-    }
-
     /// Fires one runtime event with its context to every jar's listeners and returns what they
     /// decided. One firing is shared by every jar, so a cancellation or an `InteractionResult`
     /// carries from one jar's listener to the next, as it does between Fabric listeners.
@@ -947,6 +1078,21 @@ impl HorizonJava {
     /// failed or leaned on an unmodelled host call; the report counts every callback either way.
     fn fire_event(
         &self,
+        event: GameEvent,
+        dedicated: bool,
+        context: EventContext,
+        wanted: impl Fn(&GameListener) -> bool,
+    ) -> Fired {
+        self.fire_bridged(None, Lifecycle::None, event, dedicated, context, wanted)
+    }
+
+    /// [`Self::fire_event`] from a hook that has a `ServerHost`: each jar with attachment types
+    /// the bridge runs gets a batch around its listeners (`attachments.rs`), and `lifecycle` is
+    /// the attachment step NeoForge takes at this moment, before the listeners run.
+    fn fire_bridged(
+        &self,
+        mut server: Option<&mut dyn ServerHost>,
+        lifecycle: Lifecycle,
         event: GameEvent,
         dedicated: bool,
         context: EventContext,
@@ -964,6 +1110,9 @@ impl HorizonJava {
             // game announced, and a jar that only listens for `server_started` must still see
             // the levels loaded before it.
             loaded.host.note_firing_levels(&firing);
+            let opened = server.as_deref_mut().and_then(|server| {
+                attachments::open(server, &id, &loaded.jar, &mut loaded.host, lifecycle)
+            });
             let before = loaded.host.unknown_host_call_count();
             let (jar_ran, jar_failed) = run_listeners(
                 &id,
@@ -973,6 +1122,21 @@ impl HorizonJava {
                 &mut firing,
                 &wanted,
             );
+            match server.as_deref_mut() {
+                Some(server) => attachments::close(
+                    server,
+                    &id,
+                    &loaded.jar,
+                    &mut loaded.host,
+                    opened,
+                    lifecycle,
+                ),
+                None => {
+                    if let Lifecycle::Left(player) = lifecycle {
+                        loaded.host.attachment_player_left(player);
+                    }
+                }
+            }
             let jar_unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             log_stdout(&id, &mut loaded.host);
             loaded.row.callbacks_ran += jar_ran;
@@ -1605,6 +1769,8 @@ impl State {
             jar.row.command_unknown_host_calls = 0;
             jar.row.commands_translated = 0;
             jar.row.commands_refused_at_registration = 0;
+            // No player value carries into another server's world.
+            jar.host.reset_attachment_values();
         }
     }
 }
@@ -1875,7 +2041,14 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
     let rows: Vec<_> = state
         .jars
         .iter()
-        .map(|jar| jar.row.json())
+        .map(|jar| {
+            let mut row = jar.row.json();
+            let stats = jar.host.attachment_stats();
+            if stats.types > 0 {
+                row["attachments"] = attachments::stats_json(&stats);
+            }
+            row
+        })
         .chain(state.refused.iter().map(JarRow::json))
         .collect();
     let report = json!({ "schema": SCHEMA, "jars": rows });
