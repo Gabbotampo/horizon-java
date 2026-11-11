@@ -57,6 +57,13 @@ nothing about whether the mod works. The committed ledgers predate the host-call
   overwhelmingly `target-outside-jar`); the opt-in hook tier binds plans to game hook sites instead.
   Game-class mixins remain the main phase-2 gap.
 
+- **Entrypoint census** (`tools/unmodelled_calls.py`, the native probe over the same corpora, every server
+  stage, the game's verdict), re-measured on 11 November 2026 with the interpreter-honesty fixes
+  (#37, #38, #41): `ran-clean` **174 → 112** (wide 52 → 31, mega 86 → 59, NeoForge 36 → 22), 18 jars
+  `ran-partial`, and 132 more refused, almost all on a `NullPointerException` the interpreter used to
+  carry on through. Lower is correct: those jars were clean only because failures were answered
+  silently. Detail in [docs/unmodelled-calls.md](docs/unmodelled-calls.md).
+
 Phase 1 is not met yet: neither Fabric ledger has 0 `native-gap`, and the NeoForge ledger is
 measured but not gated. See the status page for per-row detail and repro commands.
 
