@@ -53,10 +53,22 @@ impl LoadPlan {
 
 /// One jar's mod ids, lowercased because loader mod ids are compared without
 /// case.
+///
+/// A bundled jar (`META-INF/jars/*.jar`) is a mod of its own in a real loader:
+/// `libjf` ships `libjf-base` and its dependents declare a dependency on that
+/// id, so the ids a bundle provides answer for its dependents. The bundled
+/// jars' own requirements are not checked here — a library bundle asks for the
+/// loader's own surfaces, which [`HOST_PROVIDED_MODS`] already covers.
 fn mod_ids(jar: &NativeJar) -> Vec<String> {
-    [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
+    let outer = [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()];
+    let nested = crate::runtime::nested_jars::parsed(jar)
+        .into_iter()
+        .flat_map(|(_, nested)| [nested.fabric_id, nested.neoforge_id])
+        .collect::<Vec<_>>();
+    outer
         .into_iter()
         .flatten()
+        .chain(nested.iter().filter_map(Option::as_deref))
         .map(str::to_ascii_lowercase)
         .collect()
 }
