@@ -86,10 +86,10 @@ use mod_api::{
     LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
     LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
     LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext,
-    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
-    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
-    ServerTickEvent, ServerTickPhase, Text,
+    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent,
+    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
+    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
+    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -182,11 +182,17 @@ struct JavaCommand {
 }
 
 /// The argument kinds this bridge carries, and the usage spelling each one gets.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JavaArgument {
     Word,
     Text,
     Integer,
+    /// Brigadier's `EntityArgument.player()` or `.players()`, carried as the mod API's `player`
+    /// kind: the game resolves the selector to exactly one online player before the command
+    /// runs. `player()` is exact. `players()` is the one-player subset of what vanilla accepts:
+    /// a selector that picks two or more players is refused by the game's parser with feedback
+    /// instead of running once per player (named in `docs/mod-plan.md`, "Departures").
+    Player,
 }
 
 impl JavaArgument {
@@ -195,16 +201,22 @@ impl JavaArgument {
             Self::Word => "word",
             Self::Text => "text",
             Self::Integer => "integer",
+            Self::Player => "player",
         }
     }
 
     /// The kinds the runtime's façade records that this bridge carries. Everything else is
     /// refused by name rather than approximated.
+    ///
+    /// `EntityArgument.entity()` and `.entities()` stay refused: the mod API's only selector
+    /// kind resolves players, and narrowing "any entity" to "one player" would run the command on
+    /// a different set than the jar asked for (the fork seam is in `docs/mod-plan.md`).
     fn from_kind(kind: &ArgumentKind) -> Option<Self> {
         match kind {
             ArgumentKind::Word | ArgumentKind::Quoted => Some(Self::Word),
             ArgumentKind::Greedy => Some(Self::Text),
             ArgumentKind::Integer { .. } => Some(Self::Integer),
+            ArgumentKind::Entity { players: true, .. } => Some(Self::Player),
             _ => None,
         }
     }
@@ -215,9 +227,65 @@ impl JavaArgument {
             ArgumentKind::Quoted => "quoted string".to_owned(),
             ArgumentKind::Greedy => "greedy string".to_owned(),
             ArgumentKind::Integer { .. } => "integer".to_owned(),
+            ArgumentKind::Entity {
+                single: true,
+                players: false,
+            } => "single-entity selector (EntityArgument.entity)".to_owned(),
+            ArgumentKind::Entity {
+                single: false,
+                players: false,
+            } => "entity selector (EntityArgument.entities)".to_owned(),
             other => format!("{other:?}"),
         }
     }
+
+    /// The runtime's parsed argument for one value the game resolved, and the word
+    /// `CommandContext.getInput()` shows for it. `None` when the value is not this kind.
+    ///
+    /// A player is the runtime's player list of one, so `EntityArgument.getPlayer`/`getPlayers`
+    /// answer the same `game/player/<uuid>` marker the event façade already answers name, UUID
+    /// and level for. The game hands over the resolved player, not the selector text, so the
+    /// input line names the player (or, without a name, their UUID, which vanilla also accepts
+    /// as a selector) rather than repeating `@s` or `@p`.
+    fn runtime_value(
+        self,
+        value: &CommandArgumentValue,
+        player_name: impl Fn(PlayerRef) -> Option<String>,
+    ) -> Option<(brigadier::CommandArgument, String)> {
+        Some(match (self, value) {
+            (Self::Word | Self::Text, CommandArgumentValue::String(text)) => {
+                (brigadier::CommandArgument::Str(text.clone()), text.clone())
+            }
+            (Self::Integer, CommandArgumentValue::Integer(value)) => {
+                (brigadier::CommandArgument::Int(*value), value.to_string())
+            }
+            (Self::Player, CommandArgumentValue::Player(player)) => {
+                selected_player(player.uuid(), player_name(*player))
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// One selected player as the runtime's argument and its input word: the player's name, or
+/// their UUID when the game does not name them.
+fn selected_player(uuid: u128, name: Option<String>) -> (brigadier::CommandArgument, String) {
+    (
+        brigadier::CommandArgument::Players(vec![uuid]),
+        name.unwrap_or_else(|| hyphenated_uuid(uuid)),
+    )
+}
+
+/// A UUID in Java's `UUID.toString()` form (`8-4-4-4-12` lower-case hex).
+fn hyphenated_uuid(uuid: u128) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        uuid >> 96,
+        (uuid >> 80) & 0xffff,
+        (uuid >> 64) & 0xffff,
+        (uuid >> 48) & 0xffff,
+        uuid & 0xffff_ffff_ffff
+    )
 }
 
 #[mod_api::horizon_mod]
@@ -444,27 +512,21 @@ impl Hooks for HorizonJava {
             let mut arguments = Vec::new();
             let mut words = command.literals.clone();
             for (name, kind) in &command.arguments {
-                match (kind, event.command.argument(name)) {
-                    (
-                        JavaArgument::Word | JavaArgument::Text,
-                        Some(CommandArgumentValue::String(text)),
-                    ) => {
-                        arguments
-                            .push((name.clone(), brigadier::CommandArgument::Str(text.clone())));
-                        words.push(text.clone());
+                match event.command.argument(name) {
+                    Some(value) => {
+                        let Some((argument, word)) =
+                            kind.runtime_value(value, |player| player.name(&*host))
+                        else {
+                            return refuse(
+                                host,
+                                &command.usage,
+                                format!("argument '{name}' is not the kind this bridge carries"),
+                            );
+                        };
+                        arguments.push((name.clone(), argument));
+                        words.push(word);
                     }
-                    (JavaArgument::Integer, Some(CommandArgumentValue::Integer(value))) => {
-                        arguments.push((name.clone(), brigadier::CommandArgument::Int(*value)));
-                        words.push(value.to_string());
-                    }
-                    (_, Some(_)) => {
-                        return refuse(
-                            host,
-                            &command.usage,
-                            format!("argument '{name}' is not the kind this bridge carries"),
-                        );
-                    }
-                    (_, None) => {
+                    None => {
                         return refuse(
                             host,
                             &command.usage,
@@ -2161,6 +2223,70 @@ mod tests {
     /// Command-registration listeners are callbacks: their runs, failures, unmodelled host calls
     /// and refused usages land in the row, so `calcmod`'s failed registration is a counted
     /// failure in the report, not only a log line.
+    /// Brigadier's four `EntityArgument` kinds, as the runtime records them from
+    /// `EntityArgument.entity()/entities()/player()/players()` (`single`, `playersOnly`): the two
+    /// player kinds are carried as the mod API's `player` kind and spelled so in the usage the
+    /// game parses; the two entity kinds have no mod API counterpart and stay refused.
+    #[test]
+    fn only_the_player_selector_kinds_are_carried() {
+        let kind = |single, players| ArgumentKind::Entity { single, players };
+        assert_eq!(
+            JavaArgument::from_kind(&kind(true, true)),
+            Some(JavaArgument::Player)
+        );
+        assert_eq!(
+            JavaArgument::from_kind(&kind(false, true)),
+            Some(JavaArgument::Player)
+        );
+        assert_eq!(JavaArgument::from_kind(&kind(true, false)), None);
+        assert_eq!(JavaArgument::from_kind(&kind(false, false)), None);
+        assert_eq!(
+            usage(
+                &["carryon".to_owned(), "clear".to_owned()],
+                &[("target".to_owned(), JavaArgument::Player)]
+            ),
+            "carryon clear <target:player>"
+        );
+        // The refusal log names the kind the jar asked for, not a Debug dump.
+        assert_eq!(
+            JavaArgument::describe(&kind(false, false)),
+            "entity selector (EntityArgument.entities)"
+        );
+    }
+
+    /// The player the game selected reaches the Java command as the runtime's one-player list,
+    /// which `EntityArgument.getPlayer`/`getPlayers` turn into the `game/player/<uuid>` marker,
+    /// and `getInput()` names that player. Without a name the input carries the UUID in
+    /// `java.util.UUID.toString()` form (`new UUID(0x0123456789abcdefL, 0xfedcba9876543210L)`
+    /// prints `01234567-89ab-cdef-fedc-ba9876543210`).
+    #[test]
+    fn a_selected_player_is_the_runtimes_one_player_list() {
+        let uuid = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128;
+        assert_eq!(
+            selected_player(uuid, Some("Alex".to_owned())),
+            (
+                brigadier::CommandArgument::Players(vec![uuid]),
+                "Alex".to_owned()
+            )
+        );
+        assert_eq!(
+            selected_player(uuid, None).1,
+            "01234567-89ab-cdef-fedc-ba9876543210"
+        );
+        // A value of another kind is not read as a player, nor a player as text.
+        let text = CommandArgumentValue::String("Alex".to_owned());
+        assert_eq!(JavaArgument::Player.runtime_value(&text, |_| None), None);
+        assert_eq!(
+            JavaArgument::Word.runtime_value(&text, |_| None),
+            Some((
+                brigadier::CommandArgument::Str("Alex".to_owned()),
+                "Alex".to_owned()
+            ))
+        );
+        let number = CommandArgumentValue::Integer(3);
+        assert_eq!(JavaArgument::Player.runtime_value(&number, |_| None), None);
+    }
+
     #[test]
     fn command_registration_counts_reach_the_row() {
         let mut row = JarRow::refused("calcmod.jar", "calcmod".to_owned(), String::new());
