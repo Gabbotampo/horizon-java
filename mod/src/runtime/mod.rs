@@ -32329,7 +32329,7 @@ mandatory = true
     }
 
     #[test]
-    fn standard_host_maps_uuid_identity_without_randomness() {
+    fn standard_host_maps_uuid_identity_and_random_v4() {
         let mut host = StdHost::new();
         let from_string = MethodRef {
             owner: "java/util/UUID".into(),
@@ -32393,8 +32393,28 @@ mandatory = true
                 &[],
             )
             .unwrap(),
-            Value::Ref(Some("00000000-0000-4000-8000-000000000000".into()))
+            {
+                // A distinct version-4 UUID per call, as `UUID.randomUUID`.
+                let text = expect_string(&random)
+                    .strip_prefix("uuid/")
+                    .unwrap()
+                    .to_owned();
+                assert_eq!((text.len(), &text[14..15]), (36, "4"));
+                assert!("89ab".contains(&text[19..20]));
+                Value::Ref(Some(text))
+            }
         );
+        let again = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/util/UUID".into(),
+                    name: "randomUUID".into(),
+                    descriptor: "()Ljava/util/UUID;".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        assert_ne!(random, again);
         assert!(
             host.invoke(&from_string, &[Value::Ref(Some("not-a-uuid".into()))],)
                 .is_err()
@@ -33420,17 +33440,39 @@ mandatory = true
             name: "removeIf".into(),
             descriptor: "(Ljava/util/function/Predicate;)Z".into(),
         };
-        assert_eq!(
+        // `List.of` is unmodifiable: the JVM throws before testing anything.
+        assert!(matches!(
             host.invoke_instance(
                 &remove_if,
                 &list,
+                &[Value::Ref(Some("@indy:list-predicate".into()))],
+            ),
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/UnsupportedOperationException"
+        ));
+        // `new ArrayList<>(list).removeIf(...)` removes and reports it.
+        let list_copy = Value::Ref(Some("java/util/ArrayList#copy".into()));
+        host.invoke_instance(
+            &MethodRef {
+                owner: "java/util/ArrayList".into(),
+                name: "<init>".into(),
+                descriptor: "(Ljava/util/Collection;)V".into(),
+            },
+            &list_copy,
+            std::slice::from_ref(&list),
+        )
+        .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &remove_if,
+                &list_copy,
                 &[Value::Ref(Some("@indy:list-predicate".into()))],
             )
             .unwrap(),
             Value::Int(1)
         );
         assert_eq!(
-            host.invoke_instance(&size, &list, &[]).unwrap(),
+            host.invoke_instance(&size, &list_copy, &[]).unwrap(),
             Value::Int(0)
         );
     }
