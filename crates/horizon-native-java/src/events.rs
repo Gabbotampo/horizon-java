@@ -1177,6 +1177,42 @@ fn facade(marker: &str) -> Option<Facade<'_>> {
 }
 
 impl StdHost {
+    /// Record the level one firing names into the server's level ledger.
+    ///
+    /// `MinecraftServer.getAllLevels()` is every level in the server's level
+    /// map. The game's hook payloads do not carry that map, but every
+    /// level-scoped firing names its level and `LevelLoad`/`LevelUnload` say
+    /// when one appears and goes away. The ledger is the set announced and not
+    /// yet unloaded, so a listener at `server_started` (before any level tick)
+    /// still sees the levels the server opened.
+    pub fn note_firing_levels(&mut self, firing: &EventFiring) {
+        for level in &firing.facade.levels {
+            self.note_level(level.clone());
+        }
+        if let Some(id) = firing.context.level.as_deref()
+            && !self.levels.iter().any(|level| level.id == id)
+        {
+            self.note_level(FacadeLevel {
+                id: id.to_owned(),
+                ..FacadeLevel::default()
+            });
+        }
+        if firing.event == GameEvent::LevelUnload
+            && let Some(id) = firing.context.level.as_deref()
+        {
+            self.levels.retain(|level| level.id != id);
+        }
+    }
+
+    /// Add one level to the ledger, replacing the facts an earlier firing gave
+    /// for it.
+    fn note_level(&mut self, level: FacadeLevel) {
+        match self.levels.iter_mut().find(|known| known.id == level.id) {
+            Some(known) => *known = level,
+            None => self.levels.push(level),
+        }
+    }
+
     /// The statics a listener's registration and body read through the host:
     /// a Fabric `Event` field keeps its name (`fabric-event/<owner>.<FIELD>`),
     /// a Forge event's `BUS` names its event, and the façade answers
@@ -1413,7 +1449,14 @@ impl StdHost {
                 ("getPlayerList", _) => Some(marker(PLAYER_LIST.into())),
                 ("overworld", _) => Some(level_marker("minecraft:overworld")),
                 ("getAllLevels", _) => {
-                    let levels = facade.levels.iter().map(|l| level_marker(&l.id)).collect();
+                    // The firing's own list when the game gave one, else the
+                    // levels the firings announced (the game's hook payloads
+                    // carry no level map).
+                    let levels = if facade.levels.is_empty() {
+                        self.levels.iter().map(|l| level_marker(&l.id)).collect()
+                    } else {
+                        facade.levels.iter().map(|l| level_marker(&l.id)).collect()
+                    };
                     Some(self.facade_list("levels", levels))
                 }
                 _ => None,
@@ -1455,7 +1498,11 @@ impl StdHost {
                 _ => None,
             },
             Facade::Level(id) => {
-                let level = facade.levels.iter().find(|l| l.id == *id);
+                let level = facade
+                    .levels
+                    .iter()
+                    .find(|l| l.id == *id)
+                    .or_else(|| self.levels.iter().find(|l| l.id == *id));
                 match (name, returns) {
                     ("getServer", _) => Some(marker(SERVER.into())),
                     ("getGameTime", "J") => Some(Value::Long(level?.game_time)),
@@ -2242,6 +2289,7 @@ impl NativeJar {
             None => vec![event_marker(firing.event)],
         };
         let marks = host.call_log_marks();
+        host.note_firing_levels(firing);
         host.game_event = Some(Box::new(firing.clone()));
         let result = self.invoke_listener_callback(&listener.callback, event_args, host, budget);
         if let Some(after) = host.game_event.take() {
