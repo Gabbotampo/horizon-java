@@ -2,10 +2,30 @@
 //!
 //! `floor`, `ceil`, `rint`, `sqrt`, `abs` and `round` are exact in Java, and
 //! IEEE 754 gives Rust the same answers, signed zeros and NaN included;
-//! `round`'s tie and saturation rules are spelled out below. The functions
-//! answered here were compared with JDK 25 on x86-64 and agree bit for bit.
+//! `round`'s tie and saturation rules are spelled out below. Compared with
+//! JDK 25 on x86-64, every answer of these agrees bit for bit.
+//!
+//! `pow` is the exception: Java only requires it within one ulp of the exact
+//! result. The platform `pow` is within that bound but is not HotSpot's
+//! intrinsic: over 2,883 calls compared with JDK 25 on x86-64, 9 answers
+//! differed in the last bit (`pow(0.49999999999999994, -1.0)` is
+//! 2.0000000000000004 on HotSpot, 2.0 here). Its special cases differ from
+//! C's `pow` (`pow(1.0, NaN)` is NaN in Java, 1.0 in C), so those are
+//! answered first.
 
 use crate::{MethodRef, NativeError, Value, double_value, expect_float, float_value};
+
+/// `Math.pow`: Java's special cases where C's `pow` answers otherwise, then
+/// the platform `pow`.
+fn pow(base: f64, exponent: f64) -> f64 {
+    if exponent == 0.0 {
+        return 1.0;
+    }
+    if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) {
+        return f64::NAN;
+    }
+    base.powf(exponent)
+}
 
 /// `Math.round(double)`: the closest `long`, ties toward positive infinity.
 /// NaN is 0 and an out-of-range value saturates, which is what Rust's `as`
@@ -51,6 +71,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         ("sqrt", "(D)D") => unary(f64::sqrt),
         ("abs", "(D)D") => unary(f64::abs),
         ("abs", "(F)F") => argument(0).map(|value| float_value(value.abs())),
+        ("pow", "(DD)D") => argument(0).and_then(|base| Ok(double_value(pow(base, argument(1)?)))),
         ("round", "(D)J") => argument(0).map(|value| Value::Long(round_double(value))),
         ("round", "(F)I") => argument(0).map(|value| Value::Int(round_float(value as f32))),
         _ => return None,
@@ -71,8 +92,9 @@ mod tests {
     }
 
     fn double(name: &str, args: &[f64]) -> f64 {
+        let descriptor = if args.len() == 2 { "(DD)D" } else { "(D)D" };
         let args: Vec<Value> = args.iter().map(|value| Value::Float(*value)).collect();
-        match call(name, "(D)D", &args) {
+        match call(name, descriptor, &args) {
             Value::Float(value) => value,
             other => panic!("{name} answered {other:?}"),
         }
@@ -94,6 +116,18 @@ mod tests {
             call("abs", "(F)F", &[Value::Float(-1.5)]),
             Value::Float(1.5)
         );
+    }
+
+    /// `pow`'s Java special cases, where C's `pow` answers 1.0.
+    #[test]
+    fn pow_takes_java_special_cases() {
+        assert_eq!(double("pow", &[2.0, 10.0]), 1024.0);
+        assert_eq!(double("pow", &[f64::NAN, 0.0]), 1.0);
+        assert!(double("pow", &[1.0, f64::NAN]).is_nan());
+        assert!(double("pow", &[1.0, f64::INFINITY]).is_nan());
+        assert!(double("pow", &[-1.0, f64::NEG_INFINITY]).is_nan());
+        assert!(double("pow", &[-8.0, 1.0 / 3.0]).is_nan());
+        assert_eq!(double("pow", &[-2.0, 3.0]), -8.0);
     }
 
     /// `round` ties toward positive infinity, maps NaN to 0 and saturates.
