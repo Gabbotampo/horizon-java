@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 # The survey's sample: (batch, [(short id, file name under a corpus, command root or None)]).
@@ -65,11 +66,14 @@ SAMPLE = [
     ("b5", [
         ("spark", "361579-8918571.jar", "spark"),
         ("mcwifipnp", "mcwifipnp-2.1.4-26.3-fabric.jar", "uuidfixer list"),
-        ("otterlib", "1079f41d14-otterlib-0.4.0.2+26.3-fabric.jar", None),
+        # `stackrefill` declares `collective`: since cross-jar linking (#33) a dependency must
+        # sit in the same `java-mods`, so the two share a batch (the first survey ran
+        # `stackrefill` in b6 and `otterlib` here; nothing else about either changed).
+        ("stackrefill", "9f12a0dffd-stackrefill-26.3.0-5.1.jar", None),
         ("collective", "bdc7223ca2-collective-26.3.0-8.67.jar", None),
     ]),
     ("b6", [
-        ("stackrefill", "9f12a0dffd-stackrefill-26.3.0-5.1.jar", None),
+        ("otterlib", "1079f41d14-otterlib-0.4.0.2+26.3-fabric.jar", None),
         ("calcmod", "d198676d8b-calcmod-1.6.0+fabric.26.3.jar", None),
         ("entity-view-distance", "09ee9afdd2-entity-view-distance-1.9.0+26.2.jar", None),
         ("structure_pool_api", "1b0a4ed5f7-structure_pool_api-fabric-1.3.0+26.3.jar", None),
@@ -192,7 +196,61 @@ def table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def content_items(game_dir: Path) -> dict[str, list[str]]:
+    """The item ids each jar's baked packages declare, keyed by the jar's file name.
+
+    `tools/bake.py` writes one `.hmod` per namespace with the runtime's declarations as
+    `data/<ns>/horizon/item/<path>.json` and `data/<ns>/horizon/block/<path>.json` (a block whose
+    declaration says `"item": true` brings its block item). These are the ids a player can be
+    given, so the survey gives one of them for every content jar. A jar with no declared items
+    is absent; an unreadable package is skipped (its bake error is already in the bake report).
+    """
+    report_file = game_dir / "config" / "horizon_java" / "bake-report.json"
+    try:
+        report = json.loads(report_file.read_text())
+    except (OSError, ValueError):
+        return {}
+    found: dict[str, list[str]] = {}
+    for jar in report.get("jars", []):
+        ids = []
+        for package in jar.get("packages", []):
+            declared = package.get("declarations") or {}
+            if not (declared.get("items") or declared.get("blocks")):
+                continue
+            try:
+                with zipfile.ZipFile(game_dir / package["path"]) as archive:
+                    names = sorted(archive.namelist())
+                    for name in names:
+                        parts = name.split("/")
+                        if (len(parts) != 5 or parts[0] != "data" or parts[2] != "horizon"
+                                or not parts[4].endswith(".json")):
+                            continue
+                        item_id = f"{parts[1]}:{parts[4][:-len('.json')]}"
+                        if parts[3] == "item":
+                            ids.append(item_id)
+                        elif parts[3] == "block":
+                            try:
+                                body = json.loads(archive.read(name))
+                            except ValueError:
+                                continue
+                            if body.get("item"):
+                                ids.append(item_id)
+            except (OSError, KeyError, zipfile.BadZipFile):
+                continue
+        if ids:
+            found[jar["jar"]] = ids
+    return found
+
+
 def find_jar(corpus: Path, name: str) -> Path:
+    """A jar by file name under one of the corpora, or a manifest's absolute path as given.
+
+    The absolute form is for jars that are not in a corpus (the repo's own fixtures, built into a
+    scratch folder by `tools/java_mod_fixture.py`)."""
+    if Path(name).is_absolute():
+        if Path(name).is_file():
+            return Path(name)
+        raise SystemExit(f"{name}: not found")
     for directory in CORPUS_DIRS:
         candidate = corpus / directory / name
         if candidate.is_file():
@@ -239,7 +297,7 @@ class Session:
         })
         return env
 
-    def run_batch(self, batch, jars):
+    def run_batch(self, batch, jars, break_block="minecraft:dirt"):
         args = self.args
         scratch = args.out / "runs" / batch
         if scratch.exists():
@@ -278,7 +336,8 @@ class Session:
                   "jars": [{"short": short, "file": path.name, "source": str(path),
                             "command": command} for short, path, command in jars],
                   "bake": {"code": baked["code"], "out": baked["out"], "err": baked["err"]},
-                  "actions": {}, "ready": False, "ticks": None, "report": None, "log_version": None}
+                  "actions": {}, "ready": False, "ticks": None, "report": None, "log_version": None,
+                  "content_items": content_items(game_dir)}
         if not wait_for(sock, args.startup):
             result["error"] = "no control socket"
         else:
@@ -294,10 +353,19 @@ class Session:
             if position:
                 x, y, z = (int(value) for value in position)
                 result["actions"]["setblock"] = self.reply(
-                    sock, "setblock", str(x), str(y + 2), str(z + 1), "minecraft:dirt")
+                    sock, "setblock", str(x), str(y + 2), str(z + 1), break_block)
                 result["actions"]["break"] = self.reply(
                     sock, "break", str(x), str(y + 2), str(z + 1), timeout=120)
+                # A cancelled break (the m2c fixture keeps stone) leaves the block standing.
+                result["actions"]["block_after_break"] = self.reply(
+                    sock, "block", str(x), str(y + 2), str(z + 1))
             result["actions"]["give"] = self.reply(sock, "give", "minecraft:bread", "2")
+            # One item from every content jar, by the id its baked package declares.
+            result["content_gives"] = {}
+            for jar_file, ids in result["content_items"].items():
+                result["content_gives"][jar_file] = {
+                    "item": ids[0], "declared": len(ids),
+                    "reply": self.reply(sock, "give", ids[0], "1")}
             result["actions"]["use-item"] = self.reply(sock, "use-item", "--hold", "1.7")
             moved = self.reply(sock, "move", "forward", "2")
             if not moved or (moved.get("moved") or 0) < 0.5:
@@ -350,12 +418,19 @@ def systemd_state(unit: str) -> str:
 
 
 def manifest(path: Path) -> list[tuple[str, list[tuple[str, str, str | None]]]]:
+    """Batches from a JSON file. A batch may name `break_block`, the block placed and broken
+    (default dirt); the fixture batch uses stone, which the m2c fixture's listener keeps."""
     data = json.loads(path.read_text())
     batches = []
     for entry in data:
         batches.append((entry["batch"], [(jar["file"], jar["file"], jar.get("command"))
                                           for jar in entry["jars"]]))
+        BREAK_BLOCKS[entry["batch"]] = entry.get("break_block", "minecraft:dirt")
     return batches
+
+
+# The block each manifest batch places and breaks (filled by `manifest`); `--sample` uses dirt.
+BREAK_BLOCKS: dict[str, str] = {}
 
 
 def main(argv=None):
@@ -384,7 +459,8 @@ def main(argv=None):
         if args.only and batch not in args.only:
             continue
         resolved = [(short, find_jar(args.corpus, name), command) for short, name, command in jars]
-        result = session.run_batch(batch, resolved)
+        result = session.run_batch(batch, resolved,
+                                   BREAK_BLOCKS.get(batch, "minecraft:dirt"))
         rows = result.get("rows") or []
         verdicts = {}
         for row in rows:

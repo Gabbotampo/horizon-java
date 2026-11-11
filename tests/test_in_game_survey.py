@@ -9,6 +9,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -187,6 +188,89 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(batches[0][0], "b1")
             self.assertEqual(batches[0][1][0], ("a.jar", "a.jar", "hello"))
             self.assertIsNone(batches[0][1][1][2])
+
+
+class ContentItemsTest(unittest.TestCase):
+    """The ids the survey gives for a content jar come from its baked package's declarations."""
+
+    def setUp(self):
+        self.survey = load_survey()
+
+    def write_bake(self, game_dir, packages):
+        mods = game_dir / "horizon-mods"
+        mods.mkdir(parents=True)
+        rows = []
+        for jar, namespace, entries, declared in packages:
+            path = mods / f"{namespace}.hmod"
+            with zipfile.ZipFile(path, "w") as archive:
+                for name, body in entries.items():
+                    archive.writestr(name, body)
+            rows.append({"jar": jar, "namespaces": [namespace], "error": None, "skipped": [],
+                         "packages": [{"id": namespace, "namespace": namespace,
+                                       "path": f"horizon-mods/{namespace}.hmod",
+                                       "files": len(entries), "bytes": 1,
+                                       "declarations": declared}]})
+        report = game_dir / "config" / "horizon_java" / "bake-report.json"
+        report.parent.mkdir(parents=True)
+        report.write_text(json.dumps({"schema": 1, "jars": rows}))
+
+    def test_items_and_block_items_are_given_and_itemless_blocks_are_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            game_dir = Path(directory)
+            self.write_bake(game_dir, [
+                ("ruby.jar", "ruby", {
+                    "data/ruby/horizon/item/gem.json": '{"template":"minecraft:stick"}',
+                    "data/ruby/horizon/block/gem_block.json":
+                        '{"item":true,"template":"minecraft:stone"}',
+                    "data/ruby/horizon/block/ghost.json":
+                        '{"item":false,"template":"minecraft:stone"}',
+                    "assets/ruby/lang/en_us.json": "{}",
+                    "data/ruby/loot_table/blocks/gem_block.json": "{}",
+                }, {"blocks": 2, "items": 1}),
+                ("assets_only.jar", "pretty", {"assets/pretty/lang/en_us.json": "{}"},
+                 {"blocks": 0, "items": 0}),
+            ])
+            found = self.survey.content_items(game_dir)
+        self.assertEqual(found, {"ruby.jar": ["ruby:gem_block", "ruby:gem"]})
+
+    def test_no_bake_report_means_no_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.survey.content_items(Path(directory)), {})
+
+
+class FixtureManifestTest(unittest.TestCase):
+    def test_absolute_jar_paths_and_the_batch_break_block(self):
+        survey = load_survey()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jar = root / "fixtures" / "m2c_fixture.jar"
+            jar.parent.mkdir()
+            jar.write_bytes(b"jar")
+            path = root / "batches.json"
+            path.write_text(json.dumps([
+                {"batch": "fx", "break_block": "minecraft:stone",
+                 "jars": [{"file": str(jar)}]},
+                {"batch": "plain", "jars": [{"file": "a.jar"}]},
+            ]))
+            batches = survey.manifest(path)
+            # An absolute path is used as given, not searched for under the corpora.
+            self.assertEqual(survey.find_jar(root / "corpus", batches[0][1][0][1]), jar)
+            with self.assertRaises(SystemExit):
+                survey.find_jar(root / "corpus", str(root / "missing.jar"))
+        self.assertEqual(survey.BREAK_BLOCKS["fx"], "minecraft:stone")
+        self.assertEqual(survey.BREAK_BLOCKS["plain"], "minecraft:dirt")
+
+    def test_a_dependency_shares_its_dependents_batch(self):
+        # Since cross-jar linking a dependency outside the batch refuses the dependent, so the
+        # sample keeps each declared dependency it carries beside the jar that needs it.
+        survey = load_survey()
+        batch_of = {name: batch for batch, jars in survey.SAMPLE for _, name, _ in jars}
+        for dependent, dependency in [
+            ("9f12a0dffd-stackrefill-26.3.0-5.1.jar", "bdc7223ca2-collective-26.3.0-8.67.jar"),
+            ("fancymenu_neoforge_3.9.14_MC_26.3.jar", "konkrete_neoforge_1.11.1_MC_26.3.jar"),
+            ("832882-8896904.jar", "326652-8890593.jar"),
+        ]:
+            self.assertEqual(batch_of[dependent], batch_of[dependency], dependent)
 
 
 if __name__ == "__main__":
