@@ -60,12 +60,13 @@ way at `b45a717`:
 | Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
 |---|---:|---:|---:|---:|
 | wide (`corpus-xl`) | 31 → **31** | 34 → 41 | 8 → 4 | 43 → 40 |
-| mega | 59 → **60** | 67 → 83 | 10 → 4 | 116 → 105 |
-| NeoForge 26.3 | 22 → **22** | 20 → 21 | 0 → 0 | 43 → 42 |
-| **total** | **112 → 113** | 121 → 145 | 18 → 8 | 202 → 187 |
+| mega | 59 → **59** | 67 → 84 | 10 → 4 | 116 → 105 |
+| NeoForge 26.3 | 22 → **21** | 20 → 22 | 0 → 0 | 43 → 42 |
+| **total** | **112 → 111** | 121 → 147 | 18 → 8 | 202 → 187 |
 
-Fifteen jars leave `refused` and one reaches `ran-clean`. Ten `ran-partial` rows become `ran-hollow`: their second
-stage used to fail on one of those invented `null`s and now runs. The next stops are named in
+Fifteen jars leave `refused` and ten `ran-partial` rows become `ran-hollow` (their second stage used to fail on
+one of those invented `null`s and now runs). Two `ran-clean` rows leave: their `Gson` registers a type adapter or
+a custom naming strategy, and #49 now counts that write instead of emitting text that ignored the option. The next stops are named in
 [unmodelled-calls.md](unmodelled-calls.md#re-measured-11-november-2026-after-the-unmodelled-answer-batch).
 
 ### Coverage of the two gates (8 November 2026, commit `8a3c8dc59`)

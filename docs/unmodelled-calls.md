@@ -73,15 +73,17 @@ measures.
 
 | Corpus | Jars | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | `skipped` | Unknown calls (in runs that finished) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| wide (`corpus-xl`) | 223 | 31 | 41 | 4 | 40 | 107 | 1,184 |
-| mega (500 unique) | 500 | 60 | 83 | 4 | 105 | 248 | 2,449 |
-| NeoForge 26.3 | 85 | 22 | 21 | 0 | 42 | 0 | 233 |
-| **total** | **808** | **113** | **145** | **8** | **187** | **355** | **3,866** |
+| wide (`corpus-xl`) | 223 | 31 | 41 | 4 | 40 | 107 | 1,186 |
+| mega (500 unique) | 500 | 59 | 84 | 4 | 105 | 248 | 2,458 |
+| NeoForge 26.3 | 85 | 21 | 22 | 0 | 42 | 0 | 234 |
+| **total** | **808** | **111** | **147** | **8** | **187** | **355** | **3,878** |
 
-The unknown-call total is lower than the honesty-era figure even though fifteen jars now
-run further: those runs used to stop at the first invented `null` they dereferenced
-(`refused`), and a refused run's calls are not summed. The batch below is the first one
-that moves jars the *other* way — fifteen leave `refused` and one reaches `ran-clean`.
+The unknown-call total is close to the honesty-era figure even though fifteen jars now run
+further: those runs used to stop at the first invented `null` they dereferenced (`refused`),
+and a refused run's calls are not summed. The batch below is the first one that moves jars
+the *other* way — fifteen leave `refused`. Two rows leave `ran-clean` at the same time,
+because their `Gson` registers an adapter or a custom strategy and the runtime now counts
+that write instead of emitting text that ignored it.
 
 ## Ranked calls
 
@@ -109,12 +111,12 @@ alone moves them to `ran-clean`. `surface` says what a bounded runtime could do:
 | 7 | `com/google/common/collect/Maps#newHashMap()Ljava/util/HashMap;` | 5 | 5 | 4 | library |
 | 8 | `java/util/ServiceLoader#forEach(Ljava/util/function/Consumer;)V` | 3 | 3 | 3 | JDK |
 | 9 | `net/minecraft/network/protocol/common/custom/CustomPacketPayload#codec(Lnet/minecraft/network/codec/StreamMemberEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;` | 16 | 68 | 2 | game-bound |
-| 10 | `org/spongepowered/asm/mixin/MixinEnvironment#getActiveTransformer()Ljava/lang/Object;` | 2 | 2 | 2 | loader |
-| 11 | `net/minecraft/network/codec/StreamCodec#of(Lnet/minecraft/network/codec/StreamEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;` | 6 | 23 | 1 | game-bound |
-| 12 | `org/spongepowered/asm/service/MixinService#getService()Lorg/spongepowered/asm/service/IMixinService;` | 5 | 68 | 1 | loader |
-| 13 | `com/google/gson/JsonObject#addProperty(Ljava/lang/String;Ljava/lang/Boolean;)V` | 4 | 64 | 1 | library |
-| 14 | `net/neoforged/bus/api/IEventBus#addListener(Ljava/lang/Class;Ljava/util/function/Consumer;)V` | 4 | 6 | 1 | loader |
-| 15 | `java/lang/String#getBytes()[B` | 3 | 3 | 1 | JDK |
+| 10 | `com/google/gson/Gson#toJson(Ljava/lang/Object;Ljava/lang/Appendable;)V` | 7 | 7 | 2 | library |
+| 11 | `org/spongepowered/asm/mixin/MixinEnvironment#getActiveTransformer()Ljava/lang/Object;` | 2 | 2 | 2 | loader |
+| 12 | `net/minecraft/network/codec/StreamCodec#of(Lnet/minecraft/network/codec/StreamEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;` | 6 | 23 | 1 | game-bound |
+| 13 | `org/spongepowered/asm/service/MixinService#getService()Lorg/spongepowered/asm/service/IMixinService;` | 5 | 68 | 1 | loader |
+| 14 | `com/google/gson/JsonObject#addProperty(Ljava/lang/String;Ljava/lang/Boolean;)V` | 4 | 64 | 1 | library |
+| 15 | `net/neoforged/bus/api/IEventBus#addListener(Ljava/lang/Class;Ljava/util/function/Consumer;)V` | 4 | 6 | 1 | loader |
 | 16 | `net/minecraft/Optionull#mapOrElse(Ljava/lang/Object;Ljava/util/function/Function;Ljava/util/function/Supplier;)Ljava/lang/Object;` | 2 | 4 | 1 | game-bound |
 | 17 | `java/util/Collections#synchronizedMap(Ljava/util/Map;)Ljava/util/Map;` | 2 | 2 | 1 | JDK |
 | 18 | `net/minecraft/client/Minecraft#getInstance()Lnet/minecraft/client/Minecraft;` | 2 | 2 | 1 | game-bound |
@@ -255,19 +257,21 @@ executors (#52) and host method references (#53). Same corpora, deps and command
 | Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
 |---|---:|---:|---:|---:|
 | wide (`corpus-xl`) | 31 → **31** | 34 → 41 | 8 → 4 | 43 → 40 |
-| mega | 59 → **60** | 67 → 83 | 10 → 4 | 116 → 105 |
-| NeoForge | 22 → **22** | 20 → 21 | 0 → 0 | 43 → 42 |
-| **total** | **112 → 113** | 121 → 145 | 18 → 8 | 202 → 187 |
+| mega | 59 → **59** | 67 → 84 | 10 → 4 | 116 → 105 |
+| NeoForge | 22 → **21** | 20 → 22 | 0 → 0 | 43 → 42 |
+| **total** | **112 → 111** | 121 → 147 | 18 → 8 | 202 → 187 |
 
-Fifteen jars leave `refused`; one (`midnightlib-fabric`) reaches `ran-clean`. Ten
-`ran-partial` rows become `ran-hollow`: their second stage used to fail on one of those
-`null`s and now runs. Unknown calls counted: 3,703 → 3,866.
+Fifteen jars leave `refused`; ten `ran-partial` rows become `ran-hollow` (their second stage
+used to fail on one of those `null`s and now runs). Two `ran-clean` rows leave: their `Gson`
+registers a type adapter or a custom naming strategy, and #49 now counts that write instead of
+emitting text that ignored the option — the honesty rule the whole page is about. Unknown calls
+counted: 3,703 → 3,878.
 
 What each fix moved, measured on its own branch:
 
 | PR | Fixed call | Effect |
 |---|---|---|
-| #49 | `GsonBuilder` fluent calls (16 jars) | 12 leave `refused`; the pretty-printing writer now matches Gson's text |
+| #49 | `GsonBuilder` fluent calls (16 jars) | 12 leave `refused`; naming policy, `excludeFieldsWithModifiers`, non-executable prefix, special floats and long policy are applied; a custom strategy/adapter is counted, which costs two `ran-clean` rows |
 | #50 | `ModOrigin.toString()` (12 jars) | all 12 get past it; they stop on the next unmodelled answer |
 | #51 | `MapMaker.makeMap()` (18 jars reached) | 3 leave `refused`; 15 stop later |
 | #52 | `ExecutorService.execute` (7 jars) | all 7 get past it; they stop in `CommentedProperties#save` on the bounded regex subset |

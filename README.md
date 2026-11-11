@@ -63,8 +63,9 @@ nothing about whether the mod works. The committed ledgers predate the host-call
   `ran-partial`, and 132 more refused, almost all on a `NullPointerException` the interpreter used to
   carry on through. Lower was correct there: those jars were clean only because failures were answered
   silently. The unmodelled-answer batch (#49–#53: Gson's builder, `ModOrigin`, `MapMaker`, executors,
-  host method references) then moves them the other way: `ran-clean` **112 → 113**, `ran-partial` 18 → 8,
-  `refused` 202 → 187. Detail in [docs/unmodelled-calls.md](docs/unmodelled-calls.md).
+  host method references) then moves them the other way: `ran-partial` 18 → 8, `refused` 202 → 187,
+  and `ran-clean` 112 → 111 (two clean rows leave because #49 now counts a write that used an
+  adapter or custom naming strategy instead of ignoring it). Detail in [docs/unmodelled-calls.md](docs/unmodelled-calls.md).
 
 Phase 1 is not met yet: neither Fabric ledger has 0 `native-gap`, and the NeoForge ledger is
 measured but not gated. See the status page for per-row detail and repro commands.

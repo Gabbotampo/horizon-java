@@ -21755,12 +21755,17 @@ impl<H: Host> Runtime<'_, H> {
     /// accessors the mod generates find what the document declared. A document
     /// that names no field this class declares, or a class the runtime does not
     /// hold, keeps the previous JSON-shaped answer.
-    fn gson_from_json(&mut self, text: &str, class: &str) -> Result<Value, NativeError> {
+    fn gson_from_json(
+        &mut self,
+        text: &str,
+        class: &str,
+        style: &gson_model::GsonStyle,
+    ) -> Result<Value, NativeError> {
         let Some(json) = gson_document(text)? else {
             return Ok(Value::Ref(None));
         };
         let class = class.replace('.', "/");
-        if let Some(value) = self.gson_materialize(&json, &class)? {
+        if let Some(value) = self.gson_materialize(&json, &class, style)? {
             return Ok(value);
         }
         gson_json_value(&json, &class)
@@ -21781,6 +21786,7 @@ impl<H: Host> Runtime<'_, H> {
         &mut self,
         json: &serde_json::Value,
         class: &str,
+        style: &gson_model::GsonStyle,
     ) -> Result<Option<Value>, NativeError> {
         let serde_json::Value::Object(document) = json else {
             return Ok(None);
@@ -21788,17 +21794,21 @@ impl<H: Host> Runtime<'_, H> {
         if class.starts_with("java/") || !self.has_class(class) {
             return Ok(None);
         }
-        let fields = self.instance_fields(class);
+        let fields = self.gson_fields(class);
         if fields.is_empty() {
             return Ok(None);
         }
         self.ensure_initialized(class)?;
         let value = self.new_object(class);
-        for (declaring, name, descriptor) in fields {
-            let Some(raw) = document.get(&name) else {
+        for (declaring, name, descriptor, access) in fields {
+            if !style.includes_field(access) {
+                continue;
+            }
+            // The naming policy names the JSON key on the way in too.
+            let Some(raw) = document.get(&style.field_name(&name)) else {
                 continue;
             };
-            let Some(field_value) = self.gson_field_value(raw, &descriptor)? else {
+            let Some(field_value) = self.gson_field_value(raw, &descriptor, style)? else {
                 return Ok(None);
             };
             let field = MethodRef {
@@ -21806,37 +21816,16 @@ impl<H: Host> Runtime<'_, H> {
                 name,
                 descriptor,
             };
-            if let Some(key) = instance_field_key(&value, &field) {
+            if access & 0x0008 != 0 {
+                // Gson sets a static field through reflection; the
+                // invocation's static table is the same field here.
+                self.static_fields
+                    .insert(Self::static_field_key(&field), field_value);
+            } else if let Some(key) = instance_field_key(&value, &field) {
                 self.fields.insert(key, field_value);
             }
         }
         Ok(Some(value))
-    }
-
-    /// The instance fields `class` declares, superclasses first-in-walk order.
-    fn instance_fields(&self, class: &str) -> Vec<(String, String, String)> {
-        let mut fields: Vec<(String, String, String)> = Vec::new();
-        let mut current = class.to_owned();
-        for _ in 0..MAX_SUPERCLASS_WALK {
-            let Some(file) = self.class(&current) else {
-                break;
-            };
-            for field in &file.fields {
-                if field.is_static() || fields.iter().any(|(_, name, _)| name == &field.name) {
-                    continue;
-                }
-                fields.push((
-                    current.clone(),
-                    field.name.clone(),
-                    field.descriptor.clone(),
-                ));
-            }
-            if file.super_name.is_empty() || file.super_name == current {
-                break;
-            }
-            current = file.super_name.clone();
-        }
-        fields
     }
 
     /// Convert one JSON value to the field descriptor it must land in.
@@ -21847,6 +21836,7 @@ impl<H: Host> Runtime<'_, H> {
         &mut self,
         json: &serde_json::Value,
         descriptor: &str,
+        style: &gson_model::GsonStyle,
     ) -> Result<Option<Value>, NativeError> {
         if json.is_null() {
             return Ok(Some(Value::Ref(None)));
@@ -21948,10 +21938,12 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 }
                 match json {
-                    serde_json::Value::Object(_) => match self.gson_materialize(json, class)? {
-                        Some(value) => value,
-                        None => return Ok(None),
-                    },
+                    serde_json::Value::Object(_) => {
+                        match self.gson_materialize(json, class, style)? {
+                            Some(value) => value,
+                            None => return Ok(None),
+                        }
+                    }
                     // A JSON string for a jar class is its enum constant name.
                     serde_json::Value::String(name) => {
                         Value::Ref(Some(format!("enum/{class}/{name}")))
@@ -22001,161 +21993,198 @@ impl<H: Host> Runtime<'_, H> {
             "com/google/gson/GsonBuilder" | "com/google/gson/FormattingStyle" => {
                 self.invoke_gson_builder(r, receiver, args)
             }
-            "com/google/gson/Gson" => match (r.name.as_str(), r.descriptor.as_str()) {
-                ("<init>", "()V") => Ok(Some(Value::Void)),
-                ("newBuilder", "()Lcom/google/gson/GsonBuilder;") => {
-                    let style = self.gson_style_of(receiver);
-                    let builder = self.new_object("com/google/gson/GsonBuilder");
-                    if let Some(marker) = expect_ref(&builder) {
-                        self.set_gson_style(marker, style);
+            "com/google/gson/Gson" => {
+                let style = self.gson_style_of(receiver);
+                // An option that changes the output could not be applied (a
+                // custom naming/exclusion strategy, an adapter, a date format,
+                // ...): every write and read is a counted unknown instead of
+                // text that ignores it.
+                if style.is_counted()
+                    && matches!(r.name.as_str(), "toJson" | "toJsonTree" | "fromJson")
+                {
+                    return self
+                        .host
+                        .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                        .map(Some);
+                }
+                match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("<init>", "()V") => {
+                        if let Some(marker) = receiver.and_then(expect_ref) {
+                            let marker = marker.to_owned();
+                            self.set_gson_style(&marker, gson_model::GsonStyle::default());
+                        }
+                        Ok(Some(Value::Void))
                     }
-                    Ok(Some(builder))
-                }
-                // `getAdapter(Class)` names the adapter a codec's own method
-                // references later use. Bootstrap code only checks that the
-                // adapter exists (`Objects.requireNonNull`), so answer the
-                // adapter marker rather than a null the check refuses.
-                (name, descriptor)
-                    if name == "getAdapter"
-                        && descriptor.ends_with(")Lcom/google/gson/TypeAdapter;") =>
-                {
-                    Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
-                }
-                (name, descriptor)
-                    if name == "getDelegateAdapter"
-                        && descriptor.ends_with(")Lcom/google/gson/TypeAdapter;") =>
-                {
-                    Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
-                }
-                // Gson declares one `toJson` overload per element type
-                // (`JsonElement`, `Object`, and the `Type` variants). They
-                // all write the same value, so the descriptor only has to
-                // promise a `String` answer.
-                (name, descriptor)
-                    if name == "toJson" && descriptor.ends_with(")Ljava/lang/String;") =>
-                {
-                    let style = self.gson_style_of(receiver);
-                    match self.gson_to_json(args.first().unwrap_or(&Value::Ref(None)), &style, 0)? {
-                        Some(text) => Ok(Some(Value::Ref(Some(text)))),
-                        // A value with no honest JSON shape is a counted
-                        // unknown, never made-up text.
-                        None => self
-                            .host
-                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
-                            .map(Some),
+                    ("newBuilder", "()Lcom/google/gson/GsonBuilder;") => {
+                        let style = self.gson_style_of(receiver);
+                        let builder = self.new_object("com/google/gson/GsonBuilder");
+                        if let Some(marker) = expect_ref(&builder) {
+                            self.set_gson_style(marker, style);
+                        }
+                        Ok(Some(builder))
                     }
-                }
-                (name, descriptor)
-                    if name == "toJson"
-                        && descriptor.ends_with(")V")
-                        && descriptor.contains("Appendable") =>
-                {
-                    let style = self.gson_style_of(receiver);
-                    let Some(text) =
-                        self.gson_to_json(args.first().unwrap_or(&Value::Ref(None)), &style, 0)?
-                    else {
-                        return self
-                            .host
-                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
-                            .map(Some);
-                    };
-                    // The writer is the last argument in every overload:
-                    // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
-                    let target = args.last().and_then(expect_ref).ok_or_else(|| {
-                        NativeError::Metadata("Gson.toJson needs an Appendable receiver".into())
-                    })?;
-                    if let Some(key) = self.io_sink_key(target) {
-                        self.io_writers.entry(key).or_default().push_str(&text);
-                        return Ok(Some(Value::Void));
+                    // `getAdapter(Class)` names the adapter a codec's own method
+                    // references later use. Bootstrap code only checks that the
+                    // adapter exists (`Objects.requireNonNull`), so answer the
+                    // adapter marker rather than a null the check refuses.
+                    (name, descriptor)
+                        if name == "getAdapter"
+                            && descriptor.ends_with(")Lcom/google/gson/TypeAdapter;") =>
+                    {
+                        Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
-                    let builder = self.string_builders.get_mut(target).ok_or_else(|| {
-                        NativeError::Metadata(format!(
-                            "Gson.toJson Appendable {target} is not a modelled StringBuilder, \
+                    (name, descriptor)
+                        if name == "getDelegateAdapter"
+                            && descriptor.ends_with(")Lcom/google/gson/TypeAdapter;") =>
+                    {
+                        Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
+                    }
+                    // Gson declares one `toJson` overload per element type
+                    // (`JsonElement`, `Object`, and the `Type` variants). They
+                    // all write the same value, so the descriptor only has to
+                    // promise a `String` answer.
+                    (name, descriptor)
+                        if name == "toJson" && descriptor.ends_with(")Ljava/lang/String;") =>
+                    {
+                        match self.gson_to_json(
+                            args.first().unwrap_or(&Value::Ref(None)),
+                            &style,
+                            0,
+                        )? {
+                            Some(text) => Ok(Some(Value::Ref(Some(format!(
+                                "{}{text}",
+                                gson_model::non_executable_prefix(&style).unwrap_or("")
+                            ))))),
+                            // A value with no honest JSON shape is a counted
+                            // unknown, never made-up text.
+                            None => self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some),
+                        }
+                    }
+                    (name, descriptor)
+                        if name == "toJson"
+                            && descriptor.ends_with(")V")
+                            && descriptor.contains("Appendable") =>
+                    {
+                        let Some(text) = self.gson_to_json(
+                            args.first().unwrap_or(&Value::Ref(None)),
+                            &style,
+                            0,
+                        )?
+                        else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let text = format!(
+                            "{}{text}",
+                            gson_model::non_executable_prefix(&style).unwrap_or("")
+                        );
+                        // The writer is the last argument in every overload:
+                        // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
+                        let target = args.last().and_then(expect_ref).ok_or_else(|| {
+                            NativeError::Metadata("Gson.toJson needs an Appendable receiver".into())
+                        })?;
+                        if let Some(key) = self.io_sink_key(target) {
+                            self.io_writers.entry(key).or_default().push_str(&text);
+                            return Ok(Some(Value::Void));
+                        }
+                        let builder = self.string_builders.get_mut(target).ok_or_else(|| {
+                            NativeError::Metadata(format!(
+                                "Gson.toJson Appendable {target} is not a modelled StringBuilder, \
                              StringWriter or file writer"
-                        ))
-                    })?;
-                    builder.push_str(&text);
-                    Ok(Some(Value::Void))
-                }
-                ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
-                    let text = args.first().map(expect_string).ok_or_else(|| {
-                        NativeError::Metadata("Gson.fromJson needs a JSON string".into())
-                    })?;
-                    let class = args.get(1).and_then(expect_ref).ok_or_else(|| {
-                        NativeError::Metadata("Gson.fromJson needs a Class".into())
-                    })?;
-                    Ok(Some(self.gson_from_json(text, class)?))
-                }
-                ("fromJson", "(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;") => {
-                    let reader = args.first().and_then(expect_ref).ok_or_else(|| {
-                        NativeError::Metadata("Gson.fromJson needs a Reader".into())
-                    })?;
-                    let text = self.string_readers.get(reader).cloned().ok_or_else(|| {
-                        NativeError::Metadata(format!(
-                            "Gson.fromJson Reader {reader} is not a modelled StringReader, \
-                             file or stream reader"
-                        ))
-                    })?;
-                    let class = args.get(1).and_then(expect_ref).ok_or_else(|| {
-                        NativeError::Metadata("Gson.fromJson needs a Class".into())
-                    })?;
-                    Ok(Some(self.gson_from_json(&text, class)?))
-                }
-                // `Gson.fromJson(Reader, TypeToken)` takes the token's erased
-                // type: a document that is an object becomes a map and an
-                // array a list, which is what every JSON-shaped token resolves
-                // to in the bounded adapter.
-                (
-                    "fromJson",
-                    "(Ljava/io/Reader;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;",
-                )
-                | (
-                    "fromJson",
-                    "(Ljava/lang/String;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;",
-                ) => {
-                    let (text, class) = if r.descriptor.starts_with("(Ljava/io/Reader;") {
+                            ))
+                        })?;
+                        builder.push_str(&text);
+                        Ok(Some(Value::Void))
+                    }
+                    ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
+                        let text = args.first().map(expect_string).ok_or_else(|| {
+                            NativeError::Metadata("Gson.fromJson needs a JSON string".into())
+                        })?;
+                        let class = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                            NativeError::Metadata("Gson.fromJson needs a Class".into())
+                        })?;
+                        Ok(Some(self.gson_from_json(text, class, &style)?))
+                    }
+                    ("fromJson", "(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;") => {
                         let reader = args.first().and_then(expect_ref).ok_or_else(|| {
                             NativeError::Metadata("Gson.fromJson needs a Reader".into())
                         })?;
                         let text = self.string_readers.get(reader).cloned().ok_or_else(|| {
                             NativeError::Metadata(format!(
-                                "Gson.fromJson Reader {reader} is not a modelled reader"
+                                "Gson.fromJson Reader {reader} is not a modelled StringReader, \
+                             file or stream reader"
                             ))
                         })?;
-                        let token = args.get(1).and_then(expect_ref).ok_or_else(|| {
-                            NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
+                        let class = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                            NativeError::Metadata("Gson.fromJson needs a Class".into())
                         })?;
-                        (text, self.type_token_class(token))
-                    } else {
-                        let text = args
-                            .first()
-                            .map(expect_string)
-                            .unwrap_or_default()
-                            .to_owned();
-                        let token = args.get(1).and_then(expect_ref).ok_or_else(|| {
-                            NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
+                        Ok(Some(self.gson_from_json(&text, class, &style)?))
+                    }
+                    // `Gson.fromJson(Reader, TypeToken)` takes the token's erased
+                    // type: a document that is an object becomes a map and an
+                    // array a list, which is what every JSON-shaped token resolves
+                    // to in the bounded adapter.
+                    (
+                        "fromJson",
+                        "(Ljava/io/Reader;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;",
+                    )
+                    | (
+                        "fromJson",
+                        "(Ljava/lang/String;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;",
+                    ) => {
+                        let (text, class) = if r.descriptor.starts_with("(Ljava/io/Reader;") {
+                            let reader = args.first().and_then(expect_ref).ok_or_else(|| {
+                                NativeError::Metadata("Gson.fromJson needs a Reader".into())
+                            })?;
+                            let text =
+                                self.string_readers.get(reader).cloned().ok_or_else(|| {
+                                    NativeError::Metadata(format!(
+                                        "Gson.fromJson Reader {reader} is not a modelled reader"
+                                    ))
+                                })?;
+                            let token = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                                NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
+                            })?;
+                            (text, self.type_token_class(token))
+                        } else {
+                            let text = args
+                                .first()
+                                .map(expect_string)
+                                .unwrap_or_default()
+                                .to_owned();
+                            let token = args.get(1).and_then(expect_ref).ok_or_else(|| {
+                                NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
+                            })?;
+                            (text, self.type_token_class(token))
+                        };
+                        Ok(Some(self.gson_from_json(&text, &class, &style)?))
+                    }
+                    (
+                        "fromJson",
+                        "(Ljava/lang/String;Ljava/lang/reflect/Type;)Ljava/lang/Object;",
+                    ) => {
+                        let text = args.first().map(expect_string).ok_or_else(|| {
+                            NativeError::Metadata("Gson.fromJson needs a JSON string".into())
                         })?;
-                        (text, self.type_token_class(token))
-                    };
-                    Ok(Some(self.gson_from_json(&text, &class)?))
+                        let raw = args
+                            .get(1)
+                            .and_then(generic_type_marker)
+                            .and_then(|value| match value {
+                                GenericType::Class(name) => Some(name),
+                                GenericType::Parameterized { raw, .. } => Some(raw),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "java/lang/Object".into());
+                        Ok(Some(self.gson_from_json(text, &raw, &style)?))
+                    }
+                    _ => Ok(None),
                 }
-                ("fromJson", "(Ljava/lang/String;Ljava/lang/reflect/Type;)Ljava/lang/Object;") => {
-                    let text = args.first().map(expect_string).ok_or_else(|| {
-                        NativeError::Metadata("Gson.fromJson needs a JSON string".into())
-                    })?;
-                    let raw = args
-                        .get(1)
-                        .and_then(generic_type_marker)
-                        .and_then(|value| match value {
-                            GenericType::Class(name) => Some(name),
-                            GenericType::Parameterized { raw, .. } => Some(raw),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "java/lang/Object".into());
-                    Ok(Some(self.gson_from_json(text, &raw)?))
-                }
-                _ => Ok(None),
-            },
+            }
             _ => Ok(None),
         }
     }
