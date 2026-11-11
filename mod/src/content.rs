@@ -61,11 +61,7 @@ impl State {
                 Ok(jar) => parsed.push((file, Arc::new(jar))),
                 Err(error) => {
                     let id = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
-                    let row = JarRow::refused(
-                        &file,
-                        id,
-                        format!("not a readable jar: {error}"),
-                    );
+                    let row = JarRow::refused(&file, id, format!("not a readable jar: {error}"));
                     log::info!("{LOG}: {row}");
                     self.refused.push(row);
                 }
@@ -82,10 +78,7 @@ impl State {
                 let row = JarRow::refused(
                     &file,
                     jar_id(&jar, &file),
-                    format!(
-                        "requires {} (not in {JARS})",
-                        missing.join(", ")
-                    ),
+                    format!("requires {} (not in {JARS})", missing.join(", ")),
                 );
                 log::info!("{LOG}: {row}");
                 self.refused.push(row);
