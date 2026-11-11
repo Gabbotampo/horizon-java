@@ -587,3 +587,119 @@ arriving as its raw translation key.
   reruns did not reproduce; its output was not kept.
 - The run logs, the per-batch JSON and the probe outputs stay on elysium under
   `~/ava/results/resurvey-2026-11-11/` and are not committed.
+
+## Attachments first slice: carryon before/after (11 November 2026, elysium)
+
+The re-survey above put 616 of its 621 listener failures on one call, carryon's
+`Player#getData(Supplier)`. This run measures what the NeoForge data attachments first slice
+(#58 runtime, #59 mod bridge; `docs/attachments-design.md` §4, §7) did for that jar, following
+the in-game plan in `docs/attachments-design.md` §5.2. It is measurement only: nothing was changed
+in the game, the mod or the runtime.
+
+| | |
+|---|---|
+| Machine | elysium, headless, the game on a private `Xvfb :79`; load average 37–56 from other users during the runs |
+| Game source | `arismoko/horizon` `cf0113879ebee600bff86070466f75b2db90b40a` (the pin in `mod/horizon-mod.toml`), unmodified, the re-survey's stage (`HEAD` `cf01138`; only the launcher's generated `native-api/horizon_java`, `crates/native-game`, their two workspace members and their two `Cargo.lock` packages added) |
+| Game's own version line | `Horizon 0.1.0` (both runs) |
+| **before** | horizon-java `22dff61c29` (main just before #58 merged: the #57 design merge). The stage's `native-api/horizon_java` is that commit's `mod/`, its vendored runtime included; the bake probe is that commit's `horizon-native-java` |
+| **after** | horizon-java `9768f5dd6e` (main with #58 and #59), the same way |
+| Build | dev profile, default features, as both surveys; only `horizon-java-mod` and `horizon-native-game` recompiled between the two |
+| Driver | each commit's own `tools/in_game_survey.py --sample --only b2` (the tool is identical at both): carryon's re-survey batch, `carryon` + `fzzy_config` + `Iceberg` (NeoForge) + `Searchables`, command `/carryon debug`. Carryon declares no dependencies, so the batch is the whole set. Join, place and break a dirt block, give and use bread, walk 2 s, run the commands, 600 play ticks (~30 s), clean `quit`. 10 GiB systemd cap, fresh scratch tree per run |
+| World | `--world B2 --creative` with no `--seed`, exactly the re-survey's invocation: `world_gen_settings.dat` reads seed `0` in both runs. The spawn point still differed (`-38.5, 71, 0.5` before, `-25.5, 71, 0.5` after) |
+
+**Runs thrown away.** I first pinned the seed with `--seed 20261111` (two runs) and `--seed 1`
+(one run), on the `before` build. All three ended early: the pinned game's server thread hit a
+debug assertion, `entity residency operation did not finish` (`join_seq/residency/table.rs:188`,
+`UnbalancedPass { extractions: 9 | 2, lifts: 0 }`), after 151–243 server ticks. That is the game's own end-of-tick
+residency check, and the Java hooks around it were the same `entity_load`/`entity_unload` and
+`server_tick_end` firings as in every run. Without `--seed` it did not happen, in the two measured
+runs, the two relaunches below, or any of the re-survey's 11 batches. That is a candidate fork issue,
+not filed here. The three logs are kept with the results.
+
+### carryon, before → after
+
+| | before (`22dff61`) | after (`9768f5d`) |
+|---|---|---|
+| Verdict | `ran-hollow, 535 listener failures` | **`ran-hollow`** |
+| Server ticks played (`level.dat` `Time`) | 534 | 539 |
+| Listener callbacks ran / failed | 2 / **535** (534 `server_tick_end` + 1 `block_break_before`) | **542 / 0** (the 2 that ran before, plus 539 ticks and the break) |
+| Which calls fail | every logged one (99 `ServerTickEvent$Post` lines, as the log is flood-limited, the `BreakBlockEvent` line and the command) is `Player#getData(Ljava/util/function/Supplier;)Ljava/lang/Object;` | none |
+| `/carryon debug` | refused (`Player#getData(Supplier)`), chat "An unexpected error occurred while trying to execute that command" | **ran**, returned 0 with no messages, which is what the jar does for a player carrying nothing (`CommandCarryOn`'s debug handler falls through its three `isCarrying` checks to `return 0`, @254–274) |
+| Command usages translated / refused at registration | 3 / 2 | 3 / 2 (unchanged: `/carryon clear` and `/carryon place` take an `Entity` `target`) |
+| Unknown host calls, entrypoints | 13 | 13, the same ones (below) |
+| Unknown host calls, inside callbacks | 0 | 1: the `neoforge:sync_attachments (not sent)` count for the one default creation (the report's `sync_not_sent: 1`), in the first `server_tick_end` |
+| Attachment report (after only) | — | `types 1`, `live 1`, `defaults_created 1`, `decoded 0`, `encodes 1615` over `batches 1620`, `encode_failures 0`, `refusals 0`, `tainted 0`, `sync_not_sent 1` |
+
+The 13 entrypoint unknowns, from each commit's own probe (`horizon-native-java --json
+carryon-neoforge-26.3-2.12.1.jar neoforge`), are identical before and after:
+`java/lang/reflect/Field#canAccess(Object)` ×8, `IEventBus#addListener(Consumer)` ×2,
+`ModConfigSpec$Builder#build()` ×2, `ModContainer#registerConfig(ModConfig$Type, IConfigSpec,
+String)` ×1. The other three jars in the batch did not move between the two runs (`Iceberg`
+ran-clean 2/0, `Searchables` ran-clean 0/0, `fzzy_config` ran-hollow 2/0 with 8 unknown).
+
+So the slice turned every carryon listener failure in this script into a run. Carryon no longer
+fails on attachments here: no holder, serializer or hook was missing on the idle path the survey
+drives.
+
+**Cost (R1).** One player, one live value: 1,615 encodes in 1,620 batches over 539 ticks, about
+three `CompoundTag.CODEC` encodes of an empty compound per tick, one per batch that ran any of
+carryon's Java. No wall-clock cost was measured; the slice has no per-batch timing report.
+
+### Saved data
+
+After the clean `quit`, the player's file (`saves/B2/players/data/<uuid>.dat`, read on elysium
+with a small NBT reader and not committed) holds:
+
+```
+horizon:attachments: { carryon: { carry_on_data: { value: { CarryOnData: {} } } } }
+```
+
+`CarryOnData` is an empty `TAG_Compound`, and there is no `copy_on_death` and no `sync` byte. That
+is §5.2's expectation exactly: the JVM oracle's empty-compound encoding inside `value`. The
+`before` file has no `horizon:attachments` key. Both runs also leave a second player file,
+`a01e3843-….dat`, with the same UUID in both, no `Pos` and no attachments: the game writes it, not the
+mod, and it is not the player who joined.
+
+The §5.2 follow-ups on the `after` build, each relaunching a copy of the same world with
+`horizon-ctl`:
+
+- **Reload** (relaunch, 100 ticks, `quit`): no `Failed to deserialize` line; the report shows
+  `decoded 1`, `defaults_created 0`, `decode_failures 0`; carryon's callbacks 150 ran / 0 failed;
+  the saved entry is the same after the second quit.
+- **Death** (relaunch, `/kill @s`, `respawn`, 40 ticks, `quit`): `decoded 1` (the saved value at
+  login), then `defaults_created 1` after the respawn and `sync_not_sent 2`, so the non-`copyOnDeath`
+  value was dropped at death and a fresh default made at the next tick, as NeoForge does. The saved
+  entry after `quit` is the default again. But this step found **one new failure**: carryon's
+  `PlayerEvent$Clone` listener (`CommonEvents#onClone`) fails at `@1` on
+  `PlayerEvent$Clone#getOriginal()` (callbacks 113 ran / **1 failed**).
+
+### What is left for carryon, and what each needs
+
+1. **`PlayerEvent$Clone#getOriginal()`**, seen only on death. This is not an attachment holder
+   or serializer gap; the event object is not modelled. `onClone` reads `getOriginal().level().isClientSide()`,
+   then calls `PlacementHandler.placeCarriedOnDeath(original, getEntity(), isWasDeath())`, whose
+   first call is `getCarryData(original)`. Making it real needs:
+   - the Clone accessors (`getOriginal`, `getEntity`, `isWasDeath`);
+   - an original player that is a distinct holder still carrying its pre-death attachments. The fork's
+     `PlayerCloneEvent` names one player (`event.player`, `was_death`), and by the time
+     `player_clone` fires the store has already kept only `copy_on_death` envelopes (the bridge's
+     own note on `guest_respawn` order). On NeoForge the old `ServerPlayer` still holds its
+     attachments when `Clone` fires. So this needs either a fork-side original-player view or the
+     bridge holding the runtime's pre-death objects until the Clone listeners have run.
+   - Then, from the bytecode reading (not run): `ServerPlayer#level()` (`arismoko/horizon#2747`),
+     `ServerLevel#getGameRules()` + `GameRules#get`, and `Inventory#getSelectedSlot`/`setSelectedSlot`.
+2. **The 13 entrypoint unknowns** keep carryon `ran-hollow`: NeoForge config
+   (`ModConfigSpec$Builder#build`, `ModContainer#registerConfig`), the mod-bus
+   `IEventBus#addListener(Consumer)` (the re-survey's cause 2) and `Field#canAccess` in its config
+   reflection.
+3. **Two command usages** (`/carryon clear`, `/carryon place`) need the bridge's `Entity` argument
+   kind.
+4. **Sync** is counted, never sent: there is no client bridge, so the client's copy of
+   `CarryOnData` is never set. That is harmless while idle; it matters once carrying works.
+5. **Not exercised by this script:** picking up and placing (`docs/attachments-design.md` §4 lists the
+   non-attachment calls the carry path makes), multiplayer guests, an End return, and client-side
+   `getData`.
+
+Results (both batch JSONs, game logs, `java-runtime.json` reports, player files, probe outputs, the
+three discarded runs and the scripts) stay on elysium under
+`~/ava/results/attachments-carryon-2026-11-11/` and are not committed.
