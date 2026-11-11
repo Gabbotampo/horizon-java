@@ -73,16 +73,16 @@ use std::time::Duration;
 
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
-    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
-    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext,
-    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
-    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
-    ServerTickEvent, ServerTickPhase, Text,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
+    DimensionKey, EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand,
+    Hooks, Host, HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent,
+    LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent,
+    LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent,
+    LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
+    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRespawnedEvent, RegisterCommandsEvent,
+    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
+    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
+    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -303,6 +303,11 @@ impl Hooks for HorizonJava {
     fn server_stopping(&self, host: &mut dyn ServerHost, event: &mut ServerStoppingEvent) {
         self.fire(GameEvent::ServerStopping, event.dedicated, |_| true);
         let state = self.lock();
+        // One line per jar with the counts the report now holds: the report is the authority, but
+        // the log must never make a jar with failing listeners look like a clean one.
+        for row in state.rows() {
+            log::info!("{LOG}: {row}");
+        }
         if let Err(error) = write_report(host, &state) {
             log::warn!("{LOG}: {REPORT} could not be updated at server stopping: {error}");
         }
@@ -328,24 +333,37 @@ impl Hooks for HorizonJava {
                     Arc::new(facade.clone()),
                     EventContext::default(),
                 );
+                let before = loaded.host.unknown_host_call_count();
                 let (ran, failed) = run_listeners(
+                    &loaded.row.id,
                     &loaded.jar,
                     &mut loaded.host,
                     &loaded.listeners,
                     &mut firing,
                     &|_| true,
                 );
-                log::info!(
-                    "{LOG}: {}: command registration: {ran} callback(s) ran, {failed} failed",
-                    loaded.row.id
-                );
+                let listener_unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
+                let before = loaded.host.unknown_host_call_count();
                 let (native, commands, refused) =
                     translate_commands(&loaded.jar, &mut loaded.host, &loaded.row.id);
-                log::info!(
-                    "{LOG}: {}: {} command usage(s) translated, {} refused",
-                    loaded.row.id,
+                let translation_unknown =
+                    loaded.host.unknown_host_call_count().saturating_sub(before);
+                // Registration is a callback like any other: its listeners' work and failures
+                // belong in the jar's row, not only in a log line.
+                count_registration(
+                    &mut loaded.row,
+                    (ran, failed),
+                    listener_unknown,
                     native.len(),
                     refused,
+                    translation_unknown,
+                );
+                log::info!(
+                    "{LOG}: {}: command registration: {ran} callback(s) ran, {failed} failed, \
+                     {listener_unknown} unknown host call(s); {} command usage(s) translated, \
+                     {refused} refused, {translation_unknown} unknown host call(s)",
+                    loaded.row.id,
+                    native.len(),
                 );
                 log_stdout(&loaded.row.id, &mut loaded.host);
                 loaded.native_commands = native;
@@ -561,11 +579,7 @@ impl Hooks for HorizonJava {
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
     /// `PlayerEvent.Clone`); `was_death` says a death caused it.
     fn player_clone(&self, _host: &mut dyn ServerHost, event: &mut PlayerCloneEvent<'_>) {
-        let context = EventContext {
-            player: Some(event.player),
-            flag: event.was_death,
-            ..EventContext::default()
-        };
+        let context = player_clone_context(event);
         self.fire_event(GameEvent::PlayerCopy, self.dedicated(), context, |_| true);
     }
 
@@ -593,21 +607,18 @@ impl Hooks for HorizonJava {
 
     /// A living entity took damage (Fabric's `ServerLivingEntityEvents.AFTER_DAMAGE`, NeoForge's
     /// `LivingDamageEvent.Post`).
+    ///
+    /// Fabric fires `AFTER_DAMAGE` only while the entity is not dying (`LivingEntityMixin`
+    /// checks `isDeadOrDying()` before the call), but this hook does not carry the victim's
+    /// remaining health, so a killing hit cannot be told from a surviving one here. Such a hit
+    /// is fired with its real amounts rather than dropped on a guess: the departure is named in
+    /// the mod's report documentation.
     fn living_damage_post(
         &self,
         _level: &mut dyn LevelRandomHost,
         event: &mut LivingDamagePostEvent<'_>,
     ) {
-        let context = EventContext {
-            entity: Some(FacadeEntity {
-                id: event.entity,
-                kind: event.kind.to_owned(),
-                level: None,
-            }),
-            damage: Some(event.source.damage_type.to_owned()),
-            amount: event.container.health_damage(),
-            ..EventContext::default()
-        };
+        let context = living_damage_context(event);
         self.fire_event(
             GameEvent::LivingAfterDamage,
             self.dedicated(),
@@ -937,6 +948,7 @@ impl HorizonJava {
             loaded.host.note_firing_levels(&firing);
             let before = loaded.host.unknown_host_call_count();
             let (jar_ran, jar_failed) = run_listeners(
+                &id,
                 &loaded.jar,
                 &mut loaded.host,
                 &loaded.listeners,
@@ -1075,6 +1087,65 @@ fn dimension_id(dimension: LevelDimension) -> &'static str {
     dimension.key().id()
 }
 
+/// Fabric's `COPY_FROM` `alive` argument, from the hook's `was_death`.
+///
+/// The bytecode is the specification. `ServerPlayerMixin.onCopyFrom` passes its `alive`
+/// parameter straight through (`iload_2`) to `ServerPlayerEvents.CopyFrom.copyFromPlayer`, and
+/// that parameter is vanilla's `ServerPlayer.restoreFrom(ServerPlayer, boolean
+/// keepAllPlayerData)` (`@Inject(method = "restoreFrom", at = @At("TAIL"))`). The one caller,
+/// `PlayerList.respawn`, passes `false` for the death respawn (`ServerGamePacketListenerImpl`
+/// `PERFORM_RESPAWN` with health <= 0) and `true` when the player leaves the End after the
+/// credits. So `alive` is true after an End return and false after a death: the opposite of
+/// the hook's `was_death`.
+fn copy_from_alive(was_death: bool) -> bool {
+    !was_death
+}
+
+/// The `COPY_FROM`/`AFTER_RESPAWN` firing context for one player clone.
+fn player_clone_context(event: &PlayerCloneEvent<'_>) -> EventContext {
+    EventContext {
+        player: Some(event.player),
+        flag: copy_from_alive(event.was_death),
+        ..EventContext::default()
+    }
+}
+
+/// The `AFTER_DAMAGE` amounts and block flag, from the hit the game reports.
+///
+/// Returns `(baseDamageTaken, damageTaken, blocked)`. Fabric's
+/// `(LivingEntity, DamageSource, float baseDamageTaken, float damageTaken, boolean blocked)`
+/// is filled by `LivingEntityMixin.afterDamage` from `hurtServer`'s locals: `baseDamageTaken`
+/// is the `originalDamage` local (`damage` as it came in, before blocking and the reductions)
+/// and `damageTaken` is `hurtServer`'s `damage` at its `TAIL`, the amount `actuallyHurt` was
+/// given (after blocking and the armor/enchantment/Resistance steps, before absorption). The
+/// game's damage sequence names those two `original()` and `inflicted()`; `health_damage()` is
+/// what the health actually lost after absorption, which is a third, later value.
+fn after_damage_arguments(original: f32, inflicted: f32, blocked: f32) -> (f32, f32, bool) {
+    (original, inflicted, blocked > 0.0)
+}
+
+/// The `AFTER_DAMAGE` firing context for one hit.
+fn living_damage_context(event: &LivingDamagePostEvent<'_>) -> EventContext {
+    let container = event.container;
+    let (base, taken, blocked) = after_damage_arguments(
+        container.original(),
+        container.inflicted(),
+        container.blocked(),
+    );
+    EventContext {
+        entity: Some(FacadeEntity {
+            id: event.entity,
+            kind: event.kind.to_owned(),
+            level: None,
+        }),
+        damage: Some(event.source.damage_type.to_owned()),
+        amount: taken,
+        base_amount: Some(base),
+        flag: blocked,
+        ..EventContext::default()
+    }
+}
+
 /// The `InteractionResult` a Fabric listener returned, as the mod API's own result. A NeoForge
 /// listener that cancelled without a result keeps `PASS`, the default the hook documents.
 fn interaction_result(result: Option<&str>) -> InteractionResult {
@@ -1090,6 +1161,7 @@ fn interaction_result(result: Option<&str>) -> InteractionResult {
 /// Runs the listeners of this jar that `wanted` keeps, in registration order, against one shared
 /// firing.
 fn run_listeners(
+    id: &str,
     jar: &NativeJar,
     host: &mut StdHost,
     listeners: &[GameListener],
@@ -1112,7 +1184,7 @@ fn run_listeners(
             Err(error) => {
                 failed += 1;
                 log::warn!(
-                    "{LOG}: {} listener from {} failed: {error}",
+                    "{LOG}: {id}: {} listener from {} failed: {error}",
                     event.name(),
                     listener.source
                 );
@@ -1120,6 +1192,24 @@ fn run_listeners(
         }
     }
     (ran, failed)
+}
+
+/// Adds one command-registration pass to the jar's row: listeners that ran or failed, usages
+/// translated or left out, and the unmodelled host calls each phase made.
+fn count_registration(
+    row: &mut JarRow,
+    listeners: (usize, usize),
+    listener_unknown: usize,
+    translated: usize,
+    refused: usize,
+    translation_unknown: usize,
+) {
+    row.callbacks_ran += listeners.0;
+    row.callbacks_failed += listeners.1;
+    row.callback_unknown_host_calls += listener_unknown;
+    row.commands_translated += translated;
+    row.commands_refused_at_registration += refused;
+    row.command_unknown_host_calls += translation_unknown;
 }
 
 /// Sends the jar's `System.out` to the game log, one line per entry, with the jar's id.
@@ -1429,6 +1519,14 @@ impl State {
         }
     }
 
+    /// Every row the report carries, run jars first, in file-name order.
+    fn rows(&self) -> impl Iterator<Item = &JarRow> {
+        self.jars
+            .iter()
+            .map(|jar| &jar.row)
+            .chain(self.refused.iter())
+    }
+
     /// Counters are per server: the jars ran once at the content phase, and a second world this
     /// process hosts starts its own report with zero callbacks and commands.
     fn reset_server(&mut self) {
@@ -1439,6 +1537,8 @@ impl State {
             jar.row.commands_ran = 0;
             jar.row.commands_refused = 0;
             jar.row.command_unknown_host_calls = 0;
+            jar.row.commands_translated = 0;
+            jar.row.commands_refused_at_registration = 0;
         }
     }
 }
@@ -1462,6 +1562,11 @@ struct JarRow {
     commands_ran: usize,
     commands_refused: usize,
     command_unknown_host_calls: usize,
+    /// Usages the registration callback built and this bridge translated, and usages it left out
+    /// (an argument kind or predicate it cannot carry). Registration failures are callbacks:
+    /// they are counted in `callbacks_failed` too.
+    commands_translated: usize,
+    commands_refused_at_registration: usize,
     /// Content declarations this jar contributed to the game (milestone 3). Zero for a refused
     /// jar, and for a jar whose registrations the content vocabulary cannot carry.
     content_blocks: usize,
@@ -1487,10 +1592,29 @@ impl JarRow {
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            commands_translated: 0,
+            commands_refused_at_registration: 0,
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
         }
+    }
+
+    /// The verdict plus the failures that happened after the entrypoints. The verdict itself is
+    /// the entrypoint's (Fabric's and NeoForge's own loaders do not fail a load for a listener
+    /// that throws); the summary is what the log line and the report show, so a jar with failing
+    /// listeners never reads as an unqualified clean run.
+    fn summary(&self) -> String {
+        if self.callbacks_failed == 0 {
+            return self.verdict.to_owned();
+        }
+        let failures = self.callbacks_failed;
+        let noun = if failures == 1 {
+            "listener failure"
+        } else {
+            "listener failures"
+        };
+        format!("{}, {failures} {noun}", self.verdict)
     }
 
     fn json(&self) -> serde_json::Value {
@@ -1498,6 +1622,8 @@ impl JarRow {
             "file": self.file,
             "id": self.id,
             "verdict": self.verdict,
+            // `verdict` is the entrypoint's; `summary` adds what happened while the jar ran.
+            "summary": self.summary(),
             "host_calls": self.host_calls,
             "unknown_host_call_count": self.unknown_host_calls,
             "reason": self.reason,
@@ -1510,6 +1636,8 @@ impl JarRow {
                 "ran": self.commands_ran,
                 "refused": self.commands_refused,
                 "unknown_host_call_count": self.command_unknown_host_calls,
+                "translated": self.commands_translated,
+                "refused_at_registration": self.commands_refused_at_registration,
             },
             "content": {
                 "blocks": self.content_blocks,
@@ -1527,7 +1655,11 @@ impl std::fmt::Display for JarRow {
         write!(
             f,
             "{} ({}) {} ({} host calls, {} unknown host calls",
-            self.file, self.id, self.verdict, self.host_calls, self.unknown_host_calls
+            self.file,
+            self.id,
+            self.summary(),
+            self.host_calls,
+            self.unknown_host_calls
         )?;
         if let Some(reason) = &self.reason {
             write!(f, ", reason: {reason}")?;
@@ -1613,6 +1745,8 @@ fn load_jar(
                     commands_ran: 0,
                     commands_refused: 0,
                     command_unknown_host_calls: 0,
+                    commands_translated: 0,
+                    commands_refused_at_registration: 0,
                     content_blocks: 0,
                     content_items: 0,
                     content_skipped: BTreeMap::new(),
@@ -1640,6 +1774,8 @@ fn load_jar(
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            commands_translated: 0,
+            commands_refused_at_registration: 0,
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
@@ -1751,6 +1887,46 @@ mod tests {
         assert_eq!(facade.levels[0].game_time, 100);
     }
 
+    use mod_api::HurtSource;
+
+    /// A jar whose listeners fail keeps the entrypoint verdict (`ran-clean`) but its summary says
+    /// so: the log line and the report may never present it as an unqualified clean run.
+    #[test]
+    fn listener_failures_show_in_the_summary_and_the_log_line() {
+        let mut row = JarRow::refused("calcmod.jar", "calcmod".to_owned(), String::new());
+        row.verdict = "ran-clean";
+        row.reason = None;
+        assert_eq!(row.summary(), "ran-clean");
+        row.callbacks_failed = 1;
+        assert_eq!(row.summary(), "ran-clean, 1 listener failure");
+        row.callbacks_failed = 12;
+        assert_eq!(row.summary(), "ran-clean, 12 listener failures");
+        assert!(row.to_string().contains("ran-clean, 12 listener failures"));
+        assert_eq!(row.json()["summary"], "ran-clean, 12 listener failures");
+        assert_eq!(row.json()["verdict"], "ran-clean");
+    }
+
+    /// Command-registration listeners are callbacks: their runs, failures, unmodelled host calls
+    /// and refused usages land in the row, so `calcmod`'s failed registration is a counted
+    /// failure in the report, not only a log line.
+    #[test]
+    fn command_registration_counts_reach_the_row() {
+        let mut row = JarRow::refused("calcmod.jar", "calcmod".to_owned(), String::new());
+        row.verdict = "ran-clean";
+        row.reason = None;
+        count_registration(&mut row, (0, 1), 2, 3, 4, 5);
+        assert_eq!(row.callbacks_ran, 0);
+        assert_eq!(row.callbacks_failed, 1);
+        assert_eq!(row.callback_unknown_host_calls, 2);
+        assert_eq!(row.commands_translated, 3);
+        assert_eq!(row.commands_refused_at_registration, 4);
+        assert_eq!(row.command_unknown_host_calls, 5);
+        assert_eq!(row.summary(), "ran-clean, 1 listener failure");
+        let commands = &row.json()["commands"];
+        assert_eq!(commands["translated"], 3);
+        assert_eq!(commands["refused_at_registration"], 4);
+    }
+
     /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
     /// (two empty hands included), so the hand is unknown rather than guessed.
     #[test]
@@ -1772,5 +1948,59 @@ mod tests {
             one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
             None
         );
+    }
+
+    /// `PlayerList.respawn` passes `keepAllPlayerData = false` for a death respawn and `true`
+    /// for the End return after the credits; Fabric's `COPY_FROM` forwards that flag as
+    /// `alive` (`ServerPlayerMixin.onCopyFrom`, `iload_2`).
+    #[test]
+    fn copy_from_alive_is_the_keep_all_data_flag_not_the_death_flag() {
+        assert!(!copy_from_alive(true), "a death respawn keeps no data");
+        assert!(copy_from_alive(false), "leaving the End keeps all data");
+        let event = PlayerCloneEvent {
+            player: 7,
+            name: "Alex",
+            was_death: true,
+        };
+        assert!(!player_clone_context(&event).flag);
+        let event = PlayerCloneEvent {
+            was_death: false,
+            ..event
+        };
+        assert!(player_clone_context(&event).flag);
+    }
+
+    /// Fabric's `afterDamage` gets `hurtServer`'s `originalDamage` and `damage` at `TAIL`, and
+    /// `blocked`: the base amount, the dealt amount (after reductions, before absorption) and
+    /// the block flag. The health damage after absorption is a third value and is not what
+    /// either argument carries.
+    #[test]
+    fn after_damage_carries_the_base_amount_the_dealt_amount_and_the_block_flag() {
+        // DamageContainer(original 10, blocked 4, Pre left 6, health lost 2): the two
+        // arguments are the 10 (originalDamage) and the 6 (hurtServer's damage at TAIL), not
+        // the 2 the health lost and not 10 twice.
+        assert_eq!(after_damage_arguments(10.0, 6.0, 4.0), (10.0, 6.0, true));
+        // No blocking: the flag is false, not a count or an amount.
+        assert_eq!(after_damage_arguments(1.0, 1.0, 0.0), (1.0, 1.0, false));
+        let source = HurtSource {
+            damage_type: "minecraft:player_attack",
+            causing: 3,
+            direct: 3,
+            position: None,
+        };
+        // A fresh snapshot has an original and nothing else set, so the context takes the base
+        // from it and the dealt amount is the (unset here) inflicted value, not a copy.
+        let container = DamageContainer::new(10.0);
+        let event = LivingDamagePostEvent {
+            entity: 7,
+            kind: "minecraft:cow",
+            source: &source,
+            container: &container,
+        };
+        let context = living_damage_context(&event);
+        assert_eq!(context.base_amount, Some(10.0));
+        assert_eq!(context.amount, 0.0);
+        assert!(!context.flag);
+        assert_eq!(context.damage.as_deref(), Some("minecraft:player_attack"));
     }
 }

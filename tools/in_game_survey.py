@@ -119,13 +119,30 @@ def parse_reply(text: str):
     return None
 
 
+def summary_of(jar: dict) -> str | None:
+    """The row's verdict plus its listener failures (`ran-clean, 12 listener failures`).
+
+    The report writes this line itself; an older report without it is summarised here from the
+    callback count, so a jar whose listeners threw never reads as an unqualified clean run.
+    """
+    if jar.get("summary"):
+        return jar["summary"]
+    verdict = jar.get("verdict")
+    failed = (jar.get("callbacks") or {}).get("failed") or 0
+    if verdict is None or not failed:
+        return verdict
+    noun = "listener failure" if failed == 1 else "listener failures"
+    return f"{verdict}, {failed} {noun}"
+
+
 def summarise(report: dict | None, log_lines: list[str]) -> list[dict]:
     """One row per jar in the runtime report, with what the log says about it.
 
     The report is authoritative for verdicts, host-call counts, callbacks and commands; the log
     adds the command-registration totals and the reasons a command or listener failed, which the
     report does not carry. A jar missing from the report (the run died before the report) still
-    gets a row with `verdict: None`.
+    gets a row with `verdict: None`. `summary` is what a reader should judge: the entrypoint
+    verdict plus any listener failures after it.
     """
     rows = []
     for jar in (report or {}).get("jars", []):
@@ -148,6 +165,7 @@ def summarise(report: dict | None, log_lines: list[str]) -> list[dict]:
             "id": iid,
             "file": jar.get("file"),
             "verdict": jar.get("verdict"),
+            "summary": summary_of(jar),
             "host_calls": jar.get("host_calls"),
             "unknown_host_call_count": jar.get("unknown_host_call_count"),
             "reason": jar.get("reason"),
@@ -160,6 +178,18 @@ def summarise(report: dict | None, log_lines: list[str]) -> list[dict]:
             "verdict_line": text[0] if text else None,
         })
     return rows
+
+
+def table(rows: list[dict]) -> str:
+    """One batch as a markdown table: the jar, its entrypoint verdict and its summary.
+
+    `summary` is the column to read: `ran-clean` alone hides a jar whose listeners all threw, and
+    the survey's own table showed exactly that before this column existed.
+    """
+    lines = ["| jar | verdict | summary |", "|---|---|---|"]
+    for row in rows:
+        lines.append(f"| `{row['file']}` | {row['verdict']} | {row['summary']} |")
+    return "\n".join(lines)
 
 
 def find_jar(corpus: Path, name: str) -> Path:
@@ -360,6 +390,7 @@ def main(argv=None):
         for row in rows:
             verdicts[row["verdict"]] = verdicts.get(row["verdict"], 0) + 1
         print(f"{batch}: ready={result['ready']} rows={len(rows)} verdicts={verdicts}")
+        print(table(rows))
     return 0
 
 
