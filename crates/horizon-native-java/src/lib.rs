@@ -53,6 +53,7 @@ mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
+mod mod_origin;
 mod neoforge_loader;
 mod nested_jars;
 mod night_config;
@@ -5253,6 +5254,12 @@ impl Host for StdHost {
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
             return value;
         }
+        // A Fabric mod container's origin (`mod_origin.rs`); also reached
+        // through `String.valueOf`/`"" + origin`, which asks this host for the
+        // object's modelled `toString`.
+        if let Some(value) = mod_origin::invoke(r, Some(receiver), args)? {
+            return Ok(value);
+        }
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
         if let Some(value) = self.brigadier_call(r, receiver, args) {
@@ -8270,6 +8277,16 @@ impl Host for StdHost {
                     .unwrap_or_else(|| "mod-container/unknown/unknown".into())
                     .replacen("mod-container/", "metadata/", 1),
             ))),
+            (
+                "net/fabricmc/loader/api/ModContainer",
+                "getOrigin",
+                "()Lnet/fabricmc/loader/api/metadata/ModOrigin;",
+            ) => {
+                // Fabric Loader's own origin for a jar container is a `PATH`
+                // origin over the container's root (`mod_origin.rs`).
+                let id = metadata_part(expect_ref(receiver), 1);
+                Ok(mod_origin::origin_value(&id))
+            }
             (
                 "net/fabricmc/loader/api/ModContainer",
                 "getRootPaths",
@@ -24283,6 +24300,10 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_io(&r, receiver.as_ref(), &args, class, method)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, mod_origin::invoke(&r, receiver.as_ref(), &args))
+                    {
                         value
                     } else if let Some(value) = self.invoke_gson(&r, receiver.as_ref(), &args)? {
                         value
