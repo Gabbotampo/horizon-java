@@ -298,9 +298,12 @@ public interface PlayerAccessor {
 }
 "#,
     );
-    // The object is a plain marker in the same process; its class is not the
-    // target. The accessor still keys the field by the target owner and the
-    // receiver marker, so the read/write pair is the contract under test.
+    // The object is a game `Player` (a host-side marker: the stub class is
+    // not in the jar). The accessor keys the field by the target owner and
+    // the receiver marker, so the read/write pair is the contract under test.
+    // The cast passes because the jar's `@Mixin(Player.class)` accessor gives
+    // `Player` that interface; a plain `Object` here would be the JVM's
+    // `ClassCastException`.
     sources.insert(
         "demo/Main.java",
         r#"package demo;
@@ -319,7 +322,7 @@ public final class Main {
         "demo/PlayerFactory.java",
         r#"package demo;
 public final class PlayerFactory {
-    public static Object create() { return new Object(); }
+    public static Object create() { return new net.minecraft.world.entity.player.Player(); }
 }
 "#,
     );
