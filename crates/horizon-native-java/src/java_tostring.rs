@@ -17,6 +17,14 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
     if crate::value_class::is_plain_string(marker) {
         return None;
     }
+    // The empty optionals carry a bare marker (`EMPTY_OPTIONAL*` in lib.rs).
+    match marker {
+        crate::EMPTY_OPTIONAL => return Some("java/util/Optional".to_owned()),
+        crate::EMPTY_OPTIONAL_INT => return Some("java/util/OptionalInt".to_owned()),
+        crate::EMPTY_OPTIONAL_LONG => return Some("java/util/OptionalLong".to_owned()),
+        crate::EMPTY_OPTIONAL_DOUBLE => return Some("java/util/OptionalDouble".to_owned()),
+        _ => {}
+    }
     // Prefix families the host models before any class marker.
     let prefix = [
         ("identifier/", "net/minecraft/resources/Identifier"),

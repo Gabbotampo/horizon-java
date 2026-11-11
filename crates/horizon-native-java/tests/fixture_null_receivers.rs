@@ -245,6 +245,9 @@ public final class EmptyOptionals {
     empty.ifPresent(s -> ran[0]++);
     check(ran[0] == 0, "ifPresent ran");
     check(empty.toString().equals("Optional.empty"), "toString");
+    check(("" + empty).equals("Optional.empty"), "concat");
+    check(("" + OptionalInt.empty()).equals("OptionalInt.empty"), "OptionalInt concat");
+    check(String.valueOf(OptionalLong.empty()).equals("OptionalLong.empty"), "OptionalLong valueOf");
     check(empty.equals(Optional.ofNullable(null)), "equals");
     check(empty == (Object) Optional.empty(), "singleton");
     check(Optional.of("x").filter(s -> false).isEmpty(), "filtered out");
