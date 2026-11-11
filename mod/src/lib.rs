@@ -77,10 +77,11 @@ use std::time::Duration;
 
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
     EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
     HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
+    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    LevelUnloadEvent,
     LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
     PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
     PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
@@ -93,7 +94,8 @@ use runtime::brigadier::{
     CommandSource as RuntimeSource, CommandText, MessageKind, NodeKind, Requirement,
 };
 use runtime::events::{
-    EventContext, EventFacade, EventFiring, FacadeEntity, FacadePlayer, GameEvent, GameListener,
+    EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
+    GameListener,
 };
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
@@ -129,10 +131,14 @@ struct State {
     /// Whether the jars have been read and run this process. The content hooks run once, before
     /// the server exists; the server hooks reuse what they recorded.
     loaded: bool,
-    /// Players whose join this mod heard, as much of them as the hook gave:
-    /// a Java player marker answers its name and UUID, and refuses the level
-    /// and entity id it does not know.
+    /// The online players as the host names them at the last join, leave or dimension change:
+    /// UUID, name, level and entity id. A level the host could not name stays `None`, and the
+    /// façade refuses that read instead of guessing.
     players: Vec<FacadePlayer>,
+    /// The server levels the host reports open, with their clocks, refreshed on load, unload and
+    /// each level tick. A level whose clocks the host cannot read is left out rather than carried
+    /// with a made-up time.
+    levels: Vec<FacadeLevel>,
     /// `MinecraftServer.getTickCount()` as the last server tick reported it.
     tick_count: i32,
     /// Whether the open server is a dedicated one, from `server_about_to_start`.
@@ -242,6 +248,7 @@ impl Hooks for HorizonJava {
         let mut state = self.lock();
         state.dedicated = event.dedicated;
         state.players.clear();
+        state.levels.clear();
         state.tick_count = 0;
         state.reset_server();
         let count = |verdict: &str| {
@@ -314,19 +321,13 @@ impl Hooks for HorizonJava {
     /// change at runtime, so the same set is offered again.
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         let mut state = self.lock();
-        let (dedicated, tick_count, players) =
-            (state.dedicated, state.tick_count, state.players.clone());
+        let facade = state.facade();
         for loaded in &mut state.jars {
             if !loaded.commands_registered {
                 loaded.commands_registered = true;
                 let mut firing = EventFiring::new(
                     GameEvent::RegisterCommands,
-                    Arc::new(EventFacade {
-                        dedicated,
-                        tick_count,
-                        players: players.clone(),
-                        ..EventFacade::default()
-                    }),
+                    Arc::new(facade.clone()),
                     EventContext::default(),
                 );
                 let (ran, failed) = run_listeners(
@@ -367,6 +368,7 @@ impl Hooks for HorizonJava {
         event: &mut RunModCommandEvent<'_>,
     ) -> Flow {
         let mut state = self.lock();
+        let facade = state.facade();
         for loaded in &mut state.jars {
             // One Java literal path can have several executable usages: the bare command and
             // each deeper argument node. The invocation carries the arguments it parsed, so the
@@ -429,7 +431,7 @@ impl Hooks for HorizonJava {
             let run = loaded.jar.run_command(
                 &command.run,
                 &invocation,
-                Arc::new(EventFacade::default()),
+                Arc::new(facade.clone()),
                 &mut loaded.host,
                 &ExecutionBudget::within(JAR_BUDGET),
             );
@@ -473,7 +475,12 @@ impl Hooks for HorizonJava {
 
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Pre`).
-    fn level_tick_pre(&self, _host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+    fn level_tick_pre(&self, host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+        if let HostSide::Server(host) = host {
+            // The level's clocks are what `level.getGameTime()`/`getDayTime()` answer, so they
+            // are refreshed from the level the hook names, before the listeners run.
+            self.refresh_level(host, event.level);
+        }
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
             ..EventContext::default()
@@ -494,7 +501,8 @@ impl Hooks for HorizonJava {
     }
 
     /// A server level opened (Fabric's `ServerLevelEvents.LOAD`, NeoForge's `LevelEvent.Load`).
-    fn level_load(&self, _host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+    fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+        self.refresh_levels(host);
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
@@ -505,6 +513,7 @@ impl Hooks for HorizonJava {
     /// A server level closed (Fabric's `ServerLevelEvents.UNLOAD`, NeoForge's
     /// `LevelEvent.Unload`).
     fn level_unload(&self, _host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
+        self.lock().levels.retain(|level| level.id != event.dimension);
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
@@ -514,17 +523,10 @@ impl Hooks for HorizonJava {
 
     /// A player joined (Fabric's `ServerPlayConnectionEvents.JOIN` and
     /// `ServerPlayerEvents.JOIN`, NeoForge's `PlayerLoggedInEvent`).
-    fn player_logged_in(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
-        {
-            let mut state = self.lock();
-            state.players.retain(|player| player.uuid != event.player);
-            state.players.push(FacadePlayer {
-                uuid: event.player,
-                name: event.name.to_owned(),
-                level: None,
-                entity_id: None,
-            });
-        }
+    fn player_logged_in(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
+        // The hook names the joining player; the host knows every player's level and entity id.
+        // A level it cannot name stays `None`, never a guessed overworld.
+        self.refresh_players(host);
         let context = EventContext {
             player: Some(event.player),
             ..EventContext::default()
@@ -535,10 +537,8 @@ impl Hooks for HorizonJava {
     /// A player left (Fabric's `ServerPlayConnectionEvents.DISCONNECT` and
     /// `ServerPlayerEvents.LEAVE`, NeoForge's `PlayerLoggedOutEvent`). The player is already off
     /// the list when a listener hears it, as the hook says.
-    fn player_logged_out(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
-        self.lock()
-            .players
-            .retain(|player| player.uuid != event.player);
+    fn player_logged_out(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
+        self.refresh_players(host);
         let context = EventContext {
             player: Some(event.player),
             ..EventContext::default()
@@ -573,9 +573,10 @@ impl Hooks for HorizonJava {
     /// `PlayerChangedDimensionEvent`).
     fn player_changed_dimension(
         &self,
-        _host: &mut dyn ServerHost,
+        host: &mut dyn ServerHost,
         event: &mut PlayerChangedDimensionEvent<'_>,
     ) {
+        self.refresh_players(host);
         let context = EventContext {
             player: Some(event.player),
             origin: Some(event.from.to_owned()),
@@ -921,13 +922,9 @@ impl HorizonJava {
         wanted: impl Fn(&GameListener) -> bool,
     ) -> Fired {
         let mut state = self.lock();
-        let facade = Arc::new(EventFacade {
-            dedicated,
-            tick_count: state.tick_count,
-            players: state.players.clone(),
-            ..EventFacade::default()
-        });
-        let mut firing = EventFiring::new(event, facade, context);
+        let mut facade = state.facade();
+        facade.dedicated = dedicated;
+        let mut firing = EventFiring::new(event, Arc::new(facade), context);
         let (mut ran, mut failed, mut unknown) = (0, 0, 0);
         for loaded in &mut state.jars {
             let id = loaded.row.id.clone();
@@ -970,6 +967,59 @@ impl HorizonJava {
     /// Whether this server is a dedicated one.
     fn dedicated(&self) -> bool {
         self.lock().dedicated
+    }
+
+    /// Rebuilds the online player list from the host: every player the server has, with the
+    /// name, level and entity id the host knows. A level the host cannot name is `None`, so the
+    /// façade's `level()` refuses it (and counts the read) instead of answering a guess.
+    fn refresh_players(&self, host: &dyn ServerHost) {
+        let players: Vec<FacadePlayer> = host
+            .players()
+            .server_players()
+            .into_iter()
+            .map(|player| FacadePlayer {
+                uuid: player.uuid(),
+                name: player.name(host).unwrap_or_default(),
+                level: player
+                    .entity()
+                    .level(host)
+                    .map(|level| level.dimension_id().to_owned()),
+                entity_id: Some(player.entity().id() as i32),
+            })
+            .collect();
+        self.lock().players = players;
+    }
+
+    /// Rebuilds the open level list from the host, with each level's clocks. A level whose
+    /// clocks the host does not give is left out: a level in `getAllLevels()` with a made-up
+    /// time would answer `getGameTime()` with a value nobody read.
+    fn refresh_levels(&self, host: &dyn ServerHost) {
+        let levels: Vec<FacadeLevel> = host
+            .levels()
+            .list_levels()
+            .into_iter()
+            .filter_map(|level| level_entry(host, level))
+            .collect();
+        self.lock().levels = levels;
+    }
+
+    /// Refreshes one open level's clocks, after its tick or after it opened.
+    fn refresh_level(&self, host: &dyn ServerHost, level: LevelRef) {
+        let Some(entry) = level_entry(host, level) else {
+            self.lock()
+                .levels
+                .retain(|known| known.id != level.dimension_id());
+            return;
+        };
+        let mut state = self.lock();
+        match state
+            .levels
+            .iter_mut()
+            .find(|known| known.id == entry.id)
+        {
+            Some(known) => *known = entry,
+            None => state.levels.push(entry),
+        }
     }
 
     /// The player whose action a hook hears, as the mod API's own helpers name them.
@@ -1135,31 +1185,63 @@ fn mod_text(text: &CommandText) -> Text {
     }
 }
 
+/// One open level as the façade carries it, or `None` when the host does not give both clocks.
+fn level_entry(host: &dyn Host, level: LevelRef) -> Option<FacadeLevel> {
+    Some(FacadeLevel {
+        id: level.dimension_id().to_owned(),
+        game_time: level.game_time(host)?,
+        day_time: level.day_time(host)?,
+    })
+}
+
 /// The runtime's view of the command source.
 ///
-/// Every non-player source runs as the console (the façade has no separate block, cart or
-/// function origin). Its level is the overworld, which is vanilla's server-console source level:
-/// correct, not a guess.
-///
-/// A player's dimension is no mod API read (the fork seam in `docs/mod-plan.md`), so a player
-/// source's level is unknown. `CommandSourceStack.getLevel()` then goes through the runtime's
-/// unknown-host-call path — counted and failing the command visibly — instead of quietly acting on
-/// the overworld while the player stands in the Nether.
-fn runtime_source(source: &CommandSource, host: &dyn Host) -> RuntimeSource {
+/// Every source's level is the fact the mod API names, and unknown when it names none. A
+/// command block carries its own dimension (`CommandSource::CommandBlock.level`), so a block in
+/// the Nether answers `getLevel()` with the Nether. The console's is the overworld, which is
+/// vanilla's console source level; a minecart's and a function's level is not in the hook and
+/// stays unknown (a `getLevel()` read is counted, never answered with the overworld). A
+/// player's dimension is not part of `CommandSource::Player` either, so it too stays unknown
+/// (`arismoko/horizon#2747`), counted rather than guessed.
+fn runtime_source(source: &CommandSource, host: &dyn ServerHost) -> RuntimeSource {
     let level = source.permission().level();
+    let levels = host.levels().list_levels();
+    let dimension_of = |key: DimensionKey| {
+        levels
+            .iter()
+            .find(|level| level.dimension() == key)
+            .map(|level| level.dimension_id().to_owned())
+    };
     match source {
         CommandSource::Player { player, .. } => RuntimeSource {
             name: player.name(host).unwrap_or_else(|| "Player".to_owned()),
             level,
             player: Some(player.uuid()),
-            dimension: None,
+            dimension: source_dimension(source, dimension_of),
         },
         _ => RuntimeSource {
             name: "Server".to_owned(),
             level,
             player: None,
-            dimension: Some("minecraft:overworld".to_owned()),
+            dimension: source_dimension(source, dimension_of),
         },
+    }
+}
+
+/// The dimension id a source's `getLevel()` answers, or `None` when the hook does not name it.
+fn source_dimension(
+    source: &CommandSource,
+    dimension: impl Fn(DimensionKey) -> Option<String>,
+) -> Option<String> {
+    match source {
+        // Vanilla's console source is the overworld's (MinecraftServer.overworld()).
+        CommandSource::Console { .. } => Some("minecraft:overworld".to_owned()),
+        CommandSource::CommandBlock { level, .. } => dimension(*level),
+        // Neither carries a level in the hook, and a player's is not part of its source.
+        CommandSource::Player { .. }
+        | CommandSource::CommandBlockMinecart { .. }
+        | CommandSource::Function { .. } => None,
+        _ => None,
     }
 }
 
@@ -1328,6 +1410,19 @@ fn usage(path: &[String], arguments: &[(String, JavaArgument)]) -> String {
 }
 
 impl State {
+    /// The server state every firing this mod starts exposes: the dedicated flag, the tick, the
+    /// online players and the open levels. `max_players` stays `None` (unknown): the pinned mod
+    /// API has no read for it, and the runtime refuses that member rather than answering 0.
+    fn facade(&self) -> EventFacade {
+        EventFacade {
+            dedicated: self.dedicated,
+            tick_count: self.tick_count,
+            players: self.players.clone(),
+            levels: self.levels.clone(),
+            ..EventFacade::default()
+        }
+    }
+
     /// Counters are per server: the jars ran once at the content phase, and a second world this
     /// process hosts starts its own report with zero callbacks and commands.
     fn reset_server(&mut self) {
@@ -1574,6 +1669,80 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mod_api::{EntityRef, Identifier, PermissionLevel, WorldEpoch};
+
+    /// A command block answers its own dimension (`CommandSource::CommandBlock.level`), the
+    /// console the overworld (vanilla's console source), and the sources whose level the hook
+    /// does not name stay unknown so `getLevel()` refuses and counts instead of acting on the
+    /// overworld.
+    #[test]
+    fn a_command_blocks_level_is_its_own_and_unnamed_levels_stay_unknown() {
+        let named = |key: DimensionKey| match key {
+            DimensionKey::OVERWORLD => Some("minecraft:overworld".to_owned()),
+            DimensionKey::NETHER => Some("minecraft:the_nether".to_owned()),
+            _ => None,
+        };
+        let block = CommandSource::CommandBlock {
+            position: [1, 2, 3],
+            level: DimensionKey::NETHER,
+            permission: PermissionLevel::Gamemasters,
+        };
+        assert_eq!(
+            source_dimension(&block, named).as_deref(),
+            Some("minecraft:the_nether")
+        );
+        // A level the host does not list is unknown, not the overworld.
+        assert_eq!(source_dimension(&block, |_| None), None);
+        let console = CommandSource::Console {
+            permission: PermissionLevel::Owners,
+        };
+        assert_eq!(
+            source_dimension(&console, named).as_deref(),
+            Some("minecraft:overworld")
+        );
+        let cart = CommandSource::CommandBlockMinecart {
+            entity: EntityRef::new(WorldEpoch::new(1), 9),
+            permission: PermissionLevel::All,
+        };
+        assert_eq!(source_dimension(&cart, named), None);
+        let function = CommandSource::Function {
+            id: Identifier::parse("demo:probe").unwrap(),
+            permission: PermissionLevel::All,
+        };
+        assert_eq!(source_dimension(&function, named), None);
+    }
+
+    /// A Java command runs on the server the report measured, not on an empty default: the
+    /// façade carries the dedicated flag, the tick, the online players (with their levels) and
+    /// the open levels. A player's level the host could not name stays `None`.
+    #[test]
+    fn the_command_facade_carries_the_measured_server_state() {
+        let mut state = State {
+            dedicated: true,
+            tick_count: 512,
+            ..State::default()
+        };
+        state.players.push(FacadePlayer {
+            uuid: 5,
+            name: "Alex".into(),
+            level: Some("minecraft:the_nether".into()),
+            entity_id: Some(3),
+        });
+        state.levels.push(FacadeLevel {
+            id: "minecraft:the_nether".into(),
+            game_time: 100,
+            day_time: 40,
+        });
+        let facade = state.facade();
+        assert!(facade.dedicated);
+        assert_eq!(facade.tick_count, 512);
+        assert_eq!(facade.players.len(), 1);
+        assert_eq!(facade.players[0].name, "Alex");
+        assert_eq!(facade.players[0].level.as_deref(), Some("minecraft:the_nether"));
+        assert_eq!(facade.levels.len(), 1);
+        assert_eq!(facade.levels[0].id, "minecraft:the_nether");
+        assert_eq!(facade.levels[0].game_time, 100);
+    }
 
     /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
     /// (two empty hands included), so the hand is unknown rather than guessed.
