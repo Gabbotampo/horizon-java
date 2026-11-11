@@ -57,6 +57,13 @@ nothing about whether the mod works. The committed ledgers predate the host-call
   overwhelmingly `target-outside-jar`); the opt-in hook tier binds plans to game hook sites instead.
   Game-class mixins remain the main phase-2 gap.
 
+- **Entrypoint census** (`tools/unmodelled_calls.py`, the native probe over the same corpora, every server
+  stage, the game's verdict), re-measured on 11 November 2026 with the interpreter-honesty fixes
+  (#37, #38, #41): `ran-clean` **174 → 112** (wide 52 → 31, mega 86 → 59, NeoForge 36 → 22), 18 jars
+  `ran-partial`, and 132 more refused, almost all on a `NullPointerException` the interpreter used to
+  carry on through. Lower is correct: those jars were clean only because failures were answered
+  silently. Detail in [docs/unmodelled-calls.md](docs/unmodelled-calls.md).
+
 Phase 1 is not met yet: neither Fabric ledger has 0 `native-gap`, and the NeoForge ledger is
 measured but not gated. See the status page for per-row detail and repro commands.
 
@@ -102,8 +109,8 @@ What it does today:
   config service (`Host::config_files`). With no jars to run it is `{"schema":1,"jars":[]}`.
 - **M1, run jars.** Every `.jar` in `config/horizon_java/java-mods/` is read as bytes through the
   same service and run at `server_about_to_start` with its own `StdHost`. One log line per jar and
-  one row in the report: the id, `ran-clean` / `ran-hollow` / `refused`, the host-call and
-  unknown-host-call counts, and the refusal reason.
+  one row in the report: the id, `ran-clean` / `ran-hollow` / `ran-partial` / `refused`, the
+  host-call and unknown-host-call counts, and the reason a jar was refused or ran partially.
 - **M2, game hooks.** Each jar's runtime (heap, statics and recorded listeners) stays alive for the
   server, and this mod's `server_about_to_start` / `server_starting` / `server_started` /
   `server_stopping` / `server_stopped` hooks fire the Fabric `ServerLifecycleEvents` and NeoForge

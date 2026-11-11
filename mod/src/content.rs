@@ -61,11 +61,7 @@ impl State {
                 Ok(jar) => parsed.push((file, Arc::new(jar))),
                 Err(error) => {
                     let id = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
-                    let row = JarRow::refused(
-                        &file,
-                        id,
-                        format!("not a readable jar: {error}"),
-                    );
+                    let row = JarRow::refused(&file, id, format!("not a readable jar: {error}"));
                     log::info!("{LOG}: {row}");
                     self.refused.push(row);
                 }
@@ -82,10 +78,7 @@ impl State {
                 let row = JarRow::refused(
                     &file,
                     jar_id(&jar, &file),
-                    format!(
-                        "requires {} (not in {JARS})",
-                        missing.join(", ")
-                    ),
+                    format!("requires {} (not in {JARS})", missing.join(", ")),
                 );
                 log::info!("{LOG}: {row}");
                 self.refused.push(row);
@@ -359,6 +352,44 @@ fn usable_id(id: &str) -> bool {
         && path.bytes().all(|b| ok(b, b"_./-"))
 }
 
+/// The jars under the game's `config/horizon_java/java-mods/`, sorted by file name so one run's
+/// report reads the same as the next. An absent folder is no jars; an unreadable one is a warning,
+/// not a failed start.
+fn read_jar_files() -> Vec<(String, Vec<u8>)> {
+    let Ok(game_dir) = std::env::current_dir() else {
+        log::warn!("{LOG}: the game folder is unknown; no jars are read");
+        return Vec::new();
+    };
+    let folder = game_dir.join("config").join(JARS);
+    let entries = match std::fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            log::warn!("{LOG}: config/{JARS} could not be listed: {error}");
+            return Vec::new();
+        }
+    };
+    let mut files: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jar").then(|| (name, entry.path()))
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+        .into_iter()
+        .filter_map(|(name, path)| match std::fs::read(&path) {
+            Ok(bytes) => Some((name, bytes)),
+            Err(error) => {
+                log::warn!("{LOG}: config/{JARS}/{name} could not be read: {error}");
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,10 +500,11 @@ mod tests {
         assert_eq!(item.template, "minecraft:stick");
         assert_eq!(item.max_stack_size, Some(1));
         assert_eq!(item.rarity, Some(mod_api::Rarity::Rare));
-        assert!(item
-            .components
-            .iter()
-            .any(|(name, value)| name == "minecraft:item_model" && value.is_some()));
+        assert!(
+            item.components
+                .iter()
+                .any(|(name, value)| name == "minecraft:item_model" && value.is_some())
+        );
         // A content package of the namespace supplies the model: no template model is pinned.
         let packaged = item_entry(&declaration, &declaration.id, false);
         assert!(packaged.components.is_empty());
@@ -498,42 +530,4 @@ mod tests {
         assert_eq!(counts.len(), 1);
         assert_eq!(counts.get("m3_fixture"), Some(&(2, 1)));
     }
-}
-
-/// The jars under the game's `config/horizon_java/java-mods/`, sorted by file name so one run's
-/// report reads the same as the next. An absent folder is no jars; an unreadable one is a warning,
-/// not a failed start.
-fn read_jar_files() -> Vec<(String, Vec<u8>)> {
-    let Ok(game_dir) = std::env::current_dir() else {
-        log::warn!("{LOG}: the game folder is unknown; no jars are read");
-        return Vec::new();
-    };
-    let folder = game_dir.join("config").join(JARS);
-    let entries = match std::fs::read_dir(&folder) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            log::warn!("{LOG}: config/{JARS} could not be listed: {error}");
-            return Vec::new();
-        }
-    };
-    let mut files: Vec<(String, PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.ends_with(".jar").then(|| (name, entry.path()))
-        })
-        .collect();
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
-        .into_iter()
-        .filter_map(|(name, path)| match std::fs::read(&path) {
-            Ok(bytes) => Some((name, bytes)),
-            Err(error) => {
-                log::warn!("{LOG}: config/{JARS}/{name} could not be read: {error}");
-                None
-            }
-        })
-        .collect()
 }

@@ -94,7 +94,7 @@ fn facade(tick_count: i32) -> Arc<EventFacade> {
     Arc::new(EventFacade {
         tick_count,
         dedicated: true,
-        max_players: 20,
+        max_players: Some(20),
         players: vec![FacadePlayer {
             uuid: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
             name: "Alex".into(),
