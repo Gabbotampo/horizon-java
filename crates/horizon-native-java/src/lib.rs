@@ -30,6 +30,7 @@ mod dfu_pair;
 mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
+mod executors;
 mod fabric_registry;
 mod facade_saved_data;
 mod facade_server;
@@ -24180,6 +24181,14 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         mod_origin::invoke(&r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        executors::invoke_thread_factory(self, &r, receiver.as_ref(), &args)
+                    {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, executors::invoke(self, &r, receiver.as_ref(), &args))
+                    {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson(&r, receiver.as_ref(), &args))
