@@ -18,12 +18,11 @@
 
 use crate::{Entrypoint, NativeJar};
 
-/// The entrypoint kinds Fabric Loader runs on a client, in the order it runs
-/// them: `Hooks.startClient` invokes `main`, then `client`.
-const FABRIC_CLIENT_KINDS: &[&str] = &["main", "client"];
-/// The entrypoint kinds Fabric Loader runs on a dedicated server, in the order
-/// it runs them: `Hooks.startServer` invokes `main`, then `server`.
-const FABRIC_SERVER_KINDS: &[&str] = &["main", "server"];
+/// The entrypoint kinds Fabric Loader runs on a client, in the order the
+/// native path tries them.
+const FABRIC_CLIENT_KINDS: &[&str] = &["client", "main"];
+/// The entrypoint kinds Fabric Loader runs on a dedicated server.
+const FABRIC_SERVER_KINDS: &[&str] = &["server", "main"];
 /// A NeoForge (or legacy Forge) jar's only entrypoint kind: its `@Mod` classes,
 /// constructed on both sides.
 const NEOFORGE_KINDS: &[&str] = &["neoforge"];
@@ -49,25 +48,19 @@ impl NativeJar {
         }
     }
 
-    /// Every entrypoint this jar runs for a role, in loader order, each paired
-    /// with the kind that names it. Empty when the jar runs nothing in this
-    /// role.
+    /// The first of [`Self::role_entrypoint_kinds`] that declares entrypoints,
+    /// with every entrypoint of that kind, or `None` when the jar runs nothing
+    /// in this role.
     ///
-    /// Fabric runs both stages, not the first one that declares anything: a
-    /// server jar with `main` and `server` entrypoints runs `main` first and
-    /// `server` after it. Discovery uses the role's physical side, so a
-    /// NeoForge `@Mod(dist = Dist.CLIENT)` class (fzzy_config's shape) never
-    /// reaches the server: FML constructs it only on a client.
-    pub fn role_entrypoints(&self, client: bool) -> Vec<(&'static str, Entrypoint)> {
+    /// Discovery uses the role's physical side, so a NeoForge
+    /// `@Mod(dist = Dist.CLIENT)` class (fzzy_config's shape) never reaches
+    /// the server: FML constructs it only on a client.
+    pub fn role_entrypoints(&self, client: bool) -> Option<(&'static str, Vec<Entrypoint>)> {
         let side = if client { "CLIENT" } else { "SERVER" };
-        self.role_entrypoint_kinds(client)
-            .iter()
-            .flat_map(|kind| {
-                self.discover_entrypoints_on(kind, side)
-                    .into_iter()
-                    .map(move |entry| (*kind, entry))
-            })
-            .collect()
+        self.role_entrypoint_kinds(client).iter().find_map(|kind| {
+            let entries = self.discover_entrypoints_on(kind, side);
+            (!entries.is_empty()).then_some((*kind, entries))
+        })
     }
 }
 
@@ -194,11 +187,10 @@ version = "1"
             !jar.discover_entrypoints("neoforge").is_empty(),
             "the fixture's @Mod class must be discoverable for this test to mean anything"
         );
-        assert!(jar.role_entrypoints(false).is_empty());
-        let entries = jar.role_entrypoints(true);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "client");
-        assert_eq!(entries[0].1.class, "demo.ClientInit");
+        assert_eq!(jar.role_entrypoints(false), None);
+        let (kind, entries) = jar.role_entrypoints(true).unwrap();
+        assert_eq!(kind, "client");
+        assert_eq!(entries[0].class, "demo.ClientInit");
     }
 
     #[test]
@@ -209,10 +201,9 @@ version = "1"
             ("demo/NeoMod.class", &class),
         ]);
         for client in [false, true] {
-            let entries = jar.role_entrypoints(client);
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].0, "neoforge");
-            assert_eq!(entries[0].1.class, "demo.NeoMod");
+            let (kind, entries) = jar.role_entrypoints(client).unwrap();
+            assert_eq!(kind, "neoforge");
+            assert_eq!(entries[0].class, "demo.NeoMod");
         }
     }
 
@@ -234,50 +225,27 @@ version = "1"
         let client = jar.discover_entrypoints_on("neoforge", "CLIENT");
         assert_eq!(client.len(), 1);
         assert_eq!(client[0].class, "demo.NeoClient");
-        assert!(jar.role_entrypoints(false).is_empty());
-        assert_eq!(jar.role_entrypoints(true)[0].1.class, "demo.NeoClient");
+        assert!(jar.role_entrypoints(false).is_none());
+        assert_eq!(
+            jar.role_entrypoints(true).unwrap().1[0].class,
+            "demo.NeoClient"
+        );
     }
 
     #[test]
-    fn a_fabric_server_runs_main_then_server() {
-        // Fabric's Hooks.startServer invokes `main` and then `server`
-        // (Hooks.startClient invokes `main` and then `client`); the native role
-        // must run both stages in that order, not stop at the first.
+    fn a_fabric_server_prefers_server_then_main() {
         let jar = jar(&[(
             "fabric.mod.json",
             br#"{"schemaVersion":1,"id":"demo","version":"1",
                 "entrypoints":{"main":["demo.Main"],"server":["demo.Server"],"client":["demo.Client"]}}"#,
         )]);
-        let server: Vec<_> = jar
-            .role_entrypoints(false)
-            .into_iter()
-            .map(|(kind, entry)| (kind, entry.class))
-            .collect();
-        assert_eq!(
-            server,
-            [
-                ("main", "demo.Main".to_owned()),
-                ("server", "demo.Server".to_owned())
-            ]
-        );
-        let client: Vec<_> = jar
-            .role_entrypoints(true)
-            .into_iter()
-            .map(|(kind, entry)| (kind, entry.class))
-            .collect();
-        assert_eq!(
-            client,
-            [
-                ("main", "demo.Main".to_owned()),
-                ("client", "demo.Client".to_owned())
-            ]
-        );
+        assert_eq!(jar.role_entrypoints(false).unwrap().0, "server");
+        assert_eq!(jar.role_entrypoints(true).unwrap().0, "client");
         let main_only = self::jar(&[(
             "fabric.mod.json",
             br#"{"schemaVersion":1,"id":"demo","version":"1","entrypoints":{"main":["demo.Main"]}}"#,
         )]);
-        assert_eq!(main_only.role_entrypoints(false).len(), 1);
-        assert_eq!(main_only.role_entrypoints(false)[0].0, "main");
-        assert_eq!(main_only.role_entrypoints(true).len(), 1);
+        assert_eq!(main_only.role_entrypoints(false).unwrap().0, "main");
+        assert_eq!(main_only.role_entrypoints(true).unwrap().0, "main");
     }
 }

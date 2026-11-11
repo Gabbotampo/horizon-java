@@ -47,10 +47,9 @@ Per batch:
 5. Results come from `<game-dir>/config/horizon_java/java-runtime.json` (written at server start and
    rewritten at `server_stopping` with the callback/command totals) and the game log.
 
-Verdicts are the mod's own: `ran-clean` = every entrypoint stage ran with zero unmodelled host
-calls; `ran-hollow` = every stage ran with at least one; `ran-partial` = at least one stage ran and
-at least one failed, so the running stages' listeners stay active and `reason` names the failures;
-`refused` = the jar could not run, or every stage failed, and `reason` says why.
+Verdicts are the mod's own, unchanged: `ran-clean` = the entrypoints ran with zero unmodelled host
+calls; `ran-hollow` = they ran with at least one; `refused` = the jar could not run and `reason`
+says why.
 
 ## The sample
 
@@ -310,35 +309,6 @@ python3 tools/bake.py --probe /tmp/target/debug/horizon-native-java --game-dir /
 The batch driver written for this survey is `tools/in_game_survey.py`; it takes the game, the
 control tool, the probe and the jars, and writes one JSON per batch plus the reports and logs.
 
-## Follow-up at the `cf0113879e` pin: entrypoint order
-
-Re-measured 11 November 2026 on the game built from `arismoko/horizon`
-`cf0113879ebee600bff86070466f75b2db90b40a` (unmodified; the log's own line is `Horizon 0.1.0`),
-the pin `mod/horizon-mod.toml` now records; resources were prepared from the same checkout.
-Fabric's `Hooks.startServer` invokes the `main` entrypoint stage and then `server`
-(`Hooks.startClient`: `main`, then `client`), but `load_jar` stopped at the first kind that
-declared anything.
-
-| jar | before | after |
-|---|---|---|
-| `entity-view-distance` | refused: `Metadata("malformed java/util/Iterator marker (at eu/pb4/entityviewdistance/EVDMod#onInitialize +17)")` | **ran-partial**, 2 host calls: `main` failed, `server` ran; the row's `reason` names the failed stage. It is not clean: a real Fabric loader would have thrown |
-| `krypton` | ran-hollow 3, 7 host calls (main only) | ran-hollow 3, 10 host calls (`server` ran too; `main`'s 3 unknowns remain) |
-| `ResourcefulLib` | ran-hollow 2, 16 host calls (main only) | ran-hollow 2, 20 host calls (`server` ran too) |
-
-The two hollow rows are unchanged because Fabric really does run `main` on a server; what changed
-is that the side's own entrypoint runs after it. The departure from Fabric: this path records a
-failed stage and continues, while Fabric throws after the `main` stage; the jar is refused only
-when every stage failed, and a jar with any failed stage is `ran-partial`, never clean.
-
-The run's own summary line read `1 jar(s) ...: 0 ran-clean, 0 ran-hollow, 1 ran-partial,
-0 refused`, and the row's `reason` was `entrypoint(s) failed:
-eu.pb4.entityviewdistance.EVDMod: Metadata("malformed java/util/Iterator marker ...")`.
-
-**Interpreter bug for the next batch:** `entity-view-distance`'s `main` fails on
-`Metadata("malformed java/util/Iterator marker (at .../EVDMod#onInitialize +17)")`. That is this
-interpreter refusing the jar's iterator construction, not a mod error; it should become `ran-clean`
-once the marker is modelled and the stage runs.
-
 ## Follow-up: cross-jar linking
 
 Re-measured 11 November 2026 on the unmodified `cf0113879e` game (log line `Horizon 0.1.0`), with
@@ -386,3 +356,31 @@ record to answer from even though the firing carries the player's UUID.
 `PlayerRef` at the pin exposes only `entity()` and `uuid()`, so only the UUID is answered; the
 name, dimension and attachment reads keep their counted-refusal path. The attachment design note
 is in `docs/mod-plan.md`.
+
+## Follow-up: interpreter gaps
+
+Measured 11 November 2026 with the native probe (`horizon-native-java --json <jar> [main|server]`)
+and with a listener harness that loads the real jar, runs its server-side entrypoints and then
+fires the survey's event against the runtime exactly as the game bridge does (one `EventFiring`
+per event, a `game/server` façade and the `ServerFacts` snapshot). The in-game re-run on the
+pinned build could not be made in this session: the machine stayed below the build's resource
+floor (12 GB available, 40 GB free on `/`), so no claim below is an in-game verdict. The
+reproduction command is the same as the survey's with this branch's `mod/`.
+
+Each jar was first reproduced at `main`, then measured again with the fixes in this branch.
+
+| jar | before | after |
+|---|---|---|
+| `entity-view-distance` | `main` failed: `Metadata("malformed java/util/Iterator marker (at eu/pb4/entityviewdistance/EVDMod#onInitialize +17)")`; probe verdict refused (or `ran-partial` with the entrypoint-order change) | probe `main` and `server`: `ok`, **0 unknown host calls**; the `server_started` listener runs clean. A registry marker now iterates the entries registered through the host (`registry_contents`); the game's own ~140 entity types are not materialised, so the mod's per-type loop is a no-op for them, which is the bound named in that module |
+| `chunky` | `server_started` failed: `Metadata("list index is out of bounds (at org/popcraft/chunky/Chunky#<init> +101)")` | the failure is gone: `Iterable.forEach` now runs the jar's consumer, so `Server#getWorlds` collects the levels and `List.get(0)` has one. The listener then reaches `unknown native host call net/minecraft/server/level/ServerLevel#getWorldBorder()`, a game read the mod API does not carry (the same seam as `#2747`). Without the level ledger it would instead throw a real `IndexOutOfBoundsException`, because the game's `server_started` payload carries no level list; the runtime now records the levels the `LevelLoad` firings announced, and the bridge notes every firing on every jar's host, so the list is the server's own |
+| `respackopts` | both `server_started` listeners failed: `expected a native collection marker, got marker "dev/jfronny/commons/ref/WeakSet#2" (call java/util/Set#isEmpty())` | both listeners run, **0 unknown host calls**, with its declared `libjf` dependency beside it in `java-mods`. Three gaps had to line up: a jar's bundled `META-INF/jars/*.jar` libraries are on its class path (and a bundle's mod ids answer its dependents' requirements), `java.lang.ref` references and `ReferenceQueue` are modelled, and `AbstractCollection.isEmpty` on a jar class runs its own `size()`. Alone (dependency absent) the jar still fails exactly as before, which is the missing-dependency refusal that `#33` reports |
+| `calcmod` | command registration failed: `Metadata("unsupported Locale marker (at net/jsa2025/calcmod/commands/CalcCommand#<clinit> +23)")`, so it offered no command | the registration listener runs: `new Locale("en", "US")` is modelled (`java.util.Locale` constructor, fields and `BaseLocale` hash). It still counts **22** unknowns, all `java/text/NumberFormat#getInstance(Ljava/util/Locale;)`: the decimal-format model (`NumberFormat`/`DecimalFormat`) is a separate JDK gap, so `nf` is null and nothing that formats a result runs |
+| `spark` | `server_starting` failed: `MissingMethod("java/lang/Thread#getId()J")` | `Thread#getId`/`threadId` answer the runtime's one thread (id 1) and a constructed `Thread` a stable distinct id, so `ThreadDumper$Specific` is built. The listener then stops at the debug-build interpreter frame bound (12 nested jar frames) inside adventure's `TextColor#red`; an optimised build's bound is 128. That bound is a stack-safety limit, not a missing model, and is not raised here |
+
+One more JDK gap showed up behind respackopts and is fixed with it: `System.getLogger` and
+`System.Logger.Level` answer the existing disabled-logger model instead of a null that turns into
+an NPE in the jar's `DelegateLoggerPlus` initialiser.
+
+What is left in this family, in the order the five jars meet it: the world border read on a level
+(`chunky`), `java.text` decimal formatting (`calcmod`), the interpreter frame bound in
+unoptimised builds (`spark`), and the game's own registry contents (`entity-view-distance`).
