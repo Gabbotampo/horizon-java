@@ -694,6 +694,8 @@ The §5.2 follow-ups on the `after` build, each relaunching a copy of the same w
    reflection.
 3. **Two command usages** (`/carryon clear`, `/carryon place`) need the bridge's `Entity` argument
    kind.
+   *Since:* the bridge carries `EntityArgument.players()` as the mod API's `player` kind (one
+   player; `docs/mod-plan.md`, "Departures"), so both usages now translate. Not re-run in game.
 4. **Sync** is counted, never sent: there is no client bridge, so the client's copy of
    `CarryOnData` is never set. That is harmless while idle; it matters once carrying works.
 5. **Not exercised by this script:** picking up and placing (`docs/attachments-design.md` §4 lists the
