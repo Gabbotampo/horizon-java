@@ -61,7 +61,7 @@ pub(crate) fn string_instance_of(marker: &str, wanted: &str) -> bool {
 /// - a marker kind or class name: a `/` whose first segment has no `:`, `.`
 ///   or space (`list/3`, `registry/minecraft:item`, `demo/Main`), which a
 ///   resource id like `minecraft:block/stone` does not match.
-fn is_plain_string(marker: &str) -> bool {
+pub(crate) fn is_plain_string(marker: &str) -> bool {
     if marker.starts_with(['@', '[']) || SEPARATOR_FREE_MARKERS.contains(&marker) {
         return false;
     }
