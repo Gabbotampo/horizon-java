@@ -17,7 +17,7 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 | **M0, the shell** | `Hooks::server_about_to_start` and `Hooks::client_setup` log one line each. The server start writes this mod's report, `config/horizon_java/java-runtime.json`, through the mod API's own config service (`Host::config_files`), so the game files it under `config/` beside every other mod's. With no jars it is `{"schema":1,"jars":[]}`. |
 | **M1, run jars** | Every `.jar` in `config/horizon_java/java-mods/` is read as bytes (at `server_about_to_start` until M3 moved the read to the content phase, with `std::fs`; see M3), loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `ran-partial` / `refused`, its host-call and unknown-host-call counts, and the reason a jar was refused or ran partially. |
 | **M2a, lifecycle** | Each jar's `StdHost` (heap, statics, recorded listeners) is kept for the server's life. `server_about_to_start` fires the Fabric `SERVER_STARTING` and NeoForge `ServerAboutToStartEvent` listeners, `server_starting` the NeoForge `ServerStartingEvent` ones, `server_started` the Fabric `SERVER_STARTED` and NeoForge `ServerStartedEvent` ones, and `server_stopping`/`server_stopped` their own. Each hook logs callbacks run/failed and unmodelled host calls; every row's `callbacks` object totals them; a jar's `System.out` lines reach the game log with its id. |
-| **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text` and `integer` nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
+| **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text`, `integer` and player-selector (`EntityArgument.player()`/`players()`, as the mod API's `player` kind) nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 | **M2c, game events** | Every other modelled server event reaches its matching mod API hook, moment for moment: server and level ticks, level load/unload, player join/leave/respawn/clone/dimension change, entity join/leave, living damage before/after, item and block use, block and entity attack, and block break (whose cancel also fires Fabric's `CANCELED`). A cancellable hook carries the firing's cancel and, where the hook has one, the Fabric `InteractionResult` back as the hook's cancellation result. The full table, arguments and departures: [docs/mod-hooks.md](mod-hooks.md). |
 | **M3, content** | The jars now run at the game's **Registration** phase, before any resource or world loads and while the content root can still grow, instead of at `server_about_to_start`. Each `RegistryDeclaration::{Item, Block}` the runtime recorded becomes a native content declaration (`Hooks::blocks`/`items`, NeoForge's `RegisterEvent`): an item keeps the template and the properties the content vocabulary carries, and a block brings its block item. The game joins them under the jar's namespace, so `/give`, `setblock` and the inventory see `<jar id>:<path>`. A jar's own assets, lang and loot need the bake route in [m3-content-design.md](m3-content-design.md). |
 | **M3b, baked assets and declarations** | An install-time bake (`tools/bake.py`) runs each jar's server entrypoints through the offline runtime (`horizon-native-java --json <jar>`, the code the mod vendors), keeps the resource kinds a content package accepts, and writes one `.hmod` per namespace into `<game-dir>/horizon-mods/`, turned on in `horizon-mods.txt`. The package carries the jar's models, textures, item definitions, blockstates, lang and loot **and** its blocks/items as `data/<ns>/horizon/{block,item}/*.json` (the runtime's own mapping, `crates/horizon-native-java/src/content.rs`). It owns its namespace, so the game loads it without the native ownership fence; the mod's runtime declaration for that namespace is skipped (see the fence note below). Class files, metadata and unsafe paths never enter the package; everything left out is in `config/horizon_java/bake-report.json` with its reason. |
@@ -91,6 +91,19 @@ Named here, not just in comments:
   audience.
 - **A jar's command set is fixed at registration.** `Commands::refresh_commands` re-offers the same
   usages: no Java API here re-runs a registration callback with a different set.
+- **`EntityArgument.players()` takes one player.** The mod API's only selector kind is `player`:
+  the game resolves it to exactly one online player before the command runs. `player()` maps onto
+  it exactly. `players()` maps onto it as its one-player subset, so `/carryon clear @a` with two or
+  more players online is refused by the game's parser (with its feedback; a vanilla client already
+  flags the multi-player selector as it is typed, since the tree it gets says single player)
+  instead of running once per player as vanilla does. A selection of one player, `@s`, `@p`, a name
+  or a UUID behaves as vanilla. `EntityArgument.entity()` and `.entities()` are refused at
+  registration by name: narrowing "any entity" to "one player" would run the command on a set the
+  jar did not ask for. Both wait on the fork seam below ("Entity selectors in typed commands").
+- **`getInput()` names the selected player, not the selector typed.** The game hands the mod the
+  resolved `PlayerRef`, not the text, so the input line carries the player's name (or their UUID
+  when the game has no name for them, which vanilla also accepts as a selector) where the player
+  typed `@s` or `@p`.
 
 ## M3 proof
 
@@ -232,6 +245,46 @@ drops", and it travels through the same bake. Without the package the item is na
   NeoForge's `BreakBlockEvent`/`AttackEntityEvent`/`PlayerInteractEvent` cannot be filled: each call
   that needs it is counted as an unknown host call instead of answering the overworld. Filed as
   `arismoko/horizon#2747`; the acting player itself is already carried (M2c).
+
+- **Entity selectors in typed commands.** Not filed yet; the issue text, in the fork's template:
+
+  > **Ask.** Let a native command take an entity selector that resolves to entities, not only to one
+  > online player: usage kinds `entity` (exactly one entity of any type), `entities` (one or more
+  > entities) and `players` (one or more online players), delivered after the server has parsed,
+  > permission-checked and resolved the selector as vanilla's `EntitySelector` does, as new
+  > `CommandArgumentValue` variants carrying `EntityRef`s / `PlayerRef`s in selection order. Done
+  > when `Command::new("heal <targets:players>")` run as `/heal @a` with two players online calls
+  > `run_mod_command` once with both `PlayerRef`s, `<target:entity>` given
+  > `@e[type=minecraft:cow,limit=1,sort=nearest]` delivers that cow's `EntityRef`, and an empty or
+  > too-large selection is refused with vanilla's feedback (`argument.entity.notfound.entity`,
+  > `argument.entity.notfound.player`, `argument.entity.toomany`, `argument.player.toomany`)
+  > without calling the listener, on native and wasm.
+  >
+  > **Background.** The mod API's typed commands have one selector kind, `player`
+  > (`CommandArgumentValue::Player`, "must select exactly one online player",
+  > `crates/horizon-mod-vocab/src/command/`; unchanged between `cf0113879e` and `d3e649f849`).
+  > Vanilla's `EntityArgument` has four: `entity()`, `entities()`, `player()`, `players()`.
+  > Horizon Java translates the Brigadier trees Fabric/NeoForge jars register onto native typed
+  > commands; it can carry `player()` exactly and `players()` only as its one-player subset
+  > (`@a` with two players online is refused), and it refuses `entity()`/`entities()` at
+  > registration. Example: carryon 2.12.1 (NeoForge 26.3) registers `/carryon clear [<target>]` and
+  > `/carryon place [<target>]` with `EntityArgument.players()` and reads them with
+  > `EntityArgument.getPlayers`, iterating the collection. The selector permission
+  > (`Permissions.COMMANDS_ENTITY_SELECTORS`, `EntitySelectorParser.allowSelectors`) and resolution
+  > against the source's position belong on the server, as for `player` today.
+  >
+  > **Hook or handle.** `CommandArgumentValue` (new `Entity`/`Entities`/`Players` values) and the
+  > `entity`/`entities`/`players` usage kinds of `Command`
+  >
+  > **NeoForge 26.3 counterpart.** `net.minecraft.commands.arguments.EntityArgument.entity()`,
+  > `entities()`, `player()`, `players()` and `getEntity`/`getEntities`/`getOptionalEntities`/
+  > `getPlayer`/`getPlayers`/`getOptionalPlayers` (vanilla; NeoForge and Fabric use it unchanged)
+  >
+  > **Who uses it.** Horizon Java (Brigadier commands from Fabric/NeoForge jars, carryon's
+  > `/carryon clear` and `/carryon place` first); any native command that acts on several players
+  > or on a mob
+  >
+  > **Phase.** Host split
 
 ### Mod-owned data attachments (`Player#getData`)
 
