@@ -616,6 +616,16 @@ residency check, and the Java hooks around it were the same `entity_load`/`entit
 runs, the two relaunches below, or any of the re-survey's 11 batches. That is a candidate fork issue,
 not filed here. The three logs are kept with the results.
 
+*Since (reproduced on elysium, no Java jars loaded, idle after `wait-ready`):* the pinned game
+panics the same way with no mod content at all: `--seed 20261111` (`extractions: 9`, ~200 ticks) and
+`--seed 1` (`extractions: 2`), while no seed (seed `0`) runs 1,891 ticks clean. Fork main
+`d3e649f849` runs 2,205 and 2,295 ticks (seed 20261111, twice) and 2,374 (seed 1) without it. A
+first-parent bisect over the 73 merges between the two names the merge of `arismoko/horizon#2855`
+(`34724f7686`; commit `aa8209dbcc`, "Retire terminal falling blocks from entity residency"), which
+closes `arismoko/horizon#2845`: `tick_one_falling` extracted a falling block and never retired it
+when it landed, dropped or was gone, and these seeds have gravity blocks near spawn. Nothing to
+file; the next pin bump past `34724f7686` takes the fix.
+
 ### carryon, before → after
 
 | | before (`22dff61`) | after (`9768f5d`) |
