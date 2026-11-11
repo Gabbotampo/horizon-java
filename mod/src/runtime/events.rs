@@ -1009,7 +1009,9 @@ pub struct EventFacade {
     /// `MinecraftServer.getTickCount()`.
     pub tick_count: i32,
     pub dedicated: bool,
-    pub max_players: i32,
+    /// `MinecraftServer.getMaxPlayers()`, when the host knows the server's configured limit.
+    /// `None` (the default) makes a read refuse and count instead of answering a made-up 0.
+    pub max_players: Option<i32>,
     pub players: Vec<FacadePlayer>,
     pub levels: Vec<FacadeLevel>,
     /// Server-wide facts (world folder, game rules, registries, the channels
@@ -1029,8 +1031,15 @@ pub struct EventContext {
     pub entity: Option<FacadeEntity>,
     /// The damage type id of a death (`minecraft:player_attack`).
     pub damage: Option<String>,
-    /// The damage amount of an `ALLOW_DEATH`, `ALLOW_DAMAGE` or `AFTER_DAMAGE`.
+    /// The damage amount of an `ALLOW_DEATH`, `ALLOW_DAMAGE` or `AFTER_DAMAGE`; for
+    /// `AFTER_DAMAGE` it is the amount the hit dealt (`hurtServer`'s `damage` at its return,
+    /// Fabric's `damageTaken`).
     pub amount: f32,
+    /// `AFTER_DAMAGE`'s `baseDamageTaken`, the damage before the hit's reductions
+    /// (`hurtServer`'s `originalDamage`). `None` when the host hook does not name it: the
+    /// argument then reaches the listener as a `game/unknown/...` marker whose reads are
+    /// counted, never as a copy of `amount`.
+    pub base_amount: Option<f32>,
     /// The block a use, attack or break is about.
     pub pos: Option<[i32; 3]>,
     /// The block id at `pos` (`minecraft:stone`), for a Fabric block-break
@@ -1397,7 +1406,9 @@ impl StdHost {
                 ("isSingleplayer", "Z") => flag(!facade.dedicated),
                 ("isRunning" | "isSameThread", "Z") => flag(true),
                 ("getPlayerCount", "I") => int(facade.players.len() as i32),
-                ("getMaxPlayers", "I") => int(facade.max_players),
+                // A server whose limit the host does not know refuses this read, so the
+                // listener counts it instead of hearing a default that looks configured.
+                ("getMaxPlayers", "I") => facade.max_players.map(Value::Int),
                 ("getServerVersion", "Ljava/lang/String;") => Some(marker("26.3".into())),
                 ("getPlayerList", _) => Some(marker(PLAYER_LIST.into())),
                 ("overworld", _) => Some(level_marker("minecraft:overworld")),
@@ -1417,7 +1428,9 @@ impl StdHost {
                     Some(self.facade_list("players", players))
                 }
                 ("getPlayerCount", "I") => int(facade.players.len() as i32),
-                ("getMaxPlayers", "I") => int(facade.max_players),
+                // A server whose limit the host does not know refuses this read, so the
+                // listener counts it instead of hearing a default that looks configured.
+                ("getMaxPlayers", "I") => facade.max_players.map(Value::Int),
                 ("getServer", _) => Some(marker(SERVER.into())),
                 ("getPlayer", _) if r.descriptor.starts_with("(Ljava/util/UUID;)") => {
                     let wanted = args.first().and_then(expect_ref)?.strip_prefix("uuid/")?;
@@ -2120,7 +2133,12 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
         Shape::AfterDamage => vec![
             subject(),
             damage(),
-            Value::Float(f64::from(context.amount)),
+            // Fabric's `(LivingEntity, DamageSource, float baseDamageTaken, float damageTaken,
+            // boolean blocked)`: two distinct amounts, or a counted marker for the base one.
+            context.base_amount.map_or_else(
+                || missing("base damage"),
+                |amount| Value::Float(f64::from(amount)),
+            ),
             Value::Float(f64::from(context.amount)),
             Value::Int(i32::from(context.flag)),
         ],
@@ -2444,6 +2462,73 @@ mod tests {
         };
         assert_eq!(ask(&mut host, "demo:sync"), Value::Int(1));
         assert_eq!(ask(&mut host, "demo:other"), Value::Int(0));
+    }
+
+    #[test]
+    fn after_damage_arguments_are_the_base_amount_the_taken_amount_and_blocking() {
+        // Fabric's afterDamage(LivingEntity, DamageSource, float baseDamageTaken,
+        // float damageTaken, boolean blocked): javap of LivingEntityMixin passes the
+        // `originalDamage` local, then `hurtServer`'s `amount`, then `blocked`. Two
+        // distinct amounts; the base one must never be a copy of the taken one.
+        let firing = EventFiring::new(
+            GameEvent::LivingAfterDamage,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                amount: 3.5,
+                base_amount: Some(10.0),
+                flag: true,
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AfterDamage, &firing).unwrap();
+        assert_eq!(args[2], Value::Float(10.0));
+        assert_eq!(args[3], Value::Float(3.5));
+        assert_eq!(args[4], Value::Int(1));
+        // A host that does not name the base amount hands the listener a marker whose
+        // reads are counted, not the taken amount again.
+        let firing = EventFiring::new(
+            GameEvent::LivingAfterDamage,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                amount: 3.5,
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AfterDamage, &firing).unwrap();
+        assert_eq!(args[2], marker("game/unknown/base damage".into()));
+        assert_eq!(args[3], Value::Float(3.5));
+    }
+
+    #[test]
+    fn a_server_player_limit_the_facade_does_not_know_refuses() {
+        let call = MethodRef {
+            owner: "net/minecraft/server/MinecraftServer".into(),
+            name: "getMaxPlayers".into(),
+            descriptor: "()I".into(),
+        };
+        let server = marker(SERVER.into());
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::ServerStarted,
+            Arc::new(EventFacade {
+                max_players: Some(20),
+                ..EventFacade::default()
+            }),
+            EventContext::default(),
+        )));
+        assert_eq!(
+            host.game_event_call(&call, &server, &[]).unwrap().unwrap(),
+            Value::Int(20)
+        );
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::ServerStarted,
+            Arc::new(EventFacade::default()),
+            EventContext::default(),
+        )));
+        assert!(matches!(
+            host.game_event_call(&call, &server, &[]),
+            Some(Err(NativeError::UnknownHostCall(_)))
+        ));
     }
 
     #[test]

@@ -77,7 +77,7 @@ use std::time::Duration;
 
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
     EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
     HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
     LevelLoadEvent, LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
@@ -561,11 +561,7 @@ impl Hooks for HorizonJava {
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
     /// `PlayerEvent.Clone`); `was_death` says a death caused it.
     fn player_clone(&self, _host: &mut dyn ServerHost, event: &mut PlayerCloneEvent<'_>) {
-        let context = EventContext {
-            player: Some(event.player),
-            flag: event.was_death,
-            ..EventContext::default()
-        };
+        let context = player_clone_context(event);
         self.fire_event(GameEvent::PlayerCopy, self.dedicated(), context, |_| true);
     }
 
@@ -592,21 +588,18 @@ impl Hooks for HorizonJava {
 
     /// A living entity took damage (Fabric's `ServerLivingEntityEvents.AFTER_DAMAGE`, NeoForge's
     /// `LivingDamageEvent.Post`).
+    ///
+    /// Fabric fires `AFTER_DAMAGE` only while the entity is not dying (`LivingEntityMixin`
+    /// checks `isDeadOrDying()` before the call), but this hook does not carry the victim's
+    /// remaining health, so a killing hit cannot be told from a surviving one here. Such a hit
+    /// is fired with its real amounts rather than dropped on a guess: the departure is named in
+    /// the mod's report documentation.
     fn living_damage_post(
         &self,
         _level: &mut dyn LevelRandomHost,
         event: &mut LivingDamagePostEvent<'_>,
     ) {
-        let context = EventContext {
-            entity: Some(FacadeEntity {
-                id: event.entity,
-                kind: event.kind.to_owned(),
-                level: None,
-            }),
-            damage: Some(event.source.damage_type.to_owned()),
-            amount: event.container.health_damage(),
-            ..EventContext::default()
-        };
+        let context = living_damage_context(event);
         self.fire_event(
             GameEvent::LivingAfterDamage,
             self.dedicated(),
@@ -749,7 +742,9 @@ impl Hooks for HorizonJava {
             // The hook fires once per hand with that hand's stack (Fabric's `UseEntityCallback`
             // carries the `InteractionHand`); the pin's event names the stack, not the hand, so
             // which of the acting player's hands holds it is what tells them apart.
-            off_hand: self.acting_hand(host, event.stack).map(|hand| hand == Hand::Off),
+            off_hand: self
+                .acting_hand(host, event.stack)
+                .map(|hand| hand == Hand::Off),
             entity: Some(FacadeEntity {
                 id: event.entity,
                 kind: event.kind.to_owned(),
@@ -1020,6 +1015,65 @@ fn one_hand<T: PartialEq>(held: Option<&T>, main: Option<&T>, off: Option<&T>) -
 /// The dimension id of a hook's `LevelDimension`.
 fn dimension_id(dimension: LevelDimension) -> &'static str {
     dimension.key().id()
+}
+
+/// Fabric's `COPY_FROM` `alive` argument, from the hook's `was_death`.
+///
+/// The bytecode is the specification. `ServerPlayerMixin.onCopyFrom` passes its `alive`
+/// parameter straight through (`iload_2`) to `ServerPlayerEvents.CopyFrom.copyFromPlayer`, and
+/// that parameter is vanilla's `ServerPlayer.restoreFrom(ServerPlayer, boolean
+/// keepAllPlayerData)` (`@Inject(method = "restoreFrom", at = @At("TAIL"))`). The one caller,
+/// `PlayerList.respawn`, passes `false` for the death respawn (`ServerGamePacketListenerImpl`
+/// `PERFORM_RESPAWN` with health <= 0) and `true` when the player leaves the End after the
+/// credits. So `alive` is true after an End return and false after a death: the opposite of
+/// the hook's `was_death`.
+fn copy_from_alive(was_death: bool) -> bool {
+    !was_death
+}
+
+/// The `COPY_FROM`/`AFTER_RESPAWN` firing context for one player clone.
+fn player_clone_context(event: &PlayerCloneEvent<'_>) -> EventContext {
+    EventContext {
+        player: Some(event.player),
+        flag: copy_from_alive(event.was_death),
+        ..EventContext::default()
+    }
+}
+
+/// The `AFTER_DAMAGE` amounts and block flag, from the hit the game reports.
+///
+/// Returns `(baseDamageTaken, damageTaken, blocked)`. Fabric's
+/// `(LivingEntity, DamageSource, float baseDamageTaken, float damageTaken, boolean blocked)`
+/// is filled by `LivingEntityMixin.afterDamage` from `hurtServer`'s locals: `baseDamageTaken`
+/// is the `originalDamage` local (`damage` as it came in, before blocking and the reductions)
+/// and `damageTaken` is `hurtServer`'s `damage` at its `TAIL`, the amount `actuallyHurt` was
+/// given (after blocking and the armor/enchantment/Resistance steps, before absorption). The
+/// game's damage sequence names those two `original()` and `inflicted()`; `health_damage()` is
+/// what the health actually lost after absorption, which is a third, later value.
+fn after_damage_arguments(original: f32, inflicted: f32, blocked: f32) -> (f32, f32, bool) {
+    (original, inflicted, blocked > 0.0)
+}
+
+/// The `AFTER_DAMAGE` firing context for one hit.
+fn living_damage_context(event: &LivingDamagePostEvent<'_>) -> EventContext {
+    let container = event.container;
+    let (base, taken, blocked) = after_damage_arguments(
+        container.original(),
+        container.inflicted(),
+        container.blocked(),
+    );
+    EventContext {
+        entity: Some(FacadeEntity {
+            id: event.entity,
+            kind: event.kind.to_owned(),
+            level: None,
+        }),
+        damage: Some(event.source.damage_type.to_owned()),
+        amount: taken,
+        base_amount: Some(base),
+        flag: blocked,
+        ..EventContext::default()
+    }
 }
 
 /// The `InteractionResult` a Fabric listener returned, as the mod API's own result. A NeoForge
@@ -1574,6 +1628,7 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mod_api::HurtSource;
 
     /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
     /// (two empty hands included), so the hand is unknown rather than guessed.
@@ -1587,11 +1642,68 @@ mod tests {
             one_hand(Some(&"paper"), Some(&"stick"), Some(&"paper")),
             Some(Hand::Off)
         );
-        assert_eq!(one_hand::<&str>(None, Some(&"stick"), None), Some(Hand::Off));
+        assert_eq!(
+            one_hand::<&str>(None, Some(&"stick"), None),
+            Some(Hand::Off)
+        );
         assert_eq!(one_hand::<&str>(None, None, None), None);
         assert_eq!(
             one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
             None
         );
+    }
+
+    /// `PlayerList.respawn` passes `keepAllPlayerData = false` for a death respawn and `true`
+    /// for the End return after the credits; Fabric's `COPY_FROM` forwards that flag as
+    /// `alive` (`ServerPlayerMixin.onCopyFrom`, `iload_2`).
+    #[test]
+    fn copy_from_alive_is_the_keep_all_data_flag_not_the_death_flag() {
+        assert!(!copy_from_alive(true), "a death respawn keeps no data");
+        assert!(copy_from_alive(false), "leaving the End keeps all data");
+        let event = PlayerCloneEvent {
+            player: 7,
+            name: "Alex",
+            was_death: true,
+        };
+        assert!(!player_clone_context(&event).flag);
+        let event = PlayerCloneEvent {
+            was_death: false,
+            ..event
+        };
+        assert!(player_clone_context(&event).flag);
+    }
+
+    /// Fabric's `afterDamage` gets `hurtServer`'s `originalDamage` and `damage` at `TAIL`, and
+    /// `blocked`: the base amount, the dealt amount (after reductions, before absorption) and
+    /// the block flag. The health damage after absorption is a third value and is not what
+    /// either argument carries.
+    #[test]
+    fn after_damage_carries_the_base_amount_the_dealt_amount_and_the_block_flag() {
+        // DamageContainer(original 10, blocked 4, Pre left 6, health lost 2): the two
+        // arguments are the 10 (originalDamage) and the 6 (hurtServer's damage at TAIL), not
+        // the 2 the health lost and not 10 twice.
+        assert_eq!(after_damage_arguments(10.0, 6.0, 4.0), (10.0, 6.0, true));
+        // No blocking: the flag is false, not a count or an amount.
+        assert_eq!(after_damage_arguments(1.0, 1.0, 0.0), (1.0, 1.0, false));
+        let source = HurtSource {
+            damage_type: "minecraft:player_attack",
+            causing: 3,
+            direct: 3,
+            position: None,
+        };
+        // A fresh snapshot has an original and nothing else set, so the context takes the base
+        // from it and the dealt amount is the (unset here) inflicted value, not a copy.
+        let container = DamageContainer::new(10.0);
+        let event = LivingDamagePostEvent {
+            entity: 7,
+            kind: "minecraft:cow",
+            source: &source,
+            container: &container,
+        };
+        let context = living_damage_context(&event);
+        assert_eq!(context.base_amount, Some(10.0));
+        assert_eq!(context.amount, 0.0);
+        assert!(!context.flag);
+        assert_eq!(context.damage.as_deref(), Some("minecraft:player_attack"));
     }
 }
