@@ -126,6 +126,18 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             "ALL" | "TRACE" | "DEBUG" | "INFO" | "WARNING" | "ERROR" | "OFF"
         )
         .then(|| Value::Ref(Some(format!("enum/java/lang/System$Logger$Level/{name}")))),
+        // `StackWalker.Option`'s constants. `getInstance` answers the same
+        // walker for any option set (its frames always carry their class), so
+        // an option is only handed to it or compared; the marker keeps the
+        // enum's own name for `name()`/`toString`.
+        "java/lang/StackWalker$Option" => matches!(
+            name,
+            "RETAIN_CLASS_REFERENCE"
+                | "DROP_METHOD_INFO"
+                | "SHOW_REFLECT_FRAMES"
+                | "SHOW_HIDDEN_FRAMES"
+        )
+        .then(|| Value::Ref(Some(format!("enum/java/lang/StackWalker$Option/{name}")))),
         _ => None,
     }
 }

@@ -3057,7 +3057,9 @@ impl StdHost {
                     .unwrap_or(fallback);
                 Ok(Some(found))
             }
-            ("setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") => {
+            // `Properties.setProperty` returns `Object` (it is `Hashtable.put`
+            // underneath), so `javac` emits this descriptor, not a `String` one.
+            ("setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;") => {
                 let key = Self::argument(r, args, 0)?.clone();
                 let value = Self::argument(r, args, 1)?.clone();
                 let values = self
@@ -7653,6 +7655,14 @@ impl Host for StdHost {
             | ("java/lang/Enum", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
             }
+            // `Enum.name()` is final, and `javac` names the constant's own
+            // class as the owner (`StackWalker.Option.name()`), so a platform
+            // enum marker `enum/<owner>/<NAME>` answers it on that owner too.
+            (owner, "name", "()Ljava/lang/String;")
+                if is_platform_enum_constant(receiver, owner) =>
+            {
+                Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
+            }
             ("java/lang/Enum", "ordinal", "()I") => Ok(Value::Int(enum_ordinal(receiver))),
             ("java/lang/Enum", "hashCode", "()I") => {
                 Ok(Value::Int(stable_hash(expect_string(receiver))))
@@ -9574,6 +9584,15 @@ fn enum_name(value: &Value) -> &str {
     expect_string(value)
         .rsplit_once('/')
         .map_or_else(|| expect_string(value), |(_, name)| name)
+}
+
+/// Whether `value` is a platform enum constant's `enum/<owner>/<NAME>` marker
+/// of exactly `owner`, a class the host models.
+fn is_platform_enum_constant(value: &Value, owner: &str) -> bool {
+    expect_ref(value)
+        .and_then(|marker| marker.strip_prefix("enum/"))
+        .and_then(|rest| rest.rsplit_once('/'))
+        .is_some_and(|(class, _)| class == owner && host_models_class(class))
 }
 
 fn enum_ordinal(value: &Value) -> i32 {
@@ -24290,6 +24309,22 @@ impl<H: Host> Runtime<'_, H> {
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
                         format_java_string_call(self, &r, &args)?
+                    } else if r.owner == "java/lang/String"
+                        && r.name == "formatted"
+                        && r.descriptor == "([Ljava/lang/Object;)Ljava/lang/String;"
+                        && let Some(format) = receiver.clone()
+                    {
+                        // `text.formatted(args)` is `String.format(text, args)`.
+                        let format_ref = MethodRef {
+                            owner: r.owner.clone(),
+                            name: "format".into(),
+                            descriptor: "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                                .into(),
+                        };
+                        let format_args: Vec<Value> = std::iter::once(format)
+                            .chain(args.iter().cloned())
+                            .collect();
+                        format_java_string_call(self, &format_ref, &format_args)?
                     } else if let Some(value) = self.invoke_string_join(&r, &args) {
                         value
                     } else if let Some(value) =
