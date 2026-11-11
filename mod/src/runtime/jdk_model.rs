@@ -896,7 +896,10 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
             _ => return false,
         }
     };
-    let known = platform_supertypes(class);
+    let known = match platform_supertypes(class) {
+        [] => crate::runtime::java_immutable::supertypes(class),
+        known => known,
+    };
     if known.is_empty() {
         return crate::runtime::library_dispatch::fastutil_instance_of(class, wanted);
     }
