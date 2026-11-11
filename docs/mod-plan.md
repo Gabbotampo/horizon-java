@@ -235,6 +235,9 @@ drops", and it travels through the same bake. Without the package the item is na
 
 ### Mod-owned data attachments (`Player#getData`)
 
+> The design for bridging these onto the fork's store is [attachments-design.md](attachments-design.md)
+> (a proposal under review); the note below is the reasoning it starts from.
+
 NeoForge's `AttachmentType<T>` is the contract behind `getData`: a mod declares a key with a
 default supplier, an optional `IAttachmentSerializer` (so a value may be unserializable, in which
 case it lives only while the holder does), `copyOnDeath`, and an optional `StreamCodec` plus
