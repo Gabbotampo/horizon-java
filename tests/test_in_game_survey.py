@@ -114,6 +114,39 @@ class SummariseTest(unittest.TestCase):
             "ran-partial",
         )
 
+    def test_listener_failures_show_in_the_summary_and_the_table(self):
+        # The verdict stays the entrypoint's; the summary is what keeps a jar whose listeners
+        # all threw from reading as a clean run.
+        self.report["jars"][0]["verdict"] = "ran-clean"
+        self.report["jars"][0]["callbacks"] = {
+            "ran": 1, "failed": 12, "unknown_host_call_count": 0,
+        }
+        rows = {row["id"]: row for row in self.survey.summarise(self.report, self.log)}
+        self.assertEqual(rows["fancymenu"]["verdict"], "ran-clean")
+        self.assertEqual(rows["fancymenu"]["summary"], "ran-clean, 12 listener failures")
+        rendered = self.survey.table(self.survey.summarise(self.report, self.log))
+        self.assertIn("ran-clean, 12 listener failures", rendered)
+        self.assertIn("| `fancymenu.jar` | ran-clean |", rendered)
+
+    def test_the_report_summary_is_preferred_and_singular_counts_read_right(self):
+        self.report["jars"][0]["summary"] = "ran-partial, 1 listener failure"
+        self.report["jars"][0]["callbacks"]["failed"] = 1
+        rows = {row["id"]: row for row in self.survey.summarise(self.report, self.log)}
+        self.assertEqual(rows["fancymenu"]["summary"], "ran-partial, 1 listener failure")
+        self.report["jars"][0].pop("summary")
+        rows = {row["id"]: row for row in self.survey.summarise(self.report, self.log)}
+        self.assertEqual(rows["fancymenu"]["summary"], "ran-clean, 1 listener failure")
+
+    def test_registration_totals_land_in_the_usage_columns(self):
+        # The registration log line now carries both callback and usage totals; the driver reads
+        # them from that one line and the report's commands hold the same counts.
+        line = ("Horizon Java: fancymenu: command registration: 0 callback(s) ran, 1 failed, "
+                "2 unknown host call(s); 3 command usage(s) translated, 4 refused, "
+                "5 unknown host call(s)")
+        row = self.survey.summarise(self.report, [line])[0]
+        self.assertEqual(row["registration"], {"ran": 0, "failed": 1})
+        self.assertEqual(row["usages"], {"translated": 3, "refused": 4})
+
     def test_missing_report_yields_no_rows(self):
         self.assertEqual(self.survey.summarise(None, ["Horizon Java: x"]), [])
 

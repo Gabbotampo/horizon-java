@@ -77,10 +77,10 @@ use std::time::Duration;
 
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
-    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, EntityInteractEvent,
+    EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host, HostSide,
+    InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension, LevelLoadEvent,
+    LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
     LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
     PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
     PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
@@ -298,6 +298,11 @@ impl Hooks for HorizonJava {
     fn server_stopping(&self, host: &mut dyn ServerHost, event: &mut ServerStoppingEvent) {
         self.fire(GameEvent::ServerStopping, event.dedicated, |_| true);
         let state = self.lock();
+        // One line per jar with the counts the report now holds: the report is the authority, but
+        // the log must never make a jar with failing listeners look like a clean one.
+        for row in state.rows() {
+            log::info!("{LOG}: {row}");
+        }
         if let Err(error) = write_report(host, &state) {
             log::warn!("{LOG}: {REPORT} could not be updated at server stopping: {error}");
         }
@@ -329,24 +334,37 @@ impl Hooks for HorizonJava {
                     }),
                     EventContext::default(),
                 );
+                let before = loaded.host.unknown_host_call_count();
                 let (ran, failed) = run_listeners(
+                    &loaded.row.id,
                     &loaded.jar,
                     &mut loaded.host,
                     &loaded.listeners,
                     &mut firing,
                     &|_| true,
                 );
-                log::info!(
-                    "{LOG}: {}: command registration: {ran} callback(s) ran, {failed} failed",
-                    loaded.row.id
-                );
+                let listener_unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
+                let before = loaded.host.unknown_host_call_count();
                 let (native, commands, refused) =
                     translate_commands(&loaded.jar, &mut loaded.host, &loaded.row.id);
-                log::info!(
-                    "{LOG}: {}: {} command usage(s) translated, {} refused",
-                    loaded.row.id,
+                let translation_unknown =
+                    loaded.host.unknown_host_call_count().saturating_sub(before);
+                // Registration is a callback like any other: its listeners' work and failures
+                // belong in the jar's row, not only in a log line.
+                count_registration(
+                    &mut loaded.row,
+                    (ran, failed),
+                    listener_unknown,
                     native.len(),
                     refused,
+                    translation_unknown,
+                );
+                log::info!(
+                    "{LOG}: {}: command registration: {ran} callback(s) ran, {failed} failed, \
+                     {listener_unknown} unknown host call(s); {} command usage(s) translated, \
+                     {refused} refused, {translation_unknown} unknown host call(s)",
+                    loaded.row.id,
+                    native.len(),
                 );
                 log_stdout(&loaded.row.id, &mut loaded.host);
                 loaded.native_commands = native;
@@ -749,7 +767,9 @@ impl Hooks for HorizonJava {
             // The hook fires once per hand with that hand's stack (Fabric's `UseEntityCallback`
             // carries the `InteractionHand`); the pin's event names the stack, not the hand, so
             // which of the acting player's hands holds it is what tells them apart.
-            off_hand: self.acting_hand(host, event.stack).map(|hand| hand == Hand::Off),
+            off_hand: self
+                .acting_hand(host, event.stack)
+                .map(|hand| hand == Hand::Off),
             entity: Some(FacadeEntity {
                 id: event.entity,
                 kind: event.kind.to_owned(),
@@ -933,6 +953,7 @@ impl HorizonJava {
             let id = loaded.row.id.clone();
             let before = loaded.host.unknown_host_call_count();
             let (jar_ran, jar_failed) = run_listeners(
+                &id,
                 &loaded.jar,
                 &mut loaded.host,
                 &loaded.listeners,
@@ -1037,6 +1058,7 @@ fn interaction_result(result: Option<&str>) -> InteractionResult {
 /// Runs the listeners of this jar that `wanted` keeps, in registration order, against one shared
 /// firing.
 fn run_listeners(
+    id: &str,
     jar: &NativeJar,
     host: &mut StdHost,
     listeners: &[GameListener],
@@ -1059,7 +1081,7 @@ fn run_listeners(
             Err(error) => {
                 failed += 1;
                 log::warn!(
-                    "{LOG}: {} listener from {} failed: {error}",
+                    "{LOG}: {id}: {} listener from {} failed: {error}",
                     event.name(),
                     listener.source
                 );
@@ -1067,6 +1089,24 @@ fn run_listeners(
         }
     }
     (ran, failed)
+}
+
+/// Adds one command-registration pass to the jar's row: listeners that ran or failed, usages
+/// translated or left out, and the unmodelled host calls each phase made.
+fn count_registration(
+    row: &mut JarRow,
+    listeners: (usize, usize),
+    listener_unknown: usize,
+    translated: usize,
+    refused: usize,
+    translation_unknown: usize,
+) {
+    row.callbacks_ran += listeners.0;
+    row.callbacks_failed += listeners.1;
+    row.callback_unknown_host_calls += listener_unknown;
+    row.commands_translated += translated;
+    row.commands_refused_at_registration += refused;
+    row.command_unknown_host_calls += translation_unknown;
 }
 
 /// Sends the jar's `System.out` to the game log, one line per entry, with the jar's id.
@@ -1328,6 +1368,14 @@ fn usage(path: &[String], arguments: &[(String, JavaArgument)]) -> String {
 }
 
 impl State {
+    /// Every row the report carries, run jars first, in file-name order.
+    fn rows(&self) -> impl Iterator<Item = &JarRow> {
+        self.jars
+            .iter()
+            .map(|jar| &jar.row)
+            .chain(self.refused.iter())
+    }
+
     /// Counters are per server: the jars ran once at the content phase, and a second world this
     /// process hosts starts its own report with zero callbacks and commands.
     fn reset_server(&mut self) {
@@ -1338,6 +1386,8 @@ impl State {
             jar.row.commands_ran = 0;
             jar.row.commands_refused = 0;
             jar.row.command_unknown_host_calls = 0;
+            jar.row.commands_translated = 0;
+            jar.row.commands_refused_at_registration = 0;
         }
     }
 }
@@ -1361,6 +1411,11 @@ struct JarRow {
     commands_ran: usize,
     commands_refused: usize,
     command_unknown_host_calls: usize,
+    /// Usages the registration callback built and this bridge translated, and usages it left out
+    /// (an argument kind or predicate it cannot carry). Registration failures are callbacks:
+    /// they are counted in `callbacks_failed` too.
+    commands_translated: usize,
+    commands_refused_at_registration: usize,
     /// Content declarations this jar contributed to the game (milestone 3). Zero for a refused
     /// jar, and for a jar whose registrations the content vocabulary cannot carry.
     content_blocks: usize,
@@ -1386,10 +1441,29 @@ impl JarRow {
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            commands_translated: 0,
+            commands_refused_at_registration: 0,
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
         }
+    }
+
+    /// The verdict plus the failures that happened after the entrypoints. The verdict itself is
+    /// the entrypoint's (Fabric's and NeoForge's own loaders do not fail a load for a listener
+    /// that throws); the summary is what the log line and the report show, so a jar with failing
+    /// listeners never reads as an unqualified clean run.
+    fn summary(&self) -> String {
+        if self.callbacks_failed == 0 {
+            return self.verdict.to_owned();
+        }
+        let failures = self.callbacks_failed;
+        let noun = if failures == 1 {
+            "listener failure"
+        } else {
+            "listener failures"
+        };
+        format!("{}, {failures} {noun}", self.verdict)
     }
 
     fn json(&self) -> serde_json::Value {
@@ -1397,6 +1471,8 @@ impl JarRow {
             "file": self.file,
             "id": self.id,
             "verdict": self.verdict,
+            // `verdict` is the entrypoint's; `summary` adds what happened while the jar ran.
+            "summary": self.summary(),
             "host_calls": self.host_calls,
             "unknown_host_call_count": self.unknown_host_calls,
             "reason": self.reason,
@@ -1409,6 +1485,8 @@ impl JarRow {
                 "ran": self.commands_ran,
                 "refused": self.commands_refused,
                 "unknown_host_call_count": self.command_unknown_host_calls,
+                "translated": self.commands_translated,
+                "refused_at_registration": self.commands_refused_at_registration,
             },
             "content": {
                 "blocks": self.content_blocks,
@@ -1426,7 +1504,11 @@ impl std::fmt::Display for JarRow {
         write!(
             f,
             "{} ({}) {} ({} host calls, {} unknown host calls",
-            self.file, self.id, self.verdict, self.host_calls, self.unknown_host_calls
+            self.file,
+            self.id,
+            self.summary(),
+            self.host_calls,
+            self.unknown_host_calls
         )?;
         if let Some(reason) = &self.reason {
             write!(f, ", reason: {reason}")?;
@@ -1519,6 +1601,8 @@ fn load_jar(
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            commands_translated: 0,
+            commands_refused_at_registration: 0,
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
@@ -1541,6 +1625,8 @@ fn load_jar(
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            commands_translated: 0,
+            commands_refused_at_registration: 0,
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
@@ -1575,6 +1661,44 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
 mod tests {
     use super::*;
 
+    /// A jar whose listeners fail keeps the entrypoint verdict (`ran-clean`) but its summary says
+    /// so: the log line and the report may never present it as an unqualified clean run.
+    #[test]
+    fn listener_failures_show_in_the_summary_and_the_log_line() {
+        let mut row = JarRow::refused("calcmod.jar", "calcmod".to_owned(), String::new());
+        row.verdict = "ran-clean";
+        row.reason = None;
+        assert_eq!(row.summary(), "ran-clean");
+        row.callbacks_failed = 1;
+        assert_eq!(row.summary(), "ran-clean, 1 listener failure");
+        row.callbacks_failed = 12;
+        assert_eq!(row.summary(), "ran-clean, 12 listener failures");
+        assert!(row.to_string().contains("ran-clean, 12 listener failures"));
+        assert_eq!(row.json()["summary"], "ran-clean, 12 listener failures");
+        assert_eq!(row.json()["verdict"], "ran-clean");
+    }
+
+    /// Command-registration listeners are callbacks: their runs, failures, unmodelled host calls
+    /// and refused usages land in the row, so `calcmod`'s failed registration is a counted
+    /// failure in the report, not only a log line.
+    #[test]
+    fn command_registration_counts_reach_the_row() {
+        let mut row = JarRow::refused("calcmod.jar", "calcmod".to_owned(), String::new());
+        row.verdict = "ran-clean";
+        row.reason = None;
+        count_registration(&mut row, (0, 1), 2, 3, 4, 5);
+        assert_eq!(row.callbacks_ran, 0);
+        assert_eq!(row.callbacks_failed, 1);
+        assert_eq!(row.callback_unknown_host_calls, 2);
+        assert_eq!(row.commands_translated, 3);
+        assert_eq!(row.commands_refused_at_registration, 4);
+        assert_eq!(row.command_unknown_host_calls, 5);
+        assert_eq!(row.summary(), "ran-clean, 1 listener failure");
+        let commands = &row.json()["commands"];
+        assert_eq!(commands["translated"], 3);
+        assert_eq!(commands["refused_at_registration"], 4);
+    }
+
     /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
     /// (two empty hands included), so the hand is unknown rather than guessed.
     #[test]
@@ -1587,7 +1711,10 @@ mod tests {
             one_hand(Some(&"paper"), Some(&"stick"), Some(&"paper")),
             Some(Hand::Off)
         );
-        assert_eq!(one_hand::<&str>(None, Some(&"stick"), None), Some(Hand::Off));
+        assert_eq!(
+            one_hand::<&str>(None, Some(&"stick"), None),
+            Some(Hand::Off)
+        );
         assert_eq!(one_hand::<&str>(None, None, None), None);
         assert_eq!(
             one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
