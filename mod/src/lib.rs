@@ -77,12 +77,11 @@ use mod_api::{
     EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
     HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
     LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent,
-    LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
-    PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
-    PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
-    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
-    ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
+    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent,
+    PlayerLoggedOutEvent, PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext,
+    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
+    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
     ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
@@ -512,7 +511,9 @@ impl Hooks for HorizonJava {
     /// A server level closed (Fabric's `ServerLevelEvents.UNLOAD`, NeoForge's
     /// `LevelEvent.Unload`).
     fn level_unload(&self, _host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
-        self.lock().levels.retain(|level| level.id != event.dimension);
+        self.lock()
+            .levels
+            .retain(|level| level.id != event.dimension);
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
@@ -749,7 +750,9 @@ impl Hooks for HorizonJava {
             // The hook fires once per hand with that hand's stack (Fabric's `UseEntityCallback`
             // carries the `InteractionHand`); the pin's event names the stack, not the hand, so
             // which of the acting player's hands holds it is what tells them apart.
-            off_hand: self.acting_hand(host, event.stack).map(|hand| hand == Hand::Off),
+            off_hand: self
+                .acting_hand(host, event.stack)
+                .map(|hand| hand == Hand::Off),
             entity: Some(FacadeEntity {
                 id: event.entity,
                 kind: event.kind.to_owned(),
@@ -1016,11 +1019,7 @@ impl HorizonJava {
             return;
         };
         let mut state = self.lock();
-        match state
-            .levels
-            .iter_mut()
-            .find(|known| known.id == entry.id)
-        {
+        match state.levels.iter_mut().find(|known| known.id == entry.id) {
             Some(known) => *known = entry,
             None => state.levels.push(entry),
         }
@@ -1415,8 +1414,11 @@ fn usage(path: &[String], arguments: &[(String, JavaArgument)]) -> String {
 
 impl State {
     /// The server state every firing this mod starts exposes: the dedicated flag, the tick, the
-    /// online players and the open levels. `max_players` stays `None` (unknown): the pinned mod
-    /// API has no read for it, and the runtime refuses that member rather than answering 0.
+    /// online players and the open levels.
+    ///
+    /// `max_players` is deliberately not set: the pinned mod API has no `max-players` read, and a
+    /// made-up 0 is worse than a refusal. #39 makes that member unknown (the runtime refuses it
+    /// instead of answering the default); this façade carries no value either way.
     fn facade(&self) -> EventFacade {
         EventFacade {
             dedicated: self.dedicated,
@@ -1740,7 +1742,10 @@ mod tests {
         assert_eq!(facade.tick_count, 512);
         assert_eq!(facade.players.len(), 1);
         assert_eq!(facade.players[0].name, "Alex");
-        assert_eq!(facade.players[0].level.as_deref(), Some("minecraft:the_nether"));
+        assert_eq!(
+            facade.players[0].level.as_deref(),
+            Some("minecraft:the_nether")
+        );
         assert_eq!(facade.levels.len(), 1);
         assert_eq!(facade.levels[0].id, "minecraft:the_nether");
         assert_eq!(facade.levels[0].game_time, 100);
@@ -1758,7 +1763,10 @@ mod tests {
             one_hand(Some(&"paper"), Some(&"stick"), Some(&"paper")),
             Some(Hand::Off)
         );
-        assert_eq!(one_hand::<&str>(None, Some(&"stick"), None), Some(Hand::Off));
+        assert_eq!(
+            one_hand::<&str>(None, Some(&"stick"), None),
+            Some(Hand::Off)
+        );
         assert_eq!(one_hand::<&str>(None, None, None), None);
         assert_eq!(
             one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
