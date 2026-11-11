@@ -239,6 +239,8 @@ impl StdHost {
         self.brigadier_root_texts(out);
         // A server's saved data (`facade_saved_data.rs`).
         self.saved_data.root_texts(out);
+        // NeoForge attachment types and live values (`neoforge_attachments.rs`).
+        self.neoforge_attachments.root_texts(out);
     }
 }
 
