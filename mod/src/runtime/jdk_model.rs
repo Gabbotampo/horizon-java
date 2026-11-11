@@ -1226,6 +1226,12 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         if let Some(value) = self.invoke_list_sort(r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_identifier_runtime(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_value_of_builder(r, args) {
+            return Ok(Some(value));
+        }
         self.invoke_char_sequence(r, receiver, args)
     }
 
