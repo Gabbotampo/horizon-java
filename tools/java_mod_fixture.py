@@ -681,6 +681,82 @@ public final class Events {
 }
 """,
     },
+    # The COPY_FROM listener reads `alive`: false on the death respawn, true when a player leaves
+    # the End after the credits (the End case is not reachable from a control socket).
+    "copy_from": {
+        "id": "copyfrom_fixture",
+        "entry": "copyfromfixture.Events",
+        "jar": "copyfrom_fixture.jar",
+        "stubs": {
+            "net/fabricmc/fabric/api/entity/event/v1/ServerPlayerEvents.java": """
+package net.fabricmc.fabric.api.entity.event.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.server.level.ServerPlayer;
+public final class ServerPlayerEvents {
+    public static final Event<CopyFrom> COPY_FROM = null;
+    public static final Event<AfterRespawn> AFTER_RESPAWN = null;
+    public interface CopyFrom {
+        void copyFromPlayer(ServerPlayer oldPlayer, ServerPlayer newPlayer, boolean alive);
+    }
+    public interface AfterRespawn {
+        void afterRespawn(ServerPlayer oldPlayer, ServerPlayer newPlayer, boolean alive);
+    }
+}
+""",
+            "net/minecraft/server/level/ServerPlayer.java": """
+package net.minecraft.server.level;
+public class ServerPlayer {
+    public String getScoreboardName() { return ""; }
+}
+""",
+        },
+        "source": """
+package copyfromfixture;
+
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
+
+public final class Events {
+    public void onInitialize() {
+        // COPY_FROM's `alive` is vanilla's keep-all-data flag: false on the death respawn,
+        // true when the player leaves the End after the credits.
+        ServerPlayerEvents.COPY_FROM.register((oldPlayer, newPlayer, alive) ->
+            System.out.println("copyfrom: copy_from alive=" + alive));
+        ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) ->
+            System.out.println("copyfrom: after_respawn alive=" + alive));
+    }
+}
+""",
+    },
+    # A block and an item the jar registers itself, in the mod's own namespace so the bridge
+    # declares them (instead of a baked package). The block has no BlockItem, so a `give` of the
+    # block's id has to fail: that is what tells an invented item from a declared one.
+    "own_content": {
+        "id": "own_content_fixture",
+        "entry": "owncontent.Content",
+        "jar": "own_content_fixture.jar",
+        "stubs": CONTENT_STUBS,
+        "source": """
+package owncontent;
+
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+
+public final class Content {
+    public void onInitialize() {
+        Registry.register(Registries.ITEM,
+            Identifier.fromNamespaceAndPath("horizon_java", "proof_item"),
+            new Item(new Item.Properties()));
+        Registry.register(Registries.BLOCK,
+            Identifier.fromNamespaceAndPath("horizon_java", "proof_block"),
+            new Block(BlockBehaviour.Properties.of()));
+    }
+}
+""",
+    },
 }
 
 # Kept for callers that imported milestone 1's names.

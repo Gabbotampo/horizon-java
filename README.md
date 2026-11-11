@@ -109,8 +109,8 @@ What it does today:
   config service (`Host::config_files`). With no jars to run it is `{"schema":1,"jars":[]}`.
 - **M1, run jars.** Every `.jar` in `config/horizon_java/java-mods/` is read as bytes through the
   same service and run at `server_about_to_start` with its own `StdHost`. One log line per jar and
-  one row in the report: the id, `ran-clean` / `ran-hollow` / `refused`, the host-call and
-  unknown-host-call counts, and the refusal reason.
+  one row in the report: the id, `ran-clean` / `ran-hollow` / `ran-partial` / `refused`, the
+  host-call and unknown-host-call counts, and the reason a jar was refused or ran partially.
 - **M2, game hooks.** Each jar's runtime (heap, statics and recorded listeners) stays alive for the
   server, and this mod's `server_about_to_start` / `server_starting` / `server_started` /
   `server_stopping` / `server_stopped` hooks fire the Fabric `ServerLifecycleEvents` and NeoForge
