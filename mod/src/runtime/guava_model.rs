@@ -188,6 +188,7 @@ impl<H: Host> Runtime<'_, H> {
             {
                 Ok(Some(collection_value("map", &[])))
             }
+            "com/google/common/collect/MapMaker" => self.invoke_map_maker(r, receiver, args),
             _ => Ok(None),
         }
     }
@@ -877,5 +878,186 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => return Ok(None),
         }))
+    }
+}
+
+/// The synthetic field key a `MapMaker` marker keeps its option text under.
+const MAP_MAKER_OPTIONS: &str = "#mapMakerOptions";
+
+impl<H: Host> Runtime<'_, H> {
+    /// `MapMaker`, the builder Guava's `makeMap()` comes from.
+    ///
+    /// Guava 33.6's `MapMaker` is a fluent builder. Its option setters return
+    /// the receiver, reject an invalid value with `IllegalArgumentException`
+    /// (no message: `Preconditions.checkArgument`) and a repeated option with
+    /// an `IllegalStateException` naming the old value. `makeMap()` without any
+    /// strength setting is a plain `ConcurrentHashMap`, which the runtime's own
+    /// map model stands in for.
+    ///
+    /// Named departure: `weakKeys()`/`weakValues()` are accepted, but the map
+    /// the runtime answers holds its keys and values strongly. The bounded
+    /// runtime has no garbage collector and one thread, so a weak identity is
+    /// not observable, and nothing here evicts an entry.
+    fn invoke_map_maker(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(marker) = receiver.and_then(expect_ref) else {
+            return Err(NativeError::Metadata(
+                "malformed MapMaker receiver marker".into(),
+            ));
+        };
+        let marker = marker.to_owned();
+        let answer = || Ok(Some(Value::Ref(Some(marker.clone()))));
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("<init>", "()V") => Ok(Some(Value::Void)),
+            ("initialCapacity" | "concurrencyLevel", "(I)Lcom/google/common/collect/MapMaker;") => {
+                let Some(Value::Int(value)) = args.first() else {
+                    return Err(NativeError::Metadata(
+                        "MapMaker capacity needs an int".into(),
+                    ));
+                };
+                let (value, label) = (
+                    *value,
+                    if r.name == "initialCapacity" {
+                        "initial capacity"
+                    } else {
+                        "concurrency level"
+                    },
+                );
+                if let Some(previous) = self.map_maker_option(&marker, &r.name) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalStateException".into(),
+                        message: Some(format!("{label} was already set to {previous}")),
+                        frame: None,
+                    });
+                }
+                // `checkArgument(value >= 0)` for the capacity,
+                // `checkArgument(value > 0)` for the concurrency level.
+                let invalid = if r.name == "initialCapacity" {
+                    value < 0
+                } else {
+                    value <= 0
+                };
+                if invalid {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                self.set_map_maker_option(&marker, &r.name, &value.to_string());
+                answer()
+            }
+            ("weakKeys" | "weakValues", "()Lcom/google/common/collect/MapMaker;") => {
+                let option = if r.name == "weakKeys" {
+                    "keyStrength"
+                } else {
+                    "valueStrength"
+                };
+                if let Some(previous) = self.map_maker_option(&marker, option) {
+                    // `checkState(keyStrength == null, "Key strength was
+                    // already set to %s", keyStrength)`.
+                    let label = if option == "keyStrength" {
+                        "Key strength"
+                    } else {
+                        "Value strength"
+                    };
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalStateException".into(),
+                        message: Some(format!("{label} was already set to {previous}")),
+                        frame: None,
+                    });
+                }
+                // `MoreObjects` lower-cases a strength's `toString`.
+                self.set_map_maker_option(&marker, option, "WEAK");
+                answer()
+            }
+            ("makeMap", "()Ljava/util/concurrent/ConcurrentMap;") => {
+                // A concurrent map is the single-threaded runtime's map model:
+                // the same object graph, with no second thread to serve.
+                Ok(Some(collection_value("map", &[])))
+            }
+            ("toString", "()Ljava/lang/String;") => {
+                let mut out = String::from("MapMaker{");
+                for (index, (key, value)) in self.map_maker_options(&marker).iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(key);
+                    out.push('=');
+                    if key.ends_with("Strength") {
+                        out.push_str(&value.to_ascii_lowercase());
+                    } else {
+                        out.push_str(value);
+                    }
+                }
+                out.push('}');
+                Ok(Some(Value::Ref(Some(out))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// One option a `MapMaker` marker has set, if any.
+    fn map_maker_option(&self, marker: &str, option: &str) -> Option<String> {
+        self.map_maker_options(marker)
+            .into_iter()
+            .find(|(key, _)| key == option)
+            .map(|(_, value)| value)
+    }
+
+    /// Every option a `MapMaker` marker has set, in Guava's `toString` order.
+    fn map_maker_options(&self, marker: &str) -> Vec<(String, String)> {
+        let Some(text) = self
+            .fields
+            .get(&format!("{marker}|{MAP_MAKER_OPTIONS}"))
+            .and_then(expect_ref)
+        else {
+            return Vec::new();
+        };
+        let mut options: Vec<(String, String)> = Vec::new();
+        for entry in text.split(';').filter(|entry| !entry.is_empty()) {
+            let Some((key, value)) = entry.split_once('=') else {
+                continue;
+            };
+            // Guava's `toString` order is fixed: capacity, concurrency, then
+            // the strengths.
+            let order = match key {
+                "initialCapacity" => 0,
+                "concurrencyLevel" => 1,
+                "keyStrength" => 2,
+                _ => 3,
+            };
+            options.push((format!("{order}|{key}"), value.to_owned()));
+        }
+        options.sort();
+        options
+            .into_iter()
+            .map(|(key, value)| {
+                let key = key.split_once('|').map_or(key.as_str(), |(_, k)| k);
+                (key.to_owned(), value)
+            })
+            .collect()
+    }
+
+    fn set_map_maker_option(&mut self, marker: &str, option: &str, value: &str) {
+        let mut options = self.map_maker_options(marker);
+        options.push((option.to_owned(), value.to_owned()));
+        let mut encoded = String::new();
+        for (key, value) in options {
+            if !encoded.is_empty() {
+                encoded.push(';');
+            }
+            encoded.push_str(&key);
+            encoded.push('=');
+            encoded.push_str(&value);
+        }
+        self.fields.insert(
+            format!("{marker}|{MAP_MAKER_OPTIONS}"),
+            Value::Ref(Some(encoded)),
+        );
     }
 }

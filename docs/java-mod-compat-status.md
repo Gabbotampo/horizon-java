@@ -53,6 +53,22 @@ on through a call on `null`, answered a bodiless or unmodelled instance call wit
 jar's second stage. The newly refused rows stop on a `NullPointerException` on a `null` an unmodelled call answered:
 the runtime stopping where Java would on that `null`, not proof the jar is broken.
 
+The unmodelled-answer batch (#49 Gson's fluent builder/`FormattingStyle`/writer, #50 Fabric `ModOrigin`,
+#51 Guava `MapMaker`, #52 executors, #53 host method references) then moves those rows forward, measured the same
+way at `b45a717`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
+|---|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → **31** | 34 → 41 | 8 → 4 | 43 → 40 |
+| mega | 59 → **59** | 67 → 84 | 10 → 4 | 116 → 105 |
+| NeoForge 26.3 | 22 → **21** | 20 → 22 | 0 → 0 | 43 → 42 |
+| **total** | **112 → 111** | 121 → 147 | 18 → 8 | 202 → 187 |
+
+Fifteen jars leave `refused` and ten `ran-partial` rows become `ran-hollow` (their second stage used to fail on
+one of those invented `null`s and now runs). Two `ran-clean` rows leave: their `Gson` registers a type adapter or
+a custom naming strategy, and #49 now counts that write instead of emitting text that ignored the option. The next stops are named in
+[unmodelled-calls.md](unmodelled-calls.md#re-measured-11-november-2026-after-the-unmodelled-answer-batch).
+
 ### Coverage of the two gates (8 November 2026, commit `8a3c8dc59`)
 
 The committed ledgers predate the per-run unmodelled-host-call count, so every row that ran reads `ran-hollow` with

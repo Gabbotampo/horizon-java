@@ -39,6 +39,7 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("regex-pattern/", "java/util/regex/Pattern"),
         ("charset/", "java/nio/charset/Charset"),
         ("locale/", "java/util/Locale"),
+        ("mod-origin/", "net/fabricmc/loader/api/metadata/ModOrigin"),
     ];
     for (prefix, owner) in prefix {
         if marker.starts_with(prefix) {
