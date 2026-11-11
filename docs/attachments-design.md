@@ -1,7 +1,9 @@
 # Design: NeoForge data attachments on the fork's store
 
-Status: **proposal, for review.** Nothing here is implemented. It replaces the "Mod-owned data
-attachments" note in [mod-plan.md](mod-plan.md) (#34) once it is accepted.
+Status: **accepted; slice 1 implemented** (the runtime in `neoforge_attachments.rs`,
+`attachment_codec.rs` and `java_nbt.rs`; the bridge in the mod's `attachments.rs`). It replaces the
+"Mod-owned data attachments" note in [mod-plan.md](mod-plan.md) (#34). Where the implementation
+corrects this text, [§7](#7-slice-1-as-built) says so.
 
 **Why.** `Player#getData(Supplier)` is the largest single in-game failure: 616 of the 621 listener
 failures in the [re-survey](in-game-survey.md#re-survey-after-the-honesty-fixes-11-november-2026-elysium),
@@ -826,3 +828,35 @@ receivers:
 
 Before slice 2 is sized, a per-jar list of the codec nodes each serializer is built from (the
 bridgeable-type refusal reasons, once slice 1 reports them) says which nodes to model next.
+
+## 7. Slice 1 as built
+
+What the bytecode and the JVM oracle (`crates/horizon-native-java/tests/fixtures/attachments/`)
+showed that this design did not say, and what the implementation does about it:
+
+- **A codec failure at save is not "left out".** `TagValueOutput.child(id)` puts an empty compound
+  into the output before `serializer.write` runs, and `TagValueOutput.store` only reports a
+  `DataResult.error` (@81–120) without merging. So NeoForge saves the type's child as `{}` for a
+  codec error, and `serializeAttachments` (@89–139) leaves the same `{}` when `write` throws. The
+  oracle's `encode/error` case confirms `{"carryon:carry_on_data": {}}`. The bridge stores `{}` as the
+  encoding (never with `copy_on_death`), not `encoded: None` as §3.5's table said. `write` answering
+  false is different: `serializeAttachments` @125–134 discards the child, and the bridge stores no
+  bytes.
+- **The bridge is a snapshot and a journal, not a live backend.** The runtime cannot hold the game's
+  `&mut dyn ServerHost` across the interpreter, so before a batch the mod reads each online player's
+  entries for the jar's types into the runtime (absent, one of the jar's values by token, or a saved
+  compound), and after it applies the runtime's journal of `store`/`discard` calls. Nothing else runs
+  on the server thread in between, so the view is the store.
+- **Taint.** A batch that made an unmodelled host call (other than the `neoforge:sync_attachments (not
+  sent)` counts, which are accounting) marks every live value of that jar tainted; a tainted value is
+  never re-encoded, so the store keeps its last exact bytes. Taint follows the objects live during the
+  call, not data a later clean batch copies out of them.
+- **Copy failures.** Where NeoForge throws out of the respawn (an End-return or death copy whose codec
+  fails), the bridge drops that value and logs; a copy it cannot make exactly (tainted, or an
+  unmodelled encode) keeps the old object and is counted.
+- **Registration.** A supplier's unmodelled calls are counted but its type still binds: the type is the
+  modelled builder's, and an unmodelled serializer is refused per holder call, as §3.2 says.
+  `Supplier.get()` on an attachment `DeferredHolder` (the usual field type) raises the unbound-value
+  NPE before the registration point, as `DeferredHolder.get()` does.
+- **Holder calls with no `ServerHost`** are counted under a named key
+  (`… (attachment <id>: no ServerHost in this hook)`) rather than the bare method, so the report says why.

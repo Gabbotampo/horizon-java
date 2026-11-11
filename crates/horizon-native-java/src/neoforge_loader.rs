@@ -123,13 +123,18 @@ impl StdHost {
                 "Ljava/util/EnumMap;" | "Ljava/util/Map;" | "Ljava/util/Set;",
             ) => Some(Value::Ref(Some("set".into()))),
             // NeoForge's own registries. The attachment registry is a real
-            // registry the loader creates, and its id is the one the mod's
-            // rows use.
+            // registry the loader creates, keyed `neoforge:attachment_types`
+            // (`NeoForgeRegistries.Keys.ATTACHMENT_TYPES`, plural; this used
+            // to answer `attachment_type`). Its rows and the attachment bridge
+            // (`neoforge_attachments.rs`) both use the id.
             (
                 "net/neoforged/neoforge/registries/NeoForgeRegistries",
                 "ATTACHMENT_TYPES",
                 "Lnet/minecraft/core/Registry;",
-            ) => Some(Value::Ref(Some("registry/neoforge:attachment_type".into()))),
+            ) => Some(Value::Ref(Some(format!(
+                "registry/{}",
+                crate::neoforge_attachments::ATTACHMENT_TYPES_REGISTRY
+            )))),
             _ => None,
         }
     }

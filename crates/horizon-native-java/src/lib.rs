@@ -14,6 +14,7 @@ use std::{
 };
 
 mod annotation_values;
+mod attachment_codec;
 mod block_item_id;
 pub mod brigadier;
 mod checkcast;
@@ -43,6 +44,7 @@ mod heap;
 mod hook_shapes;
 mod java_identifier;
 mod java_immutable;
+mod java_nbt;
 mod java_numbers;
 mod java_regex;
 mod java_tostring;
@@ -56,6 +58,7 @@ mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
 mod mod_origin;
+pub mod neoforge_attachments;
 mod neoforge_loader;
 mod nested_jars;
 mod night_config;
@@ -89,6 +92,7 @@ use weaver::{
 
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use heap::{CallLogMark, JavaHeap};
+pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
 use mixin_plugins::ConfigPlugins;
@@ -2044,6 +2048,17 @@ pub trait Host {
     fn get_static(&mut self, _: &MethodRef) -> Result<Value, NativeError> {
         Ok(Value::Ref(None))
     }
+    /// The NeoForge attachment state and the unknown-call table it counts refusals in
+    /// (`neoforge_attachments.rs`). A host that keeps neither answers `None`, and the attachment
+    /// surface stays unmodelled.
+    fn neoforge_attachments(
+        &mut self,
+    ) -> Option<(
+        &mut neoforge_attachments::AttachmentState,
+        &mut BTreeMap<String, usize>,
+    )> {
+        None
+    }
     /// An instance field the interpreter does not hold, read with its
     /// receiver: a field of a host object (`player.connection` on a façade
     /// player). The default answers as hosts always did, without it.
@@ -2430,6 +2445,8 @@ pub struct StdHost {
     level_resources: BTreeMap<String, String>,
     /// A server's saved data the jar's callbacks stored (`facade_saved_data.rs`).
     saved_data: facade_saved_data::SavedDataState,
+    /// NeoForge data attachments on players (`neoforge_attachments.rs`).
+    neoforge_attachments: neoforge_attachments::AttachmentState,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
@@ -2551,6 +2568,7 @@ impl StdHost {
             identifier_objects: BTreeMap::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
+            neoforge_attachments: neoforge_attachments::AttachmentState::default(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
@@ -3847,6 +3865,14 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    fn neoforge_attachments(
+        &mut self,
+    ) -> Option<(
+        &mut neoforge_attachments::AttachmentState,
+        &mut BTreeMap<String, usize>,
+    )> {
+        Some((&mut self.neoforge_attachments, &mut self.unknown_host_calls))
+    }
     fn write_console(&mut self, text: &str) {
         self.console_out.push_str(text);
     }
@@ -3961,6 +3987,10 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // NeoForge's side, path and mod-container constants.
         if let Some(value) = self.neoforge_loader_static(r) {
+            return Ok(value);
+        }
+        // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
+        if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
         }
         // `MixinEnvironment.Side` constants (`mixin_plugins.rs`).
@@ -24243,6 +24273,15 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_compound_tag(&r, receiver.as_ref(), &args))
+                    {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_neoforge_attachment(&r, receiver.as_ref(), &args)
+                    ) {
+                        value
                     } else if r.owner == "java/lang/String"
                         && r.name == "format"
                         && (r.descriptor
