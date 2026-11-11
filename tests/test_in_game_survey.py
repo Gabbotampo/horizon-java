@@ -260,6 +260,23 @@ class FixtureManifestTest(unittest.TestCase):
         self.assertEqual(survey.BREAK_BLOCKS["fx"], "minecraft:stone")
         self.assertEqual(survey.BREAK_BLOCKS["plain"], "minecraft:dirt")
 
+    def test_break_waits_until_the_client_sees_the_placed_block(self):
+        # `horizon-ctl block` replies as the game does: air until the server's update arrives.
+        survey = load_survey()
+        replies = iter([
+            {"block": "minecraft:air", "loaded": True, "state": "minecraft:air"},
+            None,  # a reply that did not parse
+            {"block": "minecraft:stone", "loaded": True, "state": "minecraft:stone"},
+        ])
+        slept = []
+        reads = survey.wait_for_block(lambda: next(replies), "minecraft:stone",
+                                      sleep=slept.append)
+        self.assertEqual(reads, 3)
+        self.assertEqual(len(slept), 2)
+        never = survey.wait_for_block(lambda: {"block": "minecraft:air"}, "minecraft:stone",
+                                      tries=4, sleep=lambda _: None)
+        self.assertIsNone(never)
+
     def test_a_dependency_shares_its_dependents_batch(self):
         # Since cross-jar linking a dependency outside the batch refuses the dependent, so the
         # sample keeps each declared dependency it carries beside the jar that needs it.

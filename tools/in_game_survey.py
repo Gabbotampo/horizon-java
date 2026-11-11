@@ -354,6 +354,9 @@ class Session:
                 x, y, z = (int(value) for value in position)
                 result["actions"]["setblock"] = self.reply(
                     sock, "setblock", str(x), str(y + 2), str(z + 1), break_block)
+                result["actions"]["block_visible_after_reads"] = wait_for_block(
+                    lambda: self.reply(sock, "block", str(x), str(y + 2), str(z + 1)),
+                    break_block)
                 result["actions"]["break"] = self.reply(
                     sock, "break", str(x), str(y + 2), str(z + 1), timeout=120)
                 # A cancelled break (the m2c fixture keeps stone) leaves the block standing.
@@ -400,6 +403,23 @@ class Session:
         result["rows"] = summarise(result["report"], result.get("log_lines") or [])
         (args.out / f"{batch}.json").write_text(json.dumps(result, indent=1) + "\n")
         return result
+
+
+def wait_for_block(read, block: str, tries: int = 40, delay: float = 0.25, sleep=time.sleep):
+    """Poll `read()` (a `horizon-ctl block X Y Z` reply) until the client sees `block` there.
+
+    `setblock` runs on the server thread and `break` checks the window's own copy of the world,
+    so a `break` sent straight after `setblock` can find air and answer "there is no block"
+    before the block update arrives (it did on the first elysium run). The break is only
+    meaningful once the client shows the block. Returns the number of reads it took, or None if
+    the block never appeared (the batch then records the failed break as it is).
+    """
+    for attempt in range(1, tries + 1):
+        reply = read() or {}
+        if block in (reply.get("block"), reply.get("state")):
+            return attempt
+        sleep(delay)
+    return None
 
 
 def wait_for(path: Path, seconds: float) -> bool:
