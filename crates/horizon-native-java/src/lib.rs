@@ -37,6 +37,7 @@ mod game_hooks;
 mod guava_model;
 mod heap;
 mod hook_shapes;
+mod java_numbers;
 mod java_regex;
 mod jdk_locale_thread;
 mod jdk_model;
@@ -4114,6 +4115,9 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
+        if let Some(value) = java_numbers::static_call(r, args) {
+            return value;
+        }
         // The game-event façade's statics (`ServerPlayNetworking.canSend`).
         if let Some(value) = self.game_event_invoke(r, args) {
             return value;
@@ -4250,57 +4254,6 @@ impl Host for StdHost {
                 "fabric-event/net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback.event/{}",
                 expect_string(Self::argument(r, args, 0)?)
             )))),
-            ("java/lang/Integer", "parseInt", "(Ljava/lang/String;I)I") => {
-                let text = expect_string(Self::argument(r, args, 0)?);
-                let radix = expect_int(r, Self::argument(r, args, 1)?)?;
-                let radix = u32::try_from(radix).map_err(|_| NativeError::UncaughtException {
-                    class: "java/lang/NumberFormatException".into(),
-                    message: Some(format!("radix {radix} out of range")),
-                    frame: None,
-                })?;
-                let value =
-                    i32::from_str_radix(text, radix).map_err(|_| number_format_exception(text))?;
-                Ok(Value::Int(value))
-            }
-            ("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I") => {
-                let text = match Self::argument(r, args, 0)? {
-                    Value::Ref(Some(value)) => value.as_str(),
-                    _ => {
-                        return Err(number_format_exception(""));
-                    }
-                };
-                let value = text
-                    .trim()
-                    .parse::<i32>()
-                    .map_err(|_| number_format_exception(text))?;
-                Ok(Value::Int(value))
-            }
-            ("java/lang/Byte", "parseByte", "(Ljava/lang/String;)B") => Ok(Value::Int(i32::from(
-                parse_java_byte(Self::argument(r, args, 0)?).map_err(|_| {
-                    NativeError::Metadata(
-                        "invalid byte argument for java/lang/Byte.parseByte".into(),
-                    )
-                })?,
-            ))),
-            ("java/lang/Byte", "valueOf", "(Ljava/lang/String;)Ljava/lang/Byte;") => {
-                let value = parse_java_byte(Self::argument(r, args, 0)?).map_err(|_| {
-                    NativeError::Metadata("invalid byte argument for java/lang/Byte.valueOf".into())
-                })?;
-                Ok(Value::Ref(Some(format!("byte:{value}"))))
-            }
-            ("java/lang/Short", "parseShort", "(Ljava/lang/String;)S") => Ok(Value::Int(
-                i32::from(parse_java_short(Self::argument(r, args, 0)?)?),
-            )),
-            ("java/lang/Short", "parseShort", "(Ljava/lang/String;I)S") => {
-                let text = expect_string(Self::argument(r, args, 0)?);
-                let radix = short_radix(r, Self::argument(r, args, 1)?)?;
-                let value = i16::from_str_radix(text, radix).map_err(|_| {
-                    NativeError::Metadata(
-                        "invalid short argument for java/lang/Short.parseShort".into(),
-                    )
-                })?;
-                Ok(Value::Int(i32::from(value)))
-            }
             ("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
                 let value = i16::try_from(value).map_err(|_| {
@@ -4310,42 +4263,8 @@ impl Host for StdHost {
                 })?;
                 Ok(Value::Ref(Some(format!("short:{value}"))))
             }
-            ("java/lang/Short", "valueOf", "(Ljava/lang/String;)Ljava/lang/Short;") => {
-                let value = parse_java_short(Self::argument(r, args, 0)?)?;
-                Ok(Value::Ref(Some(format!("short:{value}"))))
-            }
-            ("java/lang/Short", "valueOf", "(Ljava/lang/String;I)Ljava/lang/Short;") => {
-                let text = expect_string(Self::argument(r, args, 0)?);
-                let radix = short_radix(r, Self::argument(r, args, 1)?)?;
-                let value = i16::from_str_radix(text, radix).map_err(|_| {
-                    NativeError::Metadata(
-                        "invalid short argument for java/lang/Short.valueOf".into(),
-                    )
-                })?;
-                Ok(Value::Ref(Some(format!("short:{value}"))))
-            }
             ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
-                Ok(Value::Ref(Some(format!("integer:{value}"))))
-            }
-            ("java/lang/Integer", "valueOf", "(Ljava/lang/String;)Ljava/lang/Integer;") => {
-                let text = expect_string(Self::argument(r, args, 0)?);
-                let value = text
-                    .trim()
-                    .parse::<i32>()
-                    .map_err(|_| number_format_exception(text))?;
-                Ok(Value::Ref(Some(format!("integer:{value}"))))
-            }
-            ("java/lang/Integer", "valueOf", "(Ljava/lang/String;I)Ljava/lang/Integer;") => {
-                let text = expect_string(Self::argument(r, args, 0)?);
-                let radix = expect_int(r, Self::argument(r, args, 1)?)?;
-                let radix = u32::try_from(radix).map_err(|_| NativeError::UncaughtException {
-                    class: "java/lang/NumberFormatException".into(),
-                    message: Some(format!("radix {radix} out of range")),
-                    frame: None,
-                })?;
-                let value =
-                    i32::from_str_radix(text, radix).map_err(|_| number_format_exception(text))?;
                 Ok(Value::Ref(Some(format!("integer:{value}"))))
             }
             ("java/lang/Integer", "compare", "(II)I") => {
@@ -4360,15 +4279,6 @@ impl Host for StdHost {
             ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
             ))),
-            ("java/lang/Character", "isLetter", "(C)Z")
-            | ("java/lang/Character", "isLetter", "(I)Z") => Ok(Value::Int(
-                java_code_point(Self::argument(r, args, 0)?).is_some_and(char::is_alphabetic)
-                    as i32,
-            )),
-            ("java/lang/Character", "isDigit", "(C)Z")
-            | ("java/lang/Character", "isDigit", "(I)Z") => Ok(Value::Int(
-                java_code_point(Self::argument(r, args, 0)?).is_some_and(char::is_numeric) as i32,
-            )),
             ("java/lang/Character", "toLowerCase", "(C)C")
             | ("java/lang/Character", "toLowerCase", "(I)I") => {
                 let value = java_code_point(Self::argument(r, args, 0)?)
@@ -4469,24 +4379,6 @@ impl Host for StdHost {
             ("java/lang/Long", "toHexString", "(J)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format!("{:x}", expect_long(r, Self::argument(r, args, 0)?)? as u64),
             ))),
-            ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => {
-                Ok(long_value(parse_java_long(Self::argument(r, args, 0)?)?))
-            }
-            ("java/lang/Long", "parseLong", "(Ljava/lang/String;I)J") => {
-                let text = expect_string(Self::argument(r, args, 0)?);
-                let radix = expect_int(r, Self::argument(r, args, 1)?)?;
-                let radix = u32::try_from(radix).map_err(|_| NativeError::UncaughtException {
-                    class: "java/lang/NumberFormatException".into(),
-                    message: Some(format!("radix {radix} out of range")),
-                    frame: None,
-                })?;
-                let value =
-                    i64::from_str_radix(text, radix).map_err(|_| number_format_exception(text))?;
-                Ok(long_value(value))
-            }
-            ("java/lang/Long", "valueOf", "(Ljava/lang/String;)Ljava/lang/Long;") => {
-                Ok(long_value(parse_java_long(Self::argument(r, args, 0)?)?))
-            }
             ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;") => {
                 Ok(long_value(expect_long(r, Self::argument(r, args, 0)?)?))
             }
@@ -10112,11 +10004,9 @@ fn collection_empty(kind: &str) -> Value {
 fn value_text(value: &Value) -> String {
     match value {
         Value::Ref(Some(value)) => {
-            if let Some(value) = value.strip_prefix("integer:") {
-                return value.to_owned();
-            }
-            if let Some(value) = value.strip_prefix("boolean:") {
-                return value.to_owned();
+            // A box prints its value (`Short.valueOf("1")` is `1`).
+            if let Some(text) = jdk_model::boxed_text(value, "Ljava/lang/Object;") {
+                return text;
             }
             // A marker whose Java `toString` is its payload: string
             // concatenation goes through `String.valueOf`, not the modelled
@@ -10364,27 +10254,6 @@ fn number_byte_value(value: &Value) -> Option<i32> {
     number_long_value(value).map(|v| (v as i8) as i32)
 }
 
-fn parse_java_byte(value: &Value) -> Result<i8, std::num::ParseIntError> {
-    expect_string(value).trim().parse::<i8>()
-}
-
-fn parse_java_short(value: &Value) -> Result<i16, NativeError> {
-    expect_string(value).parse::<i16>().map_err(|_| {
-        NativeError::Metadata("invalid short argument for java/lang/Short.parseShort".into())
-    })
-}
-
-fn short_radix(r: &MethodRef, value: &Value) -> Result<u32, NativeError> {
-    let radix = expect_int(r, value)?;
-    if !(2..=36).contains(&radix) {
-        return Err(NativeError::Metadata(format!(
-            "{} received an invalid radix",
-            r.name
-        )));
-    }
-    Ok(radix as u32)
-}
-
 fn boxed_byte(value: &Value) -> Option<i8> {
     match value {
         Value::Int(value) => i8::try_from(*value).ok(),
@@ -10419,12 +10288,6 @@ fn number_format_exception(text: &str) -> NativeError {
         }),
         frame: None,
     }
-}
-
-fn parse_java_long(value: &Value) -> Result<i64, NativeError> {
-    let text = expect_string(value).trim();
-    text.parse::<i64>()
-        .map_err(|_| number_format_exception(text))
 }
 
 /// Box a Java `long`.
