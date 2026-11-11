@@ -23,9 +23,14 @@
 //! phase, where `config_files` does not exist yet; [`content`] explains why it is `std::fs`.)
 //! Each jar logs one line and gets one row in the report:
 //!
-//! * `ran-clean`: the jar's server entrypoints ran and no host call was unmodelled;
-//! * `ran-hollow`: they ran, but at least one host call was answered neutrally (`unknown_host_call_count`);
-//! * `refused`: the jar could not be read, has no server-side entrypoint, or an entrypoint failed,
+//! * `ran-clean`: every server entrypoint stage ran and no host call was unmodelled;
+//! * `ran-hollow`: every stage ran, but at least one host call was answered neutrally
+//!   (`unknown_host_call_count`);
+//! * `ran-partial`: at least one stage ran and at least one failed (an error or a caught
+//!   interpreter panic); the listeners the running stages registered stay active, and `reason`
+//!   names every failed stage and its error. A real loader would have thrown, so this is never
+//!   counted as clean;
+//! * `refused`: the jar could not be read, has no server-side entrypoint, or every stage failed,
 //!   and `reason` says which.
 //!
 //! # Milestone 2a: listeners on real server lifecycle events
@@ -49,7 +54,8 @@
 //! `blocks` and `items` are asked once, at the game's Registration phase and before any resource
 //! loads, so that is where the jars now run ([`content`]). Each typed `RegistryDeclaration` the
 //! runtime recorded becomes a native content declaration: an item keeps its inferred template and
-//! the properties the content vocabulary carries, and a block brings its block item. The game's
+//! the properties the content vocabulary carries, and a block brings an item only when the jar
+//! registered one (a block does not invent one). The game's
 //! content root joins them under the jar's namespace, so `/give` and the inventory see
 //! `<jar id>:<path>`. Jar assets, models, lang and loot stay outside this pass, as
 //! `docs/m3-content-design.md` maps.
@@ -73,15 +79,15 @@ use std::time::Duration;
 
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
     EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
     HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent,
-    LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent,
-    PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
-    PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent,
-    RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
-    ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
+    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent,
+    PlayerLoggedOutEvent, PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext,
+    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
+    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
     ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
@@ -89,7 +95,8 @@ use runtime::brigadier::{
     CommandSource as RuntimeSource, CommandText, MessageKind, NodeKind, Requirement,
 };
 use runtime::events::{
-    EventContext, EventFacade, EventFiring, FacadeEntity, FacadePlayer, GameEvent, GameListener,
+    EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
+    GameListener,
 };
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
@@ -108,10 +115,6 @@ const SCHEMA: u64 = 1;
 const JAR_BUDGET: Duration = Duration::from_secs(30);
 /// The line every log entry starts with, so one `grep` finds all of them.
 const LOG: &str = "Horizon Java";
-/// The entrypoint kinds a server runs, in the order the probe picks them: Fabric's common
-/// `main`, NeoForge's `server`, then the class a NeoForge jar discovers by annotation.
-const SERVER_KINDS: [&str; 3] = ["main", "server", "neoforge"];
-
 /// The mod's state. The content hooks run the jars once per process, before any server exists;
 /// every later hook reuses what they recorded, and a second server this process hosts only resets
 /// the per-server state.
@@ -129,10 +132,14 @@ struct State {
     /// Whether the jars have been read and run this process. The content hooks run once, before
     /// the server exists; the server hooks reuse what they recorded.
     loaded: bool,
-    /// Players whose join this mod heard, as much of them as the hook gave:
-    /// a Java player marker answers its name and UUID, and refuses the level
-    /// and entity id it does not know.
+    /// The online players as the host names them at the last join, leave or dimension change:
+    /// UUID, name, level and entity id. A level the host could not name stays `None`, and the
+    /// façade refuses that read instead of guessing.
     players: Vec<FacadePlayer>,
+    /// The server levels the host reports open, with their clocks, refreshed on load, unload and
+    /// each level tick. A level whose clocks the host cannot read is left out rather than carried
+    /// with a made-up time.
+    levels: Vec<FacadeLevel>,
     /// `MinecraftServer.getTickCount()` as the last server tick reported it.
     tick_count: i32,
     /// Whether the open server is a dedicated one, from `server_about_to_start`.
@@ -242,6 +249,7 @@ impl Hooks for HorizonJava {
         let mut state = self.lock();
         state.dedicated = event.dedicated;
         state.players.clear();
+        state.levels.clear();
         state.tick_count = 0;
         state.reset_server();
         let count = |verdict: &str| {
@@ -256,11 +264,12 @@ impl Hooks for HorizonJava {
         let total = state.jars.len() + state.refused.len();
         match write_report(host, &state) {
             Ok(path) => log::info!(
-                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} refused; report in {path}",
+                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} ran-partial, {} refused; report in {path}",
                 env!("CARGO_PKG_VERSION"),
                 event.dedicated,
                 count("ran-clean"),
                 count("ran-hollow"),
+                count("ran-partial"),
                 count("refused"),
             ),
             Err(error) => log::warn!(
@@ -318,19 +327,13 @@ impl Hooks for HorizonJava {
     /// change at runtime, so the same set is offered again.
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         let mut state = self.lock();
-        let (dedicated, tick_count, players) =
-            (state.dedicated, state.tick_count, state.players.clone());
+        let facade = state.facade();
         for loaded in &mut state.jars {
             if !loaded.commands_registered {
                 loaded.commands_registered = true;
                 let mut firing = EventFiring::new(
                     GameEvent::RegisterCommands,
-                    Arc::new(EventFacade {
-                        dedicated,
-                        tick_count,
-                        players: players.clone(),
-                        ..EventFacade::default()
-                    }),
+                    Arc::new(facade.clone()),
                     EventContext::default(),
                 );
                 let before = loaded.host.unknown_host_call_count();
@@ -384,6 +387,7 @@ impl Hooks for HorizonJava {
         event: &mut RunModCommandEvent<'_>,
     ) -> Flow {
         let mut state = self.lock();
+        let facade = state.facade();
         for loaded in &mut state.jars {
             // One Java literal path can have several executable usages: the bare command and
             // each deeper argument node. The invocation carries the arguments it parsed, so the
@@ -436,22 +440,37 @@ impl Hooks for HorizonJava {
                     }
                 }
             }
-            let source = runtime_source(&event.source, host);
+            let source = runtime_source(event.source, host);
             let invocation = RuntimeInvocation {
                 input: words.join(" "),
                 source,
                 arguments,
             };
             let before = loaded.host.unknown_host_call_count();
-            let run = loaded.jar.run_command(
-                &command.run,
-                &invocation,
-                Arc::new(EventFacade::default()),
-                &mut loaded.host,
-                &ExecutionBudget::within(JAR_BUDGET),
+            let outcome = caught(
+                &format!("{} command /{}", loaded.row.id, command.usage),
+                || {
+                    loaded.jar.run_command(
+                        &command.run,
+                        &invocation,
+                        Arc::new(facade.clone()),
+                        &mut loaded.host,
+                        &ExecutionBudget::within(JAR_BUDGET),
+                    )
+                },
             );
             let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             loaded.row.command_unknown_host_calls += unknown;
+            let run = match outcome {
+                Ok(run) => run,
+                Err(panic) => {
+                    // The command ran as far as the panic: a failed command, not a crashed game.
+                    loaded.row.commands_refused += 1;
+                    let usage = command.usage.clone();
+                    log_stdout(&loaded.row.id, &mut loaded.host);
+                    return refuse(host, &usage, format!("the Java command panicked: {panic}"));
+                }
+            };
             match &run.outcome {
                 CommandOutcome::Refused(_) => loaded.row.commands_refused += 1,
                 _ => loaded.row.commands_ran += 1,
@@ -490,7 +509,12 @@ impl Hooks for HorizonJava {
 
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Pre`).
-    fn level_tick_pre(&self, _host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+    fn level_tick_pre(&self, host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+        if let HostSide::Server(host) = host {
+            // The level's clocks are what `level.getGameTime()`/`getDayTime()` answer, so they
+            // are refreshed from the level the hook names, before the listeners run.
+            self.refresh_level(host, event.level);
+        }
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
             ..EventContext::default()
@@ -511,7 +535,8 @@ impl Hooks for HorizonJava {
     }
 
     /// A server level opened (Fabric's `ServerLevelEvents.LOAD`, NeoForge's `LevelEvent.Load`).
-    fn level_load(&self, _host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+    fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+        self.refresh_levels(host);
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
@@ -522,6 +547,9 @@ impl Hooks for HorizonJava {
     /// A server level closed (Fabric's `ServerLevelEvents.UNLOAD`, NeoForge's
     /// `LevelEvent.Unload`).
     fn level_unload(&self, _host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
+        self.lock()
+            .levels
+            .retain(|level| level.id != event.dimension);
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
@@ -531,17 +559,10 @@ impl Hooks for HorizonJava {
 
     /// A player joined (Fabric's `ServerPlayConnectionEvents.JOIN` and
     /// `ServerPlayerEvents.JOIN`, NeoForge's `PlayerLoggedInEvent`).
-    fn player_logged_in(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
-        {
-            let mut state = self.lock();
-            state.players.retain(|player| player.uuid != event.player);
-            state.players.push(FacadePlayer {
-                uuid: event.player,
-                name: event.name.to_owned(),
-                level: None,
-                entity_id: None,
-            });
-        }
+    fn player_logged_in(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedInEvent<'_>) {
+        // The hook names the joining player; the host knows every player's level and entity id.
+        // A level it cannot name stays `None`, never a guessed overworld.
+        self.refresh_players(host);
         let context = EventContext {
             player: Some(event.player),
             ..EventContext::default()
@@ -552,10 +573,8 @@ impl Hooks for HorizonJava {
     /// A player left (Fabric's `ServerPlayConnectionEvents.DISCONNECT` and
     /// `ServerPlayerEvents.LEAVE`, NeoForge's `PlayerLoggedOutEvent`). The player is already off
     /// the list when a listener hears it, as the hook says.
-    fn player_logged_out(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
-        self.lock()
-            .players
-            .retain(|player| player.uuid != event.player);
+    fn player_logged_out(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
+        self.refresh_players(host);
         let context = EventContext {
             player: Some(event.player),
             ..EventContext::default()
@@ -586,9 +605,10 @@ impl Hooks for HorizonJava {
     /// `PlayerChangedDimensionEvent`).
     fn player_changed_dimension(
         &self,
-        _host: &mut dyn ServerHost,
+        host: &mut dyn ServerHost,
         event: &mut PlayerChangedDimensionEvent<'_>,
     ) {
+        self.refresh_players(host);
         let context = EventContext {
             player: Some(event.player),
             origin: Some(event.from.to_owned()),
@@ -933,13 +953,9 @@ impl HorizonJava {
         wanted: impl Fn(&GameListener) -> bool,
     ) -> Fired {
         let mut state = self.lock();
-        let facade = Arc::new(EventFacade {
-            dedicated,
-            tick_count: state.tick_count,
-            players: state.players.clone(),
-            ..EventFacade::default()
-        });
-        let mut firing = EventFiring::new(event, facade, context);
+        let mut facade = state.facade();
+        facade.dedicated = dedicated;
+        let mut firing = EventFiring::new(event, Arc::new(facade), context);
         let (mut ran, mut failed, mut unknown) = (0, 0, 0);
         for loaded in &mut state.jars {
             let id = loaded.row.id.clone();
@@ -988,6 +1004,55 @@ impl HorizonJava {
     /// Whether this server is a dedicated one.
     fn dedicated(&self) -> bool {
         self.lock().dedicated
+    }
+
+    /// Rebuilds the online player list from the host: every player the server has, with the
+    /// name, level and entity id the host knows. A level the host cannot name is `None`, so the
+    /// façade's `level()` refuses it (and counts the read) instead of answering a guess.
+    fn refresh_players(&self, host: &dyn ServerHost) {
+        let players: Vec<FacadePlayer> = host
+            .players()
+            .server_players()
+            .into_iter()
+            .map(|player| FacadePlayer {
+                uuid: player.uuid(),
+                name: player.name(host).unwrap_or_default(),
+                level: player
+                    .entity()
+                    .level(host)
+                    .map(|level| level.dimension_id().to_owned()),
+                entity_id: Some(player.entity().id() as i32),
+            })
+            .collect();
+        self.lock().players = players;
+    }
+
+    /// Rebuilds the open level list from the host, with each level's clocks. A level whose
+    /// clocks the host does not give is left out: a level in `getAllLevels()` with a made-up
+    /// time would answer `getGameTime()` with a value nobody read.
+    fn refresh_levels(&self, host: &dyn ServerHost) {
+        let levels: Vec<FacadeLevel> = host
+            .levels()
+            .list_levels()
+            .into_iter()
+            .filter_map(|level| level_entry(host, level))
+            .collect();
+        self.lock().levels = levels;
+    }
+
+    /// Refreshes one open level's clocks, after its tick or after it opened.
+    fn refresh_level(&self, host: &dyn ServerHost, level: LevelRef) {
+        let Some(entry) = level_entry(host, level) else {
+            self.lock()
+                .levels
+                .retain(|known| known.id != level.dimension_id());
+            return;
+        };
+        let mut state = self.lock();
+        match state.levels.iter_mut().find(|known| known.id == entry.id) {
+            Some(known) => *known = entry,
+            None => state.levels.push(entry),
+        }
     }
 
     /// The player whose action a hook hears, as the mod API's own helpers name them.
@@ -1127,14 +1192,17 @@ fn run_listeners(
         .iter()
         .filter(|listener| listener.event == event && wanted(listener))
     {
-        match jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET)) {
-            Ok(run) => {
+        let outcome = caught(&format!("{} listener from {}", id, listener.source), || {
+            jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET))
+        });
+        match outcome {
+            Ok(Ok(run)) => {
                 ran += usize::from(run.ran);
                 if run.stop {
                     break;
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 failed += 1;
                 log::warn!(
                     "{LOG}: {id}: {} listener from {} failed: {error}",
@@ -1142,9 +1210,45 @@ fn run_listeners(
                     listener.source
                 );
             }
+            Err(panic) => {
+                failed += 1;
+                log::warn!(
+                    "{LOG}: {id}: {} listener from {} failed: panicked: {panic}",
+                    event.name(),
+                    listener.source
+                );
+            }
         }
     }
     (ran, failed)
+}
+
+/// Runs one Java callback, turning a panic into a named failure.
+///
+/// The interpreter can panic on a value a jar hands it (`Integer.parseInt(s, 40)` on an
+/// unchecked radix, a slice index from malformed bytecode). A Java callback must fail, be counted
+/// in the report and leave the game running: never take the process down. `what` names the
+/// callback (entrypoint, listener or command) in the log line.
+fn caught<T>(what: &str, run: impl FnOnce() -> T) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let reason = panic_message(payload.as_ref());
+            log::warn!("{LOG}: {what} panicked: {reason}");
+            Err(reason)
+        }
+    }
+}
+
+/// A panic payload as text: the message `panic!` carried, or a note that it carried none.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "panic with a non-string payload".to_owned()
+    }
 }
 
 /// Adds one command-registration pass to the jar's row: listeners that ran or failed, usages
@@ -1195,11 +1299,11 @@ fn deliver(
 ) {
     for message in messages {
         let text = mod_text(&message.text);
-        if let MessageKind::Player(uuid) = message.kind {
-            if let Some(player) = host.player(uuid) {
-                let _ = player.tell(host, text);
-                continue;
-            }
+        if let MessageKind::Player(uuid) = message.kind
+            && let Some(player) = host.player(uuid)
+        {
+            let _ = player.tell(host, text);
+            continue;
         }
         let _ = host.commands().feedback(text);
     }
@@ -1231,31 +1335,63 @@ fn mod_text(text: &CommandText) -> Text {
     }
 }
 
+/// One open level as the façade carries it, or `None` when the host does not give both clocks.
+fn level_entry(host: &dyn Host, level: LevelRef) -> Option<FacadeLevel> {
+    Some(FacadeLevel {
+        id: level.dimension_id().to_owned(),
+        game_time: level.game_time(host)?,
+        day_time: level.day_time(host)?,
+    })
+}
+
 /// The runtime's view of the command source.
 ///
-/// Every non-player source runs as the console (the façade has no separate block, cart or
-/// function origin). Its level is the overworld, which is vanilla's server-console source level:
-/// correct, not a guess.
-///
-/// A player's dimension is no mod API read (the fork seam in `docs/mod-plan.md`), so a player
-/// source's level is unknown. `CommandSourceStack.getLevel()` then goes through the runtime's
-/// unknown-host-call path — counted and failing the command visibly — instead of quietly acting on
-/// the overworld while the player stands in the Nether.
-fn runtime_source(source: &CommandSource, host: &dyn Host) -> RuntimeSource {
+/// Every source's level is the fact the mod API names, and unknown when it names none. A
+/// command block carries its own dimension (`CommandSource::CommandBlock.level`), so a block in
+/// the Nether answers `getLevel()` with the Nether. The console's is the overworld, which is
+/// vanilla's console source level; a minecart's and a function's level is not in the hook and
+/// stays unknown (a `getLevel()` read is counted, never answered with the overworld). A
+/// player's dimension is not part of `CommandSource::Player` either, so it too stays unknown
+/// (`arismoko/horizon#2747`), counted rather than guessed.
+fn runtime_source(source: &CommandSource, host: &dyn ServerHost) -> RuntimeSource {
     let level = source.permission().level();
+    let levels = host.levels().list_levels();
+    let dimension_of = |key: DimensionKey| {
+        levels
+            .iter()
+            .find(|level| level.dimension() == key)
+            .map(|level| level.dimension_id().to_owned())
+    };
     match source {
         CommandSource::Player { player, .. } => RuntimeSource {
             name: player.name(host).unwrap_or_else(|| "Player".to_owned()),
             level,
             player: Some(player.uuid()),
-            dimension: None,
+            dimension: source_dimension(source, dimension_of),
         },
         _ => RuntimeSource {
             name: "Server".to_owned(),
             level,
             player: None,
-            dimension: Some("minecraft:overworld".to_owned()),
+            dimension: source_dimension(source, dimension_of),
         },
+    }
+}
+
+/// The dimension id a source's `getLevel()` answers, or `None` when the hook does not name it.
+fn source_dimension(
+    source: &CommandSource,
+    dimension: impl Fn(DimensionKey) -> Option<String>,
+) -> Option<String> {
+    match source {
+        // Vanilla's console source is the overworld's (MinecraftServer.overworld()).
+        CommandSource::Console { .. } => Some("minecraft:overworld".to_owned()),
+        CommandSource::CommandBlock { level, .. } => dimension(*level),
+        // Neither carries a level in the hook, and a player's is not part of its source.
+        CommandSource::Player { .. }
+        | CommandSource::CommandBlockMinecart { .. }
+        | CommandSource::Function { .. } => None,
+        _ => None,
     }
 }
 
@@ -1318,9 +1454,18 @@ impl Translator<'_> {
             match requirement {
                 Requirement::Level(node_level) => level = level.max((*node_level).min(4)),
                 Requirement::Predicate(_) => {
-                    match self
-                        .jar
-                        .requirement_level(requirement, true, self.host, &self.budget)
+                    match caught(
+                        &format!(
+                            "{} permission predicate for /{}",
+                            self.id,
+                            usage(path, arguments)
+                        ),
+                        || {
+                            self.jar
+                                .requirement_level(requirement, true, self.host, &self.budget)
+                        },
+                    )
+                    .and_then(|answer| answer.map_err(|error| error.to_string()))
                     {
                         Ok(node_level) => level = level.max(node_level.min(4)),
                         Err(error) => {
@@ -1424,6 +1569,22 @@ fn usage(path: &[String], arguments: &[(String, JavaArgument)]) -> String {
 }
 
 impl State {
+    /// The server state every firing this mod starts exposes: the dedicated flag, the tick, the
+    /// online players and the open levels.
+    ///
+    /// `max_players` is deliberately not set: the pinned mod API has no `max-players` read, and a
+    /// made-up 0 is worse than a refusal. #39 makes that member unknown (the runtime refuses it
+    /// instead of answering the default); this façade carries no value either way.
+    fn facade(&self) -> EventFacade {
+        EventFacade {
+            dedicated: self.dedicated,
+            tick_count: self.tick_count,
+            players: self.players.clone(),
+            levels: self.levels.clone(),
+            ..EventFacade::default()
+        }
+    }
+
     /// Every row the report carries, run jars first, in file-name order.
     fn rows(&self) -> impl Iterator<Item = &JarRow> {
         self.jars
@@ -1452,11 +1613,11 @@ impl State {
 struct JarRow {
     file: String,
     id: String,
-    /// `ran-clean`, `ran-hollow` or `refused`.
+    /// `ran-clean`, `ran-hollow`, `ran-partial` or `refused`.
     verdict: &'static str,
     host_calls: usize,
     unknown_host_calls: usize,
-    /// Reason a refused jar was refused; `None` for one that ran.
+    /// Why a jar was refused or ran partially; `None` for a full run.
     reason: Option<String>,
     /// Server lifecycle callbacks that ran and failed, and the unmodelled host calls they made.
     callbacks_ran: usize,
@@ -1581,38 +1742,34 @@ pub(crate) fn jar_id(jar: &NativeJar, file: &str) -> String {
         .unwrap_or_else(|| file.strip_suffix(".jar").unwrap_or(file).to_owned())
 }
 
-/// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
-/// game behind it, and with the sibling jars it declares on that host's class path. Anything the
-/// runtime does not model is counted by the host, which is what `ran-hollow` means. The host is
-/// returned because the listeners it recorded need it for the rest of the server's life.
+/// Loads one jar the way a server would: every server-side entrypoint the real loader runs, in
+/// the loader's order, in its own host, with the sibling jars it declares on that host's class
+/// path. Anything the runtime does not model is counted by the host, which is what `ran-hollow`
+/// means. The host is returned because the listeners it recorded need it for the rest of the
+/// server's life.
+///
+/// Fabric runs `main` and then `server` (Hooks.startServer), so a jar that has both runs both.
+/// A failing stage is recorded and the remaining stages still run: the failure is a limit of
+/// this interpreter, not a reason to drop an entrypoint the jar ships for the server. Each stage
+/// runs inside [`caught`], so an interpreter panic is that stage failing like any other error,
+/// never a crashed game. The jar is refused only when every stage failed; a partial run is
+/// `ran-partial` and its `reason` names the failed stages.
+// The `Err` is the refused jar's report row, built once per jar at load: boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 fn load_jar(
     file: String,
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
 ) -> Result<LoadedJar, JarRow> {
     let id = jar_id(&jar, &file);
-    let Some(kind) = SERVER_KINDS
-        .into_iter()
-        .find(|kind| !jar.discover_entrypoints_on(kind, "SERVER").is_empty())
-    else {
+    let entrypoints = jar.role_entrypoints(false);
+    if entrypoints.is_empty() {
         let reason = if jar.discover_entrypoints("client").is_empty() {
             "no main, server or neoforge entrypoint"
         } else {
             "client-only entrypoint: a server never runs it"
         };
         return Err(JarRow::refused(&file, id, reason.to_owned()));
-    };
-    let entrypoints = jar.discover_entrypoints_on(kind, "SERVER");
-    if let Some(entry) = entrypoints.iter().find(|entry| entry.adapter.is_some()) {
-        return Err(JarRow::refused(
-            &file,
-            id,
-            format!(
-                "{}: entrypoint adapter {} is not supported by the native path",
-                entry.class,
-                entry.adapter.as_deref().unwrap_or_default()
-            ),
-        ));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
     for (link, dependency) in links {
@@ -1625,39 +1782,59 @@ fn load_jar(
         }
     }
     let mut calls = 0;
-    for entry in &entrypoints {
-        let outcome = jar.execute_with_budget(
-            &entry.class,
-            entry.method.as_deref(),
-            kind,
-            &mut host,
-            &runtime::ExecutionBudget::within(JAR_BUDGET),
+    let mut ran = 0;
+    let mut failures = Vec::new();
+    for (kind, entry) in &entrypoints {
+        if let Some(adapter) = entry.adapter.as_deref() {
+            failures.push(format!(
+                "{}: entrypoint adapter {adapter} is not supported by the native path",
+                entry.class
+            ));
+            continue;
+        }
+        let outcome = caught(
+            &format!("{} entrypoint {} ({kind})", id, entry.class),
+            || {
+                jar.execute_with_budget(
+                    &entry.class,
+                    entry.method.as_deref(),
+                    kind,
+                    &mut host,
+                    &runtime::ExecutionBudget::within(JAR_BUDGET),
+                )
+            },
         );
         match outcome {
-            Ok(report) => calls += report.calls,
-            Err(error) => {
-                let unknown = host.unknown_host_call_count();
-                return Err(JarRow {
-                    file,
-                    id,
-                    verdict: "refused",
-                    host_calls: calls,
-                    unknown_host_calls: unknown,
-                    reason: Some(format!("{}: {error}", entry.class)),
-                    callbacks_ran: 0,
-                    callbacks_failed: 0,
-                    callback_unknown_host_calls: 0,
-                    commands_ran: 0,
-                    commands_refused: 0,
-                    command_unknown_host_calls: 0,
-                    commands_translated: 0,
-                    commands_refused_at_registration: 0,
-                    content_blocks: 0,
-                    content_items: 0,
-                    content_skipped: BTreeMap::new(),
-                });
+            Ok(Ok(report)) => {
+                calls += report.calls;
+                ran += 1;
             }
+            Ok(Err(error)) => failures.push(format!("{}: {error}", entry.class)),
+            // A caught panic is this stage failing: the remaining stages still run, and it counts
+            // toward `ran-partial` exactly as an interpreter error does.
+            Err(panic) => failures.push(format!("{}: panicked: {panic}", entry.class)),
         }
+    }
+    if ran == 0 {
+        return Err(JarRow {
+            file,
+            id,
+            verdict: "refused",
+            host_calls: calls,
+            unknown_host_calls: host.unknown_host_call_count(),
+            reason: Some(failures.join("; ")),
+            callbacks_ran: 0,
+            callbacks_failed: 0,
+            callback_unknown_host_calls: 0,
+            commands_ran: 0,
+            commands_refused: 0,
+            command_unknown_host_calls: 0,
+            commands_translated: 0,
+            commands_refused_at_registration: 0,
+            content_blocks: 0,
+            content_items: 0,
+            content_skipped: BTreeMap::new(),
+        });
     }
     let unknown = host.unknown_host_call_count();
     let listeners = host.game_listeners(&jar, true).listeners;
@@ -1665,14 +1842,11 @@ fn load_jar(
         row: JarRow {
             file,
             id,
-            verdict: if unknown == 0 {
-                "ran-clean"
-            } else {
-                "ran-hollow"
-            },
+            verdict: runtime::verdict::verdict(ran, failures.len(), unknown),
             host_calls: calls,
             unknown_host_calls: unknown,
-            reason: None,
+            reason: (!failures.is_empty())
+                .then(|| format!("entrypoint(s) failed: {}", failures.join("; "))),
             callbacks_ran: 0,
             callbacks_failed: 0,
             callback_unknown_host_calls: 0,
@@ -1714,6 +1888,84 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mod_api::{DamageContainer, EntityRef, Identifier, PermissionLevel, WorldEpoch};
+
+    /// A command block answers its own dimension (`CommandSource::CommandBlock.level`), the
+    /// console the overworld (vanilla's console source), and the sources whose level the hook
+    /// does not name stay unknown so `getLevel()` refuses and counts instead of acting on the
+    /// overworld.
+    #[test]
+    fn a_command_blocks_level_is_its_own_and_unnamed_levels_stay_unknown() {
+        let named = |key: DimensionKey| match key {
+            DimensionKey::OVERWORLD => Some("minecraft:overworld".to_owned()),
+            DimensionKey::NETHER => Some("minecraft:the_nether".to_owned()),
+            _ => None,
+        };
+        let block = CommandSource::CommandBlock {
+            position: [1, 2, 3],
+            level: DimensionKey::NETHER,
+            permission: PermissionLevel::Gamemasters,
+        };
+        assert_eq!(
+            source_dimension(&block, named).as_deref(),
+            Some("minecraft:the_nether")
+        );
+        // A level the host does not list is unknown, not the overworld.
+        assert_eq!(source_dimension(&block, |_| None), None);
+        let console = CommandSource::Console {
+            permission: PermissionLevel::Owners,
+        };
+        assert_eq!(
+            source_dimension(&console, named).as_deref(),
+            Some("minecraft:overworld")
+        );
+        let cart = CommandSource::CommandBlockMinecart {
+            entity: EntityRef::new(WorldEpoch::new(1), 9),
+            permission: PermissionLevel::All,
+        };
+        assert_eq!(source_dimension(&cart, named), None);
+        let function = CommandSource::Function {
+            id: Identifier::parse("demo:probe").unwrap(),
+            permission: PermissionLevel::All,
+        };
+        assert_eq!(source_dimension(&function, named), None);
+    }
+
+    /// A Java command runs on the server the report measured, not on an empty default: the
+    /// façade carries the dedicated flag, the tick, the online players (with their levels) and
+    /// the open levels. A player's level the host could not name stays `None`.
+    #[test]
+    fn the_command_facade_carries_the_measured_server_state() {
+        let mut state = State {
+            dedicated: true,
+            tick_count: 512,
+            ..State::default()
+        };
+        state.players.push(FacadePlayer {
+            uuid: 5,
+            name: "Alex".into(),
+            level: Some("minecraft:the_nether".into()),
+            entity_id: Some(3),
+        });
+        state.levels.push(FacadeLevel {
+            id: "minecraft:the_nether".into(),
+            game_time: 100,
+            day_time: 40,
+        });
+        let facade = state.facade();
+        assert!(facade.dedicated);
+        assert_eq!(facade.tick_count, 512);
+        assert_eq!(facade.players.len(), 1);
+        assert_eq!(facade.players[0].name, "Alex");
+        assert_eq!(
+            facade.players[0].level.as_deref(),
+            Some("minecraft:the_nether")
+        );
+        assert_eq!(facade.levels.len(), 1);
+        assert_eq!(facade.levels[0].id, "minecraft:the_nether");
+        assert_eq!(facade.levels[0].game_time, 100);
+    }
+
     use mod_api::HurtSource;
 
     /// A jar whose listeners fail keeps the entrypoint verdict (`ran-clean`) but its summary says
@@ -1752,6 +2004,170 @@ mod tests {
         let commands = &row.json()["commands"];
         assert_eq!(commands["translated"], 3);
         assert_eq!(commands["refused_at_registration"], 4);
+    }
+
+    /// A panic inside a Java callback is a named, counted failure: the game keeps running and
+    /// the report says which callback threw. `Integer.parseInt("1", 40)` is the probe the audit
+    /// used, and it aborts the Rust process without this wrapper.
+    /// One entrypoint class: `public class <name> implements <interface>` with a no-argument
+    /// constructor and `public void <method>()`. With `panics`, the method calls
+    /// `Integer.parseInt("1", 40)`, which panics inside the interpreter (`i32::from_str_radix`
+    /// rejects a radix above 36 by panicking); otherwise it just returns.
+    fn entrypoint_class(name: &str, interface: &str, method: &str, panics: bool) -> Vec<u8> {
+        fn u2(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn utf8(out: &mut Vec<u8>, value: &str) {
+            out.push(1);
+            u2(out, value.len() as u16);
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
+        u2(&mut out, 21); // pool slots 1..=20
+        utf8(&mut out, name); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2 Class name
+        utf8(&mut out, "java/lang/Object"); // 3
+        out.extend_from_slice(&[7, 0, 3]); // 4 Class Object
+        utf8(&mut out, "<init>"); // 5
+        utf8(&mut out, "()V"); // 6
+        out.extend_from_slice(&[12, 0, 5, 0, 6]); // 7 NameAndType <init>()V
+        out.extend_from_slice(&[10, 0, 4, 0, 7]); // 8 Methodref Object.<init>
+        utf8(&mut out, "Code"); // 9
+        utf8(&mut out, method); // 10
+        utf8(&mut out, interface); // 11
+        out.extend_from_slice(&[7, 0, 11]); // 12 Class interface
+        utf8(&mut out, "1"); // 13
+        out.extend_from_slice(&[8, 0, 13]); // 14 String "1"
+        utf8(&mut out, "java/lang/Integer"); // 15
+        out.extend_from_slice(&[7, 0, 15]); // 16 Class Integer
+        utf8(&mut out, "parseInt"); // 17
+        utf8(&mut out, "(Ljava/lang/String;I)I"); // 18
+        out.extend_from_slice(&[12, 0, 17, 0, 18]); // 19 NameAndType parseInt
+        out.extend_from_slice(&[10, 0, 16, 0, 19]); // 20 Methodref Integer.parseInt
+        // public class, this #2, super #4, one interface (#12), no fields, two methods.
+        out.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 1, 0, 12, 0, 0, 0, 2]);
+        let mut method_info = |name: u16, max_stack: u16, code: &[u8]| {
+            u2(&mut out, 0x0001); // public
+            u2(&mut out, name);
+            u2(&mut out, 6); // ()V
+            u2(&mut out, 1); // one attribute: Code
+            u2(&mut out, 9);
+            out.extend_from_slice(&(12 + code.len() as u32).to_be_bytes());
+            u2(&mut out, max_stack);
+            u2(&mut out, 1); // max_locals: `this`
+            out.extend_from_slice(&(code.len() as u32).to_be_bytes());
+            out.extend_from_slice(code);
+            u2(&mut out, 0); // no exception table
+            u2(&mut out, 0); // no attributes
+        };
+        // aload_0; invokespecial Object.<init>; return
+        method_info(5, 1, &[0x2A, 0xB7, 0, 8, 0xB1]);
+        if panics {
+            // ldc "1"; bipush 40; invokestatic Integer.parseInt; pop; return
+            method_info(10, 2, &[0x12, 14, 0x10, 40, 0xB8, 0, 20, 0x57, 0xB1]);
+        } else {
+            method_info(10, 0, &[0xB1]);
+        }
+        u2(&mut out, 0); // no class attributes
+        out
+    }
+
+    /// A Fabric jar with a `main` stage (class `demo.Main`) and a `server` stage
+    /// (`demo.Server`). `None` leaves that class out of the jar, so its stage fails to load;
+    /// `Some(panics)` ships it, panicking or not.
+    fn two_stage_jar(main: Option<bool>, server: Option<bool>) -> Arc<NativeJar> {
+        use std::io::Write;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("fabric.mod.json", options).unwrap();
+            zip.write_all(
+                br#"{"schemaVersion":1,"id":"demo","version":"1",
+                    "entrypoints":{"main":["demo.Main"],"server":["demo.Server"]}}"#,
+            )
+            .unwrap();
+            let stages = [
+                (
+                    "demo/Main",
+                    "net/fabricmc/api/ModInitializer",
+                    "onInitialize",
+                    main,
+                ),
+                (
+                    "demo/Server",
+                    "net/fabricmc/api/DedicatedServerModInitializer",
+                    "onInitializeServer",
+                    server,
+                ),
+            ];
+            for (name, interface, method, shipped) in stages {
+                if let Some(panics) = shipped {
+                    zip.start_file(format!("{name}.class"), options).unwrap();
+                    zip.write_all(&entrypoint_class(name, interface, method, panics))
+                        .unwrap();
+                }
+            }
+            zip.finish().unwrap();
+        }
+        Arc::new(NativeJar::from_bytes(&bytes.into_inner()).unwrap())
+    }
+
+    /// The verdict and reason `load_jar` gives a jar, whether it loaded or was refused.
+    fn load_verdict(jar: Arc<NativeJar>) -> (&'static str, Option<String>) {
+        match load_jar("demo.jar".to_owned(), jar, &[]) {
+            Ok(loaded) => (loaded.row.verdict, loaded.row.reason),
+            Err(row) => (row.verdict, row.reason),
+        }
+    }
+
+    /// Fabric's `Hooks.startServer` runs `main` and then `server`; the bridge runs both, records
+    /// a failed stage and keeps going, and an interpreter panic in a stage is that stage
+    /// failing (counted toward `ran-partial`), never a crashed game.
+    #[test]
+    fn every_server_stage_runs_and_a_failed_or_panicking_stage_is_partial() {
+        // Both stages ship and return: a full, clean run.
+        assert_eq!(
+            load_verdict(two_stage_jar(Some(false), Some(false))),
+            ("ran-clean", None)
+        );
+
+        // `main` cannot load, `server` still runs: partial, and the reason names only `main`.
+        let (verdict, reason) = load_verdict(two_stage_jar(None, Some(false)));
+        assert_eq!(verdict, "ran-partial");
+        let reason = reason.unwrap();
+        assert!(
+            reason.starts_with("entrypoint(s) failed: demo.Main: "),
+            "{reason}"
+        );
+        assert!(!reason.contains("demo.Server"), "{reason}");
+
+        // `main` panics in the interpreter, `server` still runs after it: partial, not a crash.
+        let (verdict, reason) = load_verdict(two_stage_jar(Some(true), Some(false)));
+        assert_eq!(verdict, "ran-partial");
+        let reason = reason.unwrap();
+        assert!(reason.contains("demo.Main: panicked: "), "{reason}");
+        assert!(!reason.contains("demo.Server"), "{reason}");
+
+        // Every stage failed (one missing, one panicking): refused, with both named.
+        let (verdict, reason) = load_verdict(two_stage_jar(None, Some(true)));
+        assert_eq!(verdict, "refused");
+        let reason = reason.unwrap();
+        assert!(reason.contains("demo.Main: "), "{reason}");
+        assert!(reason.contains("demo.Server: panicked: "), "{reason}");
+    }
+
+    #[test]
+    fn a_panicking_callback_is_a_named_failure_not_a_crash() {
+        let answer: Result<u32, String> = caught("parseInt radix 40", || {
+            panic!("radix must lie in the range [2, 36]")
+        });
+        assert_eq!(answer.unwrap_err(), "radix must lie in the range [2, 36]");
+        let answer: Result<(), String> = caught("formatted", || panic!("{} {}", "bad", "value"));
+        assert_eq!(answer.unwrap_err(), "bad value");
+        let answer: Result<(), String> = caught("quiet", || std::panic::panic_any(7_u8));
+        assert_eq!(answer.unwrap_err(), "panic with a non-string payload");
+        assert_eq!(caught("runs", || 7).unwrap(), 7);
     }
 
     /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart

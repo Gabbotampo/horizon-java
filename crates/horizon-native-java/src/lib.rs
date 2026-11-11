@@ -16,6 +16,7 @@ use std::{
 mod annotation_values;
 mod block_item_id;
 pub mod brigadier;
+mod checkcast;
 mod class_init;
 pub mod client_surface;
 mod collection_base;
@@ -27,6 +28,7 @@ mod declarations_content;
 pub mod dependencies;
 mod dfu_pair;
 mod entrypoint_role;
+mod enum_value_of;
 pub mod events;
 mod fabric_registry;
 mod facade_saved_data;
@@ -37,7 +39,10 @@ mod game_hooks;
 mod guava_model;
 mod heap;
 mod hook_shapes;
+mod java_identifier;
+mod java_immutable;
 mod java_regex;
+mod java_tostring;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
@@ -50,6 +55,7 @@ mod mixin_plugins;
 mod neoforge_loader;
 mod nested_jars;
 mod night_config;
+mod null_checks;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -60,6 +66,7 @@ mod stack_walk;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
+pub mod verdict;
 pub mod weaver;
 
 pub use facade_server::{GameRuleValue, ServerFacts};
@@ -2055,6 +2062,16 @@ pub trait Host {
         self.invoke(r, args)
     }
 
+    /// The text `String.valueOf`/`StringBuilder.append(Object)` gives for a
+    /// model object, or `None` when this host models no `toString` for it.
+    ///
+    /// Concatenating an object runs its `toString`; the interpreter's old text
+    /// was the marker itself. A host that models the object answers here so
+    /// `"" + id` and `id.toString()` agree.
+    fn modelled_to_string(&mut self, _value: &Value) -> Option<String> {
+        None
+    }
+
     /// The current elements of a mutable collection marker, when the host
     /// keeps one. Interpreter helpers that need a collection's contents run
     /// through the generic `Host` boundary, so the table is exposed here
@@ -2400,6 +2417,10 @@ pub struct StdHost {
     /// Identifiers retained by `CustomPacketPayload.Type` values created by
     /// the bounded networking façade.
     packet_types: BTreeMap<String, String>,
+    /// The id each `new ResourceLocation(...)` object carries (the class's
+    /// constructors were public before 1.21), by the object's `class#n`
+    /// marker. A constructor answers `void`, so this is where the id lives.
+    identifier_objects: BTreeMap<String, String>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -2407,6 +2428,9 @@ pub struct StdHost {
     saved_data: facade_saved_data::SavedDataState,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
+    /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
+    /// for one that owns its elements, `Some(source)` for a view.
+    unmodifiable_collections: BTreeMap<String, Option<String>>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2520,10 +2544,12 @@ impl StdHost {
             payload_bytes: BTreeMap::new(),
             fabric_entrypoint_containers: Vec::new(),
             packet_types: BTreeMap::new(),
+            identifier_objects: BTreeMap::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
+            unmodifiable_collections: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -2581,10 +2607,12 @@ impl StdHost {
     }
 
     pub(crate) fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        // Every call is counted. The table is bounded by the distinct method
+        // references in the jars' constant pools, so it needs no cap; a cap
+        // (it was 64 keys) silently dropped every later new method from
+        // `unknown_host_call_count()` and the per-phase deltas taken from it.
         let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
-        if self.unknown_host_calls.len() < 64 || self.unknown_host_calls.contains_key(&key) {
-            *self.unknown_host_calls.entry(key).or_default() += 1;
-        }
+        *self.unknown_host_calls.entry(key).or_default() += 1;
         if self.strict_unknown_host_calls {
             Err(NativeError::UnknownHostCall(r.clone()))
         } else if let Some(value) = game_builder_value(r) {
@@ -2788,14 +2816,33 @@ impl StdHost {
     ) -> Result<usize, NativeError> {
         let id = id.into();
         let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
+        self.record_loaded_mod(jar);
         // A loader also puts the linked jar's bundled jars
         // (`META-INF/jars/*.jar`) on the class path: a dependency such as
         // `libjf` keeps its classes there, and its dependents call them.
+        // Fabric loads each of them as a mod of its own.
         for (entry, nested) in nested_jars::parsed(jar) {
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
+            self.record_loaded_mod(&nested);
         }
         Ok(added)
+    }
+
+    /// A jar present beside this one is a loaded mod for `isModLoaded` and
+    /// `ModList.isLoaded`, declared as a dependency or not.
+    fn record_loaded_mod(&mut self, jar: &NativeJar) {
+        if let Some(id) = jar.fabric_id.as_deref().or(jar.neoforge_id.as_deref()) {
+            let version = jar
+                .fabric_version
+                .as_deref()
+                .or(jar.neoforge_version.as_deref());
+            // A declared dependency was seeded as `unknown`; the jar knows.
+            let known = self.mods.entry(id.to_owned()).or_default();
+            if known.is_empty() || known == "unknown" {
+                *known = version.unwrap_or("unknown").to_owned();
+            }
+        }
     }
 
     /// [`Self::link_jar`] for a caller that already parsed the library's
@@ -2900,6 +2947,9 @@ impl StdHost {
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<String>> {
         let marker = expect_ref(receiver)?;
+        if let Some(values) = self.view_values(marker) {
+            return Some(values);
+        }
         self.mutable_collections.get(marker).map(|values| {
             values
                 .iter()
@@ -3883,6 +3933,10 @@ impl Host for StdHost {
         name.starts_with("net/fabricmc/") && !self.fabric_entrypoint_containers.is_empty()
     }
 
+    fn modelled_to_string(&mut self, value: &Value) -> Option<String> {
+        crate::java_tostring::modelled(self, value)
+    }
+
     /// The command façade's markers (a source, a node, a builder) answer
     /// `instanceof` for their Brigadier and vanilla types.
     fn host_instance_of(&self, marker: &str, wanted: &str) -> bool {
@@ -4046,36 +4100,11 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some("locale/ENGLISH".into())))
             }
 
-            (
-                "net/fabricmc/loader/api/FabricLoader",
-                "getInstance",
-                "()Lnet/fabricmc/loader/api/FabricLoader;",
-            ) => Ok(Value::Ref(Some("fabric-loader".into()))),
             ("net/fabricmc/api/EnvType", "CLIENT", "Lnet/fabricmc/api/EnvType;") => {
                 Ok(Value::Ref(Some("CLIENT".into())))
             }
             ("net/fabricmc/api/EnvType", "SERVER", "Lnet/fabricmc/api/EnvType;") => {
                 Ok(Value::Ref(Some("SERVER".into())))
-            }
-            (
-                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext",
-                "get",
-                "()Lnet/neoforged/fml/javafmlmod/FMLJavaModLoadingContext;",
-            ) => Ok(Value::Ref(Some(
-                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
-            ))),
-            (
-                "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext",
-                "get",
-                "()Lnet/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext;",
-            ) => Ok(Value::Ref(Some(
-                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
-            ))),
-            ("net/neoforged/fml/ModList", "get", "()Lnet/neoforged/fml/ModList;") => {
-                Ok(Value::Ref(Some("neoforge-mod-list".into())))
-            }
-            ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => {
-                Ok(Value::Ref(Some("neoforge-mod-list".into())))
             }
             // Item rarity is a bounded set of constants. The marker names the
             // value so a recorded builder chain can name it back.
@@ -4114,8 +4143,14 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
+        if let Some(value) = java_identifier::invoke_static(self, r, args) {
+            return value;
+        }
         // The game-event façade's statics (`ServerPlayNetworking.canSend`).
         if let Some(value) = self.game_event_invoke(r, args) {
+            return value;
+        }
+        if let Some(value) = self.unmodifiable_factory(r, args) {
             return value;
         }
         if let Some(value) = self.collection_copy_of(r, args) {
@@ -4532,6 +4567,10 @@ impl Host for StdHost {
                 "valueOf",
                 "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
             ) => {
+                // The interpreter answers a jar enum and checks a game enum
+                // with a constant table (`enum_value_of.rs`); what reaches the
+                // host is a class whose constants nobody here knows, so the
+                // name cannot be checked: the marker is answered, and counted.
                 let class = class_binary_name(Self::argument(r, args, 0)?).replace('.', "/");
                 let name = expect_string(Self::argument(r, args, 1)?);
                 if name.is_empty() {
@@ -4539,13 +4578,16 @@ impl Host for StdHost {
                         "java/lang/Enum.valueOf received an empty name".into(),
                     ));
                 }
+                if game_enum_constants(&class).is_none() {
+                    self.unknown_host_call(r)?;
+                }
                 Ok(Value::Ref(Some(format!("enum/{class}/{name}"))))
             }
             // UUIDs are common in loader metadata, player identity, and
             // registration diagnostics. Keep them as canonical markers so
             // equality/string formatting is deterministic without a JVM.
             ("java/util/UUID", "randomUUID", "()Ljava/util/UUID;") => {
-                Ok(uuid_value("00000000-0000-4000-8000-000000000000")?)
+                Ok(uuid_value(&random_uuid())?)
             }
             ("java/util/UUID", "fromString", "(Ljava/lang/String;)Ljava/util/UUID;") => {
                 Ok(uuid_value(expect_string(Self::argument(r, args, 0)?))?)
@@ -4554,7 +4596,7 @@ impl Host for StdHost {
             // classes from disk would escape the bounded native sandbox. The
             // class-literal path (`Foo.class`) still provides the metadata
             // queries bootstrap code commonly needs.
-            ("java/util/Optional", "empty", "()Ljava/util/Optional;") => Ok(Value::Ref(None)),
+            ("java/util/Optional", "empty", "()Ljava/util/Optional;") => Ok(empty_optional()),
             ("java/util/Optional", "of", "(Ljava/lang/Object;)Ljava/util/Optional;") => {
                 let value = Self::argument(r, args, 0)?;
                 if matches!(value, Value::Ref(None)) {
@@ -4566,11 +4608,13 @@ impl Host for StdHost {
             }
             ("java/util/Optional", "ofNullable", "(Ljava/lang/Object;)Ljava/util/Optional;") => {
                 Ok(match Self::argument(r, args, 0)? {
-                    Value::Ref(None) => Value::Ref(None),
+                    Value::Ref(None) => empty_optional(),
                     value => optional_wrap(value.clone()),
                 })
             }
-            ("java/util/OptionalInt", "empty", "()Ljava/util/OptionalInt;") => Ok(Value::Ref(None)),
+            ("java/util/OptionalInt", "empty", "()Ljava/util/OptionalInt;") => {
+                Ok(Value::Ref(Some(EMPTY_OPTIONAL_INT.into())))
+            }
             ("java/util/OptionalInt", "of", "(I)Ljava/util/OptionalInt;") => {
                 Ok(Value::Ref(Some(format!(
                     "optional-int/{}",
@@ -4578,7 +4622,7 @@ impl Host for StdHost {
                 ))))
             }
             ("java/util/OptionalLong", "empty", "()Ljava/util/OptionalLong;") => {
-                Ok(Value::Ref(None))
+                Ok(Value::Ref(Some(EMPTY_OPTIONAL_LONG.into())))
             }
             ("java/util/OptionalLong", "of", "(J)Ljava/util/OptionalLong;") => {
                 Ok(Value::Ref(Some(format!(
@@ -4587,7 +4631,7 @@ impl Host for StdHost {
                 ))))
             }
             ("java/util/OptionalDouble", "empty", "()Ljava/util/OptionalDouble;") => {
-                Ok(Value::Ref(None))
+                Ok(Value::Ref(Some(EMPTY_OPTIONAL_DOUBLE.into())))
             }
             ("java/util/OptionalDouble", "of", "(D)Ljava/util/OptionalDouble;") => {
                 Ok(Value::Ref(Some(format!(
@@ -4840,7 +4884,10 @@ impl Host for StdHost {
                 Ok(value.clone())
             }
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(value_text(Self::argument(r, args, 0)?))))
+                // A model object prints its own `toString`, not its marker.
+                let value = Self::argument(r, args, 0)?;
+                let text = self.modelled_to_string(value);
+                Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             ("java/lang/Math", "abs", "(I)I") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -4963,7 +5010,10 @@ impl Host for StdHost {
                     })
             }
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(value_text(Self::argument(r, args, 0)?))))
+                // A model object prints its own `toString`, not its marker.
+                let value = Self::argument(r, args, 0)?;
+                let text = self.modelled_to_string(value);
+                Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             // Chat components are a common loader/bootstrap value (mod
             // names, registration diagnostics, and event messages). Keep the
@@ -5076,30 +5126,6 @@ impl Host for StdHost {
                 "isDirectory" | "isRegularFile" | "isSymbolicLink" | "isExecutable",
                 descriptor,
             ) if descriptor.starts_with("(Ljava/nio/file/Path;") => Ok(Value::Int(0)),
-            (
-                "net/minecraft/resources/Identifier" | "net/minecraft/resources/ResourceLocation",
-                name,
-                descriptor,
-            ) if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                || descriptor.ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-            {
-                let value = match name {
-                    "fromNamespaceAndPath" | "tryBuild" => {
-                        let namespace = args.first().map(expect_string).unwrap_or("minecraft");
-                        let path = args.get(1).map(expect_string).unwrap_or_default();
-                        identifier_value(namespace, path)
-                    }
-                    "withDefaultNamespace" => identifier_value(
-                        "minecraft",
-                        args.first().map(expect_string).unwrap_or_default(),
-                    ),
-                    "parse" | "tryParse" => {
-                        identifier_parse(args.first().map(expect_string).unwrap_or_default())
-                    }
-                    _ => Value::Ref(None),
-                };
-                Ok(value)
-            }
             ("net/minecraft/resources/ResourceKey", "create", descriptor)
                 if descriptor.ends_with("Lnet/minecraft/resources/ResourceKey;") =>
             {
@@ -5243,6 +5269,28 @@ impl Host for StdHost {
                 "getInstance",
                 "()Lnet/fabricmc/loader/api/FabricLoader;",
             ) => Ok(Value::Ref(Some("fabric-loader".into()))),
+            // The loader singletons the façade's instance members answer for
+            // (`getModEventBus`, `getModContainerById`). These arms used to sit
+            // in `get_static`, where a method descriptor never matches, so the
+            // call was an unmodelled `null` that only worked while calls on
+            // `null` were tolerated.
+            (
+                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext",
+                "get",
+                "()Lnet/neoforged/fml/javafmlmod/FMLJavaModLoadingContext;",
+            ) => Ok(Value::Ref(Some(
+                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
+            ))),
+            (
+                "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext",
+                "get",
+                "()Lnet/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext;",
+            ) => Ok(Value::Ref(Some(
+                "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
+            ))),
+            ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => {
+                Ok(Value::Ref(Some("neoforge-mod-list".into())))
+            }
             // A block's property builder normally comes from a static
             // factory rather than `new`. Give it a bounded marker so the
             // chain is observable; a copy variant keeps only the settings the
@@ -5319,6 +5367,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = java_identifier::invoke_instance(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.reference_member(r, Some(receiver), args) {
@@ -5458,7 +5509,14 @@ impl Host for StdHost {
                 ("<init>", _) => Ok(Value::Void),
                 ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some("main".into()))),
                 ("isDaemon", "()Z") => Ok(Value::Int(0)),
-                ("setDaemon", "(Z)V") | ("start", "()V") => Ok(Value::Void),
+                ("setDaemon", "(Z)V") => Ok(Value::Void),
+                // The bounded runtime has one thread and `<init>` keeps no
+                // `Runnable`, so a started thread's body never runs. That is
+                // not a success to report: the call is counted (and refused
+                // when strict). Running the body inline instead would run a
+                // worker loop (a file watcher, an update check, a metrics
+                // server) to the budget on the entrypoint's thread.
+                ("start", "()V") => self.unknown_host_call(r),
                 // Loader diagnostics and IDE detection scan the current
                 // thread's frames. The bounded runtime has no Java stack to
                 // hand out, so the truthful answer is an empty owned array.
@@ -5481,8 +5539,13 @@ impl Host for StdHost {
                 }
                 ("addShutdownHook", "(Ljava/lang/Thread;)V") => Ok(Value::Void),
                 ("removeShutdownHook", "(Ljava/lang/Thread;)Z") => Ok(Value::Int(1)),
-                ("availableProcessors", "()I") => Ok(Value::Int(1)),
-                ("freeMemory" | "totalMemory" | "maxMemory", "()J") => Ok(Value::Long(0)),
+                // The host's own processor count, which is what the JVM reports
+                // (both honour the process's CPU affinity and cgroup quota).
+                ("availableProcessors", "()I") => Ok(Value::Int(
+                    std::thread::available_parallelism().map_or(1, |n| n.get() as i32),
+                )),
+                // There is no Java heap to measure: counted, not invented.
+                ("freeMemory" | "totalMemory" | "maxMemory", "()J") => self.unknown_host_call(r),
                 ("gc", "()V") | ("runFinalization", "()V") => Ok(Value::Void),
                 _ => Err(NativeError::MissingMethod(format!(
                     "java/lang/Runtime#{}{}",
@@ -5914,7 +5977,7 @@ impl Host for StdHost {
                     return Ok(Value::Void);
                 }
                 ("resolveOptional", "()Ljava/util/Optional;") => {
-                    return Ok(contents.map_or(Value::Ref(None), optional_wrap));
+                    return Ok(contents.map_or_else(empty_optional, optional_wrap));
                 }
                 _ => {}
             }
@@ -5922,6 +5985,9 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            if let Some(answer) = self.unmodifiable_member(r, marker, args) {
+                return answer;
+            }
             if r.name == "removeIf"
                 && r.descriptor == "(Ljava/util/function/Predicate;)Z"
                 && !is_map_owner(&r.owner)
@@ -6741,9 +6807,9 @@ impl Host for StdHost {
             {
                 return Ok(Value::Ref(Some(format!("optional/{provider}"))));
             }
-            // No provider: `Optional.empty()`, which this host models as null.
+            // No provider: `Optional.empty()`.
             if r.name == "findFirst" && r.descriptor == "()Ljava/util/Optional;" {
-                return Ok(Value::Ref(None));
+                return Ok(empty_optional());
             }
             if r.name == "reload" && r.descriptor == "()V" {
                 return Ok(Value::Void);
@@ -7376,7 +7442,7 @@ impl Host for StdHost {
                     || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
             {
                 let current = builder_contents(receiver).unwrap_or("");
-                let added = builder_append_text(r, args)?;
+                let added = builder_append_text(self, r, args)?;
                 Ok(Value::Ref(Some(format!("string-builder/{current}{added}"))))
             }
             ("java/lang/StringBuilder", "toString", "()Ljava/lang/String;")
@@ -7700,31 +7766,28 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
             }
             ("java/util/Optional", "toString", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(match expect_ref(receiver) {
-                    Some(value) => format!(
-                        "Optional[{}]",
-                        value.strip_prefix("optional/").unwrap_or(value)
-                    ),
+                Ok(Value::Ref(Some(match optional_present(receiver) {
+                    Some(value) => {
+                        // The payload keeps a reference's own text (`optional_wrap`).
+                        let payload = Value::Ref(Some(value.to_owned()));
+                        format!("Optional[{}]", object_text(self, &payload))
+                    }
                     None => "Optional.empty".to_owned(),
                 })))
             }
-            ("java/util/Optional", "hashCode", "()I") => {
-                Ok(Value::Int(expect_ref(receiver).map_or(0, |value| {
-                    stable_hash(value.strip_prefix("optional/").unwrap_or(value))
-                })))
-            }
+            ("java/util/Optional", "hashCode", "()I") => Ok(Value::Int(
+                optional_present(receiver).map_or(0, stable_hash),
+            )),
             ("java/util/Optional", "equals", "(Ljava/lang/Object;)Z") => {
-                let left = expect_ref(receiver)
-                    .map(|value| value.strip_prefix("optional/").unwrap_or(value));
-                let right = expect_ref(Self::argument(r, args, 0)?)
-                    .map(|value| value.strip_prefix("optional/").unwrap_or(value));
+                let left = optional_present(receiver);
+                let right = optional_present(Self::argument(r, args, 0)?);
                 Ok(Value::Int((left == right) as i32))
             }
             ("java/util/Optional", "isPresent", "()Z") => {
-                Ok(Value::Int(expect_ref(receiver).is_some() as i32))
+                Ok(Value::Int(optional_present(receiver).is_some() as i32))
             }
             ("java/util/Optional", "isEmpty", "()Z") => {
-                Ok(Value::Int(expect_ref(receiver).is_none() as i32))
+                Ok(Value::Int(optional_present(receiver).is_none() as i32))
             }
             ("java/util/OptionalInt", "isPresent", "()Z") => {
                 Ok(Value::Int(optional_int_value(receiver).is_some() as i32))
@@ -7804,7 +7867,7 @@ impl Host for StdHost {
             )),
             ("java/util/OptionalDouble", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(match optional_double_value(receiver) {
-                    Some(value) => format!("OptionalDouble[{}]", value),
+                    Some(value) => format!("OptionalDouble[{}]", format_java_float(value)),
                     None => "OptionalDouble.empty".into(),
                 })))
             }
@@ -7822,10 +7885,9 @@ impl Host for StdHost {
                 "map",
                 "(Ljava/util/function/Function;)Ljava/util/Optional;",
             ) => {
-                let Some(value) = expect_ref(receiver) else {
-                    return Ok(Value::Ref(None));
+                let Some(value) = optional_present(receiver) else {
+                    return Ok(empty_optional());
                 };
-                let value = value.strip_prefix("optional/").unwrap_or(value);
                 let function = Self::argument(r, args, 0)?;
                 let applied = self.invoke_instance(
                     &MethodRef {
@@ -7838,7 +7900,7 @@ impl Host for StdHost {
                 )?;
                 Ok(match applied {
                     Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
-                    Value::Ref(None) => Value::Ref(None),
+                    Value::Ref(None) => empty_optional(),
                     value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
                 })
             }
@@ -7847,8 +7909,8 @@ impl Host for StdHost {
                 "filter",
                 "(Ljava/util/function/Predicate;)Ljava/util/Optional;",
             ) => {
-                let Some(_value) = expect_ref(receiver) else {
-                    return Ok(Value::Ref(None));
+                let Some(_value) = optional_present(receiver) else {
+                    return Ok(empty_optional());
                 };
                 let predicate = Self::argument(r, args, 0)?;
                 let accepted = matches!(
@@ -7858,12 +7920,11 @@ impl Host for StdHost {
                 Ok(if accepted {
                     receiver.clone()
                 } else {
-                    Value::Ref(None)
+                    empty_optional()
                 })
             }
             ("java/util/Optional", "ifPresent", "(Ljava/util/function/Consumer;)V") => {
-                if let Some(value) = expect_ref(receiver) {
-                    let value = value.strip_prefix("optional/").unwrap_or(value);
+                if let Some(value) = optional_present(receiver) {
                     let consumer = Self::argument(r, args, 0)?;
                     self.invoke_instance(
                         &MethodRef {
@@ -7877,17 +7938,17 @@ impl Host for StdHost {
                 }
                 Ok(Value::Void)
             }
-            ("java/util/Optional", "get", "()Ljava/lang/Object;") => match expect_ref(receiver) {
-                Some(value) => Ok(Value::Ref(Some(
-                    value.strip_prefix("optional/").unwrap_or(value).to_owned(),
-                ))),
-                // `Optional.get` on an empty optional is a throw, not a null:
-                // a `catch (NoSuchElementException)` in config bootstrap code
-                // must see it.
-                None => Err(empty_optional_exception()),
-            },
+            ("java/util/Optional", "get", "()Ljava/lang/Object;") => {
+                match optional_present(receiver) {
+                    Some(value) => Ok(Value::Ref(Some(value.to_owned()))),
+                    // `Optional.get` on an empty optional is a throw, not a null:
+                    // a `catch (NoSuchElementException)` in config bootstrap code
+                    // must see it.
+                    None => Err(empty_optional_exception()),
+                }
+            }
             ("java/util/Optional", "orElse", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
-                if expect_ref(receiver).is_some() {
+                if optional_present(receiver).is_some() {
                     self.invoke_instance(
                         &MethodRef {
                             owner: "java/util/Optional".into(),
@@ -7906,7 +7967,7 @@ impl Host for StdHost {
                 "orElseGet",
                 "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
             ) => {
-                if expect_ref(receiver).is_some() {
+                if optional_present(receiver).is_some() {
                     self.invoke_instance(
                         &MethodRef {
                             owner: "java/util/Optional".into(),
@@ -7930,7 +7991,7 @@ impl Host for StdHost {
                 }
             }
             ("java/util/Optional", "or", "(Ljava/util/function/Supplier;)Ljava/util/Optional;") => {
-                if expect_ref(receiver).is_some() {
+                if optional_present(receiver).is_some() {
                     Ok(receiver.clone())
                 } else {
                     let supplier = Self::argument(r, args, 0)?;
@@ -7944,16 +8005,18 @@ impl Host for StdHost {
                         &[],
                     )?;
                     Ok(match supplied {
-                        Value::Ref(Some(value)) if value.starts_with("optional/") => {
+                        Value::Ref(Some(value))
+                            if value == EMPTY_OPTIONAL || value.starts_with("optional/") =>
+                        {
                             Value::Ref(Some(value))
                         }
-                        Value::Ref(None) => Value::Ref(None),
+                        Value::Ref(None) => empty_optional(),
                         value => optional_wrap(value),
                     })
                 }
             }
             ("java/util/Optional", "orElseThrow", "()Ljava/lang/Object;") => {
-                if expect_ref(receiver).is_some() {
+                if optional_present(receiver).is_some() {
                     self.invoke_instance(
                         &MethodRef {
                             owner: "java/util/Optional".into(),
@@ -7972,7 +8035,7 @@ impl Host for StdHost {
                 "orElseThrow",
                 "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
             ) => {
-                if expect_ref(receiver).is_some() {
+                if optional_present(receiver).is_some() {
                     self.invoke_instance(
                         &MethodRef {
                             owner: "java/util/Optional".into(),
@@ -8028,89 +8091,6 @@ impl Host for StdHost {
                 expect_ref(receiver).is_some_and(|marker| predicate_marker_value(marker)) as i32,
             )),
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
-            (
-                "net/minecraft/resources/Identifier" | "net/minecraft/resources/ResourceLocation",
-                name,
-                descriptor,
-            ) => {
-                let (namespace, path) = identifier_parts(receiver);
-                match (name, descriptor) {
-                    ("getNamespace", "()Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(namespace.to_owned())))
-                    }
-                    ("getPath", "()Ljava/lang/String;") => Ok(Value::Ref(Some(path.to_owned()))),
-                    ("toString", "()Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(format!("{namespace}:{path}"))))
-                    }
-                    ("toShortString", "()Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(if namespace == "minecraft" {
-                            path.to_owned()
-                        } else {
-                            format!("{namespace}/{path}")
-                        })))
-                    }
-                    ("toLanguageKey", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
-                        "{namespace}.{}",
-                        path.replace('/', ".")
-                    )))),
-                    ("toLanguageKey", "(Ljava/lang/String;)Ljava/lang/String;") => {
-                        Ok(Value::Ref(Some(format!(
-                            "{}.{}.{}",
-                            expect_string(Self::argument(r, args, 0)?),
-                            namespace,
-                            path.replace('/', ".")
-                        ))))
-                    }
-                    ("withPrefix", descriptor)
-                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                            || descriptor
-                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-                    {
-                        Ok(identifier_value(
-                            namespace,
-                            &format!("{}{}", expect_string(Self::argument(r, args, 0)?), path),
-                        ))
-                    }
-                    ("withSuffix", descriptor)
-                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                            || descriptor
-                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-                    {
-                        Ok(identifier_value(
-                            namespace,
-                            &format!("{path}{}", expect_string(Self::argument(r, args, 0)?)),
-                        ))
-                    }
-                    ("withPath", descriptor)
-                        if descriptor.ends_with("Lnet/minecraft/resources/Identifier;")
-                            || descriptor
-                                .ends_with("Lnet/minecraft/resources/ResourceLocation;") =>
-                    {
-                        let apply = MethodRef {
-                            owner: "java/util/function/UnaryOperator".into(),
-                            name: "apply".into(),
-                            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
-                        };
-                        let transformed = self.invoke_instance(
-                            &apply,
-                            Self::argument(r, args, 0)?,
-                            &[Value::Ref(Some(path.to_owned()))],
-                        )?;
-                        Ok(identifier_value(namespace, expect_string(&transformed)))
-                    }
-                    ("hashCode", "()I") => {
-                        Ok(Value::Int(stable_hash(&format!("{namespace}:{path}"))))
-                    }
-                    ("equals", "(Ljava/lang/Object;)Z") => {
-                        let (other_namespace, other_path) =
-                            identifier_parts(Self::argument(r, args, 0)?);
-                        Ok(Value::Int(
-                            (namespace == other_namespace && path == other_path) as i32,
-                        ))
-                    }
-                    _ => Ok(Value::default_for(&r.descriptor)),
-                }
-            }
             // A `registry/<id>` marker is both a registry (`BuiltInRegistries.X`)
             // and its key (`Registries.X`), so `registry.key()` is the marker
             // itself and the key's identifier is the registry id. Libraries
@@ -8208,8 +8188,12 @@ impl Host for StdHost {
                 // The loader itself and the game are always loaded; a jar's
                 // platform probe asks for them before it asks for anything the
                 // metadata could name.
+                // Horizon's Fabric API façade stands in for the `fabric-api`
+                // jar wherever it answers a Fabric jar's calls.
+                let fabric_api =
+                    id == "fabric-api" && !self.fabric_entrypoint_containers.is_empty();
                 Ok(Value::Int(
-                    (self.mods.contains_key(id) || is_always_loaded_mod(id)) as i32,
+                    (self.mods.contains_key(id) || is_always_loaded_mod(id) || fabric_api) as i32,
                 ))
             }
             (
@@ -8279,7 +8263,7 @@ impl Host for StdHost {
                 // answers the path and a missing one answers an empty
                 // Optional, exactly as `ModContainer.findPath` does.
                 let name = expect_string(Self::argument(r, args, 0)?);
-                Ok(self.resource(name).map_or(Value::Ref(None), |_| {
+                Ok(self.resource(name).map_or_else(empty_optional, |_| {
                     Value::Ref(Some(format!("optional/{name}")))
                 }))
             }
@@ -8478,7 +8462,7 @@ impl Host for StdHost {
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getIconPath",
                 "(I)Ljava/util/Optional;",
-            ) => Ok(Value::Ref(None)),
+            ) => Ok(empty_optional()),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
@@ -8817,13 +8801,20 @@ impl Host for StdHost {
                 if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
                     return Ok(Value::Ref(Some(value_text(receiver))));
                 }
-                if let Some(value) = game_builder_value(r) {
-                    return Ok(value);
+                // A constructor the host does not model still leaves the
+                // object `new` made (its marker); what the object then does is
+                // a call of its own and is counted there. `super()` into
+                // `Object.<init>` and friends is the common case.
+                if r.name == "<init>" {
+                    return Ok(Value::Void);
                 }
-                // An unmodelled accessor that declares a collection or an array
-                // answers an empty modelled value: a null would fail on the
-                // caller's very next `iterator()`/`arraylength`.
-                Ok(self.neutral_unmodelled_result(&r.descriptor))
+                // Any other unmodelled instance call is an unknown host call,
+                // counted like a static one (it used to answer the neutral
+                // value uncounted, so a jar leaning on it read `ran-clean`).
+                // The answer is the same neutral value: an empty collection or
+                // array where one is declared, a game builder's marker, else
+                // `null`/`0`/`false`.
+                self.unknown_host_call(r)
             }
         }
     }
@@ -9068,7 +9059,11 @@ fn builder_contents(value: &Value) -> Option<&str> {
     }
 }
 
-fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeError> {
+fn builder_append_text<H: Host>(
+    host: &mut H,
+    r: &MethodRef,
+    args: &[Value],
+) -> Result<String, NativeError> {
     let value = StdHost::argument(r, args, 0)?;
     let text = match r.descriptor.as_str() {
         "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
@@ -9079,10 +9074,11 @@ fn builder_append_text(r: &MethodRef, args: &[Value]) -> Result<String, NativeEr
         },
         "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
         | "(Ljava/lang/Object;)Ljava/lang/StringBuffer;" => match value {
-            // `append(Object)` is `String.valueOf`: a box prints its value.
-            Value::Ref(Some(value)) => {
-                jdk_model::boxed_text(value, "Ljava/lang/Object;").unwrap_or_else(|| value.clone())
-            }
+            // `append(Object)` is `String.valueOf`: an object a model owns
+            // prints its `toString`, and a box prints its value.
+            Value::Ref(Some(value)) => crate::java_tostring::modelled_marker(host, value)
+                .or_else(|| jdk_model::boxed_text(value, "Ljava/lang/Object;"))
+                .unwrap_or_else(|| value.clone()),
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
             Value::Long(value) => value.to_string(),
@@ -9549,6 +9545,39 @@ fn duration_text(nanos: i128) -> String {
 
 fn saturating_long(value: i128) -> Value {
     Value::Long(value.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+}
+
+/// A version-4 UUID's text, from 122 random bits.
+///
+/// The bits come from `std`'s `RandomState`, whose keys are seeded from the
+/// operating system's RNG, hashed with the time and a process-wide counter,
+/// so every call answers a distinct UUID, as `UUID.randomUUID` does.
+fn random_uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos());
+    let half = |salt: u64| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(salt);
+        hasher.write_u64(count);
+        hasher.write_u128(now);
+        hasher.finish()
+    };
+    let bits = (u128::from(half(1)) << 64) | u128::from(half(2));
+    // Version 4 in bits 76..80, the IETF variant (`10`) in bits 62..64.
+    let bits = (bits & !(0xF << 76) & !(0b11 << 62)) | (0x4 << 76) | (0b10 << 62);
+    let hex = format!("{bits:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 fn uuid_value(text: &str) -> Result<Value, NativeError> {
@@ -10071,11 +10100,58 @@ fn is_lazy_optional_owner(owner: &str) -> bool {
     )
 }
 
+/// The marker of an empty `java.util.Optional`.
+///
+/// `Optional.empty()` is an object in Java: `isPresent()`, `orElse` and
+/// `ifPresent` are ordinary calls on it, and only a real `null` receiver
+/// throws `NullPointerException`. Modelling the empty optional as `null`
+/// would make every one of those calls an NPE, so it carries its own
+/// non-null marker. `optional_wrap` turns any present value (a string
+/// `"optional"` included) into `optional/<value>`, so the bare marker never
+/// collides with a present optional; a nested `Optional.of(Optional.empty())`
+/// is `optional/optional` and unwraps to this marker.
+pub(crate) const EMPTY_OPTIONAL: &str = "optional";
+/// The empty `OptionalInt`; present ones are `optional-int/<value>`.
+pub(crate) const EMPTY_OPTIONAL_INT: &str = "optional-int";
+/// The empty `OptionalLong`; present ones are `optional-long/<value>`.
+pub(crate) const EMPTY_OPTIONAL_LONG: &str = "optional-long";
+/// The empty `OptionalDouble`; present ones are `optional-double/<value>`.
+pub(crate) const EMPTY_OPTIONAL_DOUBLE: &str = "optional-double";
+
+pub(crate) fn empty_optional() -> Value {
+    Value::Ref(Some(EMPTY_OPTIONAL.into()))
+}
+
+/// The empty marker for a method whose declared result is one of the JDK's
+/// optional types, so a host answer of `null` for it becomes the empty
+/// optional Java would have returned (no JDK or library API returns a
+/// `null` Optional).
+fn empty_optional_for(descriptor: &str) -> Option<&'static str> {
+    match return_desc(descriptor) {
+        "Ljava/util/Optional;" => Some(EMPTY_OPTIONAL),
+        "Ljava/util/OptionalInt;" => Some(EMPTY_OPTIONAL_INT),
+        "Ljava/util/OptionalLong;" => Some(EMPTY_OPTIONAL_LONG),
+        "Ljava/util/OptionalDouble;" => Some(EMPTY_OPTIONAL_DOUBLE),
+        _ => None,
+    }
+}
+
+/// The value a `java.util.Optional` marker holds, or `None` for an empty one.
+///
+/// A `null` is read as empty too: a host answer that predates the empty
+/// marker must not turn into a present optional.
+pub(crate) fn optional_present(value: &Value) -> Option<&str> {
+    match expect_ref(value)? {
+        marker if marker == EMPTY_OPTIONAL => None,
+        marker => Some(marker.strip_prefix("optional/").unwrap_or(marker)),
+    }
+}
+
 fn optional_wrap(value: Value) -> Value {
     match value {
         Value::Ref(Some(value)) if value.starts_with("optional/") => Value::Ref(Some(value)),
         Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
-        Value::Ref(None) | Value::Void => Value::Ref(None),
+        Value::Ref(None) | Value::Void => empty_optional(),
         value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
     }
 }
@@ -11096,28 +11172,54 @@ fn parse_collection_value(value: &str) -> Result<Value, NativeError> {
     parse_value_marker(value)
 }
 
-fn collection_text(host: &StdHost, value: &Value) -> Result<String, NativeError> {
+fn collection_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError> {
     let values = host_collection_values(host, value)?;
-    let marker = expect_string(value);
-    let kind = marker.split('/').next().unwrap_or(marker);
+    let marker = expect_string(value).to_owned();
+    let kind = marker.split('/').next().unwrap_or(&marker);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    let values = values
-        .iter()
-        .map(|value| match parse_collection_value(value) {
-            Ok(Value::Ref(Some(value))) => value,
-            Ok(Value::Ref(None)) => "null".into(),
-            Ok(Value::Int(value)) => value.to_string(),
-            Ok(Value::Long(value)) => value.to_string(),
-            Ok(Value::Float(value)) => format_java_float(value),
-            Ok(Value::Void) => "void".into(),
-            Err(_) => value.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(match kind {
-        "map" => format!("{{{values}}}"),
-        _ => format!("[{values}]"),
+    let class = marker.split_once('#').map(|(class, _)| class);
+    let is_map = kind == "map"
+        || class.is_some_and(|class| {
+            is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
+        });
+    // `AbstractCollection.toString`/`AbstractMap.toString`: each element is
+    // `String.valueOf(element)`, and the collection itself inside it prints
+    // `(this Collection)`/`(this Map)`.
+    let mut texts = Vec::with_capacity(values.len());
+    for element in &values {
+        texts.push(match parse_collection_value(element) {
+            Ok(Value::Ref(Some(inner))) if inner == marker => if is_map {
+                "(this Map)"
+            } else {
+                "(this Collection)"
+            }
+            .to_owned(),
+            Ok(element) => object_text(host, &element),
+            Err(_) => element.clone(),
+        });
+    }
+    Ok(if is_map {
+        let pairs = texts
+            .chunks(2)
+            .map(|pair| pair.join("="))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{{pairs}}}")
+    } else {
+        format!("[{}]", texts.join(", "))
     })
+}
+
+/// `String.valueOf(Object)` of one value a model holds (a collection's
+/// element, an optional's payload): a box prints its value and a model
+/// object its `toString`.
+fn object_text(host: &mut StdHost, value: &Value) -> String {
+    match value {
+        Value::Ref(Some(marker)) => jdk_model::boxed_text(marker, "Ljava/lang/Object;")
+            .or_else(|| host.modelled_to_string(value))
+            .unwrap_or_else(|| marker.clone()),
+        other => value_text(other),
+    }
 }
 
 fn instance_field_key(receiver: &Value, field: &MethodRef) -> Option<String> {
@@ -19654,8 +19756,7 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let present =
-            expect_ref(receiver).map(|value| value.strip_prefix("optional/").unwrap_or(value));
+        let present = optional_present(receiver);
         let callback = match r.name.as_str() {
             "map" if r.descriptor == "(Ljava/util/function/Function;)Ljava/util/Optional;" => {
                 args.first()
@@ -19696,7 +19797,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         let Some(value) = present else {
             return match r.name.as_str() {
-                "map" => Ok(Some(Value::Ref(None))),
+                "map" => Ok(Some(empty_optional())),
                 "ifPresent" => Ok(Some(Value::Void)),
                 "orElseGet" => self
                     .invoke_callback(callback, &[])
@@ -19715,7 +19816,7 @@ impl<H: Host> Runtime<'_, H> {
             };
             return Ok(Some(match result {
                 Value::Int(flag) if flag != 0 => receiver.clone(),
-                _ => Value::Ref(None),
+                _ => empty_optional(),
             }));
         }
         let Some(result) = self.invoke_callback(callback, &[Value::Ref(Some(value.to_owned()))])?
@@ -19728,7 +19829,7 @@ impl<H: Host> Runtime<'_, H> {
                     Value::Ref(Some(value))
                 }
                 Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
-                Value::Ref(None) | Value::Void => Value::Ref(None),
+                Value::Ref(None) | Value::Void => empty_optional(),
                 value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
             })),
             "ifPresent" => Ok(Some(Value::Void)),
@@ -20153,6 +20254,9 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_enum_value_of(r, args)? {
+            return Ok(Some(value));
+        }
         // An annotation the lookup handed out answers its own members, so
         // `found.value()` reads the class file's value instead of dispatching
         // into an interface that has no code.
@@ -20993,7 +21097,7 @@ impl<H: Host> Runtime<'_, H> {
                 if descriptor.ends_with(")Ljava/lang/StringBuilder;")
                     || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
             {
-                let added = builder_append_text(r, args)?;
+                let added = builder_append_text(self.host, r, args)?;
                 self.string_builders
                     .entry(marker.to_owned())
                     .or_default()
@@ -22739,8 +22843,7 @@ impl<H: Host> Runtime<'_, H> {
             let Some(receiver) = receiver else {
                 return Ok(None);
             };
-            let values = expect_ref(receiver)
-                .map(|value| value.strip_prefix("optional/").unwrap_or(value))
+            let values = optional_present(receiver)
                 .map(|value| Value::Ref(Some(value.to_owned())))
                 .into_iter()
                 .collect();
@@ -23214,7 +23317,22 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 return self.host.invoke_instance(&r, receiver, args);
             }
-            return Ok(Value::default_for(return_desc(desc)));
+            // Nothing in the jar implements the call: a `native` method (the
+            // JVM's `UnsatisfiedLinkError` without its library) or an abstract
+            // member reached on an object the jar does not own (a host
+            // marker), whose real implementation lives outside the jar. The
+            // host answers it like any call across the boundary, so an
+            // unmodelled one is counted (and refused when strict) instead of
+            // a silent `0`/`null`.
+            let r = MethodRef {
+                owner: class.to_owned(),
+                name: method.to_owned(),
+                descriptor: desc.to_owned(),
+            };
+            return match receiver.as_ref() {
+                Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                None => self.host.invoke(&r, args),
+            };
         };
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
         let mut local = 0;
@@ -24036,13 +24154,15 @@ impl<H: Host> Runtime<'_, H> {
                     stack.push(Value::Ref(Some(marker)));
                 }
                 0xc0 => {
-                    // The bounded runtime does not model a JVM type lattice;
-                    // consume the class operand and preserve the reference.
-                    let _ = read_u16(code, &mut pc)?;
-                    let _ = stack
+                    // The reference stays on the stack; a cast to a class the
+                    // runtime holds is checked (`checkcast.rs`).
+                    let index = read_u16(code, &mut pc)?;
+                    let target = class_name(&file.pool, index)?.to_owned();
+                    let value = stack
                         .last()
                         .cloned()
                         .ok_or_else(|| underflow(class, method, at))?;
+                    invoke_or_catch!(at, self.checkcast(&value, &target));
                 }
                 0xc1 => {
                     let index = read_u16(code, &mut pc)?;
@@ -24069,8 +24189,10 @@ impl<H: Host> Runtime<'_, H> {
                 0xc2 | 0xc3 => {
                     // The bounded runtime is single-threaded; monitorenter
                     // and monitorexit consume their receiver without adding
-                    // JVM monitor state.
-                    let _ = pop(&mut stack, class, method, at)?;
+                    // JVM monitor state. Both still need an object.
+                    if pop(&mut stack, class, method, at)? == Value::Ref(None) {
+                        invoke_or_catch!(at, Err(null_checks::enter_monitor_on_null()))
+                    }
                 }
                 0xb2 => {
                     let i = read_u16(code, &mut pc)?;
@@ -24153,6 +24275,9 @@ impl<H: Host> Runtime<'_, H> {
                     let outcome =
                         self.dispatch_field_anchor(&r, false, None, class, method, desc, at)?;
                     let value = match outcome {
+                        AnchorOutcome::Normal if receiver == Value::Ref(None) => {
+                            invoke_or_catch!(at, Err(null_checks::read_field_on_null(&r)))
+                        }
                         AnchorOutcome::Normal => {
                             match instance_field_key(&receiver, &r)
                                 .and_then(|key| self.fields.get(&key).cloned())
@@ -24188,6 +24313,9 @@ impl<H: Host> Runtime<'_, H> {
                         desc,
                         at,
                     )?;
+                    if outcome == AnchorOutcome::Normal && receiver == Value::Ref(None) {
+                        invoke_or_catch!(at, Err(null_checks::assign_field_on_null(&r)))
+                    }
                     if outcome == AnchorOutcome::Normal
                         && let Some(key) = instance_field_key(&receiver, &r)
                     {
@@ -24250,10 +24378,19 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    // Whether the answer is a jar method body's own `areturn`
+                    // (which may legitimately be `null`) rather than a host or
+                    // model answer.
+                    let mut jar_body = false;
                     let value = if let Some(value) = anchor_replacement {
                         value
                     } else if let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)? {
                         value
+                    } else if receiver == Some(Value::Ref(None)) {
+                        // JVMS §6.5: an instance call on `null` throws before
+                        // anything is dispatched. An `@Redirect` or a cancelling
+                        // hook above replaced the call, so it never ran.
+                        invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
                     } else if r.owner == "java/lang/String"
                         && r.name == "format"
                         && (r.descriptor
@@ -24370,6 +24507,7 @@ impl<H: Host> Runtime<'_, H> {
                         {
                             value
                         } else if jar_owned {
+                            jar_body = true;
                             invoke_or_catch!(
                                 at,
                                 self.invoke(
@@ -24435,8 +24573,19 @@ impl<H: Host> Runtime<'_, H> {
                                 // called on a lambda of this jar: its one
                                 // abstract method is the lambda's body.
                                 if self.foreign_functional_call(&resolved, receiver, &args) {
-                                    invoke_or_catch!(at, self.invoke_callback(receiver, &args))
-                                        .unwrap_or_else(|| Value::default_for(&resolved.descriptor))
+                                    // A lambda the runtime cannot run is the
+                                    // host's call to answer (and count), not a
+                                    // silent default.
+                                    match invoke_or_catch!(
+                                        at,
+                                        self.invoke_callback(receiver, &args)
+                                    ) {
+                                        Some(value) => value,
+                                        None => invoke_or_catch!(
+                                            at,
+                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                        ),
+                                    }
                                 } else {
                                     invoke_or_catch!(
                                         at,
@@ -24452,6 +24601,14 @@ impl<H: Host> Runtime<'_, H> {
                             "native dispatch for {}#{}{} exceeded {MAX_SUPERCLASS_WALK} superclasses",
                             r.owner, r.name, r.descriptor
                         )));
+                    };
+                    // No JDK or library API answers a `null` Optional: a host
+                    // answer of null for one is its empty value.
+                    let value = match empty_optional_for(&r.descriptor) {
+                        Some(empty) if !jar_body && value == Value::Ref(None) => {
+                            Value::Ref(Some(empty.into()))
+                        }
+                        _ => value,
                     };
                     if value != Value::Void {
                         stack.push(value);
@@ -24508,6 +24665,16 @@ impl<H: Host> Runtime<'_, H> {
                         let mut captured = captured;
                         for value in &mut captured {
                             if let Some(text) = self.library_to_string(value, class, method)? {
+                                *value = Value::Ref(Some(text));
+                            }
+                        }
+                        // Every other model object prints its own `toString`
+                        // too (`"" + id` is `a:x`, not the id's marker). A
+                        // `String` operand is already its text.
+                        for (value, argument) in captured.iter_mut().zip(&arguments) {
+                            if argument != "Ljava/lang/String;"
+                                && let Some(text) = self.host.modelled_to_string(value)
+                            {
                                 *value = Value::Ref(Some(text));
                             }
                         }
@@ -24601,6 +24768,9 @@ impl<H: Host> Runtime<'_, H> {
                     // its message and cause in the host and returns normally;
                     // only an uncaught throw fails.
                     let thrown = pop(&mut stack, class, method, at)?;
+                    if thrown == Value::Ref(None) {
+                        invoke_or_catch!(at, Err(null_checks::throw_null()))
+                    }
                     let thrown_class = thrown_class(&thrown);
                     if let Some(handler) =
                         self.exception_handler(file, method, desc, at, &thrown_class)?
@@ -30761,7 +30931,7 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&first, &loader, &[]).unwrap(),
-            Value::Ref(None)
+            empty_optional()
         );
     }
 
@@ -32156,7 +32326,7 @@ mandatory = true
     }
 
     #[test]
-    fn standard_host_maps_uuid_identity_without_randomness() {
+    fn standard_host_maps_uuid_identity_and_random_v4() {
         let mut host = StdHost::new();
         let from_string = MethodRef {
             owner: "java/util/UUID".into(),
@@ -32220,8 +32390,28 @@ mandatory = true
                 &[],
             )
             .unwrap(),
-            Value::Ref(Some("00000000-0000-4000-8000-000000000000".into()))
+            {
+                // A distinct version-4 UUID per call, as `UUID.randomUUID`.
+                let text = expect_string(&random)
+                    .strip_prefix("uuid/")
+                    .unwrap()
+                    .to_owned();
+                assert_eq!((text.len(), &text[14..15]), (36, "4"));
+                assert!("89ab".contains(&text[19..20]));
+                Value::Ref(Some(text))
+            }
         );
+        let again = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/util/UUID".into(),
+                    name: "randomUUID".into(),
+                    descriptor: "()Ljava/util/UUID;".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        assert_ne!(random, again);
         assert!(
             host.invoke(&from_string, &[Value::Ref(Some("not-a-uuid".into()))],)
                 .is_err()
@@ -32588,7 +32778,7 @@ mandatory = true
             name: "empty".into(),
             descriptor: "()Ljava/util/Optional;".into(),
         };
-        assert_eq!(host.invoke(&empty, &[]).unwrap(), Value::Ref(None));
+        assert_eq!(host.invoke(&empty, &[]).unwrap(), empty_optional());
         let of = MethodRef {
             owner: "java/util/Optional".into(),
             name: "of".into(),
@@ -32607,7 +32797,7 @@ mandatory = true
         };
         assert_eq!(
             host.invoke(&of_nullable, &[Value::Ref(None)]).unwrap(),
-            Value::Ref(None)
+            empty_optional()
         );
         let optional_to_string = MethodRef {
             owner: "java/util/Optional".into(),
@@ -32650,10 +32840,12 @@ mandatory = true
             )
             .unwrap();
         assert_eq!(mapped, Value::Ref(Some("optional/demo".into())));
+        // Mapping an empty optional answers the empty optional, whether the
+        // receiver is the empty marker or a host `null` read as empty.
         assert_eq!(
             host.invoke_instance(&map, &Value::Ref(None), &[Value::Ref(None)])
                 .unwrap(),
-            Value::Ref(None)
+            empty_optional()
         );
         let to_string = MethodRef {
             owner: "java/util/Optional".into(),
@@ -32691,7 +32883,7 @@ mandatory = true
                 &[Value::Ref(None)],
             )
             .unwrap(),
-            Value::Ref(None)
+            empty_optional()
         );
         let or = MethodRef {
             owner: "java/util/Optional".into(),
@@ -32714,7 +32906,7 @@ mandatory = true
                 &[Value::Ref(Some("@indy:empty-supplier".into()))],
             )
             .unwrap(),
-            Value::Ref(None)
+            empty_optional()
         );
         let if_present = MethodRef {
             owner: "java/util/Optional".into(),
@@ -32798,7 +32990,7 @@ mandatory = true
         };
         let empty_value = host.invoke(&empty, &[]).unwrap();
         let value = host.invoke(&of, &[Value::Int(42)]).unwrap();
-        assert_eq!(empty_value, Value::Ref(None));
+        assert_eq!(empty_value, Value::Ref(Some(EMPTY_OPTIONAL_INT.into())));
         assert_eq!(value, Value::Ref(Some("optional-int/42".into())));
 
         let present = MethodRef {
@@ -32862,7 +33054,7 @@ mandatory = true
                 &[Value::Ref(Some("long:9007199254740991".into()))],
             )
             .unwrap();
-        assert_eq!(empty_long, Value::Ref(None));
+        assert_eq!(empty_long, Value::Ref(Some(EMPTY_OPTIONAL_LONG.into())));
         assert_eq!(
             long,
             Value::Ref(Some("optional-long/9007199254740991".into()))
@@ -32903,7 +33095,7 @@ mandatory = true
         };
         let empty_double = host.invoke(&double_empty, &[]).unwrap();
         let double = host.invoke(&double_of, &[Value::Float(3.5)]).unwrap();
-        assert_eq!(empty_double, Value::Ref(None));
+        assert_eq!(empty_double, Value::Ref(Some(EMPTY_OPTIONAL_DOUBLE.into())));
         assert_eq!(double, Value::Ref(Some("optional-double/3.5".into())));
         let double_get = MethodRef {
             owner: "java/util/OptionalDouble".into(),
@@ -33245,17 +33437,39 @@ mandatory = true
             name: "removeIf".into(),
             descriptor: "(Ljava/util/function/Predicate;)Z".into(),
         };
-        assert_eq!(
+        // `List.of` is unmodifiable: the JVM throws before testing anything.
+        assert!(matches!(
             host.invoke_instance(
                 &remove_if,
                 &list,
+                &[Value::Ref(Some("@indy:list-predicate".into()))],
+            ),
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/UnsupportedOperationException"
+        ));
+        // `new ArrayList<>(list).removeIf(...)` removes and reports it.
+        let list_copy = Value::Ref(Some("java/util/ArrayList#copy".into()));
+        host.invoke_instance(
+            &MethodRef {
+                owner: "java/util/ArrayList".into(),
+                name: "<init>".into(),
+                descriptor: "(Ljava/util/Collection;)V".into(),
+            },
+            &list_copy,
+            std::slice::from_ref(&list),
+        )
+        .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &remove_if,
+                &list_copy,
                 &[Value::Ref(Some("@indy:list-predicate".into()))],
             )
             .unwrap(),
             Value::Int(1)
         );
         assert_eq!(
-            host.invoke_instance(&size, &list, &[]).unwrap(),
+            host.invoke_instance(&size, &list_copy, &[]).unwrap(),
             Value::Int(0)
         );
     }
@@ -34557,7 +34771,7 @@ mandatory = true
                 &[Value::Int(64)],
             )
             .unwrap();
-        assert_eq!(icon, Value::Ref(None));
+        assert_eq!(icon, empty_optional());
         let dependencies = MethodRef {
             owner: "net/fabricmc/loader/api/metadata/ModMetadata".into(),
             name: "getDependencies".into(),
@@ -34686,7 +34900,9 @@ mandatory = true
             name: "get".into(),
             descriptor: "()Lnet/neoforged/fml/ModList;".into(),
         };
-        let list = host.get_static(&get).unwrap();
+        // `ModList.get()` is an `invokestatic`, which reaches the host's
+        // `invoke`, not `get_static`.
+        let list = host.invoke(&get, &[]).unwrap();
         assert_eq!(list, Value::Ref(Some("neoforge-mod-list".into())));
         let loaded = MethodRef {
             owner: "net/neoforged/fml/ModList".into(),
@@ -34751,11 +34967,14 @@ mandatory = true
     fn standard_host_maps_legacy_forge_loader_aliases() {
         let mut host = StdHost::new().with_mod("legacy", "2.0");
         let list = host
-            .get_static(&MethodRef {
-                owner: "net/minecraftforge/fml/ModList".into(),
-                name: "get".into(),
-                descriptor: "()Lnet/minecraftforge/fml/ModList;".into(),
-            })
+            .invoke(
+                &MethodRef {
+                    owner: "net/minecraftforge/fml/ModList".into(),
+                    name: "get".into(),
+                    descriptor: "()Lnet/minecraftforge/fml/ModList;".into(),
+                },
+                &[],
+            )
             .unwrap();
         assert_eq!(list, Value::Ref(Some("neoforge-mod-list".into())));
         let container = host
@@ -34855,7 +35074,9 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&short, &id, &[]).unwrap(),
-            Value::Ref(Some("ruby/lamp".into()))
+            // Vanilla's `toShortString` strips the namespace only for
+            // `minecraft`; every other id is its full `namespace:path`.
+            Value::Ref(Some("ruby:lamp".into()))
         );
         let prefixed = MethodRef {
             owner: "net/minecraft/resources/Identifier".into(),
@@ -34890,7 +35111,11 @@ mandatory = true
                 &[Value::Ref(Some("@indy:path-transform".into()))],
             )
             .unwrap();
-        assert_eq!(transformed, Value::Ref(Some("identifier/ruby:lamp".into())));
+        // The operator is a jar lambda the host boundary cannot run; the call
+        // is counted rather than answered with the old id (the earlier
+        // identity answer was a guess).
+        assert_eq!(transformed, Value::Ref(None));
+        assert!(host.unknown_host_call_count() > 0);
         let key_create = MethodRef {
             owner: "net/minecraft/resources/ResourceKey".into(),
             name: "create".into(),
@@ -37698,26 +37923,37 @@ mandatory = true
     fn athrow_without_a_throwable_marker_reports_a_total_diagnostic() {
         let jar = NativeJar::from_classes([athrow_probe_class()]);
         let mut host = NullHost;
-        for method in ["nullThrow", "otherThrow"] {
-            let error = jar
-                .invoke_method("demo/Throws", method, "()V", None, &mut host)
-                .expect_err("athrow must not return a neutral value");
-            match &error {
-                NativeError::UncaughtException { class, message, .. } => {
-                    assert_eq!(class, "java/lang/Throwable", "{method}");
-                    assert_eq!(*message, None, "{method}");
-                }
-                other => panic!("{method} reported {other:?}"),
+        // `throw null` is the JVM's `NullPointerException` (JVMS §6.5
+        // `athrow`; OpenJDK's message "Cannot throw exception"), not a
+        // nameless `Throwable`.
+        let error = jar
+            .invoke_method("demo/Throws", "nullThrow", "()V", None, &mut host)
+            .expect_err("athrow of null must throw");
+        match &error {
+            NativeError::UncaughtException { class, message, .. } => {
+                assert_eq!(class, "java/lang/NullPointerException");
+                assert_eq!(message.as_deref(), Some("Cannot throw exception"));
             }
-            // The frame that threw is part of the diagnostic, so the assertion
-            // checks the stable prefix rather than the whole line.
-            assert!(
-                error
-                    .to_string()
-                    .starts_with("uncaught exception java/lang/Throwable"),
-                "{method}: {error}"
-            );
+            other => panic!("nullThrow reported {other:?}"),
         }
+        let error = jar
+            .invoke_method("demo/Throws", "otherThrow", "()V", None, &mut host)
+            .expect_err("athrow must not return a neutral value");
+        match &error {
+            NativeError::UncaughtException { class, message, .. } => {
+                assert_eq!(class, "java/lang/Throwable");
+                assert_eq!(*message, None);
+            }
+            other => panic!("otherThrow reported {other:?}"),
+        }
+        // The frame that threw is part of the diagnostic, so the assertion
+        // checks the stable prefix rather than the whole line.
+        assert!(
+            error
+                .to_string()
+                .starts_with("uncaught exception java/lang/Throwable"),
+            "otherThrow: {error}"
+        );
     }
 
     /// One class whose `static int m()` calls `Objects.requireNonNull(null)`
@@ -38287,14 +38523,13 @@ mandatory = true
                 &mut unlinked,
             )
             .expect_err("the map cannot be sized without the enum's values");
-        // The unmodelled `values()` answers an empty array, so the synthetic
-        // `$SwitchMap` store is out of bounds; the holder's `try` only catches
-        // `NoSuchFieldError`, so the throw leaves the invocation as the JDK
-        // exception it is.
+        // Without the library the enum constant is an unmodelled read that
+        // answers `null`, and the synthetic `$SwitchMap` initialiser's
+        // `ordinal()` on it throws `NullPointerException`; the holder's `try`
+        // only catches `NoSuchFieldError`, so the throw leaves the invocation
+        // as the JDK exception it is.
         assert!(
-            unlinked_error
-                .to_string()
-                .contains("ArrayIndexOutOfBoundsException"),
+            unlinked_error.to_string().contains("NullPointerException"),
             "{unlinked_error}"
         );
 
