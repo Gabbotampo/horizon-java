@@ -16,6 +16,7 @@ use std::{
 mod annotation_values;
 mod block_item_id;
 pub mod brigadier;
+mod checkcast;
 mod class_init;
 pub mod client_surface;
 mod collection_base;
@@ -27,6 +28,7 @@ mod declarations_content;
 pub mod dependencies;
 mod dfu_pair;
 mod entrypoint_role;
+mod enum_value_of;
 pub mod events;
 mod fabric_registry;
 mod facade_saved_data;
@@ -63,6 +65,7 @@ mod stack_walk;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
+pub mod verdict;
 pub mod weaver;
 
 pub use facade_server::{GameRuleValue, ServerFacts};
@@ -2599,10 +2602,12 @@ impl StdHost {
     }
 
     pub(crate) fn unknown_host_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        // Every call is counted. The table is bounded by the distinct method
+        // references in the jars' constant pools, so it needs no cap; a cap
+        // (it was 64 keys) silently dropped every later new method from
+        // `unknown_host_call_count()` and the per-phase deltas taken from it.
         let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
-        if self.unknown_host_calls.len() < 64 || self.unknown_host_calls.contains_key(&key) {
-            *self.unknown_host_calls.entry(key).or_default() += 1;
-        }
+        *self.unknown_host_calls.entry(key).or_default() += 1;
         if self.strict_unknown_host_calls {
             Err(NativeError::UnknownHostCall(r.clone()))
         } else if let Some(value) = game_builder_value(r) {
@@ -4532,12 +4537,19 @@ impl Host for StdHost {
                 "valueOf",
                 "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
             ) => {
+                // The interpreter answers a jar enum and checks a game enum
+                // with a constant table (`enum_value_of.rs`); what reaches the
+                // host is a class whose constants nobody here knows, so the
+                // name cannot be checked: the marker is answered, and counted.
                 let class = class_binary_name(Self::argument(r, args, 0)?).replace('.', "/");
                 let name = expect_string(Self::argument(r, args, 1)?);
                 if name.is_empty() {
                     return Err(NativeError::Metadata(
                         "java/lang/Enum.valueOf received an empty name".into(),
                     ));
+                }
+                if game_enum_constants(&class).is_none() {
+                    self.unknown_host_call(r)?;
                 }
                 Ok(Value::Ref(Some(format!("enum/{class}/{name}"))))
             }
@@ -5467,7 +5479,14 @@ impl Host for StdHost {
                 ("<init>", _) => Ok(Value::Void),
                 ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some("main".into()))),
                 ("isDaemon", "()Z") => Ok(Value::Int(0)),
-                ("setDaemon", "(Z)V") | ("start", "()V") => Ok(Value::Void),
+                ("setDaemon", "(Z)V") => Ok(Value::Void),
+                // The bounded runtime has one thread and `<init>` keeps no
+                // `Runnable`, so a started thread's body never runs. That is
+                // not a success to report: the call is counted (and refused
+                // when strict). Running the body inline instead would run a
+                // worker loop (a file watcher, an update check, a metrics
+                // server) to the budget on the entrypoint's thread.
+                ("start", "()V") => self.unknown_host_call(r),
                 // Loader diagnostics and IDE detection scan the current
                 // thread's frames. The bounded runtime has no Java stack to
                 // hand out, so the truthful answer is an empty owned array.
@@ -8740,13 +8759,20 @@ impl Host for StdHost {
                 if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
                     return Ok(Value::Ref(Some(value_text(receiver))));
                 }
-                if let Some(value) = game_builder_value(r) {
-                    return Ok(value);
+                // A constructor the host does not model still leaves the
+                // object `new` made (its marker); what the object then does is
+                // a call of its own and is counted there. `super()` into
+                // `Object.<init>` and friends is the common case.
+                if r.name == "<init>" {
+                    return Ok(Value::Void);
                 }
-                // An unmodelled accessor that declares a collection or an array
-                // answers an empty modelled value: a null would fail on the
-                // caller's very next `iterator()`/`arraylength`.
-                Ok(self.neutral_unmodelled_result(&r.descriptor))
+                // Any other unmodelled instance call is an unknown host call,
+                // counted like a static one (it used to answer the neutral
+                // value uncounted, so a jar leaning on it read `ran-clean`).
+                // The answer is the same neutral value: an empty collection or
+                // array where one is declared, a game builder's marker, else
+                // `null`/`0`/`false`.
+                self.unknown_host_call(r)
             }
         }
     }
@@ -20150,6 +20176,9 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_enum_value_of(r, args)? {
+            return Ok(Some(value));
+        }
         // An annotation the lookup handed out answers its own members, so
         // `found.value()` reads the class file's value instead of dispatching
         // into an interface that has no code.
@@ -23210,7 +23239,22 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 return self.host.invoke_instance(&r, receiver, args);
             }
-            return Ok(Value::default_for(return_desc(desc)));
+            // Nothing in the jar implements the call: a `native` method (the
+            // JVM's `UnsatisfiedLinkError` without its library) or an abstract
+            // member reached on an object the jar does not own (a host
+            // marker), whose real implementation lives outside the jar. The
+            // host answers it like any call across the boundary, so an
+            // unmodelled one is counted (and refused when strict) instead of
+            // a silent `0`/`null`.
+            let r = MethodRef {
+                owner: class.to_owned(),
+                name: method.to_owned(),
+                descriptor: desc.to_owned(),
+            };
+            return match receiver.as_ref() {
+                Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                None => self.host.invoke(&r, args),
+            };
         };
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
         let mut local = 0;
@@ -24032,13 +24076,15 @@ impl<H: Host> Runtime<'_, H> {
                     stack.push(Value::Ref(Some(marker)));
                 }
                 0xc0 => {
-                    // The bounded runtime does not model a JVM type lattice;
-                    // consume the class operand and preserve the reference.
-                    let _ = read_u16(code, &mut pc)?;
-                    let _ = stack
+                    // The reference stays on the stack; a cast to a class the
+                    // runtime holds is checked (`checkcast.rs`).
+                    let index = read_u16(code, &mut pc)?;
+                    let target = class_name(&file.pool, index)?.to_owned();
+                    let value = stack
                         .last()
                         .cloned()
                         .ok_or_else(|| underflow(class, method, at))?;
+                    invoke_or_catch!(at, self.checkcast(&value, &target));
                 }
                 0xc1 => {
                     let index = read_u16(code, &mut pc)?;
@@ -24449,8 +24495,19 @@ impl<H: Host> Runtime<'_, H> {
                                 // called on a lambda of this jar: its one
                                 // abstract method is the lambda's body.
                                 if self.foreign_functional_call(&resolved, receiver, &args) {
-                                    invoke_or_catch!(at, self.invoke_callback(receiver, &args))
-                                        .unwrap_or_else(|| Value::default_for(&resolved.descriptor))
+                                    // A lambda the runtime cannot run is the
+                                    // host's call to answer (and count), not a
+                                    // silent default.
+                                    match invoke_or_catch!(
+                                        at,
+                                        self.invoke_callback(receiver, &args)
+                                    ) {
+                                        Some(value) => value,
+                                        None => invoke_or_catch!(
+                                            at,
+                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                        ),
+                                    }
                                 } else {
                                     invoke_or_catch!(
                                         at,

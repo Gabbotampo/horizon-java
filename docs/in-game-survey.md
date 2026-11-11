@@ -54,7 +54,10 @@ says why.
 ## The sample
 
 The census at `e0d0f1f` (`docs/unmodelled-calls.md`, rerun with `tools/unmodelled_calls.py`)
-labels **172 jars `ran-clean`**: 51 in `corpus-xl`, 84 in `mega`, 37 in `neoforge`. The sample is:
+labelled **172 jars `ran-clean`**: 51 in `corpus-xl`, 84 in `mega`, 37 in `neoforge`. The sample was
+drawn from that run. (Re-measured on 11 November 2026 with the interpreter-honesty fixes and every
+server stage, the census labels **112** `ran-clean`: 31, 59 and 22; see
+[docs/unmodelled-calls.md](unmodelled-calls.md#re-measured-11-november-2026).) The sample is:
 
 - **All 22 distinct mods among the 172 that register commands or listeners** (26 rows
   collapse to 22 mods because some jars appear in two corpora). Every run-clean jar with an
@@ -85,53 +88,58 @@ it says nothing about content declarations.
 ## Results
 
 `native` is the census verdict (with declared dependencies, as the census links them) followed by
-the same jar probed alone with no `--link` (as the game runs it). `content` is declared/skipped
+the same jar probed alone with no `--link` (as the game runs it). **Re-measured on 11 November 2026**
+with the interpreter-honesty fixes (a call on `null` throws, bodiless and unmodelled instance calls
+are counted, casts / `Enum.valueOf` / `Thread.start` are checked or counted; #37, #38, #41) and every
+server stage the loader runs (`main`, then `server`): 21 of the 40 rows changed, and
+20 are still `ran-clean` in the census (it was 39). The `in game` and later columns are the
+batch runs above, from before these fixes; they are not re-run here. `content` is declared/skipped
 typed declarations. `commands` is command usages translated/refused at registration. `listeners`
 is callbacks that ran/failed over the batch's life. A dash means the jar produced nothing
 observable after its entrypoint.
 
 | jar | loader | native | in game | content | commands | listeners | what visibly worked | what failed, and why |
 |---|---|---|---|---|---|---|---|---|
-| `fancymenu_neoforge_3.9.14_MC_26.3.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 7 tr, 9 ref | 3/0 | 3 lifecycle listeners fired (server_started, player_join, server_stopping) | `/fmvariable get test` refused: `ServerPlayer#level()`; 9 usages refused (Entity and Bool arguments) |
+| `fancymenu_neoforge_3.9.14_MC_26.3.jar` | NE | refused / refused alone | **ran-clean** | 0/0 | 7 tr, 9 ref | 3/0 | 3 lifecycle listeners fired (server_started, player_join, server_stopping) | `/fmvariable get test` refused: `ServerPlayer#level()`; 9 usages refused (Entity and Bool arguments) |
 | `konkrete_neoforge_1.11.1_MC_26.3.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `Jade-mc26.3-NeoForge-26.3.5.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 2 ref | 0/0 | command registration callback ran | both usages refused (Entity argument), so `/jade` is not a registered usage |
+| `Jade-mc26.3-NeoForge-26.3.5.jar` | NE | ran-hollow (4) / ran-hollow alone (4) | **ran-clean** | 0/0 | 0 tr, 2 ref | 0/0 | command registration callback ran | both usages refused (Entity argument), so `/jade` is not a registered usage |
 | `midnightlib-neoforge-1.10.0+26.3.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `carryon-neoforge-26.3-2.12.1.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 3 tr, 2 ref | 5/660 | 5 callbacks ran (server_started, block/attack/use listeners) | 660 tick callbacks failed on `Player#getData(Supplier)`; `/carryon debug` refused on the same call; 2 usages refused (Entity argument) |
-| `fzzy_config-0.7.7+fix3+26.3+neoforge.jar` | NE | ran-clean / clean alone | **refused** | 0/0 | 0 tr, 0 ref | 0/0 | — | refused: the client `@Mod` class `FzzyConfigNeoForgeClient` ran on the server and hit "recursion exceeded 12 nested jar frames" |
+| `carryon-neoforge-26.3-2.12.1.jar` | NE | ran-hollow (13) / ran-hollow alone (13) | **ran-clean** | 0/0 | 3 tr, 2 ref | 5/660 | 5 callbacks ran (server_started, block/attack/use listeners) | 660 tick callbacks failed on `Player#getData(Supplier)`; `/carryon debug` refused on the same call; 2 usages refused (Entity argument) |
+| `fzzy_config-0.7.7+fix3+26.3+neoforge.jar` | NE | ran-hollow (8) / ran-hollow alone (8) | **refused** | 0/0 | 0 tr, 0 ref | 0/0 | — | refused: the client `@Mod` class `FzzyConfigNeoForgeClient` ran on the server and hit "recursion exceeded 12 nested jar frames" |
 | `Iceberg-26.3-neoforge-1.4.3.2.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 1/1 | 1 listener ran (level load) | player_join listener failed on `ServerPlayer#level()` |
 | `Searchables-neoforge-26.3-1.0.3.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
 | `470193-8893473.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 10 tr, 1 ref | 642/0 | 642 server-tick callbacks ran; 10 usages registered | `/connectivity packetsSummary` answered "Incorrect argument for command"; 1 usage refused |
 | `456640-8026052.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 1 tr, 1 ref | 642/0 | 642 server-tick callbacks ran; 1 usage registered | `/limitedchunks listnonplayerchunktickets` refused: `CommandSourceStack#getLevel()`; 1 usage refused |
-| `326652-8890593.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 642/0 | 642 server-tick callbacks ran | nothing beyond the entrypoint line |
-| `832882-8896904.jar` | FA | ran-clean / ran-hollow alone (1) | **ran-hollow** | 0/0 | 2 tr, 3 ref | 0/0 | 2 command usages registered | 3 usages refused (Resource arguments); entry hollow on its own `CommonConfiguration#disableLegacyRandomCrashes` field; `/structureessentials showGenerationTimes` is not a registered usage |
+| `326652-8890593.jar` | FA | ran-hollow (78) / ran-hollow alone (78) | **ran-clean** | 0/0 | 0 tr, 0 ref | 642/0 | 642 server-tick callbacks ran | nothing beyond the entrypoint line |
+| `832882-8896904.jar` | FA | ran-hollow (198) / ran-hollow alone (1) | **ran-hollow** | 0/0 | 2 tr, 3 ref | 0/0 | 2 command usages registered | 3 usages refused (Resource arguments); entry hollow on its own `CommonConfiguration#disableLegacyRandomCrashes` field; `/structureessentials showGenerationTimes` is not a registered usage |
 | `fc1f2f374c-Chunky-Fabric-1.5.3.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 35 tr, 7 ref | 1/1 | 1 lifecycle listener ran; 35 usages registered | server_started listener failed: interpreter `list index is out of bounds` in `Chunky#<init>`; `/chunky` refused on `ChunkyFabric#chunky()`; 6 usages refused (Dimension argument) and 1 (its permission predicate) |
 | `respackopts-26.3.0.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/2 | 2 server_started callbacks attempted | both server_started listeners failed: `WeakSet` collection marker not modelled (`Set#isEmpty`) |
-| `c661609de9-modelbrowser-1.5.1.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 3 tr, 3 ref | 0/0 | `/modelbrowser items_always_equippable` ran in Java and answered the player | the command replied with the raw translation key `commands.modelbrowser.gamerule.query`; 3 usages refused (Bool argument) |
+| `c661609de9-modelbrowser-1.5.1.jar` | FA | ran-hollow (3) / ran-hollow alone (3) | **ran-clean** | 0/0 | 3 tr, 3 ref | 0/0 | `/modelbrowser items_always_equippable` ran in Java and answered the player | the command replied with the raw translation key `commands.modelbrowser.gamerule.query`; 3 usages refused (Bool argument) |
 | `baguettelib-26.3-Fabric-2.0.7.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/1 | join and leave listeners fired | player_join failed on `ServerPlayer#level()`, player_leave on `ServerPlayer#getUUID()` (the second after the report snapshot) |
-| `361579-8918571.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 1/1 | 2 lifecycle callbacks attempted | server_starting listener failed: `MissingMethod("java/lang/Thread#getId()J")`; no command usage translated |
+| `361579-8918571.jar` | FA | ran-hollow (1) / ran-hollow alone (1) | **ran-clean** | 0/0 | 0 tr, 0 ref | 1/1 | 2 lifecycle callbacks attempted | server_starting listener failed: `MissingMethod("java/lang/Thread#getId()J")`; no command usage translated |
 | `mcwifipnp-2.1.4-26.3-fabric.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 2/0 | 2 lifecycle callbacks ran | none of its command usages were translated |
 | `1079f41d14-otterlib-0.4.0.2+26.3-fabric.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `bdc7223ca2-collective-26.3.0-8.67.jar` | FA | ran-hollow (67) | **ran-hollow** | 0/0 | 44 tr, 0 ref | 4350/3 | 4,350 callbacks over 9 events; 44 command usages registered | entry hollow: 67 unknown calls (`Items.*` statics, `RandomSource.create`, its own `EventPhaseData`); 3 listener failures (`MinecraftServer#getWorldPath` twice, `Level#registryAccess`) |
-| `9f12a0dffd-stackrefill-26.3.0-5.1.jar` | FA | ran-clean / ran-hollow alone (1) | **ran-hollow** | 0/0 | 0 tr, 0 ref | 0/0 | — | entry hollow: 1 unknown call, `collective`'s `ShouldLoadCheck#shouldLoad` (its dependency is not linked in the game) |
+| `bdc7223ca2-collective-26.3.0-8.67.jar` | FA | refused / refused alone | **ran-hollow** | 0/0 | 44 tr, 0 ref | 4350/3 | 4,350 callbacks over 9 events; 44 command usages registered | entry hollow: 67 unknown calls (`Items.*` statics, `RandomSource.create`, its own `EventPhaseData`); 3 listener failures (`MinecraftServer#getWorldPath` twice, `Level#registryAccess`) |
+| `9f12a0dffd-stackrefill-26.3.0-5.1.jar` | FA | refused / ran-hollow alone (1) | **ran-hollow** | 0/0 | 0 tr, 0 ref | 0/0 | — | entry hollow: 1 unknown call, `collective`'s `ShouldLoadCheck#shouldLoad` (its dependency is not linked in the game) |
 | `d198676d8b-calcmod-1.6.0+fabric.26.3.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | command registration callback attempted | command registration listener failed: unsupported `Locale` marker, so no command was registered |
-| `09ee9afdd2-entity-view-distance-1.9.0+26.2.jar` | FA | ran-clean / refused alone | **refused** | 0/0 | 0 tr, 0 ref | 0/0 | — | refused: `Metadata("malformed java/util/Iterator marker")` — it needs its Fabric API dependency, which the game does not link |
+| `09ee9afdd2-entity-view-distance-1.9.0+26.2.jar` | FA | ran-clean / clean alone | **refused** | 0/0 | 0 tr, 0 ref | 0/0 | — | refused: `Metadata("malformed java/util/Iterator marker")` — it needs its Fabric API dependency, which the game does not link |
 | `1b0a4ed5f7-structure_pool_api-fabric-1.3.0+26.3.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 1/0 | 1 server_starting callback ran | nothing beyond one lifecycle callback |
-| `supermartijn642configlib-1.1.8-neoforge-mc26.3.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 1/0 | 1 server_starting callback ran | nothing beyond one lifecycle callback |
-| `Bookshelf-neoforge-MC26.3-26.3.0.4.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
+| `supermartijn642configlib-1.1.8-neoforge-mc26.3.jar` | NE | ran-hollow (3) / ran-hollow alone (3) | **ran-clean** | 0/0 | 0 tr, 0 ref | 1/0 | 1 server_starting callback ran | nothing beyond one lifecycle callback |
+| `Bookshelf-neoforge-MC26.3-26.3.0.4.jar` | NE | refused / refused alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
 | `cloth-config-neoforge-26.3.159.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `geckolib-neoforge-26.3-5.5.7.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `yet_another_config_lib_v3-3.9.7+26.3-neoforge.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `ForgeConfigAPIPort-v26.3.1-mc26.3.x-NeoForge.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
+| `geckolib-neoforge-26.3-5.5.7.jar` | NE | ran-hollow (2) / ran-hollow alone (2) | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
+| `yet_another_config_lib_v3-3.9.7+26.3-neoforge.jar` | NE | ran-hollow (1) / ran-hollow alone (1) | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
+| `ForgeConfigAPIPort-v26.3.1-mc26.3.x-NeoForge.jar` | NE | ran-hollow (1) / ran-hollow alone (1) | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
 | `fast-ip-ping-v1.0.12-mc26.3.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
 | `Clumps-neoforge-26.3-26.3.2.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `PacketFixer-neoforge-3.3.7.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
+| `PacketFixer-neoforge-3.3.7.jar` | NE | ran-hollow (2) / ran-hollow alone (2) | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
 | `NoChatReports-NEOFORGE-26.3-v2.21.0.jar` | NE | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `MossyLib-1.6.0+26.3+fabric.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `825dce0c0b-ResourcefulLib-6.0.1.jar` | FA | ran-clean / ran-hollow alone (2) | **ran-hollow** | 0/0 | 0 tr, 0 ref | 0/0 | — | entry hollow: 2 unknown calls, `Optionull#mapOrElse` |
-| `krypton-0.3.2.jar` | FA | ran-clean / ran-hollow alone (3) | **ran-hollow** | 0/0 | 0 tr, 0 ref | 0/0 | — | entry hollow: 3 unknown calls (its own `Natives#cipher`/`compress`, `System#setProperty`) |
+| `MossyLib-1.6.0+26.3+fabric.jar` | FA | ran-hollow (1) / ran-hollow alone (1) | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
+| `825dce0c0b-ResourcefulLib-6.0.1.jar` | FA | ran-hollow (2) / ran-hollow alone (2) | **ran-hollow** | 0/0 | 0 tr, 0 ref | 0/0 | — | entry hollow: 2 unknown calls, `Optionull#mapOrElse` |
+| `krypton-0.3.2.jar` | FA | ran-partial / ran-partial alone | **ran-hollow** | 0/0 | 0 tr, 0 ref | 0/0 | — | entry hollow: 3 unknown calls (its own `Natives#cipher`/`compress`, `System#setProperty`) |
 | `asynclogger-2.2.2+26.1.2-fabric.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
 | `c2me-fabric-mc26.3-0.4.2-alpha.0.106.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
-| `structure_layout_optimizer-1.1.4+26.3-fabric.jar` | FA | ran-clean / clean alone | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
+| `structure_layout_optimizer-1.1.4+26.3-fabric.jar` | FA | ran-hollow (1) / ran-hollow alone (1) | **ran-clean** | 0/0 | 0 tr, 0 ref | 0/0 | — | — |
 
 
 Loader: `FA` = Fabric, `NE` = NeoForge.
