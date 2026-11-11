@@ -4749,6 +4749,14 @@ impl Host for StdHost {
                 }
                 Ok(fallback.clone())
             }
+            // `Objects.isNull`/`nonNull` are predicates a mod passes as a
+            // method reference (`filter(Objects::nonNull)`).
+            ("java/util/Objects", "isNull", "(Ljava/lang/Object;)Z") => Ok(Value::Int(i32::from(
+                matches!(Self::argument(r, args, 0)?, Value::Ref(None)),
+            ))),
+            ("java/util/Objects", "nonNull", "(Ljava/lang/Object;)Z") => Ok(Value::Int(i32::from(
+                !matches!(Self::argument(r, args, 0)?, Value::Ref(None)),
+            ))),
             ("java/util/Objects", "requireNonNull", descriptor)
                 if descriptor.starts_with("(Ljava/lang/Object;")
                     && descriptor.ends_with(")Ljava/lang/Object;") =>
@@ -10876,6 +10884,65 @@ fn is_map_owner(owner: &str) -> bool {
                 | "com/google/common/collect/ImmutableMap"
                 | "com/google/common/collect/ImmutableBiMap"
         )
+}
+
+/// Whether one call names the abstract method of a JDK functional interface.
+///
+/// A method reference to a host method (`list::clear` as a `Runnable`,
+/// `map::size` as a `Supplier`, `String::length` as a `Function`) is a callback
+/// marker, so a call of the interface's abstract method on that marker must run
+/// it rather than reach the host as an unmodelled method with a neutral answer.
+/// Only the interface's own abstract member is listed: a default combinator
+/// (`Consumer.andThen`) keeps its own composition model.
+/// Box the primitive a callback's target answered when the functional-interface
+/// method the caller invoked returns a reference.
+///
+/// Java's lambda body does this itself (`Function<String, Boolean> f =
+/// list::add` compiles to a synthetic method that returns
+/// `Boolean.valueOf(list.add(s))`); the interpreter runs the target directly,
+/// so the conversion happens here.
+fn box_callback_result<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    receiver: &Value,
+    value: Value,
+    call_descriptor: &str,
+) -> Result<Value, NativeError> {
+    if !return_desc(call_descriptor).starts_with('L') {
+        return Ok(value);
+    }
+    let Some(marker) = expect_ref(receiver) else {
+        return Ok(value);
+    };
+    let Ok(callback) = parse_callback_marker(marker) else {
+        return Ok(value);
+    };
+    let target_return = return_desc(&callback.target.descriptor).to_owned();
+    runtime.box_primitive(&target_return, &value)
+}
+
+fn is_jdk_functional_method(r: &MethodRef) -> bool {
+    match (r.owner.as_str(), r.name.as_str()) {
+        ("java/lang/Runnable", "run") => r.descriptor == "()V",
+        ("java/util/concurrent/Callable", "call") => r.descriptor.ends_with(")Ljava/lang/Object;"),
+        ("java/util/Comparator", "compare") => r
+            .descriptor
+            .starts_with("(Ljava/lang/Object;Ljava/lang/Object;)"),
+        (owner, name) if owner.starts_with("java/util/function/") => matches!(
+            name,
+            "get"
+                | "getAsInt"
+                | "getAsLong"
+                | "getAsDouble"
+                | "getAsBoolean"
+                | "apply"
+                | "applyAsInt"
+                | "applyAsLong"
+                | "applyAsDouble"
+                | "accept"
+                | "test"
+        ),
+        _ => false,
+    }
 }
 
 /// The `key=value` assignments one `.properties` document declares.
@@ -24402,7 +24469,8 @@ impl<H: Host> Runtime<'_, H> {
                                     | "java/util/function/BiConsumer"
                                     | "java/util/function/BiFunction"
                                     | "java/util/function/Supplier"
-                            ) {
+                            ) || is_jdk_functional_method(&resolved)
+                            {
                                 if let Some(receiver) = receiver.as_ref() {
                                     // A default combinator (`Consumer.andThen`,
                                     // `Function.compose`, `Predicate.and`) closes
@@ -24420,7 +24488,19 @@ impl<H: Host> Runtime<'_, H> {
                                     } else if let Some(value) =
                                         invoke_or_catch!(at, self.invoke_callback(receiver, &args))
                                     {
-                                        value
+                                        // A method reference whose target returns a
+                                        // primitive (`list::add` as a `Function`) is
+                                        // boxed by the lambda's own synthetic method in
+                                        // Java, which the callback path bypasses.
+                                        invoke_or_catch!(
+                                            at,
+                                            box_callback_result(
+                                                self,
+                                                receiver,
+                                                value,
+                                                &resolved.descriptor
+                                            )
+                                        )
                                     } else {
                                         invoke_or_catch!(
                                             at,
