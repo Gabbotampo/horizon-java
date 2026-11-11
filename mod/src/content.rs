@@ -61,11 +61,7 @@ impl State {
                 Ok(jar) => parsed.push((file, Arc::new(jar))),
                 Err(error) => {
                     let id = file.strip_suffix(".jar").unwrap_or(&file).to_owned();
-                    let row = JarRow::refused(
-                        &file,
-                        id,
-                        format!("not a readable jar: {error}"),
-                    );
+                    let row = JarRow::refused(&file, id, format!("not a readable jar: {error}"));
                     log::info!("{LOG}: {row}");
                     self.refused.push(row);
                 }
@@ -82,10 +78,7 @@ impl State {
                 let row = JarRow::refused(
                     &file,
                     jar_id(&jar, &file),
-                    format!(
-                        "requires {} (not in {JARS})",
-                        missing.join(", ")
-                    ),
+                    format!("requires {} (not in {JARS})", missing.join(", ")),
                 );
                 log::info!("{LOG}: {row}");
                 self.refused.push(row);
@@ -172,8 +165,15 @@ fn unowned_counts<'a>(
 }
 
 /// Pushes one `content::Block` per typed block declaration. A block keeps the runtime's inferred
-/// template (`minecraft:stone`) and the properties the content vocabulary has a key for; its item
-/// comes with it (`item: true`).
+/// template (`minecraft:stone`) and the properties the content vocabulary has a key for.
+///
+/// It does **not** bring an item. Vanilla registers block items one by one in `Items`
+/// (`Items.STONE`, `Items.DIRT`...), not by walking the block registry, and a Fabric/NeoForge mod
+/// registers its own `BlockItem` or none at all. The runtime's inferred `item` flag says only
+/// that a block was built from `BlockBehaviour.Properties`, which is no evidence of an item. An
+/// item this bridge declares is one the jar registered through the item registry
+/// (`declare_items`); a block's `item` stays false and `Block.block_item`/`pick_item` stay unset
+/// unless the vocabulary carries the mod's own registration later.
 pub(crate) fn declare_blocks(
     state: &mut State,
     context: &RegistrationContext,
@@ -210,26 +210,7 @@ pub(crate) fn declare_blocks(
                 );
                 continue;
             }
-            // Push the default before naming a field: the element type is the event's, so this
-            // module never has to spell `horizon_mod_package::content::Block`, a crate a native
-            // mod may not depend on (docs/m3-content-design.md, seam 1).
-            event.blocks.push(Default::default());
-            let block = event.blocks.last_mut().expect("just pushed");
-            block.id = id;
-            block.template = declaration.template.clone();
-            block.item = declaration.item;
-            block.properties.hardness = declaration.hardness;
-            block.properties.explosion_resistance = declaration.explosion_resistance;
-            block.properties.friction = declaration.friction;
-            block.properties.requires_tool = declaration.requires_tool;
-            // A content package of the same namespace supplies the block item's own model; with
-            // none, the item keeps the template's so the block has the template's look.
-            if !owns_assets(context, &block.id) {
-                block.components.push((
-                    "minecraft:item_model".to_owned(),
-                    Some(mod_api::Tag::String(declaration.template.as_str().into())),
-                ));
-            }
+            event.blocks.push(block_entry(&declaration, &id));
             jar.row.content_blocks += 1;
             count += 1;
         }
@@ -240,8 +221,12 @@ pub(crate) fn declare_blocks(
     );
 }
 
-/// Pushes one `content::Item` per typed item declaration, except the ones a declared block already
-/// gives its own id. The template and the keys `item_declaration_properties` exports carry over.
+/// Pushes one `content::Item` per typed item declaration. The template and the keys
+/// `item_declaration_properties` exports carry over.
+///
+/// A block's own `BlockItem` registration is exactly one of these rows, so it is declared with the
+/// properties the jar gave it. Nothing is skipped because a block has the same id: the block no
+/// longer invents an item (`declare_blocks`), so the item registry is the only source of items.
 pub(crate) fn declare_items(
     state: &mut State,
     context: &RegistrationContext,
@@ -249,7 +234,6 @@ pub(crate) fn declare_items(
 ) {
     state.ensure_loaded(context);
     let owned = owned_namespaces(context);
-    let block_items = block_item_ids(state);
     let mut declared = BTreeSet::new();
     let mut count = 0;
     for jar in &mut state.jars {
@@ -271,11 +255,6 @@ pub(crate) fn declare_items(
                 // and declared by a baked content package instead.
                 continue;
             }
-            if block_items.contains(&id) {
-                // A block's item is declared with the block (`item: true`); declaring the same id
-                // again refuses the whole namespace at the content root.
-                continue;
-            }
             if !declared.insert(id.clone()) {
                 log::warn!(
                     "{LOG}: {}: item {} is declared more than once; only the first is used",
@@ -284,28 +263,9 @@ pub(crate) fn declare_items(
                 );
                 continue;
             }
-            event.items.push(Default::default());
-            let item = event.items.last_mut().expect("just pushed");
-            item.id = id;
-            item.template = declaration.template.clone();
-            item.max_stack_size = declaration.max_stack_size;
-            item.rarity = declaration.rarity.map(|rarity| match rarity {
-                runtime::content::Rarity::Common => mod_api::Rarity::Common,
-                runtime::content::Rarity::Uncommon => mod_api::Rarity::Uncommon,
-                runtime::content::Rarity::Rare => mod_api::Rarity::Rare,
-                runtime::content::Rarity::Epic => mod_api::Rarity::Epic,
-            });
-            item.crafting_remainder = declaration.crafting_remainder.clone();
-            // The content plan renames the template's `minecraft:item_model` to the new id, and
-            // nothing then defines that id. A content package of the same namespace (the bake in
-            // docs/m3-content-design.md) supplies the real definition; without one, keep the
-            // template's model so the item draws with the vanilla art.
-            if !owns_assets(context, &item.id) {
-                item.components.push((
-                    "minecraft:item_model".to_owned(),
-                    Some(mod_api::Tag::String(declaration.template.as_str().into())),
-                ));
-            }
+            event
+                .items
+                .push(item_entry(&declaration, &id, !owns_assets(context, &id)));
             jar.row.content_items += 1;
             count += 1;
         }
@@ -329,21 +289,50 @@ fn owns_assets(context: &RegistrationContext, id: &str) -> bool {
     })
 }
 
-/// The ids of blocks that bring their own item, so the item registry's own row for that id is not
-/// a second declaration.
-fn block_item_ids(state: &State) -> BTreeSet<String> {
-    let mut ids = BTreeSet::new();
-    for jar in &state.jars {
-        for declaration in runtime::content::declarations(jar.host.registrations()) {
-            if let runtime::content::ContentDeclaration::Block(block) = declaration
-                && block.item
-                && usable_id(&block.id)
-            {
-                ids.insert(block.id);
-            }
-        }
+/// One block declaration as the content vocabulary's block. `item` is false: an item exists only
+/// when the jar registered one, and `components` is the item's patch (the vocabulary says so), so
+/// a block without an item carries none.
+fn block_entry(declaration: &runtime::content::Block, id: &str) -> mod_api::Block {
+    let mut block = mod_api::Block::default();
+    block.id = id.to_owned();
+    block.template = declaration.template.clone();
+    block.item = false;
+    block.properties.hardness = declaration.hardness;
+    block.properties.explosion_resistance = declaration.explosion_resistance;
+    block.properties.friction = declaration.friction;
+    block.properties.requires_tool = declaration.requires_tool;
+    block
+}
+
+/// One item declaration as the content vocabulary's item, with the template's model when no
+/// content package of the item's namespace supplies its own.
+fn item_entry(
+    declaration: &runtime::content::Item,
+    id: &str,
+    keep_template_model: bool,
+) -> mod_api::Item {
+    let mut item = mod_api::Item::default();
+    item.id = id.to_owned();
+    item.template = declaration.template.clone();
+    item.max_stack_size = declaration.max_stack_size;
+    item.rarity = declaration.rarity.map(|rarity| match rarity {
+        runtime::content::Rarity::Common => mod_api::Rarity::Common,
+        runtime::content::Rarity::Uncommon => mod_api::Rarity::Uncommon,
+        runtime::content::Rarity::Rare => mod_api::Rarity::Rare,
+        runtime::content::Rarity::Epic => mod_api::Rarity::Epic,
+    });
+    item.crafting_remainder = declaration.crafting_remainder.clone();
+    // The content plan renames the template's `minecraft:item_model` to the new id, and nothing
+    // then defines that id. A content package of the same namespace (the bake in
+    // docs/m3-content-design.md) supplies the real definition; without one, keep the template's
+    // model so the item draws with the vanilla art.
+    if keep_template_model {
+        item.components.push((
+            "minecraft:item_model".to_owned(),
+            Some(mod_api::Tag::String(declaration.template.as_str().into())),
+        ));
     }
-    ids
+    item
 }
 
 /// A content id this bridge may declare: `namespace:path` in the characters a content namespace
@@ -361,6 +350,44 @@ fn usable_id(id: &str) -> bool {
         && !path.is_empty()
         && namespace.bytes().all(|b| ok(b, b"_.-"))
         && path.bytes().all(|b| ok(b, b"_./-"))
+}
+
+/// The jars under the game's `config/horizon_java/java-mods/`, sorted by file name so one run's
+/// report reads the same as the next. An absent folder is no jars; an unreadable one is a warning,
+/// not a failed start.
+fn read_jar_files() -> Vec<(String, Vec<u8>)> {
+    let Ok(game_dir) = std::env::current_dir() else {
+        log::warn!("{LOG}: the game folder is unknown; no jars are read");
+        return Vec::new();
+    };
+    let folder = game_dir.join("config").join(JARS);
+    let entries = match std::fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            log::warn!("{LOG}: config/{JARS} could not be listed: {error}");
+            return Vec::new();
+        }
+    };
+    let mut files: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.ends_with(".jar").then(|| (name, entry.path()))
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+        .into_iter()
+        .filter_map(|(name, path)| match std::fs::read(&path) {
+            Ok(bytes) => Some((name, bytes)),
+            Err(error) => {
+                log::warn!("{LOG}: config/{JARS}/{name} could not be read: {error}");
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -430,6 +457,59 @@ mod tests {
         assert!(!owns(&owned, "bare"));
     }
 
+    /// A block declaration never invents an item: the runtime's inferred `item` flag only says the
+    /// block was built from `BlockBehaviour.Properties`, while vanilla and mods register block
+    /// items one by one in the item registry.
+    #[test]
+    fn a_block_declaration_brings_no_item_of_its_own() {
+        let declaration = runtime::content::Block {
+            id: "horizon_java:proof_block".to_owned(),
+            template: "minecraft:stone".to_owned(),
+            // What the runtime infers for any block built from a property chain.
+            item: true,
+            hardness: Some(2.0),
+            explosion_resistance: Some(6.0),
+            friction: None,
+            requires_tool: Some(true),
+        };
+        let block = block_entry(&declaration, &declaration.id);
+        assert!(!block.item);
+        assert!(
+            block.components.is_empty(),
+            "an item's component patch has no item to belong to"
+        );
+        assert_eq!(block.template, "minecraft:stone");
+        assert_eq!(block.properties.hardness, Some(2.0));
+        assert_eq!(block.properties.explosion_resistance, Some(6.0));
+        assert_eq!(block.properties.requires_tool, Some(true));
+    }
+
+    /// A mod's own `BlockItem` is an item registration and is declared with its properties even
+    /// when a block shares the id; nothing is dropped as a "duplicate" of an invented item.
+    #[test]
+    fn an_item_declaration_is_kept_even_when_a_block_shares_its_id() {
+        let declaration = runtime::content::Item {
+            id: "horizon_java:proof_block".to_owned(),
+            template: "minecraft:stick".to_owned(),
+            max_stack_size: Some(1),
+            rarity: Some(runtime::content::Rarity::Rare),
+            crafting_remainder: None,
+        };
+        let item = item_entry(&declaration, &declaration.id, true);
+        assert_eq!(item.id, "horizon_java:proof_block");
+        assert_eq!(item.template, "minecraft:stick");
+        assert_eq!(item.max_stack_size, Some(1));
+        assert_eq!(item.rarity, Some(mod_api::Rarity::Rare));
+        assert!(
+            item.components
+                .iter()
+                .any(|(name, value)| name == "minecraft:item_model" && value.is_some())
+        );
+        // A content package of the namespace supplies the model: no template model is pinned.
+        let packaged = item_entry(&declaration, &declaration.id, false);
+        assert!(packaged.components.is_empty());
+    }
+
     /// A jar's own namespace is not in the manifest, so its declarations are skipped and counted
     /// per namespace; a bare or malformed id is not a declaration this bridge counts either.
     #[test]
@@ -450,42 +530,4 @@ mod tests {
         assert_eq!(counts.len(), 1);
         assert_eq!(counts.get("m3_fixture"), Some(&(2, 1)));
     }
-}
-
-/// The jars under the game's `config/horizon_java/java-mods/`, sorted by file name so one run's
-/// report reads the same as the next. An absent folder is no jars; an unreadable one is a warning,
-/// not a failed start.
-fn read_jar_files() -> Vec<(String, Vec<u8>)> {
-    let Ok(game_dir) = std::env::current_dir() else {
-        log::warn!("{LOG}: the game folder is unknown; no jars are read");
-        return Vec::new();
-    };
-    let folder = game_dir.join("config").join(JARS);
-    let entries = match std::fs::read_dir(&folder) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            log::warn!("{LOG}: config/{JARS} could not be listed: {error}");
-            return Vec::new();
-        }
-    };
-    let mut files: Vec<(String, PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.ends_with(".jar").then(|| (name, entry.path()))
-        })
-        .collect();
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
-        .into_iter()
-        .filter_map(|(name, path)| match std::fs::read(&path) {
-            Ok(bytes) => Some((name, bytes)),
-            Err(error) => {
-                log::warn!("{LOG}: config/{JARS}/{name} could not be read: {error}");
-                None
-            }
-        })
-        .collect()
 }

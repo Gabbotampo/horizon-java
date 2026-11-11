@@ -23,9 +23,14 @@
 //! phase, where `config_files` does not exist yet; [`content`] explains why it is `std::fs`.)
 //! Each jar logs one line and gets one row in the report:
 //!
-//! * `ran-clean`: the jar's server entrypoints ran and no host call was unmodelled;
-//! * `ran-hollow`: they ran, but at least one host call was answered neutrally (`unknown_host_call_count`);
-//! * `refused`: the jar could not be read, has no server-side entrypoint, or an entrypoint failed,
+//! * `ran-clean`: every server entrypoint stage ran and no host call was unmodelled;
+//! * `ran-hollow`: every stage ran, but at least one host call was answered neutrally
+//!   (`unknown_host_call_count`);
+//! * `ran-partial`: at least one stage ran and at least one failed (an error or a caught
+//!   interpreter panic); the listeners the running stages registered stay active, and `reason`
+//!   names every failed stage and its error. A real loader would have thrown, so this is never
+//!   counted as clean;
+//! * `refused`: the jar could not be read, has no server-side entrypoint, or every stage failed,
 //!   and `reason` says which.
 //!
 //! # Milestone 2a: listeners on real server lifecycle events
@@ -49,7 +54,8 @@
 //! `blocks` and `items` are asked once, at the game's Registration phase and before any resource
 //! loads, so that is where the jars now run ([`content`]). Each typed `RegistryDeclaration` the
 //! runtime recorded becomes a native content declaration: an item keeps its inferred template and
-//! the properties the content vocabulary carries, and a block brings its block item. The game's
+//! the properties the content vocabulary carries, and a block brings an item only when the jar
+//! registered one (a block does not invent one). The game's
 //! content root joins them under the jar's namespace, so `/give` and the inventory see
 //! `<jar id>:<path>`. Jar assets, models, lang and loot stay outside this pass, as
 //! `docs/m3-content-design.md` maps.
@@ -73,16 +79,16 @@ use std::time::Duration;
 
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DamageContainer,
-    DimensionKey, EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand,
-    Hooks, Host, HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent,
-    LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent,
-    LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent,
-    LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
-    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRespawnedEvent, RegisterCommandsEvent,
-    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
-    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
-    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
+    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
+    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
+    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
+    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent,
+    PlayerLoggedOutEvent, PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext,
+    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
+    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -109,10 +115,6 @@ const SCHEMA: u64 = 1;
 const JAR_BUDGET: Duration = Duration::from_secs(30);
 /// The line every log entry starts with, so one `grep` finds all of them.
 const LOG: &str = "Horizon Java";
-/// The entrypoint kinds a server runs, in the order the probe picks them: Fabric's common
-/// `main`, NeoForge's `server`, then the class a NeoForge jar discovers by annotation.
-const SERVER_KINDS: [&str; 3] = ["main", "server", "neoforge"];
-
 /// The mod's state. The content hooks run the jars once per process, before any server exists;
 /// every later hook reuses what they recorded, and a second server this process hosts only resets
 /// the per-server state.
@@ -262,11 +264,12 @@ impl Hooks for HorizonJava {
         let total = state.jars.len() + state.refused.len();
         match write_report(host, &state) {
             Ok(path) => log::info!(
-                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} refused; report in {path}",
+                "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} ran-partial, {} refused; report in {path}",
                 env!("CARGO_PKG_VERSION"),
                 event.dedicated,
                 count("ran-clean"),
                 count("ran-hollow"),
+                count("ran-partial"),
                 count("refused"),
             ),
             Err(error) => log::warn!(
@@ -437,22 +440,37 @@ impl Hooks for HorizonJava {
                     }
                 }
             }
-            let source = runtime_source(&event.source, host);
+            let source = runtime_source(event.source, host);
             let invocation = RuntimeInvocation {
                 input: words.join(" "),
                 source,
                 arguments,
             };
             let before = loaded.host.unknown_host_call_count();
-            let run = loaded.jar.run_command(
-                &command.run,
-                &invocation,
-                Arc::new(facade.clone()),
-                &mut loaded.host,
-                &ExecutionBudget::within(JAR_BUDGET),
+            let outcome = caught(
+                &format!("{} command /{}", loaded.row.id, command.usage),
+                || {
+                    loaded.jar.run_command(
+                        &command.run,
+                        &invocation,
+                        Arc::new(facade.clone()),
+                        &mut loaded.host,
+                        &ExecutionBudget::within(JAR_BUDGET),
+                    )
+                },
             );
             let unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
             loaded.row.command_unknown_host_calls += unknown;
+            let run = match outcome {
+                Ok(run) => run,
+                Err(panic) => {
+                    // The command ran as far as the panic: a failed command, not a crashed game.
+                    loaded.row.commands_refused += 1;
+                    let usage = command.usage.clone();
+                    log_stdout(&loaded.row.id, &mut loaded.host);
+                    return refuse(host, &usage, format!("the Java command panicked: {panic}"));
+                }
+            };
             match &run.outcome {
                 CommandOutcome::Refused(_) => loaded.row.commands_refused += 1,
                 _ => loaded.row.commands_ran += 1,
@@ -1174,14 +1192,17 @@ fn run_listeners(
         .iter()
         .filter(|listener| listener.event == event && wanted(listener))
     {
-        match jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET)) {
-            Ok(run) => {
+        let outcome = caught(&format!("{} listener from {}", id, listener.source), || {
+            jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET))
+        });
+        match outcome {
+            Ok(Ok(run)) => {
                 ran += usize::from(run.ran);
                 if run.stop {
                     break;
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 failed += 1;
                 log::warn!(
                     "{LOG}: {id}: {} listener from {} failed: {error}",
@@ -1189,9 +1210,45 @@ fn run_listeners(
                     listener.source
                 );
             }
+            Err(panic) => {
+                failed += 1;
+                log::warn!(
+                    "{LOG}: {id}: {} listener from {} failed: panicked: {panic}",
+                    event.name(),
+                    listener.source
+                );
+            }
         }
     }
     (ran, failed)
+}
+
+/// Runs one Java callback, turning a panic into a named failure.
+///
+/// The interpreter can panic on a value a jar hands it (`Integer.parseInt(s, 40)` on an
+/// unchecked radix, a slice index from malformed bytecode). A Java callback must fail, be counted
+/// in the report and leave the game running: never take the process down. `what` names the
+/// callback (entrypoint, listener or command) in the log line.
+fn caught<T>(what: &str, run: impl FnOnce() -> T) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let reason = panic_message(payload.as_ref());
+            log::warn!("{LOG}: {what} panicked: {reason}");
+            Err(reason)
+        }
+    }
+}
+
+/// A panic payload as text: the message `panic!` carried, or a note that it carried none.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "panic with a non-string payload".to_owned()
+    }
 }
 
 /// Adds one command-registration pass to the jar's row: listeners that ran or failed, usages
@@ -1242,11 +1299,11 @@ fn deliver(
 ) {
     for message in messages {
         let text = mod_text(&message.text);
-        if let MessageKind::Player(uuid) = message.kind {
-            if let Some(player) = host.player(uuid) {
-                let _ = player.tell(host, text);
-                continue;
-            }
+        if let MessageKind::Player(uuid) = message.kind
+            && let Some(player) = host.player(uuid)
+        {
+            let _ = player.tell(host, text);
+            continue;
         }
         let _ = host.commands().feedback(text);
     }
@@ -1397,9 +1454,18 @@ impl Translator<'_> {
             match requirement {
                 Requirement::Level(node_level) => level = level.max((*node_level).min(4)),
                 Requirement::Predicate(_) => {
-                    match self
-                        .jar
-                        .requirement_level(requirement, true, self.host, &self.budget)
+                    match caught(
+                        &format!(
+                            "{} permission predicate for /{}",
+                            self.id,
+                            usage(path, arguments)
+                        ),
+                        || {
+                            self.jar
+                                .requirement_level(requirement, true, self.host, &self.budget)
+                        },
+                    )
+                    .and_then(|answer| answer.map_err(|error| error.to_string()))
                     {
                         Ok(node_level) => level = level.max(node_level.min(4)),
                         Err(error) => {
@@ -1547,11 +1613,11 @@ impl State {
 struct JarRow {
     file: String,
     id: String,
-    /// `ran-clean`, `ran-hollow` or `refused`.
+    /// `ran-clean`, `ran-hollow`, `ran-partial` or `refused`.
     verdict: &'static str,
     host_calls: usize,
     unknown_host_calls: usize,
-    /// Reason a refused jar was refused; `None` for one that ran.
+    /// Why a jar was refused or ran partially; `None` for a full run.
     reason: Option<String>,
     /// Server lifecycle callbacks that ran and failed, and the unmodelled host calls they made.
     callbacks_ran: usize,
@@ -1676,38 +1742,34 @@ pub(crate) fn jar_id(jar: &NativeJar, file: &str) -> String {
         .unwrap_or_else(|| file.strip_suffix(".jar").unwrap_or(file).to_owned())
 }
 
-/// Loads one jar the way a server would: its server-side entrypoints, in its own host, with no
-/// game behind it, and with the sibling jars it declares on that host's class path. Anything the
-/// runtime does not model is counted by the host, which is what `ran-hollow` means. The host is
-/// returned because the listeners it recorded need it for the rest of the server's life.
+/// Loads one jar the way a server would: every server-side entrypoint the real loader runs, in
+/// the loader's order, in its own host, with the sibling jars it declares on that host's class
+/// path. Anything the runtime does not model is counted by the host, which is what `ran-hollow`
+/// means. The host is returned because the listeners it recorded need it for the rest of the
+/// server's life.
+///
+/// Fabric runs `main` and then `server` (Hooks.startServer), so a jar that has both runs both.
+/// A failing stage is recorded and the remaining stages still run: the failure is a limit of
+/// this interpreter, not a reason to drop an entrypoint the jar ships for the server. Each stage
+/// runs inside [`caught`], so an interpreter panic is that stage failing like any other error,
+/// never a crashed game. The jar is refused only when every stage failed; a partial run is
+/// `ran-partial` and its `reason` names the failed stages.
+// The `Err` is the refused jar's report row, built once per jar at load: boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 fn load_jar(
     file: String,
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
 ) -> Result<LoadedJar, JarRow> {
     let id = jar_id(&jar, &file);
-    let Some(kind) = SERVER_KINDS
-        .into_iter()
-        .find(|kind| !jar.discover_entrypoints_on(kind, "SERVER").is_empty())
-    else {
+    let entrypoints = jar.role_entrypoints(false);
+    if entrypoints.is_empty() {
         let reason = if jar.discover_entrypoints("client").is_empty() {
             "no main, server or neoforge entrypoint"
         } else {
             "client-only entrypoint: a server never runs it"
         };
         return Err(JarRow::refused(&file, id, reason.to_owned()));
-    };
-    let entrypoints = jar.discover_entrypoints_on(kind, "SERVER");
-    if let Some(entry) = entrypoints.iter().find(|entry| entry.adapter.is_some()) {
-        return Err(JarRow::refused(
-            &file,
-            id,
-            format!(
-                "{}: entrypoint adapter {} is not supported by the native path",
-                entry.class,
-                entry.adapter.as_deref().unwrap_or_default()
-            ),
-        ));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
     for (link, dependency) in links {
@@ -1720,39 +1782,59 @@ fn load_jar(
         }
     }
     let mut calls = 0;
-    for entry in &entrypoints {
-        let outcome = jar.execute_with_budget(
-            &entry.class,
-            entry.method.as_deref(),
-            kind,
-            &mut host,
-            &runtime::ExecutionBudget::within(JAR_BUDGET),
+    let mut ran = 0;
+    let mut failures = Vec::new();
+    for (kind, entry) in &entrypoints {
+        if let Some(adapter) = entry.adapter.as_deref() {
+            failures.push(format!(
+                "{}: entrypoint adapter {adapter} is not supported by the native path",
+                entry.class
+            ));
+            continue;
+        }
+        let outcome = caught(
+            &format!("{} entrypoint {} ({kind})", id, entry.class),
+            || {
+                jar.execute_with_budget(
+                    &entry.class,
+                    entry.method.as_deref(),
+                    kind,
+                    &mut host,
+                    &runtime::ExecutionBudget::within(JAR_BUDGET),
+                )
+            },
         );
         match outcome {
-            Ok(report) => calls += report.calls,
-            Err(error) => {
-                let unknown = host.unknown_host_call_count();
-                return Err(JarRow {
-                    file,
-                    id,
-                    verdict: "refused",
-                    host_calls: calls,
-                    unknown_host_calls: unknown,
-                    reason: Some(format!("{}: {error}", entry.class)),
-                    callbacks_ran: 0,
-                    callbacks_failed: 0,
-                    callback_unknown_host_calls: 0,
-                    commands_ran: 0,
-                    commands_refused: 0,
-                    command_unknown_host_calls: 0,
-                    commands_translated: 0,
-                    commands_refused_at_registration: 0,
-                    content_blocks: 0,
-                    content_items: 0,
-                    content_skipped: BTreeMap::new(),
-                });
+            Ok(Ok(report)) => {
+                calls += report.calls;
+                ran += 1;
             }
+            Ok(Err(error)) => failures.push(format!("{}: {error}", entry.class)),
+            // A caught panic is this stage failing: the remaining stages still run, and it counts
+            // toward `ran-partial` exactly as an interpreter error does.
+            Err(panic) => failures.push(format!("{}: panicked: {panic}", entry.class)),
         }
+    }
+    if ran == 0 {
+        return Err(JarRow {
+            file,
+            id,
+            verdict: "refused",
+            host_calls: calls,
+            unknown_host_calls: host.unknown_host_call_count(),
+            reason: Some(failures.join("; ")),
+            callbacks_ran: 0,
+            callbacks_failed: 0,
+            callback_unknown_host_calls: 0,
+            commands_ran: 0,
+            commands_refused: 0,
+            command_unknown_host_calls: 0,
+            commands_translated: 0,
+            commands_refused_at_registration: 0,
+            content_blocks: 0,
+            content_items: 0,
+            content_skipped: BTreeMap::new(),
+        });
     }
     let unknown = host.unknown_host_call_count();
     let listeners = host.game_listeners(&jar, true).listeners;
@@ -1760,14 +1842,11 @@ fn load_jar(
         row: JarRow {
             file,
             id,
-            verdict: if unknown == 0 {
-                "ran-clean"
-            } else {
-                "ran-hollow"
-            },
+            verdict: runtime::verdict::verdict(ran, failures.len(), unknown),
             host_calls: calls,
             unknown_host_calls: unknown,
-            reason: None,
+            reason: (!failures.is_empty())
+                .then(|| format!("entrypoint(s) failed: {}", failures.join("; "))),
             callbacks_ran: 0,
             callbacks_failed: 0,
             callback_unknown_host_calls: 0,
@@ -1809,7 +1888,7 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mod_api::{EntityRef, Identifier, PermissionLevel, WorldEpoch};
+    use mod_api::{DamageContainer, EntityRef, Identifier, PermissionLevel, WorldEpoch};
 
     /// A command block answers its own dimension (`CommandSource::CommandBlock.level`), the
     /// console the overworld (vanilla's console source), and the sources whose level the hook
@@ -1925,6 +2004,170 @@ mod tests {
         let commands = &row.json()["commands"];
         assert_eq!(commands["translated"], 3);
         assert_eq!(commands["refused_at_registration"], 4);
+    }
+
+    /// A panic inside a Java callback is a named, counted failure: the game keeps running and
+    /// the report says which callback threw. `Integer.parseInt("1", 40)` is the probe the audit
+    /// used, and it aborts the Rust process without this wrapper.
+    /// One entrypoint class: `public class <name> implements <interface>` with a no-argument
+    /// constructor and `public void <method>()`. With `panics`, the method calls
+    /// `Integer.parseInt("1", 40)`, which panics inside the interpreter (`i32::from_str_radix`
+    /// rejects a radix above 36 by panicking); otherwise it just returns.
+    fn entrypoint_class(name: &str, interface: &str, method: &str, panics: bool) -> Vec<u8> {
+        fn u2(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        fn utf8(out: &mut Vec<u8>, value: &str) {
+            out.push(1);
+            u2(out, value.len() as u16);
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
+        u2(&mut out, 21); // pool slots 1..=20
+        utf8(&mut out, name); // 1
+        out.extend_from_slice(&[7, 0, 1]); // 2 Class name
+        utf8(&mut out, "java/lang/Object"); // 3
+        out.extend_from_slice(&[7, 0, 3]); // 4 Class Object
+        utf8(&mut out, "<init>"); // 5
+        utf8(&mut out, "()V"); // 6
+        out.extend_from_slice(&[12, 0, 5, 0, 6]); // 7 NameAndType <init>()V
+        out.extend_from_slice(&[10, 0, 4, 0, 7]); // 8 Methodref Object.<init>
+        utf8(&mut out, "Code"); // 9
+        utf8(&mut out, method); // 10
+        utf8(&mut out, interface); // 11
+        out.extend_from_slice(&[7, 0, 11]); // 12 Class interface
+        utf8(&mut out, "1"); // 13
+        out.extend_from_slice(&[8, 0, 13]); // 14 String "1"
+        utf8(&mut out, "java/lang/Integer"); // 15
+        out.extend_from_slice(&[7, 0, 15]); // 16 Class Integer
+        utf8(&mut out, "parseInt"); // 17
+        utf8(&mut out, "(Ljava/lang/String;I)I"); // 18
+        out.extend_from_slice(&[12, 0, 17, 0, 18]); // 19 NameAndType parseInt
+        out.extend_from_slice(&[10, 0, 16, 0, 19]); // 20 Methodref Integer.parseInt
+        // public class, this #2, super #4, one interface (#12), no fields, two methods.
+        out.extend_from_slice(&[0, 0x21, 0, 2, 0, 4, 0, 1, 0, 12, 0, 0, 0, 2]);
+        let mut method_info = |name: u16, max_stack: u16, code: &[u8]| {
+            u2(&mut out, 0x0001); // public
+            u2(&mut out, name);
+            u2(&mut out, 6); // ()V
+            u2(&mut out, 1); // one attribute: Code
+            u2(&mut out, 9);
+            out.extend_from_slice(&(12 + code.len() as u32).to_be_bytes());
+            u2(&mut out, max_stack);
+            u2(&mut out, 1); // max_locals: `this`
+            out.extend_from_slice(&(code.len() as u32).to_be_bytes());
+            out.extend_from_slice(code);
+            u2(&mut out, 0); // no exception table
+            u2(&mut out, 0); // no attributes
+        };
+        // aload_0; invokespecial Object.<init>; return
+        method_info(5, 1, &[0x2A, 0xB7, 0, 8, 0xB1]);
+        if panics {
+            // ldc "1"; bipush 40; invokestatic Integer.parseInt; pop; return
+            method_info(10, 2, &[0x12, 14, 0x10, 40, 0xB8, 0, 20, 0x57, 0xB1]);
+        } else {
+            method_info(10, 0, &[0xB1]);
+        }
+        u2(&mut out, 0); // no class attributes
+        out
+    }
+
+    /// A Fabric jar with a `main` stage (class `demo.Main`) and a `server` stage
+    /// (`demo.Server`). `None` leaves that class out of the jar, so its stage fails to load;
+    /// `Some(panics)` ships it, panicking or not.
+    fn two_stage_jar(main: Option<bool>, server: Option<bool>) -> Arc<NativeJar> {
+        use std::io::Write;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut bytes);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("fabric.mod.json", options).unwrap();
+            zip.write_all(
+                br#"{"schemaVersion":1,"id":"demo","version":"1",
+                    "entrypoints":{"main":["demo.Main"],"server":["demo.Server"]}}"#,
+            )
+            .unwrap();
+            let stages = [
+                (
+                    "demo/Main",
+                    "net/fabricmc/api/ModInitializer",
+                    "onInitialize",
+                    main,
+                ),
+                (
+                    "demo/Server",
+                    "net/fabricmc/api/DedicatedServerModInitializer",
+                    "onInitializeServer",
+                    server,
+                ),
+            ];
+            for (name, interface, method, shipped) in stages {
+                if let Some(panics) = shipped {
+                    zip.start_file(format!("{name}.class"), options).unwrap();
+                    zip.write_all(&entrypoint_class(name, interface, method, panics))
+                        .unwrap();
+                }
+            }
+            zip.finish().unwrap();
+        }
+        Arc::new(NativeJar::from_bytes(&bytes.into_inner()).unwrap())
+    }
+
+    /// The verdict and reason `load_jar` gives a jar, whether it loaded or was refused.
+    fn load_verdict(jar: Arc<NativeJar>) -> (&'static str, Option<String>) {
+        match load_jar("demo.jar".to_owned(), jar, &[]) {
+            Ok(loaded) => (loaded.row.verdict, loaded.row.reason),
+            Err(row) => (row.verdict, row.reason),
+        }
+    }
+
+    /// Fabric's `Hooks.startServer` runs `main` and then `server`; the bridge runs both, records
+    /// a failed stage and keeps going, and an interpreter panic in a stage is that stage
+    /// failing (counted toward `ran-partial`), never a crashed game.
+    #[test]
+    fn every_server_stage_runs_and_a_failed_or_panicking_stage_is_partial() {
+        // Both stages ship and return: a full, clean run.
+        assert_eq!(
+            load_verdict(two_stage_jar(Some(false), Some(false))),
+            ("ran-clean", None)
+        );
+
+        // `main` cannot load, `server` still runs: partial, and the reason names only `main`.
+        let (verdict, reason) = load_verdict(two_stage_jar(None, Some(false)));
+        assert_eq!(verdict, "ran-partial");
+        let reason = reason.unwrap();
+        assert!(
+            reason.starts_with("entrypoint(s) failed: demo.Main: "),
+            "{reason}"
+        );
+        assert!(!reason.contains("demo.Server"), "{reason}");
+
+        // `main` panics in the interpreter, `server` still runs after it: partial, not a crash.
+        let (verdict, reason) = load_verdict(two_stage_jar(Some(true), Some(false)));
+        assert_eq!(verdict, "ran-partial");
+        let reason = reason.unwrap();
+        assert!(reason.contains("demo.Main: panicked: "), "{reason}");
+        assert!(!reason.contains("demo.Server"), "{reason}");
+
+        // Every stage failed (one missing, one panicking): refused, with both named.
+        let (verdict, reason) = load_verdict(two_stage_jar(None, Some(true)));
+        assert_eq!(verdict, "refused");
+        let reason = reason.unwrap();
+        assert!(reason.contains("demo.Main: "), "{reason}");
+        assert!(reason.contains("demo.Server: panicked: "), "{reason}");
+    }
+
+    #[test]
+    fn a_panicking_callback_is_a_named_failure_not_a_crash() {
+        let answer: Result<u32, String> = caught("parseInt radix 40", || {
+            panic!("radix must lie in the range [2, 36]")
+        });
+        assert_eq!(answer.unwrap_err(), "radix must lie in the range [2, 36]");
+        let answer: Result<(), String> = caught("formatted", || panic!("{} {}", "bad", "value"));
+        assert_eq!(answer.unwrap_err(), "bad value");
+        let answer: Result<(), String> = caught("quiet", || std::panic::panic_any(7_u8));
+        assert_eq!(answer.unwrap_err(), "panic with a non-string payload");
+        assert_eq!(caught("runs", || 7).unwrap(), 7);
     }
 
     /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
