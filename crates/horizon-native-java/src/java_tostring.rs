@@ -62,7 +62,9 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         && crate::host_models_class(class)
         && !matches!(class, "java/lang/StringBuilder" | "java/lang/StringBuffer")
     {
-        return Some(class.to_owned());
+        // An unmodifiable collection prints through its interface's model.
+        let interface = crate::java_immutable::supertypes(class).first();
+        return Some(interface.copied().unwrap_or(class).to_owned());
     }
     None
 }
