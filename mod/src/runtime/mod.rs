@@ -19,6 +19,7 @@ use std::{
 mod annotation_values;
 mod block_item_id;
 pub mod brigadier;
+mod checkcast;
 mod class_init;
 pub mod client_surface;
 mod collection_base;
@@ -30,6 +31,7 @@ mod declarations_content;
 pub mod dependencies;
 mod dfu_pair;
 mod entrypoint_role;
+mod enum_value_of;
 pub mod events;
 mod fabric_registry;
 mod facade_saved_data;
@@ -4514,12 +4516,19 @@ impl Host for StdHost {
                 "valueOf",
                 "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
             ) => {
+                // The interpreter answers a jar enum and checks a game enum
+                // with a constant table (`enum_value_of.rs`); what reaches the
+                // host is a class whose constants nobody here knows, so the
+                // name cannot be checked: the marker is answered, and counted.
                 let class = class_binary_name(Self::argument(r, args, 0)?).replace('.', "/");
                 let name = expect_string(Self::argument(r, args, 1)?);
                 if name.is_empty() {
                     return Err(NativeError::Metadata(
                         "java/lang/Enum.valueOf received an empty name".into(),
                     ));
+                }
+                if game_enum_constants(&class).is_none() {
+                    self.unknown_host_call(r)?;
                 }
                 Ok(Value::Ref(Some(format!("enum/{class}/{name}"))))
             }
@@ -5464,7 +5473,14 @@ impl Host for StdHost {
                 ("<init>", _) => Ok(Value::Void),
                 ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some("main".into()))),
                 ("isDaemon", "()Z") => Ok(Value::Int(0)),
-                ("setDaemon", "(Z)V") | ("start", "()V") => Ok(Value::Void),
+                ("setDaemon", "(Z)V") => Ok(Value::Void),
+                // The bounded runtime has one thread and `<init>` keeps no
+                // `Runnable`, so a started thread's body never runs. That is
+                // not a success to report: the call is counted (and refused
+                // when strict). Running the body inline instead would run a
+                // worker loop (a file watcher, an update check, a metrics
+                // server) to the budget on the entrypoint's thread.
+                ("start", "()V") => self.unknown_host_call(r),
                 // Loader diagnostics and IDE detection scan the current
                 // thread's frames. The bounded runtime has no Java stack to
                 // hand out, so the truthful answer is an empty owned array.
@@ -20205,6 +20221,9 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_enum_value_of(r, args)? {
+            return Ok(Some(value));
+        }
         // An annotation the lookup handed out answers its own members, so
         // `found.value()` reads the class file's value instead of dispatching
         // into an interface that has no code.
@@ -24102,13 +24121,15 @@ impl<H: Host> Runtime<'_, H> {
                     stack.push(Value::Ref(Some(marker)));
                 }
                 0xc0 => {
-                    // The bounded runtime does not model a JVM type lattice;
-                    // consume the class operand and preserve the reference.
-                    let _ = read_u16(code, &mut pc)?;
-                    let _ = stack
+                    // The reference stays on the stack; a cast to a class the
+                    // runtime holds is checked (`checkcast.rs`).
+                    let index = read_u16(code, &mut pc)?;
+                    let target = class_name(&file.pool, index)?.to_owned();
+                    let value = stack
                         .last()
                         .cloned()
                         .ok_or_else(|| underflow(class, method, at))?;
+                    invoke_or_catch!(at, self.checkcast(&value, &target));
                 }
                 0xc1 => {
                     let index = read_u16(code, &mut pc)?;
