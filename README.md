@@ -60,7 +60,7 @@ nothing about whether the mod works. The committed ledgers predate the host-call
 - **Entrypoint census** (`tools/unmodelled_calls.py`, the native probe over the same corpora, every server
   stage, the game's verdict), re-measured on 11 November 2026 with the interpreter-honesty fixes
   (#37, #38, #41): `ran-clean` **174 → 112** (wide 52 → 31, mega 86 → 59, NeoForge 36 → 22), 18 jars
-  `ran-partial`, and 133 more refused, almost all on a `NullPointerException` the interpreter used to
+  `ran-partial`, and 132 more refused, almost all on a `NullPointerException` the interpreter used to
   carry on through. Lower is correct: those jars were clean only because failures were answered
   silently. Detail in [docs/unmodelled-calls.md](docs/unmodelled-calls.md).
 

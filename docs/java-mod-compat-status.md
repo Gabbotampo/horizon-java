@@ -38,14 +38,14 @@ carrying: game-class mixins, event callbacks and the client surface. The design 
 The ledgers above run each jar on a real dedicated server; the entrypoint census
 ([unmodelled-calls.md](unmodelled-calls.md)) runs the native probe over the same corpora, entrypoints only,
 with every server stage the loader runs (`main`, then `server`) and the game's own verdict. Re-measured at
-`07bd0cf` plus the interpreter-honesty PRs (#37: a call on `null` throws `NullPointerException`, empty optionals
+`1894d35` plus the interpreter-honesty PRs (#37: a call on `null` throws `NullPointerException`, empty optionals
 are objects; #38: bodiless and unmodelled instance calls are counted, no 64-key cap; #41: casts to jar classes,
 `Enum.valueOf` and `Thread.start` are checked or counted), old → new:
 
 | Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
 |---|---:|---:|---:|---:|
-| wide (`corpus-xl`) | 52 → **31** | 53 → 35 | 0 → 8 | 11 → 42 |
-| mega | 86 → **59** | 138 → 68 | 0 → 10 | 28 → 115 |
+| wide (`corpus-xl`) | 52 → **31** | 52 → 34 | 0 → 8 | 12 → 43 |
+| mega | 86 → **59** | 136 → 67 | 0 → 10 | 30 → 116 |
 | NeoForge 26.3 | 36 → **22** | 21 → 20 | 0 → 0 | 28 → 43 |
 
 The numbers going down is the correct outcome: 62 jars had read `ran-clean` only because the interpreter carried
