@@ -24244,10 +24244,9 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_io(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        mod_origin::invoke(&r, receiver.as_ref(), &args)
-                    ) {
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, mod_origin::invoke(&r, receiver.as_ref(), &args))
+                    {
                         value
                     } else if let Some(value) =
                         executors::invoke_thread_factory(self, &r, receiver.as_ref(), &args)

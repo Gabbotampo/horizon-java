@@ -189,7 +189,9 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let receiver = receiver.and_then(expect_ref).map(|marker| marker.to_owned());
+        let receiver = receiver
+            .and_then(expect_ref)
+            .map(|marker| marker.to_owned());
         match r.owner.as_str() {
             "com/google/gson/FormattingStyle" => {
                 let Some(marker) = receiver else {

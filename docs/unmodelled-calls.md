@@ -6,15 +6,19 @@
 descriptor (`null`, `0`, `false`). This page ranks those calls over the three measured
 corpora so fixes target the jars they actually hold back.
 
-Measured on 11 November 2026 at `1894d35` (main, with #45) plus the four interpreter-honesty
+Measured on 11 November 2026 at `b45a717` (main) plus the four interpreter-honesty
 PRs: null receivers and empty optionals (#37), bodiless and instance calls counted
-(#38), checkcast / `Enum.valueOf` / `Thread.start` (#41), and the census-stages PR that
-carries this page. With the native probe (`crates/horizon-native-java`), one process per jar, each
-jar with its declared dependency closure on the same class path and **every server stage
-the loader runs** (`main`, then `server`). The numbers went **down**, and that is the
-correct outcome: every jar that left `ran-clean` had been reading clean only because the
-interpreter answered a call on `null`, a bodiless method or an unmodelled instance call
-silently. See [Re-measured](#re-measured-11-november-2026) for old → new.
+(#38), checkcast / `Enum.valueOf` / `Thread.start` (#41), the census-stages PR that
+carried this page, and the unmodelled-answer batch: Gson's builder and writer (#49),
+Fabric `ModOrigin` (#50), Guava `MapMaker` (#51), executors (#52) and host method
+references (#53). With the native probe (`crates/horizon-native-java`), one process per
+jar, each jar with its declared dependency closure on the same class path and **every
+server stage the loader runs** (`main`, then `server`). The honesty fixes first made the
+numbers go **down**, and that was the correct outcome: every jar that left `ran-clean`
+had been reading clean only because the interpreter answered a call on `null`, a bodiless
+method or an unmodelled instance call silently. The answer batch then moves the jars that
+stopped on those invented `null`s forward. See
+[Re-measured](#re-measured-11-november-2026) for old → new.
 
 ```sh
 cargo build --profile fast -p horizon-native-java
@@ -69,14 +73,15 @@ measures.
 
 | Corpus | Jars | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | `skipped` | Unknown calls (in runs that finished) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| wide (`corpus-xl`) | 223 | 31 | 34 | 8 | 43 | 107 | 1,146 |
-| mega (500 unique) | 500 | 59 | 67 | 10 | 116 | 248 | 2,311 |
-| NeoForge 26.3 | 85 | 22 | 20 | 0 | 43 | 0 | 231 |
-| **total** | **808** | **112** | **121** | **18** | **202** | **355** | **3,688** |
+| wide (`corpus-xl`) | 223 | 31 | 41 | 4 | 40 | 107 | 1,184 |
+| mega (500 unique) | 500 | 60 | 83 | 4 | 105 | 248 | 2,449 |
+| NeoForge 26.3 | 85 | 22 | 21 | 0 | 42 | 0 | 233 |
+| **total** | **808** | **113** | **145** | **8** | **187** | **355** | **3,866** |
 
-The unknown-call total dropped because most heavily hollow runs now stop at the first
-`null` they dereference (`refused`), and a refused run's calls are not summed; the calls
-are not modelled now, they are no longer reached.
+The unknown-call total is lower than the honesty-era figure even though fifteen jars now
+run further: those runs used to stop at the first invented `null` they dereferenced
+(`refused`), and a refused run's calls are not summed. The batch below is the first one
+that moves jars the *other* way — fifteen leave `refused` and one reaches `ran-clean`.
 
 ## Ranked calls
 
@@ -95,46 +100,46 @@ alone moves them to `ran-clean`. `surface` says what a bounded runtime could do:
 
 | # | call | jars | calls | sole | surface |
 |---:|---|---:|---:|---:|---|
-| 1 | `com/google/gson/FormattingStyle#PRETTYLcom/google/gson/FormattingStyle;` | 10 | 10 | 10 | library |
-| 2 | `java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;` | 8 | 14 | 7 | JDK |
-| 3 | `net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V` | 12 | 29 | 5 | loader |
+| 1 | `java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;` | 8 | 14 | 7 | JDK |
+| 2 | `net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V` | 13 | 30 | 5 | loader |
+| 3 | `java/lang/StackWalker$Option#RETAIN_CLASS_REFERENCELjava/lang/StackWalker$Option;` | 10 | 10 | 5 | JDK |
 | 4 | `java/util/Properties#setProperty(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;` | 7 | 28 | 5 | JDK |
 | 5 | `net/fabricmc/loader/api/FabricLoader#getAllMods()Ljava/util/Collection;` | 9 | 28 | 4 | loader |
 | 6 | `net/minecraft/network/codec/StreamCodec#ofMember(Lnet/minecraft/network/codec/StreamMemberEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;` | 7 | 44 | 4 | game-bound |
 | 7 | `com/google/common/collect/Maps#newHashMap()Ljava/util/HashMap;` | 5 | 5 | 4 | library |
 | 8 | `java/util/ServiceLoader#forEach(Ljava/util/function/Consumer;)V` | 3 | 3 | 3 | JDK |
-| 9 | `net/minecraft/network/protocol/common/custom/CustomPacketPayload#codec(Lnet/minecraft/network/codec/StreamMemberEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;` | 14 | 64 | 2 | game-bound |
+| 9 | `net/minecraft/network/protocol/common/custom/CustomPacketPayload#codec(Lnet/minecraft/network/codec/StreamMemberEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;` | 16 | 68 | 2 | game-bound |
 | 10 | `org/spongepowered/asm/mixin/MixinEnvironment#getActiveTransformer()Ljava/lang/Object;` | 2 | 2 | 2 | loader |
 | 11 | `net/minecraft/network/codec/StreamCodec#of(Lnet/minecraft/network/codec/StreamEncoder;Lnet/minecraft/network/codec/StreamDecoder;)Lnet/minecraft/network/codec/StreamCodec;` | 6 | 23 | 1 | game-bound |
 | 12 | `org/spongepowered/asm/service/MixinService#getService()Lorg/spongepowered/asm/service/IMixinService;` | 5 | 68 | 1 | loader |
 | 13 | `com/google/gson/JsonObject#addProperty(Ljava/lang/String;Ljava/lang/Boolean;)V` | 4 | 64 | 1 | library |
 | 14 | `net/neoforged/bus/api/IEventBus#addListener(Ljava/lang/Class;Ljava/util/function/Consumer;)V` | 4 | 6 | 1 | loader |
-| 15 | `net/minecraft/Optionull#mapOrElse(Ljava/lang/Object;Ljava/util/function/Function;Ljava/util/function/Supplier;)Ljava/lang/Object;` | 2 | 4 | 1 | game-bound |
-| 16 | `java/util/List#getFirst()Ljava/lang/Object;` | 1 | 2 | 1 | JDK |
-| 17 | `java/util/Base64#getUrlEncoder()Ljava/util/Base64$Encoder;` | 1 | 1 | 1 | JDK |
-| 18 | `net/fabricmc/loader/api/FabricLoader#invokeEntrypoints(Ljava/lang/String;Ljava/lang/Class;Ljava/util/function/Consumer;)V` | 1 | 1 | 1 | loader |
-| 19 | `net/minecraft/client/Minecraft#getInstance()Lnet/minecraft/client/Minecraft;` | 1 | 1 | 1 | game-bound |
-| 20 | `net/minecraft/network/codec/StreamCodec#composite(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/BiFunction;)Lnet/minecraft/network/codec/StreamCodec;` | 17 | 43 | 0 | game-bound |
-| 21 | `net/minecraft/network/codec/StreamCodec#composite(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;` | 14 | 55 | 0 | game-bound |
-| 22 | `net/minecraft/network/codec/StreamCodec#composite(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lcom/mojang/datafixers/util/Function3;)Lnet/minecraft/network/codec/StreamCodec;` | 12 | 45 | 0 | game-bound |
-| 23 | `net/minecraft/network/codec/ByteBufCodecs#STRING_UTF8Lnet/minecraft/network/codec/StreamCodec;` | 11 | 106 | 0 | game-bound |
-| 24 | `net/minecraft/network/codec/ByteBufCodecs#BOOLLnet/minecraft/network/codec/StreamCodec;` | 11 | 46 | 0 | game-bound |
-| 25 | `com/mojang/serialization/codecs/RecordCodecBuilder#create(Ljava/util/function/Function;)Lcom/mojang/serialization/Codec;` | 11 | 18 | 0 | game-bound |
-| 26 | `net/minecraft/network/codec/ByteBufCodecs#INTLnet/minecraft/network/codec/StreamCodec;` | 10 | 46 | 0 | game-bound |
-| 27 | `xaero/lib/common/config/option/ConfigOptionManager#frozenZ` | 7 | 592 | 0 | mod-owned |
-| 28 | `java/lang/Math#pow(DD)D` | 7 | 238 | 0 | JDK |
-| 29 | `java/lang/Math#floor(D)D` | 7 | 108 | 0 | JDK |
-| 30 | `net/minecraft/world/effect/MobEffectCategory#HARMFULLnet/minecraft/world/effect/MobEffectCategory;` | 7 | 60 | 0 | game-bound |
-| 31 | `net/minecraft/core/Registry#registerForHolder(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;` | 7 | 40 | 0 | game-bound |
-| 32 | `java/lang/Math#ceil(D)D` | 7 | 27 | 0 | JDK |
-| 33 | `java/lang/Math#min(DD)D` | 7 | 27 | 0 | JDK |
-| 34 | `net/minecraft/world/effect/MobEffectCategory#NEUTRALLnet/minecraft/world/effect/MobEffectCategory;` | 7 | 20 | 0 | game-bound |
-| 35 | `java/io/FileOutputStream#close()V` | 7 | 14 | 0 | JDK |
-| 36 | `xaero/lib/common/config/single/SingleConfigManager#configLxaero/lib/common/config/Config;` | 7 | 14 | 0 | mod-owned |
-| 37 | `com/mojang/serialization/codecs/RecordCodecBuilder#mapCodec(Ljava/util/function/Function;)Lcom/mojang/serialization/MapCodec;` | 7 | 13 | 0 | game-bound |
-| 38 | `net/minecraft/network/codec/StreamCodec#composite(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lcom/mojang/datafixers/util/Function4;)Lnet/minecraft/network/codec/StreamCodec;` | 7 | 13 | 0 | game-bound |
-| 39 | `net/minecraft/network/chat/CommonComponents#EMPTYLnet/minecraft/network/chat/Component;` | 7 | 7 | 0 | game-bound |
-| 40 | `net/minecraft/network/codec/StreamCodec#map(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;` | 7 | 7 | 0 | game-bound |
+| 15 | `java/lang/String#getBytes()[B` | 3 | 3 | 1 | JDK |
+| 16 | `net/minecraft/Optionull#mapOrElse(Ljava/lang/Object;Ljava/util/function/Function;Ljava/util/function/Supplier;)Ljava/lang/Object;` | 2 | 4 | 1 | game-bound |
+| 17 | `java/util/Collections#synchronizedMap(Ljava/util/Map;)Ljava/util/Map;` | 2 | 2 | 1 | JDK |
+| 18 | `net/minecraft/client/Minecraft#getInstance()Lnet/minecraft/client/Minecraft;` | 2 | 2 | 1 | game-bound |
+| 19 | `java/util/List#getFirst()Ljava/lang/Object;` | 1 | 2 | 1 | JDK |
+| 20 | `java/util/Base64#getUrlEncoder()Ljava/util/Base64$Encoder;` | 1 | 1 | 1 | JDK |
+| 21 | `java/util/concurrent/CompletableFuture#runAsync(Ljava/lang/Runnable;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;` | 1 | 1 | 1 | JDK |
+| 22 | `net/fabricmc/loader/api/FabricLoader#invokeEntrypoints(Ljava/lang/String;Ljava/lang/Class;Ljava/util/function/Consumer;)V` | 1 | 1 | 1 | loader |
+| 23 | `net/minecraft/network/codec/StreamCodec#composite(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/BiFunction;)Lnet/minecraft/network/codec/StreamCodec;` | 18 | 44 | 0 | game-bound |
+| 24 | `net/minecraft/network/codec/StreamCodec#composite(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;` | 14 | 55 | 0 | game-bound |
+| 25 | `net/minecraft/network/codec/StreamCodec#composite(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Lcom/mojang/datafixers/util/Function3;)Lnet/minecraft/network/codec/StreamCodec;` | 12 | 45 | 0 | game-bound |
+| 26 | `com/mojang/serialization/codecs/RecordCodecBuilder#create(Ljava/util/function/Function;)Lcom/mojang/serialization/Codec;` | 12 | 20 | 0 | game-bound |
+| 27 | `net/minecraft/network/codec/ByteBufCodecs#STRING_UTF8Lnet/minecraft/network/codec/StreamCodec;` | 11 | 106 | 0 | game-bound |
+| 28 | `net/minecraft/network/codec/ByteBufCodecs#BOOLLnet/minecraft/network/codec/StreamCodec;` | 11 | 46 | 0 | game-bound |
+| 29 | `net/minecraft/network/codec/ByteBufCodecs#INTLnet/minecraft/network/codec/StreamCodec;` | 10 | 46 | 0 | game-bound |
+| 30 | `net/minecraft/network/codec/StreamCodec#map(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;` | 8 | 8 | 0 | game-bound |
+| 31 | `xaero/lib/common/config/option/ConfigOptionManager#frozenZ` | 7 | 592 | 0 | mod-owned |
+| 32 | `java/lang/Math#pow(DD)D` | 7 | 238 | 0 | JDK |
+| 33 | `java/lang/Math#floor(D)D` | 7 | 108 | 0 | JDK |
+| 34 | `java/lang/reflect/Field#setAccessible(Z)V` | 7 | 74 | 0 | JDK |
+| 35 | `net/minecraft/world/effect/MobEffectCategory#HARMFULLnet/minecraft/world/effect/MobEffectCategory;` | 7 | 60 | 0 | game-bound |
+| 36 | `net/minecraft/core/Registry#registerForHolder(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;` | 7 | 40 | 0 | game-bound |
+| 37 | `java/lang/Math#ceil(D)D` | 7 | 27 | 0 | JDK |
+| 38 | `java/lang/Math#min(DD)D` | 7 | 27 | 0 | JDK |
+| 39 | `net/minecraft/world/effect/MobEffectCategory#NEUTRALLnet/minecraft/world/effect/MobEffectCategory;` | 7 | 20 | 0 | game-bound |
+| 40 | `java/io/FileOutputStream#close()V` | 7 | 14 | 0 | JDK |
 
 `<checkcast>` rows are casts the runtime could not check (a game object cast to a jar
 interface a Mixin may add, an opaque marker); they are counted, not passed.
@@ -240,6 +245,39 @@ common receivers are `ModOrigin.toString()` (12 jars), `GsonBuilder` fluent call
 Per PR on its own against `0c45845` (ran-clean total 174): #37 → 156, #38 → 118, #41 →
 174 (no corpus jar depended on an unchecked cast, an invalid `valueOf` name or
 `Thread.start`; the new counts landed in jars already hollow).
+
+## Re-measured (11 November 2026, after the unmodelled-answer batch)
+
+Old is `b45a717` (main) and new is the same commit with #49–#53: Gson's fluent builder,
+`FormattingStyle` and writer (#49), Fabric `ModOrigin` (#50), Guava `MapMaker` (#51),
+executors (#52) and host method references (#53). Same corpora, deps and command.
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
+|---|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → **31** | 34 → 41 | 8 → 4 | 43 → 40 |
+| mega | 59 → **60** | 67 → 83 | 10 → 4 | 116 → 105 |
+| NeoForge | 22 → **22** | 20 → 21 | 0 → 0 | 43 → 42 |
+| **total** | **112 → 113** | 121 → 145 | 18 → 8 | 202 → 187 |
+
+Fifteen jars leave `refused`; one (`midnightlib-fabric`) reaches `ran-clean`. Ten
+`ran-partial` rows become `ran-hollow`: their second stage used to fail on one of those
+`null`s and now runs. Unknown calls counted: 3,703 → 3,866.
+
+What each fix moved, measured on its own branch:
+
+| PR | Fixed call | Effect |
+|---|---|---|
+| #49 | `GsonBuilder` fluent calls (16 jars) | 12 leave `refused`; the pretty-printing writer now matches Gson's text |
+| #50 | `ModOrigin.toString()` (12 jars) | all 12 get past it; they stop on the next unmodelled answer |
+| #51 | `MapMaker.makeMap()` (18 jars reached) | 3 leave `refused`; 15 stop later |
+| #52 | `ExecutorService.execute` (7 jars) | all 7 get past it; they stop in `CommentedProperties#save` on the bounded regex subset |
+| #53 | method references to host methods | no label moves (a dropped reference was a silent wrong answer, not a stop); pinned by fixtures |
+
+What is left where those runs now stop: `BigDecimal.stripTrailingZeros()` and
+`String.replace` on a null argument (Serilum's shared init), a Balm event's `listeners`
+field, `EnumConfigProperty`'s `getEnumConstants`, `FabricBalmCapabilities`, and
+`CommentedProperties#save`'s `Pattern` outside the native regex subset. The game-bound
+list below is unchanged.
 
 ## Known limits of this census
 
