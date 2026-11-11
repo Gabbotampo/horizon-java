@@ -616,6 +616,16 @@ residency check, and the Java hooks around it were the same `entity_load`/`entit
 runs, the two relaunches below, or any of the re-survey's 11 batches. That is a candidate fork issue,
 not filed here. The three logs are kept with the results.
 
+*Since (reproduced on elysium, no Java jars loaded, idle after `wait-ready`):* the pinned game
+panics the same way with no mod content at all: `--seed 20261111` (`extractions: 9`, ~200 ticks) and
+`--seed 1` (`extractions: 2`), while no seed (seed `0`) runs 1,891 ticks clean. Fork main
+`d3e649f849` runs 2,205 and 2,295 ticks (seed 20261111, twice) and 2,374 (seed 1) without it. A
+first-parent bisect over the 73 merges between the two names the merge of `arismoko/horizon#2855`
+(`34724f7686`; commit `aa8209dbcc`, "Retire terminal falling blocks from entity residency"), which
+closes `arismoko/horizon#2845`: `tick_one_falling` extracted a falling block and never retired it
+when it landed, dropped or was gone, and these seeds have gravity blocks near spawn. Nothing to
+file; the next pin bump past `34724f7686` takes the fix.
+
 ### carryon, before → after
 
 | | before (`22dff61`) | after (`9768f5d`) |
@@ -688,6 +698,12 @@ The §5.2 follow-ups on the `after` build, each relaunching a copy of the same w
      bridge holding the runtime's pre-death objects until the Clone listeners have run.
    - Then, from the bytecode reading (not run): `ServerPlayer#level()` (`arismoko/horizon#2747`),
      `ServerLevel#getGameRules()` + `GameRules#get`, and `Inventory#getSelectedSlot`/`setSelectedSlot`.
+
+   *Since:* the runtime answers `PlayerEvent$Clone#isWasDeath()` (the hook's `was_death`, as
+   NeoForge's `restoreFrom` posts it) and `getEntity()` already was. `getOriginal()` stays refused:
+   the fork's hook names one player at pin and fork main alike, and the store is already the
+   `copy_on_death` subset when it fires. The fork issue text is in `docs/mod-plan.md`,
+   "Fork seams needed" ("The old player on `player_clone`"), not filed.
 2. **The 13 entrypoint unknowns** keep carryon `ran-hollow`: NeoForge config
    (`ModConfigSpec$Builder#build`, `ModContainer#registerConfig`), the mod-bus
    `IEventBus#addListener(Consumer)` (the re-survey's cause 2) and `Field#canAccess` in its config
