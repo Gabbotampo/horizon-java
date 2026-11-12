@@ -29,11 +29,6 @@
 //! search past its step or depth budget. The caller turns that into an
 //! unknown host call, never a guessed answer.
 
-// Only `matches` is wired into the runtime here; `replaceAll`/`replaceFirst`,
-// `split` and the quoting helpers are answered by the stacked
-// `regex_calls.rs` PR. The oracle tests already exercise all of them.
-#![allow(dead_code)]
-
 mod engine;
 mod syntax;
 #[cfg(test)]

@@ -78,6 +78,7 @@ mod reflect_enum;
 mod reflect_generic;
 mod reflect_names;
 mod reflect_override;
+mod regex_calls;
 mod registry_contents;
 mod stack_walk;
 mod type_switch;
@@ -4771,20 +4772,6 @@ impl Host for StdHost {
                     None => Value::Ref(None),
                 })
             }
-            // `Pattern.matches(regex, input)` is `String.matches` spelled
-            // statically; `java_regex` answers it exactly or it is counted.
-            (
-                "java/util/regex/Pattern",
-                "matches",
-                "(Ljava/lang/String;Ljava/lang/CharSequence;)Z",
-            ) => {
-                let pattern = expect_string(Self::argument(r, args, 0)?);
-                let input = expect_string(Self::argument(r, args, 1)?);
-                match java_regex::matches(pattern, input) {
-                    Ok(matched) => Ok(Value::Int(i32::from(matched))),
-                    Err(_) => self.unknown_host_call(r),
-                }
-            }
             ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
                 Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
             ),
@@ -7576,15 +7563,6 @@ impl Host for StdHost {
             ("java/lang/String", "isBlank", "()Z") => {
                 Ok(Value::Int(expect_string(receiver).trim().is_empty() as i32))
             }
-            // Whole-input regex validation (`id.matches("[a-z0-9_.-]*")`).
-            // A pattern outside the modelled subset is counted, never guessed.
-            ("java/lang/String", "matches", "(Ljava/lang/String;)Z") => {
-                let pattern = expect_string(Self::argument(r, args, 0)?);
-                match java_regex::matches(pattern, expect_string(receiver)) {
-                    Ok(matched) => Ok(Value::Int(i32::from(matched))),
-                    Err(_) => self.unknown_host_call(r),
-                }
-            }
             ("java/lang/String", "substring", "(I)Ljava/lang/String;") => {
                 let start = expect_int(r, Self::argument(r, args, 0)?)?;
                 let value = expect_string(receiver);
@@ -9328,158 +9306,6 @@ fn utf16_last_index_of(haystack: &str, needle: &str) -> i32 {
         .windows(needle.len())
         .rposition(|window| window == needle)
         .map_or(-1, |index| index as i32)
-}
-
-/// The most parts one `String.split` call may produce.
-///
-/// Split results are caller-visible arrays, so a pattern that matches at every
-/// character of a long string must not turn into an unbounded allocation.
-const MAX_SPLIT_PARTS: usize = 65_536;
-
-/// The bounded `java.util.regex` subset `String.split` understands.
-///
-/// The runtime has no regex engine and no new dependency is allowed, so the
-/// shapes real mods pass most often are modelled exactly and everything else is
-/// a named diagnostic rather than a wrong split.
-enum SplitPattern {
-    /// `\R`: a `\r\n` pair or one Unicode line break.
-    LineBreak,
-    /// `\s+` (a whole run) or `\s` (exactly one character).
-    Whitespace { run: bool },
-    /// A pattern whose only metacharacters are escapes: it matches its text.
-    Literal(String),
-}
-
-/// The characters Java's default `\s` matches.
-fn is_java_space(value: char) -> bool {
-    value.is_ascii_whitespace() || value == '\u{000B}'
-}
-
-impl SplitPattern {
-    /// The leftmost match at or after byte offset `from`, as `(start, end)`.
-    ///
-    /// Every supported shape matches at least one character, so the caller's
-    /// scan always advances and cannot loop on a zero-width match.
-    fn find_at(&self, input: &str, from: usize) -> Option<(usize, usize)> {
-        let tail = input.get(from..)?;
-        match self {
-            Self::Literal(literal) => tail
-                .find(literal.as_str())
-                .map(|index| (from + index, from + index + literal.len())),
-            Self::LineBreak => tail.char_indices().find_map(|(offset, value)| {
-                let start = from + offset;
-                Some(match value {
-                    '\r' if tail[offset..].starts_with("\r\n") => (start, start + 2),
-                    '\r' | '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
-                        (start, start + value.len_utf8())
-                    }
-                    _ => return None,
-                })
-            }),
-            Self::Whitespace { run } => {
-                let offset = tail
-                    .char_indices()
-                    .find(|(_, value)| is_java_space(*value))?;
-                let start = from + offset.0;
-                if !run {
-                    return Some((start, start + offset.1.len_utf8()));
-                }
-                let end = input[start..]
-                    .char_indices()
-                    .find(|(_, value)| !is_java_space(*value))
-                    .map_or(input.len(), |(offset, _)| start + offset);
-                Some((start, end))
-            }
-        }
-    }
-}
-
-/// Parse a `String.split` argument, or say why it stays outside the subset.
-fn parse_split_pattern(pattern: &str) -> Result<SplitPattern, String> {
-    match pattern {
-        r"\R" => return Ok(SplitPattern::LineBreak),
-        r"\s+" => return Ok(SplitPattern::Whitespace { run: true }),
-        r"\s" => return Ok(SplitPattern::Whitespace { run: false }),
-        _ => {}
-    }
-    let mut literal = String::new();
-    let mut chars = pattern.chars();
-    while let Some(value) = chars.next() {
-        match value {
-            '\\' => match chars.next() {
-                Some('t') => literal.push('\t'),
-                Some('n') => literal.push('\n'),
-                Some('r') => literal.push('\r'),
-                Some('f') => literal.push('\u{000C}'),
-                Some(escaped) if escaped.is_ascii_punctuation() => literal.push(escaped),
-                _ => {
-                    return Err(format!(
-                        "pattern {pattern:?} is outside the bounded regex subset"
-                    ));
-                }
-            },
-            value if ".^$*+?()[]{}|".contains(value) => {
-                return Err(format!(
-                    "pattern {pattern:?} is outside the bounded regex subset"
-                ));
-            }
-            value => literal.push(value),
-        }
-    }
-    if literal.is_empty() {
-        return Err("the empty pattern is outside the bounded regex subset".into());
-    }
-    Ok(SplitPattern::Literal(literal))
-}
-
-/// Java's `String.split(regex, limit)` over [`SplitPattern`].
-///
-/// The caller's limit keeps its meaning: `0` and negative apply the pattern
-/// everywhere (`0` also drops trailing empty parts), and a positive limit
-/// applies it at most `limit - 1` times with the rest kept as the last part.
-/// A call that never matched answers `[input]`, which is what Java does even
-/// for the empty string.
-fn split_java_string(input: &str, pattern: &str, limit: i32) -> Result<Vec<String>, String> {
-    let pattern = parse_split_pattern(pattern)?;
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut search = 0usize;
-    let mut matched = false;
-    while search < input.len() {
-        if limit > 0 && parts.len() + 1 >= limit as usize {
-            break;
-        }
-        let Some((from, to)) = pattern.find_at(input, search) else {
-            break;
-        };
-        parts.push(input[start..from].to_owned());
-        if parts.len() >= MAX_SPLIT_PARTS {
-            return Err(format!(
-                "produced more than {MAX_SPLIT_PARTS} parts in one call"
-            ));
-        }
-        matched = true;
-        start = to;
-        search = to;
-    }
-    if !matched {
-        return Ok(vec![input.to_owned()]);
-    }
-    parts.push(input[start..].to_owned());
-    if parts.len() > MAX_SPLIT_PARTS {
-        return Err(format!(
-            "produced more than {MAX_SPLIT_PARTS} parts in one call"
-        ));
-    }
-    if limit == 0 {
-        while parts.last().is_some_and(|part| part.is_empty()) {
-            parts.pop();
-        }
-    }
-    if limit > 0 {
-        parts.truncate(limit as usize);
-    }
-    Ok(parts)
 }
 
 fn event_is_cancelled(value: &Value) -> bool {
@@ -22375,63 +22201,6 @@ impl<H: Host> Runtime<'_, H> {
         Some(Value::Ref(Some(clone)))
     }
 
-    /// `String.split` over the bounded regex subset, answering a runtime-owned
-    /// `String[]`.
-    ///
-    /// The host layer has no array table, so a split answered there can only be
-    /// `null`, and the caller's `arraylength` would read as a metadata error.
-    /// The result array therefore belongs to this execution, exactly like a
-    /// `toArray()` from a stream. Patterns outside [`SplitPattern`] are named in
-    /// a diagnostic instead of silently mis-splitting.
-    fn invoke_string_split(
-        &mut self,
-        r: &MethodRef,
-        receiver: Option<&Value>,
-        args: &[Value],
-        class: &str,
-        method: &str,
-    ) -> Result<Option<Value>, NativeError> {
-        if r.owner != "java/lang/String" || r.name != "split" {
-            return Ok(None);
-        }
-        let limit = match r.descriptor.as_str() {
-            "(Ljava/lang/String;)[Ljava/lang/String;" => 0,
-            "(Ljava/lang/String;I)[Ljava/lang/String;" => {
-                expect_int(r, StdHost::argument(r, args, 1)?)?
-            }
-            _ => return Ok(None),
-        };
-        // A null receiver or pattern is an NPE on the JVM, and config code
-        // commonly catches it around an optional value; keep it a real throw
-        // so the caller's handler runs instead of turning into a hard stop.
-        let receiver =
-            receiver
-                .and_then(expect_ref)
-                .ok_or_else(|| NativeError::UncaughtException {
-                    class: "java/lang/NullPointerException".into(),
-                    message: Some("String#split has a null receiver".into()),
-                    frame: None,
-                })?;
-        let pattern = expect_ref(StdHost::argument(r, args, 0)?).ok_or_else(|| {
-            NativeError::UncaughtException {
-                class: "java/lang/NullPointerException".into(),
-                message: Some("String#split has a null pattern".into()),
-                frame: None,
-            }
-        })?;
-        let parts = split_java_string(receiver.as_str(), pattern, limit)
-            .map_err(|reason| NativeError::Metadata(format!("String#split {reason}")))?;
-        let marker = self.new_array(class, method);
-        self.arrays.insert(
-            marker.clone(),
-            parts
-                .into_iter()
-                .map(|part| Value::Ref(Some(part)))
-                .collect(),
-        );
-        Ok(Some(Value::Ref(Some(marker))))
-    }
-
     /// Where one member call dispatches: the nearest class in the jar's
     /// superclass chain that declares it, or the first class the jar does not
     /// own, which the host answers like any inherited JDK method would.
@@ -24251,9 +24020,11 @@ impl<H: Host> Runtime<'_, H> {
                         format_java_string_call(self, &r, &args)?
                     } else if let Some(value) = self.invoke_string_join(&r, &args) {
                         value
-                    } else if let Some(value) =
-                        self.invoke_string_split(&r, receiver.as_ref(), &args, class, method)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_regex(&r, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // `String`'s regex methods (`regex_calls.rs`).
                         value
                     } else if let Some(value) =
                         self.invoke_reflect_array(&r, &args, class, method)?
@@ -28286,6 +28057,7 @@ fn split_dynamic_captures(captures: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::regex_calls::split_java_string;
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
@@ -28927,13 +28699,29 @@ mod tests {
     }
 
     #[test]
-    fn split_java_string_names_patterns_outside_the_subset() {
-        for pattern in ["", "[,;]", "a|b", ",+", "(x)"] {
-            let error = split_java_string("a,b", pattern, 0).unwrap_err();
-            assert!(
-                error.contains("outside the bounded regex subset"),
-                "{pattern:?}: {error}"
+    fn split_java_string_answers_general_patterns_like_the_jvm() {
+        // `"a,b".split(pattern)` on OpenJDK 27.
+        let cases: &[(&str, &[&str])] = &[
+            ("", &["a", ",", "b"]),
+            ("[,;]", &["a", "b"]),
+            ("a|b", &["", ","]),
+            (",+", &["a", "b"]),
+            ("(x)", &["a,b"]),
+        ];
+        for (pattern, expected) in cases {
+            assert_eq!(
+                split_java_string("a,b", pattern, 0).unwrap(),
+                *expected,
+                "{pattern:?}"
             );
+        }
+    }
+
+    #[test]
+    fn split_java_string_names_patterns_outside_the_subset() {
+        for pattern in ["\\p{IsAlphabetic}", "(?x) a", "a{"] {
+            let error = split_java_string("a,b", pattern, 0).unwrap_err();
+            assert!(error.contains(pattern), "{pattern:?}: {error}");
         }
     }
 

@@ -1106,9 +1106,11 @@ annotation member the use site left out answers the interface's `AnnotationDefau
 followed by the call's arguments (a static reference is told apart by arity), `invokevirtual` on a concrete base
 method reaches the override of a constructed jar subclass, and a Mixin `static` accessor's placeholder body is
 replaced by the generated contract. `StackWalker.walk` sees the interpreter's own jar frames (innermost first; host
-frames do not exist natively and are not invented). `String.matches`/`Pattern.matches` answer a bounded, exact regex
-subset (literals, classes, groups, alternation, greedy and lazy quantifiers) and name any other pattern instead of
-guessing. Game values that are never null in the game answer an opaque marker of their declared type when the host
+frames do not exist natively and are not invented). `String.matches`/`replaceAll`/`replaceFirst`/`split` and `Pattern.matches`/`quote`
+answer through a reimplementation of `java.util.regex` (`java_regex/`: Java's node graph and backtracking order,
+classes, anchors, lookaround, back references, the `CASE_INSENSITIVE`/`MULTILINE`/`DOTALL`/`LITERAL` flags and the
+replacement-string rules with their exceptions), diffed against OpenJDK 27 by `tools/java_regex_oracle.py`; any
+pattern, input or group outside that subset is counted instead of guessed. Game values that are never null in the game answer an opaque marker of their declared type when the host
 does not model them: codecs, steps of a `...$Builder` chain and its `build()`, and a game type's own `create*`
 factory; every vanilla `Registries`/`BuiltInRegistries` field answers its registry id, and a mod registry made with
 `ResourceKey.createRegistryKey` and `FabricRegistryBuilder` carries its id.
