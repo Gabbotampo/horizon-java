@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
                         row["failed"] = [str(item)[:400] for item in result["failed"]]
                     rows.append(row)
                 else:
-                    rows.append({
+                    row = {
                         "jar": jar.name,
                         "verdict": "refused",
                         "kind": kind,
@@ -237,7 +237,14 @@ def main(argv: list[str] | None = None) -> int:
                         "error": str(result.get("error"))[:400],
                         "deps": [dep.name for dep in deps],
                         "missing": missing,
-                    })
+                    }
+                    # The calls the jar counted before it stopped. Kept for
+                    # reading why it was refused; the ranking and totals stay
+                    # over runs that finished, so they are not aggregated.
+                    before = result.get("unknown_host_calls")
+                    if isinstance(before, list) and before:
+                        row["counted_before_error"] = before
+                    rows.append(row)
         report[name] = {"directory": str(directory), "rows": rows}
 
     totals, ranked = aggregate({name: data["rows"] for name, data in report.items()})

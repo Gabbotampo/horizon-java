@@ -156,14 +156,16 @@ class SampleTest(unittest.TestCase):
     def setUp(self):
         self.survey = load_survey()
 
-    def test_sample_is_ten_batches_of_four_distinct_jars(self):
+    def test_sample_is_ten_batches_of_43_distinct_jars(self):
+        # Four per batch, and a fifth in the three batches whose jar needed a dependency the
+        # first sample left out (melody, libjf, ResourcefulConfig).
         batches = self.survey.SAMPLE
         self.assertEqual(len(batches), 10)
         names = [jar[1] for _, jars in batches for jar in jars]
-        self.assertEqual(len(names), 40)
-        self.assertEqual(len(set(names)), 40)
-        for _, jars in batches:
-            self.assertEqual(len(jars), 4)
+        self.assertEqual(len(names), 43)
+        self.assertEqual(len(set(names)), 43)
+        self.assertEqual({batch: len(jars) for batch, jars in batches if len(jars) != 4},
+                         {"b1": 5, "b4": 5, "b10": 5})
 
     def test_find_jar_searches_each_corpus_once(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -286,6 +288,9 @@ class FixtureManifestTest(unittest.TestCase):
             ("9f12a0dffd-stackrefill-26.3.0-5.1.jar", "bdc7223ca2-collective-26.3.0-8.67.jar"),
             ("fancymenu_neoforge_3.9.14_MC_26.3.jar", "konkrete_neoforge_1.11.1_MC_26.3.jar"),
             ("832882-8896904.jar", "326652-8890593.jar"),
+            ("fancymenu_neoforge_3.9.14_MC_26.3.jar", "melody_neoforge_1.0.17_MC_26.3.jar"),
+            ("respackopts-26.3.0.jar", "libjf-26.3.1.jar"),
+            ("structure_layout_optimizer-1.1.4+26.3-fabric.jar", "ResourcefulConfig-6.0.2.jar"),
         ]:
             self.assertEqual(batch_of[dependent], batch_of[dependency], dependent)
 

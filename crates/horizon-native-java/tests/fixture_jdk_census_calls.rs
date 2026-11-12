@@ -156,3 +156,43 @@ public final class Main {
         .collect();
     assert_eq!(unknown, Vec::new());
 }
+
+/// A `formatted` call the formatter refuses (`%a` is not modelled) is left to
+/// the host and counted under its own name, not as `String.format`.
+#[test]
+fn refused_formatted_is_counted_as_formatted() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "demo/Main.java",
+        r#"package demo;
+public final class Main {
+    public static String text;
+    public static void main() {
+        text = "%a".formatted(1.0);
+    }
+}
+"#,
+    );
+    let jar_path = build_jar("census-refused-formatted", sources, &[], &[]);
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = jar.seed_host(StdHost::new());
+    jar.execute("demo.Main", Some("main"), "main", &mut host)
+        .unwrap();
+    let calls: Vec<String> = host
+        .unknown_host_calls()
+        .into_iter()
+        .map(|(call, _)| call)
+        .collect();
+    assert!(
+        calls.contains(
+            &"java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;".to_owned()
+        ),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("java/lang/String#format(")),
+        "{calls:?}"
+    );
+}

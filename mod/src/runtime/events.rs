@@ -56,6 +56,7 @@ use crate::runtime::{
 };
 
 pub use crate::runtime::facade_server::{GameRuleValue, ServerFacts};
+pub use crate::runtime::facade_world::{FacadeStack, HeldItems};
 
 /// One game event the game can fire, whatever loader named it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -868,13 +869,9 @@ const SUBSCRIBE_EVENT: &[&str] = &[
     "Lnet/neoforged/bus/api/SubscribeEvent;",
     "Lnet/minecraftforge/eventbus/api/SubscribeEvent;",
 ];
-const EVENT_BUS_SUBSCRIBER: &[&str] = &[
-    "Lnet/neoforged/fml/common/EventBusSubscriber;",
-    "Lnet/neoforged/fml/common/Mod$EventBusSubscriber;",
-];
 
 /// The game event and loader an event class names, if the game fires it.
-fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
+pub(crate) fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
     let client = class
         .strip_prefix(NEOFORGE_CLIENT_EVENT_ROOT)
         .map(|rest| (rest, EventLoader::NeoForge))
@@ -990,6 +987,10 @@ pub struct FacadeLevel {
     pub id: String,
     pub game_time: i64,
     pub day_time: i64,
+    /// The level's world border as `[min_x, min_z, max_x, max_z]`, vanilla's
+    /// `getMinX()`... (`facade_world.rs`); `None` when the game gave none, so
+    /// `getWorldBorder()` refuses.
+    pub world_border: Option<[f64; 4]>,
 }
 
 /// A non-player entity as the façade shows it.
@@ -1058,6 +1059,9 @@ pub struct EventContext {
     /// The level a player left (`AFTER_PLAYER_CHANGE_LEVEL`'s origin);
     /// `level` is the destination.
     pub origin: Option<String>,
+    /// What `player` holds and their game mode, read by the hook for this
+    /// firing (`facade_world.rs`). `None` makes those reads refuse.
+    pub held: Option<HeldItems>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1336,6 +1340,9 @@ impl StdHost {
                 None => Err(NativeError::UnknownHostCall(r.clone())),
             });
         }
+        if let Some(answer) = self.world_facade_call(text, r, args) {
+            return Some(answer);
+        }
         if let Some(hit) = text.strip_prefix("game/block-hit/") {
             return Some(
                 block_hit_answer(hit, r).ok_or_else(|| NativeError::UnknownHostCall(r.clone())),
@@ -1507,6 +1514,9 @@ impl StdHost {
                     ("getServer", _) => Some(marker(SERVER.into())),
                     ("getGameTime", "J") => Some(Value::Long(level?.game_time)),
                     ("getDayTime", "J") => Some(Value::Long(level?.day_time)),
+                    ("getWorldBorder", "Lnet/minecraft/world/level/border/WorldBorder;") => level?
+                        .world_border
+                        .map(|_| crate::runtime::facade_world::border_marker(id)),
                     ("isClientSide", "Z") => flag(false),
                     ("dimension", _) => Some(dimension_key(id)),
                     ("players", _) => {
@@ -1532,6 +1542,15 @@ impl StdHost {
                     ("getUUID", _) => return uuid_value(&uuid_text(*uuid)).ok(),
                     ("getStringUUID", _) => return Some(marker(uuid_text(*uuid))),
                     _ => {}
+                }
+                if let Some(answer) = crate::runtime::facade_world::player_member(
+                    context.player,
+                    context.held.as_ref(),
+                    *uuid,
+                    r,
+                    args,
+                ) {
+                    return answer;
                 }
                 let p = player(*uuid)?;
                 match (name, returns) {
@@ -1597,6 +1616,44 @@ impl StdHost {
         }
     }
 
+    /// A call on a world-border, held-stack or item marker
+    /// (`facade_world.rs`), or `None` for any other receiver. Outside a firing
+    /// they refuse: their facts belong to the firing that handed them out.
+    fn world_facade_call(
+        &self,
+        text: &str,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        use crate::runtime::facade_world::{ITEM, STACK, WORLD_BORDER};
+        let firing = self.game_event.as_deref();
+        if let Some(dimension) = text.strip_prefix(WORLD_BORDER) {
+            let bounds = firing.and_then(|firing| {
+                firing
+                    .facade
+                    .levels
+                    .iter()
+                    .chain(&self.levels)
+                    .find(|level| level.id == dimension)
+                    .and_then(|level| level.world_border)
+            });
+            return Some(crate::runtime::facade_world::border_answer(text, bounds, r, args));
+        }
+        if let Some(rest) = text.strip_prefix(STACK) {
+            let context = firing.map(|firing| &firing.context);
+            return Some(crate::runtime::facade_world::stack_answer(
+                text,
+                rest,
+                context.and_then(|context| context.player),
+                context.and_then(|context| context.held.as_ref()),
+                r,
+                args,
+            ));
+        }
+        let id = text.strip_prefix(ITEM)?;
+        Some(crate::runtime::facade_world::item_answer(text, id, r, args))
+    }
+
     /// A fresh list marker holding `values`, through the host's own
     /// collection table so `size`/`get`/`iterator` work on it.
     fn facade_list(&mut self, what: &str, values: Vec<Value>) -> Value {
@@ -1605,15 +1662,19 @@ impl StdHost {
         Value::Ref(Some(marker))
     }
 
-    /// Every listener this host recorded, with its event identity, plus the
-    /// static `@EventBusSubscriber` methods `jar` declares. `server` drops
-    /// subscribers marked `Dist.CLIENT`.
+    /// Every listener this host recorded, with its event identity. The static
+    /// `@EventBusSubscriber` methods are among the NeoForge bus listeners once
+    /// [`NativeJar::inject_event_subscribers`] ran, validated as FML injects
+    /// them (`neoforge_inject.rs`).
     pub fn game_listeners(&self, jar: &NativeJar, server: bool) -> GameListeners {
         let mut out = GameListeners::default();
         for invocation in &self.invocations {
             listeners_from(invocation, jar, &mut out);
         }
-        subscriber_classes(jar, server, &mut out);
+        // NeoForge bus-8 `addListener`s, each already checked to name a fired class.
+        for listener in &self.neoforge_bus.listeners {
+            push_neoforge_listener(listener, &mut out);
+        }
         if server {
             // A server never fires a client event: a common entrypoint's
             // client registrations count as events it does not fire.
@@ -1972,6 +2033,23 @@ fn push_bus_listener(
     });
 }
 
+/// A NeoForge bus-8 listener (`neoforge_bus.rs`) as the listener the game fires.
+fn push_neoforge_listener(listener: &crate::runtime::neoforge_bus::BusListener, out: &mut GameListeners) {
+    let Some((event, loader)) = bus_event(&listener.class) else {
+        return;
+    };
+    out.listeners.push(GameListener {
+        event,
+        loader,
+        source: listener.class.clone(),
+        callback: listener.callback.clone(),
+        receives_cancelled: listener.receive_canceled,
+        order: ListenerOrder::Priority(listener.priority),
+        shape: None,
+        combine: Combine::Void,
+    });
+}
+
 /// The `@SubscribeEvent` methods of `class`: static ones without a receiver,
 /// instance ones on `object`.
 fn subscribe_methods(
@@ -2034,42 +2112,6 @@ fn subscribe_methods(
             combine: Combine::Void,
         });
     }
-}
-
-/// NeoForge's automatic subscribers: every `@EventBusSubscriber` class's
-/// static `@SubscribeEvent` methods, without a `register` call.
-fn subscriber_classes(jar: &NativeJar, server: bool, out: &mut GameListeners) {
-    for (name, file) in &jar.classes {
-        let Some(annotation) = file
-            .annotations
-            .iter()
-            .find(|a| EVENT_BUS_SUBSCRIBER.contains(&a.descriptor.as_str()))
-        else {
-            continue;
-        };
-        if server && subscriber_client_only(annotation) {
-            continue;
-        }
-        subscribe_methods(jar, name, None, out);
-    }
-}
-
-/// `@EventBusSubscriber(value = Dist.CLIENT)`: the class only loads on a client.
-fn subscriber_client_only(annotation: &crate::runtime::Annotation) -> bool {
-    fn names(value: &crate::runtime::AnnotationValue, out: &mut Vec<String>) {
-        match value {
-            crate::runtime::AnnotationValue::String(text) => out.push(text.clone()),
-            crate::runtime::AnnotationValue::Array(values) => {
-                values.iter().for_each(|value| names(value, out))
-            }
-            _ => {}
-        }
-    }
-    let mut dists = Vec::new();
-    if let Some(value) = annotation.values.get("value") {
-        names(value, &mut dists);
-    }
-    !dists.is_empty() && dists.iter().all(|dist| dist.ends_with(".CLIENT"))
 }
 
 /// The `InteractionHand` argument a firing names, or a marker whose every read

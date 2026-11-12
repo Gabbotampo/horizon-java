@@ -44,7 +44,7 @@ const ACC_INTERFACE: u16 = 0x0200;
 
 /// The class file's own access flags, read back from its bytes (the parsed
 /// model keeps none). `None` for a class built in memory without bytes.
-fn class_access(file: &ClassFile) -> Option<u16> {
+pub(super) fn class_access(file: &ClassFile) -> Option<u16> {
     if file.raw.is_empty() {
         return None;
     }
@@ -94,6 +94,86 @@ impl<H: Host> Runtime<'_, H> {
                     .map(|_| ())
             }
         }
+    }
+
+    /// `value instanceof target` where `checkcast` could decide it, `None`
+    /// where it would count the cast. `null` is never an instance.
+    pub(super) fn known_instance_of(&self, value: &Value, target: &str) -> Option<bool> {
+        if matches!(value, Value::Ref(None)) {
+            return Some(false);
+        }
+        let target_is_interface = self
+            .class(target)
+            .and_then(class_access)
+            .map(|access| access & ACC_INTERFACE != 0);
+        match self.cast_verdict(value, target, target_is_interface).0 {
+            Verdict::Yes => Some(true),
+            Verdict::No => Some(false),
+            Verdict::Unknown => None,
+        }
+    }
+
+    /// Whether an `instanceof target` the opcode's models all answered `false`
+    /// is a guess rather than a known "no".
+    ///
+    /// The JVM always knows; the runtime knows when it holds the value's
+    /// class chain, or the value is a JDK object (boxes, collections, plain
+    /// strings), which never extends a jar, game or loader type. It does not
+    /// know for an opaque host marker (a game object, a loader's mod
+    /// container) against a type no model answers for: a jar type where
+    /// `checkcast` would count the cast, or a non-JDK type the runtime does
+    /// not hold (`net/neoforged/fml/javafmlmod/FMLModContainer`). Those go to
+    /// the host as `Target#<instanceof>(Object)`, counted like an unmodelled
+    /// call.
+    ///
+    /// Named limit: a JDK target (`java/`, `javax/`, `jdk/`) keeps the
+    /// uncounted `false`, as before. The JDK models answer for the JDK
+    /// objects they build, and an opaque marker against a JDK interface
+    /// is left for a later change.
+    pub(super) fn instance_of_is_guess(&self, value: &Value, target: &str) -> bool {
+        let marker = match value {
+            Value::Ref(Some(marker)) => marker.as_str(),
+            // `null` is never an instance; a box is a JDK object.
+            _ => return false,
+        };
+        if ["java/", "javax/", "jdk/"]
+            .iter()
+            .any(|prefix| target.starts_with(prefix))
+        {
+            return false;
+        }
+        // `String` is final and in `java.base`, so a text `instanceof String`
+        // accepts is no jar, game or loader type. (`checkcast` still counts a
+        // string cast to a jar type: a departure there, not here.)
+        if crate::runtime::value_class::is_plain_string(marker) {
+            return false;
+        }
+        // An object a library model built itself: the model knows its whole
+        // type, so its `false` is an answer.
+        if crate::runtime::gson_tree::is_tree(marker) || crate::runtime::neoforge_loader::container_type_known(marker)
+        {
+            return false;
+        }
+        if self.class(target).is_some() {
+            return self.known_instance_of(value, target).is_none();
+        }
+        // A jar object whose chain leaves the held classes at a JDK class is
+        // known not to be a game or loader type; one whose chain reaches a
+        // game class is not.
+        !matches!(self.cast_verdict(value, target, None).0, Verdict::No)
+    }
+
+    /// The class of a jar (or linked) object or enum constant marker, as
+    /// `checkcast` reads it; `None` for any other value.
+    pub(super) fn known_object_class(&self, value: &Value) -> Option<String> {
+        let marker = expect_ref(value)?;
+        marker
+            .strip_prefix("enum/")
+            .and_then(|rest| rest.rsplit_once('/').map(|(class, _)| class))
+            .or_else(|| marker.split_once('#').map(|(class, _)| class))
+            .or(Some(marker.as_str()))
+            .filter(|class| self.class(class).is_some())
+            .map(str::to_owned)
     }
 
     fn cast_verdict(

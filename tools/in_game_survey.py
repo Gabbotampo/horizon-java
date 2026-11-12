@@ -12,7 +12,7 @@ integrated-server run driven through the control socket.
         --resources .local/horizon-client/26.3 --corpus ~/horizon-corpus \\
         --out /tmp/in-game-survey --sample
 
-`--sample` runs the 40 jars the survey selected (see `SAMPLE`); without it, `--manifest FILE`
+`--sample` runs the 43 jars the survey selected (see `SAMPLE`); without it, `--manifest FILE`
 gives `{"batch": "b1", "jars": [{"file": "...", "command": "root or null"}]}` rows and each
 `file` is found under `--corpus` by name.
 
@@ -37,13 +37,16 @@ from pathlib import Path
 # The survey's sample: (batch, [(short id, file name under a corpus, command root or None)]).
 # Selection: every distinct mod among the census's server-side `ran-clean` jars that registers a
 # command or a listener, plus two declared dependencies that are themselves mods, plus sixteen
-# no-hook control jars. See docs/in-game-survey.md, "The sample".
+# no-hook control jars, plus (12 November 2026) the three dependency jars that three sampled
+# jars were refused without. See docs/in-game-survey.md, "The sample".
 SAMPLE = [
     ("b1", [
         ("fancymenu", "fancymenu_neoforge_3.9.14_MC_26.3.jar", "fmvariable get test"),
         ("konkrete", "konkrete_neoforge_1.11.1_MC_26.3.jar", None),
         ("jade", "Jade-mc26.3-NeoForge-26.3.5.jar", "jade"),
         ("midnightlib", "midnightlib-neoforge-1.10.0+26.3.jar", None),
+        # fancymenu's other dependency (MIT).
+        ("melody", "melody_neoforge_1.0.17_MC_26.3.jar", None),
     ]),
     ("b2", [
         ("carryon", "carryon-neoforge-26.3-2.12.1.jar", "carryon debug"),
@@ -62,6 +65,9 @@ SAMPLE = [
         ("respackopts", "respackopts-26.3.0.jar", None),
         ("modelbrowser", "c661609de9-modelbrowser-1.5.1.jar", "modelbrowser items_always_equippable"),
         ("baguettelib", "baguettelib-26.3-Fabric-2.0.7.jar", None),
+        # respackopts' dependency: libjf bundles libjf-base, -data-manipulation-v0 and
+        # -config-core-v2 (LGPL-3.0-or-later).
+        ("libjf", "libjf-26.3.1.jar", None),
     ]),
     ("b5", [
         ("spark", "361579-8918571.jar", "spark"),
@@ -101,6 +107,8 @@ SAMPLE = [
         ("asynclogger", "asynclogger-2.2.2+26.1.2-fabric.jar", None),
         ("c2me", "c2me-fabric-mc26.3-0.4.2-alpha.0.106.jar", None),
         ("structure_layout_optimizer", "structure_layout_optimizer-1.1.4+26.3-fabric.jar", None),
+        # structure_layout_optimizer's dependency (MIT).
+        ("resourcefulconfig", "ResourcefulConfig-6.0.2.jar", None),
     ]),
 ]
 

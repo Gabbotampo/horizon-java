@@ -1026,7 +1026,7 @@ than rows; the cache held 86 entries in 436 KiB.
    fell from 22 still failing to 4: static Mixin accessors run their generated contract, reflection answers the
    class file (superclass, assignability, enums, constructors, nested simple names, annotations with defaults,
    `Modifier`), JDK method references keep their arguments, concrete virtual calls reach overrides, pattern-matching
-   `switch` sites answer, `String.matches` has a bounded regex, `StackWalker` sees jar frames, and game codecs,
+   `switch` sites answer, `String`'s regex methods match like `java.util.regex`, `StackWalker` sees jar frames, and game codecs,
    builders, registry keys, `BlockItemId`/`ColorCollection` ids and mod registries are never null. The four left:
    archers and wizards read `spell_engine`'s config classes, which a lone jar does not have (both reach `Done` with
    `spell_engine` and `structure_pool_api` beside them; a real loader would refuse them alone for the missing

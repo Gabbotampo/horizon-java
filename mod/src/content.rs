@@ -26,7 +26,7 @@ use std::sync::Arc;
 use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
 
 use crate::runtime;
-use crate::{JARS, JarRow, LOG, State, jar_id, load_jar};
+use crate::{JARS, JarRow, LOG, LoadedJar, State, jar_id, load_jar};
 
 /// This mod's manifest id (`mod/horizon-mod.toml`): the package whose namespaces the game's
 /// declaration fence checks.
@@ -103,16 +103,32 @@ impl State {
                 }
             }
         }
-        // NeoForge's `RegisterEvent` for `neoforge:attachment_types`: once every entrypoint stage
-        // of every jar has run, in load order (`runtime::neoforge_attachments`).
-        for jar in &mut self.jars {
-            let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
-            for problem in jar.jar.register_attachment_types(&mut jar.host, &budget) {
-                log::warn!(
-                    "{LOG}: {}: attachment type not registered: {problem}",
-                    jar.row.id
-                );
+        // NeoForge's loading stages after the constructors (`runtime::neoforge_lifecycle`): each
+        // stage posts its event to every jar's containers, then runs every jar's deferred work, as
+        // FML runs a step's `DeferredWorkQueue` once every mod's event was posted.
+        for stage in runtime::neoforge_lifecycle::LoadingStage::ALL {
+            for jar in &mut self.jars {
+                jar.run_loading_stage(stage);
             }
+            for jar in &mut self.jars {
+                jar.run_deferred_work(stage);
+            }
+            // NeoForge's `RegisterEvent` for `neoforge:attachment_types`, in load order
+            // (`runtime::neoforge_attachments`): the registry step that follows construction.
+            if stage == runtime::neoforge_lifecycle::LoadingStage::Construct {
+                for jar in &mut self.jars {
+                    let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
+                    for problem in jar.jar.register_attachment_types(&mut jar.host, &budget) {
+                        log::warn!(
+                            "{LOG}: {}: attachment type not registered: {problem}",
+                            jar.row.id
+                        );
+                    }
+                }
+            }
+        }
+        for jar in &mut self.jars {
+            jar.finish_loading();
         }
         for jar in &mut self.jars {
             let declarations = runtime::content::declarations(jar.host.registrations());
@@ -401,6 +417,67 @@ fn read_jar_files() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+impl LoadedJar {
+    /// One loading stage's posts to this jar's containers. A listener that throws is a failure of
+    /// the jar's load, as it fails NeoForge's (departure L1: the later stages still run).
+    fn run_loading_stage(&mut self, stage: runtime::neoforge_lifecycle::LoadingStage) {
+        let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
+        let (jar, host) = (&self.jar, &mut self.host);
+        match crate::caught(&format!("{} {}", self.row.id, stage.name()), || {
+            jar.run_loading_stage(stage, host, &budget)
+        }) {
+            Ok(problems) => self.failures.extend(problems),
+            Err(panic) => self
+                .failures
+                .push(format!("{}: panicked: {panic}", stage.name())),
+        }
+    }
+
+    /// The deferred work this jar's containers queued during `stage`.
+    fn run_deferred_work(&mut self, stage: runtime::neoforge_lifecycle::LoadingStage) {
+        let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
+        let (jar, host) = (&self.jar, &mut self.host);
+        match crate::caught(
+            &format!("{} {}: deferred work", self.row.id, stage.name()),
+            || jar.run_deferred_work(host, &budget),
+        ) {
+            Ok(problems) => self.failures.extend(problems),
+            Err(panic) => self
+                .failures
+                .push(format!("{}: deferred work panicked: {panic}", stage.name())),
+        }
+    }
+
+    /// After the loading stages: the listeners the jar now holds (a setup listener may register
+    /// more), and the row's verdict over everything its load ran. The log line is written again
+    /// when the stages changed it.
+    fn finish_loading(&mut self) {
+        let registered = self.host.game_listeners(&self.jar, true);
+        self.listeners = registered.listeners;
+        self.orderings = registered.phase_orderings;
+        // The pinned mod API has no payload channel: a NeoForge jar's `PayloadRegistrar`
+        // registrations ran, but no packet reaches their handlers, so each one is counted. (A
+        // Fabric jar's `PayloadTypeRegistry` rows are the same gap, not yet counted.)
+        if self.jar.fabric_id.is_none() && !self.jar.neoforge_entrypoints.is_empty() {
+            self.host
+                .count_unrouted_payloads("the game's mod API has no payload channel");
+        }
+        let unknown = self.host.unknown_host_call_count();
+        let verdict = runtime::verdict::verdict(self.stages_ran, self.failures.len(), unknown);
+        let reason = (!self.failures.is_empty())
+            .then(|| format!("entrypoint(s) failed: {}", self.failures.join("; ")));
+        let changed = verdict != self.row.verdict
+            || unknown != self.row.unknown_host_calls
+            || reason != self.row.reason;
+        self.row.verdict = verdict;
+        self.row.unknown_host_calls = unknown;
+        self.row.reason = reason;
+        if changed {
+            log::info!("{LOG}: after the loading stages: {}", self.row);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +530,36 @@ mod tests {
         );
         assert_eq!(reads, 1);
         assert!(state.loaded);
+    }
+
+    /// A NeoForge jar's loading stages run in the content pass, after every jar's constructors:
+    /// its lifecycle listeners and deferred work run (the jar's own two failures, a listener and a
+    /// deferred task that throw, make it `ran-partial`), and a game-bus listener its setup added is
+    /// one the game holds (`runtime::neoforge_lifecycle`).
+    #[test]
+    fn the_content_pass_runs_neoforges_loading_stages() {
+        let bytes = runtime::neoforge_lifecycle::tests::fixture_jar_bytes().to_vec();
+        let mut state = State::default();
+        state.ensure_loaded_with(|| vec![("life.jar".to_owned(), bytes)], &[]);
+        let jar = &mut state.jars[0];
+        let printed = jar.host.take_stdout();
+        for line in [
+            "common",
+            "common-work-supply",
+            "load-complete-work",
+            "payloads",
+        ] {
+            assert!(printed.lines().any(|out| out == line), "{line}: {printed}");
+        }
+        assert_eq!(jar.row.verdict, "ran-partial");
+        assert_eq!(jar.failures.len(), 2, "{:?}", jar.failures);
+        assert_eq!(
+            jar.listeners
+                .iter()
+                .map(|listener| listener.event)
+                .collect::<Vec<_>>(),
+            [runtime::events::GameEvent::RegisterCommands]
+        );
     }
 
     /// The game's fence (`horizon-mod-api/src/parts/owned_namespaces.rs`) lets a native mod

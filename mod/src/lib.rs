@@ -97,7 +97,7 @@ use runtime::brigadier::{
 };
 use runtime::events::{
     EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
-    GameListener,
+    GameListener, PhaseOrdering, ServerFacts, dispatch_order,
 };
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
@@ -105,6 +105,7 @@ use serde_json::json;
 mod attachments;
 mod content;
 mod runtime;
+mod server_facts;
 
 /// This mod's report, in its own `config/horizon_java/` folder.
 const REPORT: &str = "horizon_java/java-runtime.json";
@@ -146,6 +147,9 @@ struct State {
     tick_count: i32,
     /// Whether the open server is a dedicated one, from `server_about_to_start`.
     dedicated: bool,
+    /// The world folder and registries the host gives (`server_facts.rs`), read at
+    /// `server_about_to_start` and again as each level loads.
+    server: Arc<ServerFacts>,
 }
 
 /// What one game event's listeners decided, for the hook that fired it.
@@ -165,10 +169,17 @@ struct LoadedJar {
     jar: Arc<NativeJar>,
     host: StdHost,
     listeners: Vec<GameListener>,
+    /// The jar's Fabric `addPhaseOrdering` calls, which order every jar's listeners of that field.
+    orderings: Vec<PhaseOrdering>,
     /// Commands the jar registered through the Brigadier façade, translated once.
     commands: Vec<JavaCommand>,
     native_commands: Vec<Command>,
     commands_registered: bool,
+    /// Entrypoint stages that ran, and every failure of the jar's load so far (entrypoints,
+    /// `@EventBusSubscriber` injection, loading stages): the verdict is recomputed from them once
+    /// the loading stages ran (`content.rs`).
+    stages_ran: usize,
+    failures: Vec<String>,
 }
 
 /// One Java command this bridge can run: its usage, the literal path that selects it, the
@@ -321,6 +332,11 @@ impl Hooks for HorizonJava {
         state.players.clear();
         state.levels.clear();
         state.tick_count = 0;
+        state.server = Arc::new(server_facts::server_facts(host));
+        log::info!(
+            "{LOG}: server facts at server start: {}",
+            server_facts::describe(&state.server)
+        );
         state.reset_server();
         let count = |verdict: &str| {
             state
@@ -438,14 +454,9 @@ impl Hooks for HorizonJava {
                     EventContext::default(),
                 );
                 let before = loaded.host.unknown_host_call_count();
-                let (ran, failed) = run_listeners(
-                    &loaded.row.id,
-                    &loaded.jar,
-                    &mut loaded.host,
-                    &loaded.listeners,
-                    &mut firing,
-                    &|_| true,
-                );
+                let order = listener_order(std::slice::from_ref(&*loaded), &firing, &|_| true);
+                let (ran, failed) =
+                    run_listeners(std::slice::from_mut(loaded), &order, &mut firing)[0];
                 let listener_unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
                 let before = loaded.host.unknown_host_call_count();
                 let (native, commands, refused) =
@@ -654,6 +665,18 @@ impl Hooks for HorizonJava {
     /// A server level opened (Fabric's `ServerLevelEvents.LOAD`, NeoForge's `LevelEvent.Load`).
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
         self.refresh_levels(host);
+        // The world folder and the data-pack registries may only be complete once a level
+        // is open; a fact that did not change keeps its `Arc`.
+        let facts = server_facts::server_facts(host);
+        let mut state = self.lock();
+        if *state.server != facts {
+            log::info!(
+                "{LOG}: server facts at level load: {}",
+                server_facts::describe(&facts)
+            );
+            state.server = Arc::new(facts);
+        }
+        drop(state);
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
@@ -900,15 +923,21 @@ impl Hooks for HorizonJava {
     /// A player used the item in their hand (Fabric's `UseItemCallback`, NeoForge's
     /// `PlayerInteractEvent.RightClickItem`).
     fn right_click_item(&self, host: HostSide<'_>, event: &mut RightClickItemEvent<'_>) -> Flow {
-        if !matches!(host, HostSide::Server(_)) {
+        let HostSide::Server(host) = host else {
             return Flow::Continue;
-        }
+        };
         let click = event.click;
+        // `player.getItemInHand(hand)` is the hook's own stack; the other hand and the game
+        // mode are read from the host for this firing only.
+        let held = host
+            .player(click.player)
+            .and_then(|player| server_facts::held_items(host, player, click.hand, click.stack));
         let context = EventContext {
             level: Some(dimension_id(click.dimension).to_owned()),
             player: Some(click.player),
             pos: Some(click.pos),
             off_hand: Some(click.hand == Hand::Off),
+            held,
             ..EventContext::default()
         };
         let fired = self.fire_event(GameEvent::UseItem, self.dedicated(), context, |_| true);
@@ -1164,26 +1193,35 @@ impl HorizonJava {
         let mut facade = state.facade();
         facade.dedicated = dedicated;
         let mut firing = EventFiring::new(event, Arc::new(facade), context);
-        let (mut ran, mut failed, mut unknown) = (0, 0, 0);
+        // Every jar's batch opens first: the listeners then run as one event, in the loaders'
+        // order across every jar (a NeoForge priority or a Fabric phase is global, as one bus or
+        // one `Event` field is in a real game), and the batches close after.
+        let mut opened = Vec::with_capacity(state.jars.len());
+        let mut before = Vec::with_capacity(state.jars.len());
         for loaded in &mut state.jars {
-            let id = loaded.row.id.clone();
             // Every jar's host hears about the level this firing names, whether or not it has a
             // listener for the event: `MinecraftServer.getAllLevels()` answers from what the
             // game announced, and a jar that only listens for `server_started` must still see
             // the levels loaded before it.
             loaded.host.note_firing_levels(&firing);
-            let opened = server.as_deref_mut().and_then(|server| {
-                attachments::open(server, &id, &loaded.jar, &mut loaded.host, lifecycle)
-            });
-            let before = loaded.host.unknown_host_call_count();
-            let (jar_ran, jar_failed) = run_listeners(
-                &id,
-                &loaded.jar,
-                &mut loaded.host,
-                &loaded.listeners,
-                &mut firing,
-                &wanted,
-            );
+            opened.push(server.as_deref_mut().and_then(|server| {
+                attachments::open(
+                    server,
+                    &loaded.row.id,
+                    &loaded.jar,
+                    &mut loaded.host,
+                    lifecycle,
+                )
+            }));
+            before.push(loaded.host.unknown_host_call_count());
+        }
+        let order = listener_order(&state.jars, &firing, &wanted);
+        let counts = run_listeners(&mut state.jars, &order, &mut firing);
+        let (mut ran, mut failed, mut unknown) = (0, 0, 0);
+        for (((loaded, opened), before), (jar_ran, jar_failed)) in
+            state.jars.iter_mut().zip(opened).zip(before).zip(counts)
+        {
+            let id = loaded.row.id.clone();
             match server.as_deref_mut() {
                 Some(server) => attachments::close(
                     server,
@@ -1402,34 +1440,61 @@ fn interaction_result(result: Option<&str>) -> InteractionResult {
     }
 }
 
-/// Runs the listeners of this jar that `wanted` keeps, in registration order, against one shared
-/// firing.
-fn run_listeners(
-    id: &str,
-    jar: &NativeJar,
-    host: &mut StdHost,
-    listeners: &[GameListener],
-    firing: &mut EventFiring,
+/// The `(jar, slot)` listeners of `firing`'s event that `wanted` keeps, in the order the loaders
+/// run them ([`dispatch_order`]): Fabric phases (with every jar's `addPhaseOrdering`), then
+/// NeoForge/Forge `EventPriority`, then the jars' load order and each jar's registration order.
+fn listener_order(
+    jars: &[LoadedJar],
+    firing: &EventFiring,
     wanted: &dyn Fn(&GameListener) -> bool,
-) -> (usize, usize) {
-    let (mut ran, mut failed) = (0, 0);
-    let event = firing.event;
-    for listener in listeners
+) -> Vec<(usize, usize)> {
+    let entries: Vec<(usize, usize, &GameListener)> = jars
         .iter()
-        .filter(|listener| listener.event == event && wanted(listener))
-    {
+        .enumerate()
+        .flat_map(|(at, loaded)| {
+            loaded
+                .listeners
+                .iter()
+                .enumerate()
+                .map(move |(slot, listener)| (at, slot, listener))
+        })
+        .filter(|(_, _, listener)| listener.event == firing.event && wanted(listener))
+        .collect();
+    let orderings: Vec<&PhaseOrdering> = jars.iter().flat_map(|jar| &jar.orderings).collect();
+    dispatch_order(&entries, &orderings)
+}
+
+/// Runs the `(jar, slot)` listeners in `order` against one shared firing, each on its own jar's
+/// host, and answers each jar's `(ran, failed)`. A listener that decides the event (a Fabric
+/// `boolean` or `InteractionResult` invoker's answer) ends the firing for every jar.
+fn run_listeners(
+    jars: &mut [LoadedJar],
+    order: &[(usize, usize)],
+    firing: &mut EventFiring,
+) -> Vec<(usize, usize)> {
+    let mut counts = vec![(0, 0); jars.len()];
+    let event = firing.event;
+    for &(at, slot) in order {
+        let LoadedJar {
+            row,
+            jar,
+            host,
+            listeners,
+            ..
+        } = &mut jars[at];
+        let (id, listener) = (&row.id, &listeners[slot]);
         let outcome = caught(&format!("{} listener from {}", id, listener.source), || {
             jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET))
         });
         match outcome {
             Ok(Ok(run)) => {
-                ran += usize::from(run.ran);
+                counts[at].0 += usize::from(run.ran);
                 if run.stop {
                     break;
                 }
             }
             Ok(Err(error)) => {
-                failed += 1;
+                counts[at].1 += 1;
                 log::warn!(
                     "{LOG}: {id}: {} listener from {} failed: {error}",
                     event.name(),
@@ -1437,7 +1502,7 @@ fn run_listeners(
                 );
             }
             Err(panic) => {
-                failed += 1;
+                counts[at].1 += 1;
                 log::warn!(
                     "{LOG}: {id}: {} listener from {} failed: panicked: {panic}",
                     event.name(),
@@ -1446,7 +1511,7 @@ fn run_listeners(
             }
         }
     }
-    (ran, failed)
+    counts
 }
 
 /// Runs one Java callback, turning a panic into a named failure.
@@ -1567,6 +1632,9 @@ fn level_entry(host: &dyn Host, level: LevelRef) -> Option<FacadeLevel> {
         id: level.dimension_id().to_owned(),
         game_time: level.game_time(host)?,
         day_time: level.day_time(host)?,
+        // `getWorldBorder()`'s bounds, refreshed with the clocks on every level tick, so a
+        // border the server moves is read as it is now.
+        world_border: level.world_border(host),
     })
 }
 
@@ -1577,8 +1645,8 @@ fn level_entry(host: &dyn Host, level: LevelRef) -> Option<FacadeLevel> {
 /// the Nether answers `getLevel()` with the Nether. The console's is the overworld, which is
 /// vanilla's console source level; a minecart's and a function's level is not in the hook and
 /// stays unknown (a `getLevel()` read is counted, never answered with the overworld). A
-/// player's dimension is not part of `CommandSource::Player` either, so it too stays unknown
-/// (`arismoko/horizon#2747`), counted rather than guessed.
+/// player's source is `player.createCommandSourceStack()`, whose level is `player.level()`:
+/// the level the host names for the player's entity, or unknown when it names none.
 fn runtime_source(source: &CommandSource, host: &dyn ServerHost) -> RuntimeSource {
     let level = source.permission().level();
     let levels = host.levels().list_levels();
@@ -1593,7 +1661,10 @@ fn runtime_source(source: &CommandSource, host: &dyn ServerHost) -> RuntimeSourc
             name: player.name(host).unwrap_or_else(|| "Player".to_owned()),
             level,
             player: Some(player.uuid()),
-            dimension: source_dimension(source, dimension_of),
+            dimension: player
+                .entity()
+                .level(host)
+                .map(|level| level.dimension_id().to_owned()),
         },
         _ => RuntimeSource {
             name: "Server".to_owned(),
@@ -1613,7 +1684,8 @@ fn source_dimension(
         // Vanilla's console source is the overworld's (MinecraftServer.overworld()).
         CommandSource::Console { .. } => Some("minecraft:overworld".to_owned()),
         CommandSource::CommandBlock { level, .. } => dimension(*level),
-        // Neither carries a level in the hook, and a player's is not part of its source.
+        // Neither carries a level in the hook; a player's is read from the host by
+        // `runtime_source`, not from the source.
         CommandSource::Player { .. }
         | CommandSource::CommandBlockMinecart { .. }
         | CommandSource::Function { .. } => None,
@@ -1807,6 +1879,7 @@ impl State {
             tick_count: self.tick_count,
             players: self.players.clone(),
             levels: self.levels.clone(),
+            server: Arc::clone(&self.server),
             ..EventFacade::default()
         }
     }
@@ -2012,6 +2085,7 @@ fn load_jar(
     let mut calls = 0;
     let mut ran = 0;
     let mut failures = Vec::new();
+    let mut failed_classes = Vec::new();
     for (kind, entry) in &entrypoints {
         if let Some(adapter) = entry.adapter.as_deref() {
             failures.push(format!(
@@ -2037,10 +2111,31 @@ fn load_jar(
                 calls += report.calls;
                 ran += 1;
             }
-            Ok(Err(error)) => failures.push(format!("{}: {error}", entry.class)),
+            Ok(Err(error)) => {
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{}: {error}", entry.class));
+            }
             // A caught panic is this stage failing: the remaining stages still run, and it counts
             // toward `ran-partial` exactly as an interpreter error does.
-            Err(panic) => failures.push(format!("{}: panicked: {panic}", entry.class)),
+            Err(panic) => {
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{}: panicked: {panic}", entry.class));
+            }
+        }
+    }
+    // FML injects each container's `@EventBusSubscriber` classes once its `@Mod` classes are
+    // built; a failed injection fails that container (`runtime::neoforge_inject`).
+    if ran > 0 {
+        let injected = caught(&format!("{id} @EventBusSubscriber injection"), || {
+            jar.inject_event_subscribers(
+                &mut host,
+                &runtime::ExecutionBudget::within(JAR_BUDGET),
+                &failed_classes,
+            )
+        });
+        match injected {
+            Ok(problems) => failures.extend(problems),
+            Err(panic) => failures.push(format!("@EventBusSubscriber injection panicked: {panic}")),
         }
     }
     if ran == 0 {
@@ -2065,7 +2160,8 @@ fn load_jar(
         });
     }
     let unknown = host.unknown_host_call_count();
-    let listeners = host.game_listeners(&jar, true).listeners;
+    let registered = host.game_listeners(&jar, true);
+    let (listeners, orderings) = (registered.listeners, registered.phase_orderings);
     Ok(LoadedJar {
         row: JarRow {
             file,
@@ -2090,9 +2186,12 @@ fn load_jar(
         jar,
         host,
         listeners,
+        orderings,
         commands: Vec::new(),
         native_commands: Vec::new(),
         commands_registered: false,
+        stages_ran: ran,
+        failures,
     })
 }
 
@@ -2186,6 +2285,7 @@ mod tests {
             id: "minecraft:the_nether".into(),
             game_time: 100,
             day_time: 40,
+            world_border: None,
         });
         let facade = state.facade();
         assert!(facade.dedicated);
@@ -2411,6 +2511,71 @@ mod tests {
             zip.finish().unwrap();
         }
         Arc::new(NativeJar::from_bytes(&bytes.into_inner()).unwrap())
+    }
+
+    /// Two NeoForge jars listening to one event run as one bus: `EventPriority` first, then the
+    /// jars' load order, so a cancellation in one jar decides what the other's listeners see.
+    /// Each jar registers the runtime bus fixture's `BusDemo.cancel` listeners
+    /// (`crates/horizon-native-java/tests/fixtures/neoforge_bus`); the expected lines are that
+    /// fixture's `oracle.jsonl` case `cancel_two_mods` (the same two registrations on one real
+    /// bus-8.0.5 bus, OpenJDK 25.0.5): `cancels, uncancels, skipped, uncancels, runs-again,
+    /// runs-again, cancels-last`, split by jar (within one priority the first jar's listener comes
+    /// first). Jar after jar, the second jar would have printed `uncancels, runs-again,
+    /// cancels-last`.
+    #[test]
+    fn listeners_of_every_jar_run_in_one_priority_order() {
+        use crate::runtime::neoforge_bus::fixture_tests::fixture_jar_bytes;
+        use crate::runtime::{MethodRef, Value};
+        let budget = ExecutionBudget::within(Duration::from_secs(20));
+        let mut jars: Vec<LoadedJar> = ["first", "second"]
+            .into_iter()
+            .map(|id| {
+                let jar = Arc::new(NativeJar::from_bytes(fixture_jar_bytes()).unwrap());
+                let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+                jar.invoke_persistent(
+                    &MethodRef {
+                        owner: "demo/BusDemo".into(),
+                        name: "cancel".into(),
+                        descriptor: "(Lnet/neoforged/bus/api/IEventBus;)V".into(),
+                    },
+                    None,
+                    &[Value::Ref(Some(runtime::neoforge_bus::GAME_BUS.into()))],
+                    &mut host,
+                    &budget,
+                )
+                .unwrap();
+                let registered = host.game_listeners(&jar, true);
+                LoadedJar {
+                    row: JarRow::refused(&format!("{id}.jar"), id.to_owned(), String::new()),
+                    jar,
+                    host,
+                    listeners: registered.listeners,
+                    orderings: registered.phase_orderings,
+                    commands: Vec::new(),
+                    native_commands: Vec::new(),
+                    commands_registered: false,
+                    stages_ran: 1,
+                    failures: Vec::new(),
+                }
+            })
+            .collect();
+        let mut firing = EventFiring::new(
+            GameEvent::LivingAllowDeath,
+            Arc::new(EventFacade::default()),
+            EventContext::default(),
+        );
+        let order = listener_order(&jars, &firing, &|_| true);
+        let counts = run_listeners(&mut jars, &order, &mut firing);
+        let lines = |jar: &mut LoadedJar| -> Vec<String> {
+            jar.host.take_stdout().lines().map(str::to_owned).collect()
+        };
+        assert_eq!(
+            lines(&mut jars[0]),
+            ["cancels", "uncancels", "runs-again", "cancels-last"]
+        );
+        assert_eq!(lines(&mut jars[1]), ["skipped", "uncancels", "runs-again"]);
+        assert_eq!(counts, [(4, 0), (3, 0)]);
+        assert!(firing.cancelled);
     }
 
     /// The verdict and reason `load_jar` gives a jar, whether it loaded or was refused.
