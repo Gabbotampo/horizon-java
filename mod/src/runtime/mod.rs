@@ -62,12 +62,14 @@ mod java_nbt;
 mod java_numbers;
 mod java_regex;
 mod java_tostring;
+mod jdk_call;
 mod jdk_character;
 mod jdk_character_table;
 mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
+mod jdk_skeletons;
 mod jdk_stream;
 mod jdk_string_builder;
 mod jdk_supertypes;
@@ -19395,9 +19397,32 @@ impl<H: Host> Runtime<'_, H> {
                     .map(Some);
             }
             if let Some(value) =
+                self.invoke_jdk_skeleton(&callback.target, 0xb9, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
+            if let Some(value) =
                 self.count_unmodelled_jar_operand(&callback.target, 0xb9, Some(&receiver), &rest)?
             {
                 return Ok(Some(value));
+            }
+            // `StringBuilder::append` bound to a builder (`list.forEach(out::append)`):
+            // the builder's text lives in the interpreter, so the call runs
+            // through the same chain as a direct call (`jdk_call.rs`).
+            if matches!(
+                callback.target.owner.as_str(),
+                "java/lang/StringBuilder" | "java/lang/StringBuffer"
+            ) {
+                return self
+                    .call_virtual(
+                        jdk_call::Site::Virtual,
+                        &callback.target.owner,
+                        &callback.target.name,
+                        &callback.target.descriptor,
+                        &receiver,
+                        &rest,
+                    )
+                    .map(Some);
             }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
@@ -19730,7 +19755,8 @@ impl<H: Host> Runtime<'_, H> {
                 return true;
             }
             let Some(file) = self.class(&current) else {
-                return false;
+                // A JDK skeleton superclass's own supertypes (`jdk_skeletons/`).
+                return jdk_skeletons::skeleton_is_instance(&current, wanted).unwrap_or(false);
             };
             if file
                 .interface_names()
@@ -22843,12 +22869,14 @@ impl<H: Host> Runtime<'_, H> {
         // `&mut self` calls the instruction loop makes.
         let linked = Arc::clone(&self.linked);
         let host_models = self.host.models_class(class);
-        let file = match self.classes.get(class) {
-            Some(file) => file,
-            None if !host_models => linked
+        // A JDK body's call-site frame (`jdk_call.rs`).
+        let site = jdk_call::site(class);
+        let file = match (self.classes.get(class), site.as_deref()) {
+            (Some(file), _) | (None, Some(file)) => file,
+            (None, None) if !host_models => linked
                 .get(class)
                 .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?,
-            None => {
+            (None, None) => {
                 return Err(NativeError::MissingMethod(format!(
                     "{class}#{method}{desc}"
                 )));
@@ -24041,6 +24069,13 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // A JDK skeleton's body or a JDK interface default the
+                        // receiver inherits (`jdk_skeletons/`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)

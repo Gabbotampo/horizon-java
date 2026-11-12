@@ -143,6 +143,10 @@ impl<H: Host> Runtime<'_, H> {
                 name: "toString".into(),
                 descriptor: TO_STRING.into(),
             };
+            // Run where `jdk_skeletons/` implements it, counted otherwise.
+            if let Some(text) = self.invoke_jdk_skeleton(&to_string, 0xb6, Some(value), &[])? {
+                return Ok(Some(text));
+            }
             return self.host.unknown_operand_call(&to_string).map(Some);
         }
         // A concrete JDK collection's `toString` over the jar's own
