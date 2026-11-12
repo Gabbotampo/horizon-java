@@ -61,16 +61,11 @@ use std::{
 };
 
 use crate::{
-    MethodRef, NativeError, Value, boolean_value, collection_value, expect_ref, identifier_parse,
-    path_join, path_value, stable_hash,
+    MethodRef, NativeError, Value, collection_value, expect_ref, identifier_parse, path_join,
+    path_value, stable_hash,
 };
 
-/// A game rule's value as the game holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GameRuleValue {
-    Bool(bool),
-    Int(i32),
-}
+pub use crate::game_rules::GameRuleValue;
 
 /// What the game knows about the running server, beyond the per-object facts
 /// each firing passes. Every fact is optional in effect: an empty map or a
@@ -157,14 +152,11 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
                 .find(|(field, _)| *field == r.name)
                 .map(|(_, id)| marker(format!("{LEVEL_RESOURCE}{id}")))
         }
-        GAME_RULES_CLASS
-            if r.descriptor == "Lnet/minecraft/world/level/gamerules/GameRule;"
-                && r.name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') =>
-        {
-            Some(marker(format!(
-                "{GAME_RULE}{}",
-                r.name.to_ascii_lowercase()
-            )))
+        // Only the rules the 26.3 jar declares: another name is no field of
+        // vanilla's `GameRules`, and stays counted.
+        GAME_RULES_CLASS if r.descriptor == "Lnet/minecraft/world/level/gamerules/GameRule;" => {
+            crate::game_rules::by_field(&r.name)
+                .map(|_| marker(format!("{GAME_RULE}{}", r.name.to_ascii_lowercase())))
         }
         _ => None,
     }
@@ -330,13 +322,7 @@ pub(crate) fn answer(
         _ => {}
     }
     if let Some(id) = text.strip_prefix(GAME_RULE) {
-        return match (r.name.as_str(), descriptor) {
-            ("id" | "toString", "()Ljava/lang/String;") => Ok(marker(id)),
-            ("getIdentifier", "()Lnet/minecraft/resources/Identifier;") => {
-                Ok(identifier_parse(&format!("minecraft:{id}")))
-            }
-            _ => refuse(r),
-        };
+        return crate::game_rules::rule_member(id, r, args).map_or_else(|| refuse(r), Ok);
     }
     if let Some(id) = text.strip_prefix(LEVEL_RESOURCE) {
         return match (r.name.as_str(), descriptor) {
@@ -345,29 +331,30 @@ pub(crate) fn answer(
         };
     }
     if text == RULES {
-        let rule = args
+        let id = args
             .first()
             .and_then(expect_ref)
-            .and_then(|t| t.strip_prefix(GAME_RULE))
-            .and_then(|id| facts.game_rules.get(id));
-        return match (r.name.as_str(), descriptor, rule) {
-            (
-                "get",
-                "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;",
-                Some(value),
-            ) => Ok(match value {
-                GameRuleValue::Bool(b) => boolean_value(*b),
-                GameRuleValue::Int(i) => marker(format!("integer:{i}")),
-            }),
+            .and_then(|t| t.strip_prefix(GAME_RULE));
+        let read: fn(GameRuleValue) -> Value = match (r.name.as_str(), descriptor) {
+            ("get", "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;") => {
+                GameRuleValue::boxed
+            }
+            // `gameRule.serialize(get(gameRule))`: `value.toString()`.
             (
                 "getAsString",
                 "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/String;",
-                Some(value),
-            ) => Ok(marker(match value {
-                GameRuleValue::Bool(b) => b.to_string(),
-                GameRuleValue::Int(i) => i.to_string(),
-            })),
-            _ => refuse(r),
+            ) => |value: GameRuleValue| marker(value.serialized()),
+            _ => return refuse(r),
+        };
+        // The world's value, as the game holds it now. A rule the world
+        // lacks throws as vanilla's `get` does when vanilla lacks it too (a
+        // feature-gated rule); any other absence refuses.
+        return match id.map(|id| (id, facts.game_rules.get(id))) {
+            Some((_, Some(value))) => Ok(read(*value)),
+            Some((id, None)) => Err(crate::game_rules::missing_value(id)
+                .filter(|_| !facts.game_rules.is_empty())
+                .unwrap_or_else(|| NativeError::UnknownHostCall(r.clone()))),
+            None => refuse(r),
         };
     }
     if text == LAYERED {
@@ -689,7 +676,7 @@ mod tests {
         assert!(owns(&rules));
         assert_eq!(
             answer(&facts, &rules, &get, &[rule("KEEP_INVENTORY")]).unwrap(),
-            boolean_value(true)
+            crate::boolean_value(true)
         );
         assert_eq!(
             answer(&facts, &rules, &get, &[rule("RANDOM_TICK_SPEED")]).unwrap(),
@@ -704,6 +691,41 @@ mod tests {
             "(Lnet/minecraft/world/level/gamerules/GameRule;Ljava/lang/Object;Lnet/minecraft/server/MinecraftServer;)V",
         );
         assert!(answer(&facts, &rules, &set, &[rule("KEEP_INVENTORY")]).is_err());
+        // `getAsString` is `serialize(get(rule))`, the value's `toString()`
+        // (the oracle's `after-set` row: `true`, `7`).
+        let as_string = call(
+            GAME_RULES_CLASS,
+            "getAsString",
+            "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/String;",
+        );
+        let mut changed = facts.clone();
+        changed
+            .game_rules
+            .insert("random_tick_speed".into(), GameRuleValue::Int(7));
+        assert_eq!(
+            answer(&changed, &rules, &as_string, &[rule("RANDOM_TICK_SPEED")]).unwrap(),
+            marker("7")
+        );
+        assert_eq!(
+            answer(&changed, &rules, &as_string, &[rule("KEEP_INVENTORY")]).unwrap(),
+            marker("true")
+        );
+        // A world without `minecart_improvements` has no `max_minecart_speed`:
+        // vanilla's `get` throws (game_rules.rs pins the message).
+        assert!(matches!(
+            answer(&facts, &rules, &get, &[rule("MAX_MINECART_SPEED")]),
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/IllegalArgumentException"
+        ));
+        // A `GameRules` field 26.3 does not declare is no rule marker.
+        assert_eq!(
+            static_field(&call(
+                GAME_RULES_CLASS,
+                "DO_DAYLIGHT_CYCLE",
+                "Lnet/minecraft/world/level/gamerules/GameRule;",
+            )),
+            None
+        );
     }
 
     #[test]

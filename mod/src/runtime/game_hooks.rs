@@ -958,7 +958,11 @@ impl<H: Host> GameHookHost<'_, H> {
     ) -> Option<Result<Value, NativeError>> {
         if facade_server::owns(text) {
             return Some(
-                facade_server::answer(&self.context.server, text, r, args).map_err(|_| {
+                // A Java exception vanilla throws there stays one.
+                facade_server::answer(&self.context.server, text, r, args).map_err(|error| {
+                    if matches!(error, NativeError::UncaughtException { .. }) {
+                        return error;
+                    }
                     NativeError::Metadata(format!(
                         "game hook value {text} does not model {}#{}{}",
                         r.owner, r.name, r.descriptor
