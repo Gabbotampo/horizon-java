@@ -71,6 +71,7 @@ mod jdk_string_builder;
 mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
+mod jvm_dispatch;
 mod library_dispatch;
 mod map_compute;
 mod method_handles;
@@ -22210,11 +22211,10 @@ impl<H: Host> Runtime<'_, H> {
                 // the host superclass is known not to declare it itself:
                 // `Object` and `Record` cannot (an interface may not default
                 // their public methods), and `Enum`'s own methods are final.
-                let host_cannot_declare = match current.as_str() {
-                    "java/lang/Object" | "java/lang/Record" => true,
-                    "java/lang/Enum" => !ENUM_DECLARED_METHODS.contains(&name),
-                    _ => false,
-                };
+                // The JDK's collection skeletons are known too (`jvm_dispatch.rs`).
+                let host_cannot_declare =
+                    jvm_dispatch::jdk_superclass_declares(&current, name, descriptor)
+                        == Some(false);
                 if host_cannot_declare
                     && let Some(owner) = self.inherited_default_owner(&chain, name, descriptor)
                 {
@@ -23818,6 +23818,10 @@ impl<H: Host> Runtime<'_, H> {
                                 .and_then(|key| self.fields.get(&key).cloned())
                             {
                                 Some(value) => value,
+                                // JVMS §2.3: a jar field nothing wrote yet.
+                                None if self.reads_unwritten_jar_field(&r, &receiver) => {
+                                    Value::default_for(&r.descriptor)
+                                }
                                 None => self.host.get_field(&receiver, &r)?,
                             }
                         }
@@ -23926,6 +23930,16 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(owner) =
+                        self.jvm_selected_jar_body(&r, op, receiver.as_ref())
+                    {
+                        // The receiver's own body, before any host model
+                        // (`jvm_dispatch.rs`).
+                        jar_body = true;
+                        invoke_or_catch!(
+                            at,
+                            self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
+                        )
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_service_loader(&r, receiver.as_ref(), &args)
