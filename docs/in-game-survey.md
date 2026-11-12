@@ -1026,3 +1026,194 @@ translation keys.
 Results (all 11 batch JSONs, game logs, `java-runtime.json` reports, the per-merge probe sweep, the
 probes of every hollow and partial jar, the build log and the scripts) stay on elysium under
 `~/ava/results/survey4-2026-11-13/` and are not committed.
+
+## Fifth survey: stack-bounded frames, nested-jar ids and the bridge's server reads (13 November 2026, elysium)
+
+The 43-jar sample in the same 10 batches, plus the fixture batch, re-run on current `main`. The
+`#85` column is survey #4 above (`1c3f1b3931`). The delta covers #86 (jar frames bounded by the
+stack actually left, class init in the caller's frame), #87 (nested-jar ids and provides), #88 (the
+bridge's server facts and registries, held items, world border, a player source's level), #89
+(`Double`/`Float.toString`, modified UTF-8 constants), #90 (`Character`/`UnicodeBlock` from Java
+25's tables), #91 (`StringBuilder`/`StringBuffer`) and #92 (test wording only).
+
+| | |
+|---|---|
+| Machine | elysium (x86_64, 24 cores, RTX 3090), headless, the game on a private `Xvfb :85`; nice 10, `CARGO_BUILD_JOBS=12` |
+| Game source | `arismoko/horizon` `cf0113879ebee600bff86070466f75b2db90b40a` (still the pin in `mod/horizon-mod.toml`), unmodified; the same stage worktree as surveys 2–4, with `native-api/horizon_java` replaced by `bf46291`'s `mod/` (the `horizon-mod-api` path edit only). `Cargo.lock` gains exactly the two generated packages (`horizon-java-mod`, `horizon-native-game`) |
+| Game's own version line | `Horizon 0.1.0`: the first line of all 11 batch logs. The pinned game logs no commit field, so the stage's `HEAD` above is the build |
+| Measured | **horizon-java `bf4629112a`** (`main` with #92). `tools/vendor.py --check`: 98 vendored files match `crates/horizon-native-java/src` (`vendor.lock` records `316ce8d`, a stale record, not a different runtime) |
+| Build | dev profile, default features, rust 1.99.1, a fresh target dir (deleted after the run); `HORIZON_NO_AUDIO=1` at run time; the generated `main.rs` binds `mod_0::hooks` as the launcher writes it |
+| Driver | `tools/in_game_survey.py --sample`, then `--manifest` with the fixture batch: fresh scratch tree per batch under `~/ava/env`, 10 GiB systemd cap, 600 play ticks, `--world B<n> --creative` with no `--seed` |
+
+**Fixtures:** all four `ran-clean`. `/javahello Viola` answered `Hello, Viola!`, `give
+m3_fixture:ruby_block 1` gave one, and `m2c` logged `kept stone` and `break canceled`, and this time
+`horizon-ctl` read `minecraft:stone` after the break, as the fixture intends. Surveys 3 and 4 logged
+the same two `m2c` lines but read `minecraft:air`. The read checks the window's copy of the world one
+tick after the break, so it can see the client's predicted break before the server's correction
+arrives. Nothing on the break path changed in `mod/` since #85, and a second fixture run read stone
+again. This is a read-timing difference, not a change in what the jar does.
+
+**Playability:** 11/11 runs reached `wait-ready` (728–778 play ticks), placed and broke dirt in all
+10 sample batches, moved 0.4–9.4 blocks, and quit cleanly.
+
+### Per jar, #85 → now
+
+Every row of the sample, in the columns survey #4 used: `unk` is the entrypoint unknown host-call
+count; `cb` is listener callbacks ran/failed, with the unknown calls counted inside them in
+brackets; usages are command usages translated/refused at registration; the command column is the
+survey's one command per jar. Rows in **bold** moved.
+
+| batch | jar | #85 (`1c3f1b3`) | now (`bf46291`) | cb #85 → now | usages | survey command, #85 → now |
+|---|---|---|---|---|---|---|
+| b1 | `jade` | ran-hollow, 4 unk | ran-hollow, 4 unk | 1/0 (0) → 1/0 (0) | 2/0 → 2/0 | `/jade`: unknown command → same |
+| b1 | `konkrete` | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b1 | `fancymenu` | ran-hollow, 2 unk | ran-hollow, 2 unk | 4/0 (3) → 4/0 (3) | 12/4 → 12/4 | `/fmvariable get test`: ran, no message → same |
+| b1 | `midnightlib` | ran-clean | ran-clean | 1/0 → 1/0 | — | — |
+| b2 | `iceberg_nf` | ran-clean | ran-clean | 2/0 (1) → 2/0 (1) | — | — |
+| b2 | `searchables` | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b2 | `carryon` | ran-hollow, 2 unk | ran-hollow, 2 unk | 672/0 (2) → 667/0 (6) | 5/0 → 5/0 | `/carryon debug`: ran, no reply → same |
+| b2 | `fzzy_config` | ran-hollow, 8 unk | ran-hollow, 8 unk | 2/0 → 2/0 | 4/0 → 4/0 | incorrect argument → same |
+| b3 | `cupboard` | ran-clean | ran-clean | 701/0 → 661/0 | — | — |
+| b3 | **`limitedchunks`** | ran-clean | ran-clean | 702/0 → 662/0 | 1/1 → 1/1 | refused (`CommandSourceStack#getLevel()`) → **refused one read later** (`ServerLevel#getChunkSource()`) |
+| b3 | `connectivity` | ran-clean | ran-clean | 702/0 → 662/0 | 10/1 → 10/1 | incorrect argument → same |
+| b3 | `structureessentials` | ran-clean | ran-clean | 1/0 → 1/0 | 2/3 → 2/3 | unknown command → same |
+| b4 | `baguettelib` | ran-clean | ran-clean | 1/0 (2) → 1/0 (2) | — | — |
+| b4 | `modelbrowser` | ran-clean | ran-clean | 1/0 → 1/0 | 3/3 → 3/3 | ran, reply is the raw key `commands.modelbrowser.gamerule.query` → same |
+| b4 | **`chunky`** | ran-clean, 1 listener failure | **ran-clean** | 2/1 (8) → **3/0** (7) | 35/7 → **45/9** | refused (`ServerPlayer#<instanceof>`) → same |
+| b4 | **`respackopts`** | refused | **ran-clean** | — → 2/0 (2) | — → 0/0 | — |
+| b5 | `spark` | ran-hollow, 1 listener failure, 1 unk | same | 2/1 (8) → 2/1 (8) | 0/0 → 0/0 | `/spark`: unknown command → same |
+| b5 | `mcwifipnp` | ran-clean, 1 listener failure | same | 2/1 (1) → 2/1 (1) | 6/2 → 6/2 | ran, reply is the raw key `mcwifipnp.commands.uuidfixer.default.show` → same |
+| b5 | **`stackrefill`** | ran-hollow, 1 listener failure, 3 unk | **ran-hollow, 3 unk** | 1370/1 (4) → **1395/0** (4) | — | — |
+| b5 | **`collective`** | ran-hollow, 3 listener failures, 474 unk | ran-hollow, 3 listener failures, **106 unk** | 5020/3 (951) → 5178/3 (998) | 44/0 → 44/0 | — |
+| b6 | `otterlib` | ran-clean | ran-clean | 2/0 → 2/0 | — | — |
+| b6 | `calcmod` | ran-clean | ran-clean | 1/0 (22) → 1/0 (22) | 51/6 → 51/6 | — |
+| b6 | `entity-view-distance` | ran-clean | ran-clean | 2/0 (1) → 2/0 (1) | 1/2 → 1/2 | — |
+| b6 | `structure_pool_api` | ran-clean | ran-clean | 1/0 → 1/0 | — | — |
+| b7 | `supermartijn642configlib` | ran-hollow, 3 unk | ran-hollow, 3 unk | 1/0 → 1/0 | — | — |
+| b7 | `bookshelf` | ran-hollow, 1 listener failure, 18 unk | same | 0/1 (10) → 0/1 (10) | — | — |
+| b7 | `cloth-config` | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b7 | `geckolib` | ran-hollow, 2 unk | ran-hollow, 2 unk | 0/0 → 0/0 | — | — |
+| b8 | `yacl` | ran-hollow, 1 unk | ran-hollow, 1 unk | 0/0 → 0/0 | — | — |
+| b8 | `forgeconfigapiport` | ran-hollow, 1 unk | ran-hollow, 1 unk | 0/0 → 0/0 | — | — |
+| b8 | `fast-ip-ping` | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b8 | `clumps` | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b9 | `packetfixer` | ran-hollow, 2 unk | ran-hollow, 2 unk | 0/0 → 0/0 | — | — |
+| b9 | `nochatreports` | ran-hollow, 1 unk | ran-hollow, 1 unk | 0/0 → 0/0 | — | — |
+| b9 | `mossylib` | ran-hollow, 1 unk | ran-hollow, 1 unk | 0/0 → 0/0 | — | — |
+| b9 | `resourcefullib` | ran-hollow, 2 unk | ran-hollow, 2 unk | 0/0 → 0/0 | — | — |
+| b10 | `krypton` | ran-partial, 2 unk | ran-partial, 2 unk | 0/0 → 0/0 | — | — |
+| b10 | `asynclogger` | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b10 | `c2me` | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b10 | **`structure_layout_optimizer`** | refused | **ran-hollow, 3 unk** | — → 0/0 | — | — |
+| b1 | *`melody`* (new in #84) | ran-clean | ran-clean | 0/0 → 0/0 | — | — |
+| b4 | *`libjf`* (new in #84) | refused | refused | — | — | — |
+| b10 | *`ResourcefulConfig`* (new in #84) | ran-partial, 8 unk | ran-partial, 8 unk | 1/0 → 1/0 | — | — |
+
+Host-call totals are identical to #85 on every unchanged row. Callback counts on the tick- and
+entity-driven listeners (`cupboard`, `connectivity`, `limitedchunks`, `carryon`, `collective`,
+`stackrefill`) follow run length and world.
+
+### What moved, and the PR behind each
+
+A native probe was built at every first-parent merge from `1c3f1b3` to `bf46291` (`8110291` #86,
+`de7b675` #87, `83b984d` #88, `0dbb5d5` #89, `f20c40f` #90, `610f4d1` #91, `bf46291` #92). At both
+ends it ran **every** sample jar (`main`, `server` and `neoforge`, with dependencies linked as the
+batches link them); at the merges between, it ran the movers. The first merge where a result
+changed is named. Listener, command and dependency-check changes are not visible to the probe and
+are attributed from the failure #85's run logged, which is gone or moved here.
+
+| jar | before → after | cause |
+|---|---|---|
+| `respackopts` | refused (`requires libjf_base, libjf_config_core_v2, libjf_data_manipulation_v0`) → **ran-clean** | **#87**: the game's dependency check now counts `libjf`'s nested-jar mod ids. The probe with `--link libjf` gives `ok`, 0 unknowns, at every merge, so the refusal was the dependency check alone. Its two listeners run and count 2 unknowns inside callbacks |
+| `structure_layout_optimizer` (with `ResourcefulConfig`) | refused (`recursion exceeded 12 nested jar frames at …TranslatableValue#<init>`) → **ran-hollow, 3** | **#86**. Probe: refused at `1c3f1b3`, `ok` with 3 unknowns from `8110291` on (`Class#getEnclosingClass` ×1, `Optionull#mapOrDefault` ×2). **It runs in game.** The jar loads at game-log line 8, before resources load and before any `Server thread` line, so on the process's startup thread, in a debug build. #86 measured that a 2 MiB thread refuses this chain after 11 debug frames, and the jar ran, so the startup thread has the room (elysium's `ulimit -s` is 8192 KiB). #86 left that question open; it is answered |
+| `collective` | ran-hollow 474 → **ran-hollow 106** | **#90** (474 → 462: `Character#toUpperCase` ×12) and **#91** (462 → 106: `StringBuilder#charAt` ×344, `setCharAt` ×12). Its 3 listener failures stay, two of them moved (next row) |
+| `collective` listeners | `getWorldPath` ×2, `Level#registryAccess` → `getWorldPath` ×2, **`Registry#getOrThrow(ResourceKey)`** | **#88** answers `registryAccess()`, so `level_load` gets one read further and stops at `getOrThrow`, which #88 left counted. #88 answers `getWorldPath` only once the host names the world folder, and the log shows `server facts at server start: world folder unknown`, then `/horizon/game/saves/B5` at level load. Both `SERVER_STARTING`/`ServerAboutToStartEvent` reads therefore still refuse. This is the fork timing gap #88 described: `world_root` is set after `server_about_to_start` |
+| `chunky` | 1 listener failure → **0**; usages 35/7 → **45/9** | **#88** (`ServerLevel#getWorldBorder()`). With `SERVER_STARTED` running, the `ChunkyFabric#chunky()` permission predicate now evaluates (#85's log: "needs a permission predicate this bridge cannot evaluate"), so `/chunky` and its `border add/load/remove` subtree are offered: 10 more usages translated and 2 more refused. All 9 refusals are now `Dimension` arguments. Registration unknowns go 1 → 0. `/chunky` itself still refuses at `ServerPlayer#<instanceof>`, as it did in #85's log (survey #4's table named `ChunkyFabric#chunky()` there, but that was the registration predicate, not the runtime refusal) |
+| `stackrefill` | 1 listener failure → **0** | **#88** (`Player#getItemInHand(InteractionHand)` answered for the use-item firing). Its tick-time writes are still not bridged (#88's note), so it stays `ran-hollow` on its 3 entry unknowns (`CountDownLatch#await`/`getCount`, `ThreadPoolExecutor#allowCoreThreadTimeOut`) |
+| `limitedchunks` | `/limitedchunks listnonplayerchunktickets` refused at `getLevel()` → refused at `getChunkSource()` | **#88** answers a player source's level; the next read has no seam (#88 says so) |
+| `carryon` | 2 → 6 unknowns inside callbacks | **Run-dependent, not a regression.** A second run of `b2` alone counted 1. The count follows which entity events fire in the world, and the jar's entry unknowns, listeners and command are unchanged |
+
+**#89 and #92 changed no probe result** on any of the 43 jars, and nothing in game is attributed
+to them. Neither did #87 (the probe already linked `libjf`).
+
+### Totals, #85 → now
+
+The original 40 jars (comparable with surveys 3 and 4), then the three dependency jars alone:
+
+| Measure | #85 (`1c3f1b3931`), 40 jars | Now (`bf4629112a`), same 40 | The 3 new jars, #85 → now |
+|---|---|---|---|
+| In-game verdicts | 21 `ran-clean` (2 with listener failures), 16 `ran-hollow` (4 with listener failures), 1 `ran-partial`, 2 `refused` | **22 `ran-clean`** (1 with a listener failure: `mcwifipnp`), **17 `ran-hollow`** (3 with listener failures: `collective`, `spark`, `bookshelf`), 1 `ran-partial`, **0 `refused`** | unchanged: 1 `ran-clean` (`melody`), 1 `ran-partial` (`ResourcefulConfig`), 1 `refused` (`libjf`) |
+| Unknown host calls (entrypoints) | 527 | **162**: `collective` −368, `structure_layout_optimizer` +3 | 8 → 8 |
+| Unknown host calls inside callbacks | 1,013 | 1,065: `collective` 951 → 998 and `carryon` 2 → 6 (both run-dependent), `respackopts` +2, `chunky` 8 → 7 | 0 → 0 |
+| Callbacks ran / failed | 9,193 / 8 | 9,254 / **6** | 1 / 0 → 1 / 0 |
+| Listener failures by jar | `chunky` 1, `mcwifipnp` 1, `collective` 3, `stackrefill` 1, `spark` 1, `bookshelf` 1 | `mcwifipnp` 1 (its own `IUPnPProvider#getUPnPInstance()` at `SERVER_STOPPING`), `collective` 3 (`getWorldPath` ×2, `Registry#getOrThrow`), `spark` 1 (`HttpClient$Builder` NPE), `bookshelf` 1 (`Rarity is not an enum`) | 0 → 0 |
+| Command usages translated / refused | 176 / 29 | **186 / 31** (`chunky` +10/+2) | 0 / 0 |
+| Survey commands run / refused at runtime | 4 / 2 | 4 / 2: `modelbrowser`, `carryon`, `fancymenu`, `mcwifipnp` run; `limitedchunks` (now at `ServerLevel#getChunkSource()`) and `chunky` (`ServerPlayer#<instanceof>`) are refused | — |
+| Content declarations | 0 blocks, 0 items | the same | the same |
+
+With the three dependency jars, the 43 are **23 `ran-clean`, 17 `ran-hollow`, 2 `ran-partial`, 1
+`refused`**. The one refusal, `libjf`, is a library with no `main`, `server` or `neoforge`
+entrypoint (see survey #4); nothing in it fails.
+
+**Running is not working.** None of the 40 is refused now, but 17 are `ran-hollow` and 1 is
+`ran-partial`. Three of the hollow jars have a listener that throws on every run (`collective`,
+`spark`, `bookshelf`), and `mcwifipnp` is `ran-clean` with one. `structure_layout_optimizer` and
+`respackopts` moved because their own code now runs. Neither was exercised in the world beyond
+loading: `respackopts` has no command, and `structure_layout_optimizer`'s work is in worldgen
+mixins, which the game does not apply.
+
+### Regressions
+
+**None found.** No jar got a worse label. No listener, command or fixture that worked in #85 fails
+now. The probe at `1c3f1b3` and at `bf46291`, run over every jar and every entrypoint kind, differs
+only on `collective` (`main` and `neoforge`, fewer unknowns) and `structure_layout_optimizer`
+(refused → ok). So nothing like survey #4's `structure_layout_optimizer` is hiding under an
+unchanged label in this sample.
+
+Two smaller things are noted, not counted as regressions:
+
+- **`limitedchunks`' command row counts 0 unknown calls** (was 1) although the command is still
+  refused on an unknown call (`ServerLevel#getChunkSource()`, named in the log). The refusal is
+  real and reported; only the counter misses it. Not attributed: it is either how the new
+  `getLevel()` answer reaches the next read, or a refusal path that does not increment the host's
+  count. Worth a look, because a counter that misses refusals understates the gap.
+- `carryon`'s callback unknowns (2 → 6), explained in the table above.
+
+### Top in-game causes now
+
+1. **NeoForge mod-bus `IEventBus#addListener` / `IEventBus#register`**, unchanged since #85: 26
+   calls (`addListener(Consumer)` 19, `addListener(Class, Consumer)` 6, `register` 1) in **9
+   jars**, and the *only* unknowns in 7 of the 17 hollow jars (`fzzy_config` 8, `Jade` 4,
+   `supermartijn642configlib` 3, `carryon` 2, `fancymenu` 2, `forgeconfigapiport` 1, `yacl` 1), plus
+   4 of `bookshelf`'s 18 and 1 of `geckolib`'s 2. Still the biggest single lever on the label.
+2. **Mojang codecs (DataFixerUpper): 2 jars, 21 calls, the remaining partial and one listener
+   failure.** `RecordCodecBuilder#mapCodec` ×12 (`bookshelf` 10, `ResourcefulConfig` 2),
+   `Codec#xmap` ×2, then `dispatch`, `listOf`, `encodeStart`, `RecordCodecBuilder#create`,
+   `JsonOps#INSTANCE`, `Identifier#CODEC` and `UUIDUtil#AUTHLIB_CODEC`. Together that is 13 of
+   `bookshelf`'s unknowns and all 8 of `ResourcefulConfig`'s. `ResourcefulConfig` is `ran-partial`
+   because `WebServer#loadConfig +39` dereferences the null `DataResult` that `encodeStart`
+   answered. `bookshelf`'s `RegisterCommandsEvent` listener dies in `MapCodecs#getEnumsByName`
+   because the host's `Rarity` is not seen as an enum.
+3. **`collective`'s game reads: 1 jar, 106 entry unknowns and all 3 of its listener failures.**
+   Vanilla's static registry constants make up 68 of the 106: `Blocks#*` ×37, `Items#*` ×27,
+   `BlockEntityTypes#*` ×2 and `MapColor#*` ×2. Then `Gson#toJsonTree` ×12 (plus `Gson#toJson(JsonElement,
+   JsonWriter)` and `JsonWriter#setIndent` ×1 each), `Class#isEnum` ×12, `CustomPacketPayload#codec`
+   ×4, and single `Collections`/`CountDownLatch`/`ThreadPoolExecutor`/`RandomSource#create` calls.
+   Its listeners stop at `MinecraftServer#getWorldPath` ×2 (the fork's `world_root` timing, which
+   needs a fork change, not a runtime one) and `Registry#getOrThrow(ResourceKey)`.
+
+Then the host reads behind refused commands and listeners: `ServerLevel#getChunkSource()`
+(`/limitedchunks`), `ServerPlayer#<instanceof>` (`/chunky`), `spark`'s `HttpClient$Builder` NPE in
+`BytesocksClientJdk#<init> +61`, and `mcwifipnp`'s `IUPnPProvider#getUPnPInstance()` at shutdown.
+After those come the single-call hollows, unchanged: `Properties#setProperty` ×2 (`PacketFixer`), `String#formatted` ×1
+(`MossyLib`), `Optionull#mapOrElse` ×2 (`ResourcefulLib`), `Optionull#mapOrDefault` ×2 and
+`Class#getEnclosingClass` ×1 (`structure_layout_optimizer`, new), `Gson#toJson(Object, Appendable)`
+×1 (`NoChatReports`), `DeferredRegister$DataComponents#registerComponentType` (`geckolib`),
+`MixinEnvironment#getActiveTransformer()` (`spark`), the three concurrency calls (`stackrefill`),
+and `krypton`'s Netty `Unpooled#directBuffer` in `NativeConstraints#<clinit>`. The command bridge
+refuses 31 usages (`chunky`'s 9 are all `Dimension`), and `modelbrowser`'s and `mcwifipnp`'s
+replies still arrive as raw translation keys.
+
+Results stay on elysium under `~/ava/results/survey5-2026-11-13/` and are not committed: all 11
+batch JSONs and game logs, the `java-runtime.json` reports, the fixture and `b2` reruns, the
+per-merge probe sweep over all 43 jars, the build log and the scripts.
