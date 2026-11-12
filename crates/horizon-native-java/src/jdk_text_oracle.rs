@@ -1,8 +1,9 @@
 //! Replays what OpenJDK 27 answered (`jdk_text_oracle.json`, written by
 //! `tools/jdk_tables/TextOracle.java`) through the runtime's own models, one
 //! section each ([`SECTIONS`]): `Double.toString`/`Float.toString`
-//! (`jdk_float_text.rs`). The file also records the `Character` and
-//! `StringBuilder` answers the models that follow are replayed against.
+//! (`jdk_float_text.rs`) and the `Character` statics (`jdk_character.rs`).
+//! The file also records the `StringBuilder` answers the builder model is
+//! replayed against.
 //!
 //! Every expected value in the file is the JDK's output for a generated
 //! input; nothing is derived from the code under test. The committed file is
@@ -11,7 +12,28 @@
 
 use serde_json::Value as Json;
 
+use crate::{MethodRef, NativeError, Value};
+
 const SAMPLE: &str = include_str!("jdk_text_oracle.json");
+
+/// A JSON text: a string, or an array of UTF-16 code units (one that holds a
+/// lone surrogate, which a JSON string cannot carry).
+fn units(json: &Json) -> Option<Vec<u16>> {
+    match json {
+        Json::String(text) => Some(text.encode_utf16().collect()),
+        Json::Array(units) => Some(
+            units
+                .iter()
+                .map(|unit| unit.as_u64().unwrap() as u16)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn text(json: &Json) -> Option<String> {
+    units(json).map(|units| String::from_utf16(&units).expect("a text without lone surrogates"))
+}
 
 fn check_float_text(oracle: &Json) -> Vec<String> {
     let mut failures = Vec::new();
@@ -38,9 +60,82 @@ fn check_float_text(oracle: &Json) -> Vec<String> {
     failures
 }
 
+/// What `jdk_character::static_call` gave, in the oracle's notation.
+fn answered(result: Option<Result<Value, NativeError>>) -> Json {
+    match result {
+        None => Json::from("unmodelled"),
+        Some(Ok(Value::Int(value))) => Json::from(value),
+        Some(Ok(Value::Ref(None))) => Json::Null,
+        Some(Ok(Value::Ref(Some(marker)))) => match marker.strip_prefix("unicode-block/") {
+            Some(block) => serde_json::json!({ "block": block }),
+            None => serde_json::json!({ "text": marker }),
+        },
+        Some(Err(NativeError::UncaughtException { class, message, .. })) => {
+            serde_json::json!({ "throws": { "class": class, "message": message } })
+        }
+        Some(other) => Json::from(format!("{other:?}")),
+    }
+}
+
+fn check_characters(oracle: &Json) -> Vec<String> {
+    let mut failures = Vec::new();
+    for case in oracle["characters"].as_array().unwrap() {
+        let cp = case["cp"].as_i64().unwrap() as i32;
+        for (key, expected) in case["answers"].as_object().unwrap() {
+            // `name(descriptor)` with an optional `/second-argument`.
+            let (call, second) = match key.rsplit_once('/') {
+                Some((call, second)) if second.parse::<i32>().is_ok() => {
+                    (call, second.parse::<i32>().ok())
+                }
+                _ => (key.as_str(), None),
+            };
+            let (owner, name, descriptor) = match call.split_once('(') {
+                Some(("UnicodeBlock.of", params)) => (
+                    "java/lang/Character$UnicodeBlock",
+                    "of",
+                    format!("({params}Ljava/lang/Character$UnicodeBlock;"),
+                ),
+                Some((name, rest)) => ("java/lang/Character", name, format!("({rest}")),
+                None => panic!("bad key {key}"),
+            };
+            let r = MethodRef {
+                owner: owner.into(),
+                name: name.into(),
+                descriptor: descriptor.clone(),
+            };
+            let mut args = vec![Value::Int(cp)];
+            args.extend(second.map(Value::Int));
+            let got = answered(crate::jdk_character::static_call(&r, &args));
+            // The oracle writes texts and messages as strings (or code-unit
+            // arrays); normalise both sides to strings.
+            let normalised = |json: &Json| -> Json {
+                let mut json = json.clone();
+                if let Some(message) = json.pointer_mut("/throws/message")
+                    && let Some(text) = text(message)
+                {
+                    *message = Json::from(text);
+                }
+                if let Some(value) = json.pointer_mut("/text")
+                    && let Some(text) = text(value)
+                {
+                    *value = Json::from(text);
+                }
+                json
+            };
+            if normalised(expected) != normalised(&got) {
+                failures.push(format!("{key} of {cp:#x}: got {got}, JDK {expected}"));
+            }
+        }
+    }
+    failures
+}
+
 /// The oracle's sections and the check that replays each.
 type Check = fn(&Json) -> Vec<String>;
-const SECTIONS: &[(&str, Check)] = &[("doubles and floats", check_float_text)];
+const SECTIONS: &[(&str, Check)] = &[
+    ("doubles and floats", check_float_text),
+    ("characters", check_characters),
+];
 
 /// Every section's failures, labelled by section, and each section's size.
 fn check_all(oracle: &Json) -> (Vec<String>, Vec<String>) {

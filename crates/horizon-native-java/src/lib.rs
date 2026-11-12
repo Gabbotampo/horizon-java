@@ -55,6 +55,8 @@ mod java_nbt;
 mod java_numbers;
 mod java_regex;
 mod java_tostring;
+mod jdk_character;
+mod jdk_character_table;
 mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
@@ -4036,6 +4038,10 @@ impl Host for StdHost {
         if let Some(value) = self.neoforge_loader_static(r) {
             return Ok(value);
         }
+        // `Character.UnicodeBlock` constants (`jdk_character.rs`).
+        if let Some(value) = jdk_character::unicode_block_static(r) {
+            return Ok(value);
+        }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
@@ -4231,6 +4237,9 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
+        if let Some(value) = jdk_character::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -4401,12 +4410,6 @@ impl Host for StdHost {
             ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
             ))),
-            ("java/lang/Character", "toLowerCase", "(C)C")
-            | ("java/lang/Character", "toLowerCase", "(I)I") => {
-                let value = java_code_point(Self::argument(r, args, 0)?)
-                    .and_then(|c| c.to_lowercase().next());
-                Ok(Value::Int(value.map_or(0xfffd, u32::from) as i32))
-            }
             ("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
                 Ok(Value::Ref(Some(format!("character:{value}"))))
@@ -5333,6 +5336,10 @@ impl Host for StdHost {
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
             return value;
+        }
+        // `Character.UnicodeBlock#toString` (`jdk_character.rs`).
+        if let Some(value) = jdk_character::unicode_block_instance(r, receiver) {
+            return Ok(value);
         }
         // A Fabric mod container's origin (`mod_origin.rs`); also reached
         // through `String.valueOf`/`"" + origin`, which asks this host for the
@@ -10123,14 +10130,6 @@ fn boxed_integer(value: &Value) -> Option<i32> {
             .and_then(|value| value.parse::<i32>().ok()),
         _ => None,
     }
-}
-
-fn java_code_point(value: &Value) -> Option<char> {
-    let code_point = boxed_integer(value)?;
-    (0..=0x10ffff)
-        .contains(&code_point)
-        .then(|| char::from_u32(code_point as u32))
-        .flatten()
 }
 
 fn boxed_character(value: &Value) -> Option<i32> {
