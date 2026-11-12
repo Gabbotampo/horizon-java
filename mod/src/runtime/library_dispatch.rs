@@ -18,6 +18,10 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // `ServiceLoader` through a method reference (`Provider::get`).
+        if let Some(value) = self.invoke_service_loader(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // NightConfig's read-with-default (`night_config.rs`).
         if let Some(value) = night_config::invoke(r, args) {
             return Ok(Some(value));

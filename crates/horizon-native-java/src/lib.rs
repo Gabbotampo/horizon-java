@@ -67,6 +67,7 @@ mod mixin_plugins;
 mod mod_config_register;
 mod mod_config_spec;
 mod mod_origin;
+mod native_library;
 pub mod neoforge_attachments;
 mod neoforge_loader;
 mod nested_jars;
@@ -80,6 +81,7 @@ mod reflect_names;
 mod reflect_override;
 mod registry_contents;
 mod sequenced;
+mod service_loader;
 mod stack_walk;
 mod type_switch;
 mod value_class;
@@ -4199,6 +4201,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(refusal) = native_library::refusal(r, args) {
+            return Err(refusal);
+        }
         if let Some(value) = self.neoforge_loader_call(r, args) {
             return Ok(value);
         }
@@ -5329,6 +5334,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(refusal) = native_library::refusal(r, args) {
+            return Err(refusal);
+        }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
             return Ok(value);
@@ -5377,9 +5385,19 @@ impl Host for StdHost {
         // final, so javac's `List.getClass` (an interface-typed receiver) is the
         // same method whatever owner the call names.
         if r.name == "getClass" && r.descriptor == "()Ljava/lang/Class;" {
-            return Ok(
-                class_of_value(receiver).map_or(Value::Ref(None), |class| Value::Ref(Some(class)))
-            );
+            // A marker no model can name (a host object, a lambda, an array)
+            // is still an object of *some* class: the neutral `null` is a
+            // guess, so it is counted, not answered silently.
+            // A text `instanceof String` accepts is a `String` here too.
+            return match class_of_value(receiver) {
+                Some(class) => Ok(Value::Ref(Some(class))),
+                None if expect_ref(receiver)
+                    .is_some_and(|text| value_class::is_plain_string(text)) =>
+                {
+                    Ok(Value::Ref(Some("java/lang/String".into())))
+                }
+                None => self.unknown_host_call(r),
+            };
         }
         if let Some(value) = self.payload_type_registry_call(r, Some(receiver), args) {
             return Ok(value);
@@ -6749,12 +6767,13 @@ impl Host for StdHost {
             let marker = receiver_marker.as_deref().ok_or_else(|| {
                 NativeError::Metadata("malformed java/util/ServiceLoader$Provider marker".into())
             })?;
-            let Some(rest) = marker.strip_prefix("service-provider/") else {
+            // The interpreter answers a provider (`service_loader.rs`); this
+            // is the host's nominal fallback, the class name.
+            let Some((_, provider)) = service_loader::provider_parts(marker) else {
                 return Err(NativeError::Metadata(
                     "unsupported java/util/ServiceLoader$Provider marker".into(),
                 ));
             };
-            let provider = rest.split_once('/').map_or(rest, |(_, provider)| provider);
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("get" | "type", "()Ljava/lang/Object;" | "()Ljava/lang/Class;") => {
                     Ok(Value::Ref(Some(provider.to_owned())))
@@ -6769,7 +6788,7 @@ impl Host for StdHost {
             let marker = receiver_marker.as_deref().ok_or_else(|| {
                 NativeError::Metadata("malformed java/util/ServiceLoader marker".into())
             })?;
-            let service = marker.strip_prefix("service-loader/").ok_or_else(|| {
+            let service = service_loader::loader_service(marker).ok_or_else(|| {
                 NativeError::Metadata("unsupported java/util/ServiceLoader marker".into())
             })?;
             if r.name == "iterator" && r.descriptor == "()Ljava/util/Iterator;" {
@@ -9983,6 +10002,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/SecurityException"
         | "java/lang/ArrayStoreException"
         | "java/util/NoSuchElementException"
+        | "java/util/ConcurrentModificationException"
         | "java/io/UncheckedIOException" => "java/lang/RuntimeException",
         "java/lang/NumberFormatException"
         | "java/nio/charset/UnsupportedCharsetException"
@@ -10006,9 +10026,10 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/InterruptedException"
         | "java/lang/CloneNotSupportedException"
         | "java/util/concurrent/TimeoutException" => "java/lang/Exception",
-        "java/lang/AssertionError" | "java/lang/LinkageError" | "java/lang/VirtualMachineError" => {
-            "java/lang/Error"
-        }
+        "java/lang/AssertionError"
+        | "java/lang/LinkageError"
+        | "java/lang/VirtualMachineError"
+        | "java/util/ServiceConfigurationError" => "java/lang/Error",
         "java/lang/ExceptionInInitializerError"
         | "java/lang/NoClassDefFoundError"
         | "java/lang/ClassFormatError"
@@ -12523,6 +12544,15 @@ pub enum NativeError {
     },
     /// The fail-closed host mode rejected a call with no bounded model.
     UnknownHostCall(MethodRef),
+    /// The jar loads native code (`System.load`/`loadLibrary`), which the
+    /// bounded runtime cannot run. Not catchable by the jar
+    /// (`native_library.rs` says why).
+    NativeLibrary {
+        /// `owner#name` of the load call.
+        call: String,
+        /// The path or library name the jar passed.
+        library: String,
+    },
     Zip(String),
     Metadata(String),
 }
@@ -12533,6 +12563,10 @@ impl std::fmt::Display for NativeError {
                 f,
                 "unknown native host call {}#{}{}",
                 method.owner, method.name, method.descriptor
+            ),
+            Self::NativeLibrary { call, library } => write!(
+                f,
+                "loads a native library ({call} \"{library}\"); the native path cannot run native code"
             ),
             Self::UncaughtException {
                 class,
@@ -12594,6 +12628,7 @@ impl NativeError {
             {
                 Some(EntrypointSkip::KotlinRuntime)
             }
+            Self::NativeLibrary { .. } => Some(EntrypointSkip::NativeLibrary),
             _ => None,
         }
     }
@@ -12985,6 +13020,8 @@ pub enum EntrypointSkip {
     KotlinRuntime,
     /// An entrypoint adapter the native path does not implement.
     UnsupportedAdapter,
+    /// The entrypoint loads a native library (`System.load`/`loadLibrary`).
+    NativeLibrary,
 }
 
 impl EntrypointSkip {
@@ -12992,7 +13029,7 @@ impl EntrypointSkip {
     pub fn label(&self) -> &'static str {
         match self {
             Self::KotlinRuntime => "needs-loader",
-            Self::MissingClass | Self::UnsupportedAdapter => "native-gap",
+            Self::MissingClass | Self::UnsupportedAdapter | Self::NativeLibrary => "native-gap",
         }
     }
 
@@ -13007,6 +13044,9 @@ impl EntrypointSkip {
             }
             Self::UnsupportedAdapter => {
                 "the Fabric entrypoint adapter is not implemented by the native path"
+            }
+            Self::NativeLibrary => {
+                "the entrypoint loads a native library (System.load/loadLibrary); the native path runs bytecode only"
             }
         }
     }
@@ -22760,27 +22800,6 @@ impl<H: Host> Runtime<'_, H> {
             );
             return Ok(Some(self.new_stream(class, method, values)));
         }
-        // `ServiceLoader.stream()` hands out one `Provider` per seeded
-        // service entry; the provider marker names its implementation class
-        // so the following `Provider.get` can build the real instance.
-        if r.owner == "java/util/ServiceLoader"
-            && r.name == "stream"
-            && r.descriptor == "()Ljava/util/stream/Stream;"
-        {
-            let Some(receiver) = receiver.and_then(expect_ref) else {
-                return Ok(None);
-            };
-            let Some(service) = receiver.strip_prefix("service-loader/") else {
-                return Ok(None);
-            };
-            let values = self
-                .host
-                .service_providers(service)
-                .into_iter()
-                .map(|provider| Value::Ref(Some(format!("service-provider/{service}/{provider}"))))
-                .collect::<Vec<_>>();
-            return Ok(Some(self.new_stream(class, method, values)));
-        }
         if !r.owner.starts_with("java/util/stream/") {
             return Ok(None);
         }
@@ -24037,6 +24056,22 @@ impl<H: Host> Runtime<'_, H> {
                                 || (wanted == "java/lang/Class"
                                     && class_marker_like(marker, self.classes, &self.linked))
                         });
+                    // A `false` no model can stand behind is counted
+                    // (`checkcast.rs`), and the host's answer is the result.
+                    let matches = if !matches && self.instance_of_is_guess(&value, &wanted) {
+                        let check = MethodRef {
+                            owner: wanted.to_owned(),
+                            name: "<instanceof>".into(),
+                            descriptor: "(Ljava/lang/Object;)Z".into(),
+                        };
+                        let answer = invoke_or_catch!(
+                            at,
+                            self.host.invoke(&check, std::slice::from_ref(&value))
+                        );
+                        matches!(answer, Value::Int(flag) if flag != 0)
+                    } else {
+                        matches
+                    };
                     stack.push(Value::Int(i32::from(matches)));
                 }
                 0xc2 | 0xc3 => {
@@ -24244,6 +24279,12 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_service_loader(&r, receiver.as_ref(), &args)
+                    ) {
+                        // Providers built as the JDK builds them (`service_loader.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_jar_text(&r, op, receiver.as_ref(), &args, class, method)

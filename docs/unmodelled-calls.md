@@ -323,6 +323,52 @@ No verdict got worse. The Gson calls still counted are `Gson` writes through an 
 custom strategy (#49's rule), `toJsonTree`, `toJson(JsonElement, JsonWriter)`,
 `TypeToken#getType` and two `GsonBuilder#setPrettyPrinting` calls, all unchanged by this model.
 
+## Re-measured (12 November 2026, honesty gaps)
+
+Four places answered without counting, against `6e3684b`:
+`Object#getClass` on a marker no model names (now counted; a plain text answers `String`, as
+`instanceof String` already did); `instanceof` against a non-JDK type the runtime cannot decide
+(now the counted call `Target#<instanceof>(Object)`, the way `checkcast` counts
+`Target#<checkcast>`); `System.load`/`loadLibrary` and `Runtime#load`/`loadLibrary` (now an
+uncatchable refusal, "loads a native library", `native-gap`); and the probe's `--json`, which
+dropped the counted table when every entrypoint threw (it now reports `unknown_host_calls` next
+to `error`, and `tools/unmodelled_calls.py` keeps it as `counted_before_error`, outside the totals).
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 896 → 896 |
+| mega | 60 → 60 | 87 → **88** | 4 → 4 | 101 → **100** | 2,468 → 2,472 |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 256 |
+
+- `voxy` refused → `ran-hollow` (4): its `Logger#objToString` read `getClass().isArray()` on a
+  string and died on the old `null`.
+- `voicechat-neoforge` 2 → 3: one `log4j core Logger#<instanceof>` on a host logger is now counted.
+- Both `e4mc` builds stay refused and move one step on: `getClass().isEnum()` on a string answered
+  `null`; now they stop at kaleido's own `IllegalArgumentException`.
+- Both `Bookshelf` builds stay refused at the same throw, and now show the counted
+  `Object#getClass` in their table (the `ServiceLoader` provider marker it is called on).
+- `krypton` is unchanged: it stops on the counted `Unpooled#directBuffer` null in
+  `NativeConstraints.<clinit>` before it reaches `System.load`.
+- 161 of 178 refused rows now carry a counted table.
+## Re-measured (12 November 2026, `ServiceLoader` providers)
+
+`ServiceLoader` now builds its providers the way JDK 27 does (`service_loader.rs`). Before,
+`Provider.get` split its marker at the first `/`, so every packaged service gave a wrong class
+name, and no provider was ever constructed. Against `6e3684b`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 896 → 898 |
+| mega | 60 → 60 | 87 → 87 | 4 → 4 | 101 → 101 | 2,468 → 2,500 |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+
+No verdict moved. The rises come from jars that now run further. `structure_layout_optimizer`
+(1 → 3) and `authme` (1 → 31) get past the formerly counted `ServiceLoader#forEach` into their
+next unmodelled calls (`Optionull#mapOrDefault`, `Class#getEnclosingClass`). Both `Bookshelf` builds
+get past the provider: NeoForge's now stops at `instanceof FMLModContainer`, Fabric's at
+`MapCodecs#getEnumsByName`. `moderner-beta`, `servercore`, `ItemBorders`, `Highlighter` and
+`AdvancementPlaques` stay refused, now at a later throw, because their providers' constructors
+ran.
 ## Re-measured (12 November 2026, sequenced lists and `FMLModContainer`)
 
 JDK 21's `getFirst`/`getLast`/`removeFirst`/`removeLast`/`addFirst`/`addLast`/`reversed` now
