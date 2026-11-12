@@ -38,8 +38,10 @@
 //!   queue in enqueue order once every container's event was posted; a task that throws is
 //!   recorded (`captureException` suppresses it) and the rest still run, and the step then fails.
 //!   The future is a marker whose every method is counted;
-//! * `RegisterPayloadHandlersEvent#registrar` is the host's payload registrar
-//!   (`payload_registrations`).
+//! * `RegisterPayloadHandlersEvent#registrar` is the host's payload registrar: its `playTo*` /
+//!   `configuration*` calls are recorded (`payload_registrations`, the probe's
+//!   `payload_directions`). An embedding with no payload channel (the game's mod API at its pin)
+//!   counts each one ([`StdHost::count_unrouted_payloads`]).
 //!
 //! Anything else a handler calls on an event (`getIMCStream`, …) goes on to the host and is counted
 //! as an unknown host call, as every unmodelled call is; a jar whose handler leans on one is not
@@ -229,6 +231,20 @@ impl StdHost {
             }
             _ => None,
         }
+    }
+}
+
+/// [`StdHost::count_unrouted_payloads`]: one unknown host call per recorded payload registration,
+/// named `PayloadRegistrar#<direction> (<why>)`.
+pub(crate) fn count_unrouted_payloads(host: &mut StdHost, why: &str) {
+    for registration in &host.payload_registrations {
+        *host
+            .unknown_host_calls
+            .entry(format!(
+                "net/neoforged/neoforge/network/registration/PayloadRegistrar#{} ({why})",
+                registration.direction
+            ))
+            .or_default() += 1;
     }
 }
 

@@ -455,6 +455,13 @@ impl LoadedJar {
         let registered = self.host.game_listeners(&self.jar, true);
         self.listeners = registered.listeners;
         self.orderings = registered.phase_orderings;
+        // The pinned mod API has no payload channel: a NeoForge jar's `PayloadRegistrar`
+        // registrations ran, but no packet reaches their handlers, so each one is counted. (A
+        // Fabric jar's `PayloadTypeRegistry` rows are the same gap, not yet counted.)
+        if self.jar.fabric_id.is_none() && !self.jar.neoforge_entrypoints.is_empty() {
+            self.host
+                .count_unrouted_payloads("the game's mod API has no payload channel");
+        }
         let unknown = self.host.unknown_host_call_count();
         let verdict = runtime::verdict::verdict(self.stages_ran, self.failures.len(), unknown);
         let reason = (!self.failures.is_empty())
