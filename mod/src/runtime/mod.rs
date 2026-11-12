@@ -23338,14 +23338,16 @@ impl<H: Host> Runtime<'_, H> {
                     stack.push(constant_wide_value(&file.pool, i)?);
                 }
                 // iadd/isub/imul/idiv/irem. The long twins (odd opcodes) take
-                // the 64-bit path below so no long value is truncated.
+                // the 64-bit path below so no long value is truncated. Add,
+                // subtract and multiply keep the low-order bits on overflow
+                // (JVMS §6.5), so they wrap; only division can fail.
                 0x60 | 0x64 | 0x68 | 0x6c | 0x70 => {
                     let rhs = pop_int(&mut stack, class, method, at)?;
                     let lhs = pop_int(&mut stack, class, method, at)?;
                     let value = match op {
-                        0x60 => lhs.checked_add(rhs),
-                        0x64 => lhs.checked_sub(rhs),
-                        0x68 => lhs.checked_mul(rhs),
+                        0x60 => Some(lhs.wrapping_add(rhs)),
+                        0x64 => Some(lhs.wrapping_sub(rhs)),
+                        0x68 => Some(lhs.wrapping_mul(rhs)),
                         0x6c => java_int_div(lhs, rhs),
                         _ => java_int_rem(lhs, rhs),
                     }
@@ -23359,9 +23361,9 @@ impl<H: Host> Runtime<'_, H> {
                     let rhs = pop_long(&mut stack, class, method, at)?;
                     let lhs = pop_long(&mut stack, class, method, at)?;
                     let value = match op {
-                        0x61 => lhs.checked_add(rhs),
-                        0x65 => lhs.checked_sub(rhs),
-                        0x69 => lhs.checked_mul(rhs),
+                        0x61 => Some(lhs.wrapping_add(rhs)),
+                        0x65 => Some(lhs.wrapping_sub(rhs)),
+                        0x69 => Some(lhs.wrapping_mul(rhs)),
                         0x6d => java_long_div(lhs, rhs),
                         _ => java_long_rem(lhs, rhs),
                     }
@@ -23461,7 +23463,8 @@ impl<H: Host> Runtime<'_, H> {
                     let amount = *code.get(pc + 1).ok_or(NativeError::Truncated)? as i8 as i32;
                     pc += 2;
                     let value = match locals.get(index) {
-                        Some(Value::Int(value)) => value.saturating_add(amount),
+                        // `iinc` wraps like `iadd`.
+                        Some(Value::Int(value)) => value.wrapping_add(amount),
                         _ => {
                             return Err(NativeError::TypeMismatch {
                                 class: class.to_owned(),
