@@ -86,6 +86,10 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_mapped_registry(r, receiver, args) {
             return Ok(Some(value));
         }
+        // Gson's JSON tree, for a method reference and `String.valueOf`.
+        if let Some(value) = self.invoke_gson_tree(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         Ok(None)
     }
 
@@ -448,6 +452,7 @@ impl<H: Host> Runtime<'_, H> {
             || expect_ref(value).is_some_and(|marker| {
                 self.proxy_instance_of(marker, wanted)
                     || crate::value_class::string_instance_of(marker, wanted)
+                    || crate::gson_tree::instance_of(marker, wanted)
             })
     }
 

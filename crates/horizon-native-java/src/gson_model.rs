@@ -315,6 +315,20 @@ impl GsonStyle {
         Some(style)
     }
 
+    /// The writer options `Gson.toJson` applies to a `JsonElement`
+    /// (`gson_tree.rs`). The `Gson`'s strictness is not recorded, so the tree
+    /// writer is not told it is lenient.
+    pub(super) fn tree_style(&self) -> super::gson_tree::TreeStyle {
+        super::gson_tree::TreeStyle {
+            newline: self.formatting.newline.clone(),
+            indent: self.formatting.indent.clone(),
+            space_after_separators: self.formatting.space_after_separators,
+            html_safe: self.html_safe,
+            serialize_nulls: self.serialize_nulls,
+            lenient: false,
+        }
+    }
+
     /// Whether a `toJson`/`fromJson` on this `Gson` must be a counted unknown.
     pub(super) fn is_counted(&self) -> bool {
         self.counted
@@ -775,6 +789,10 @@ impl<H: Host> Runtime<'_, H> {
         style: &GsonStyle,
         depth: usize,
     ) -> Result<Option<String>, NativeError> {
+        // A `JsonElement` is written by its own adapter (`gson_tree.rs`).
+        if let Some(text) = self.gson_tree_json(value, &style.tree_style(), depth)? {
+            return Ok(text);
+        }
         let text = match value {
             Value::Ref(None) | Value::Void => Some("null".to_owned()),
             Value::Int(value) => Some(value.to_string()),

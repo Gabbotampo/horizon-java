@@ -41,6 +41,7 @@ mod field_get_set;
 mod game_codecs;
 mod game_hooks;
 mod gson_model;
+mod gson_tree;
 mod guava_model;
 mod heap;
 mod hook_shapes;
@@ -4045,7 +4046,7 @@ impl Host for StdHost {
             return Ok(value);
         }
         // Gson's `FormattingStyle` constants (`gson_model.rs`).
-        if let Some(value) = gson_model::static_field(r) {
+        if let Some(value) = gson_model::static_field(r).or_else(|| gson_tree::static_field(r)) {
             return Ok(value);
         }
         // Registry statics get a stable marker instead of a null constant so
@@ -10866,6 +10867,7 @@ fn is_map_owner(owner: &str) -> bool {
                 | "java/util/concurrent/ConcurrentSkipListMap"
                 | "com/google/common/collect/ImmutableMap"
                 | "com/google/common/collect/ImmutableBiMap"
+                | gson_tree::TREE_MAP
         )
 }
 
@@ -24286,6 +24288,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, executors::invoke(self, &r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_gson_tree(&r, receiver.as_ref(), &args))
+                    {
+                        // Gson's JSON tree (`gson_tree.rs`).
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson(&r, receiver.as_ref(), &args))
