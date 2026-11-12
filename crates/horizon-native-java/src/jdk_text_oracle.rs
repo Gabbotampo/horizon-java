@@ -1,9 +1,8 @@
 //! Replays what OpenJDK 27 answered (`jdk_text_oracle.json`, written by
 //! `tools/jdk_tables/TextOracle.java`) through the runtime's own models, one
 //! section each ([`SECTIONS`]): `Double.toString`/`Float.toString`
-//! (`jdk_float_text.rs`) and the `Character` statics (`jdk_character.rs`).
-//! The file also records the `StringBuilder` answers the builder model is
-//! replayed against.
+//! (`jdk_float_text.rs`), the `Character` statics (`jdk_character.rs`) and
+//! `StringBuilder`/`StringBuffer` calls (`jdk_string_builder.rs`).
 //!
 //! Every expected value in the file is the JDK's output for a generated
 //! input; nothing is derived from the code under test. The committed file is
@@ -12,6 +11,7 @@
 
 use serde_json::Value as Json;
 
+use crate::jdk_string_builder::{Answer, Arg, Outcome, call};
 use crate::{MethodRef, NativeError, Value};
 
 const SAMPLE: &str = include_str!("jdk_text_oracle.json");
@@ -33,6 +33,100 @@ fn units(json: &Json) -> Option<Vec<u16>> {
 
 fn text(json: &Json) -> Option<String> {
     units(json).map(|units| String::from_utf16(&units).expect("a text without lone surrogates"))
+}
+
+fn argument(json: &Json) -> Arg {
+    let (kind, value) = json.as_object().unwrap().iter().next().unwrap();
+    match kind.as_str() {
+        "int" => Arg::Int(value.as_i64().unwrap() as i32),
+        "long" => Arg::Long(value.as_i64().unwrap()),
+        "float" => Arg::Float(f64::from(f32::from_bits(value.as_u64().unwrap() as u32))),
+        "double" => Arg::Double(f64::from_bits(value.as_str().unwrap().parse().unwrap())),
+        "chars" => Arg::Chars(units(value)),
+        // A text argument never holds a lone surrogate the runtime would
+        // have to carry: the generator keeps those to `char` arguments.
+        "text" => Arg::Text(units(value).map(|units| String::from_utf16_lossy(&units))),
+        other => panic!("unknown argument kind {other}"),
+    }
+}
+
+/// A capacity or length request the builder model leaves counted
+/// (`MAX_UNITS` in `jdk_string_builder.rs`).
+fn heap_sized(name: &str, args: &[Arg]) -> bool {
+    let big = |arg: Option<&Arg>| matches!(arg, Some(Arg::Int(size)) if *size > 1 << 24);
+    match name {
+        "<init>" | "ensureCapacity" | "setLength" => big(args.first()),
+        // JDK 27 overflows the length here (`repeat("z", Integer.MAX_VALUE)`
+        // leaves the builder one unit shorter instead of throwing).
+        "repeat" => big(args.get(1)),
+        _ => false,
+    }
+}
+
+/// Check every builder case of `oracle`; returns the failures.
+fn check_builders(oracle: &Json) -> Vec<String> {
+    let mut failures = Vec::new();
+    for case in oracle["builders"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let descriptor = case["descriptor"].as_str().unwrap();
+        let initial = text(&case["initial"]).unwrap();
+        let args: Vec<Arg> = case["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(argument)
+            .collect();
+        // A text argument with a lone surrogate cannot reach the model.
+        if case["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg.get("text").is_some_and(Json::is_array))
+        {
+            continue;
+        }
+        let outcome = call(name, descriptor, &initial, &args);
+        let expect = &case["expect"];
+        let matched = match (&outcome, expect) {
+            (Outcome::Unmodelled, Json::String(word)) => word == "unmodelled",
+            // A capacity or length past the model's bound is counted on
+            // purpose: whether the JDK allocates it depends on its heap.
+            (Outcome::Unmodelled, _) if heap_sized(name, &args) => true,
+            (Outcome::Throw { class, message }, _) if expect.get("throws").is_some() => {
+                let thrown = &expect["throws"];
+                thrown["class"] == *class && text(&thrown["message"]).as_deref() == Some(message)
+            }
+            (
+                Outcome::Done {
+                    text: after,
+                    answer,
+                },
+                _,
+            ) if expect.get("after").is_some() => {
+                let after = after.clone().unwrap_or_else(|| initial.clone());
+                let expected = &expect["answer"];
+                let answered = match answer {
+                    Answer::This => expected == "this",
+                    Answer::Void => expected == "void",
+                    Answer::Int(value) => expected["int"] == *value,
+                    Answer::Text(value) => text(&expected["text"]).as_deref() == Some(value),
+                    Answer::WriteChars { at, units: written } => {
+                        expected["write"]["at"] == *at
+                            && units(&expected["write"]["units"]).as_ref() == Some(written)
+                    }
+                };
+                answered && text(&expect["after"]).as_deref() == Some(after.as_str())
+            }
+            _ => false,
+        };
+        if !matched {
+            failures.push(format!(
+                "{} {name}{descriptor} on {initial:?} with {args:?}: got {outcome:?}, JDK {expect}",
+                case["owner"]
+            ));
+        }
+    }
+    failures
 }
 
 fn check_float_text(oracle: &Json) -> Vec<String> {
@@ -135,6 +229,7 @@ type Check = fn(&Json) -> Vec<String>;
 const SECTIONS: &[(&str, Check)] = &[
     ("doubles and floats", check_float_text),
     ("characters", check_characters),
+    ("builders", check_builders),
 ];
 
 /// Every section's failures, labelled by section, and each section's size.
