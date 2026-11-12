@@ -54,6 +54,17 @@ class UnmodelledCallsTests(unittest.TestCase):
         _, ranked = TOOL.aggregate(corpora)
         self.assertEqual([row["sole"] for row in ranked], [0, 0])
 
+    def test_calls_counted_before_a_refusal_are_not_ranked(self):
+        # A refused jar keeps what it counted before it stopped, for reading;
+        # the totals and ranking stay over runs that finished.
+        corpora = {"wide": [
+            {"verdict": "refused", "counted_before_error": [["z", 3]]},
+            {"verdict": "ran-hollow", "calls": [["a", 1]], "unknown": 1},
+        ]}
+        totals, ranked = TOOL.aggregate(corpora)
+        self.assertEqual(totals["wide"]["unknown_total"], 1)
+        self.assertEqual([row["call"] for row in ranked], ["a"])
+
     def test_parse_corpus_splits_name_and_directory(self):
         self.assertEqual(TOOL.parse_corpus("neoforge=/tmp/x"),
                          ("neoforge", Path("/tmp/x")))

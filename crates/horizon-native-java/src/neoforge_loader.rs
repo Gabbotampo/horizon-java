@@ -266,8 +266,12 @@ impl StdHost {
             ("net/neoforged/api/distmarker/Dist", "toString", "()Ljava/lang/String;") => {
                 Some(Value::Ref(Some(enum_name(marker).to_owned())))
             }
+            // A `javafml` mod's container is an `FMLModContainer`, whose
+            // `getEventBus()` is that mod's bus.
             (
-                "net/neoforged/fml/ModContainer" | "net/minecraftforge/fml/ModContainer",
+                "net/neoforged/fml/ModContainer"
+                | "net/minecraftforge/fml/ModContainer"
+                | FML_MOD_CONTAINER,
                 "getEventBus" | "getModEventBus",
                 "()Lnet/neoforged/bus/api/IEventBus;",
             ) => Some(Value::Ref(Some("net/neoforged/bus/api/IEventBus".into()))),
@@ -372,6 +376,58 @@ impl StdHost {
         }
         is_always_loaded_mod(id).then_some("unknown")
     }
+}
+
+const FML_MOD_CONTAINER: &str = "net/neoforged/fml/javafmlmod/FMLModContainer";
+
+impl StdHost {
+    /// `instanceof` for a mod container marker. Every container is a
+    /// `ModContainer`; FML builds an `FMLModContainer` for each mod of a jar
+    /// whose `neoforge.mods.toml` says `modLoader="javafml"`. Only the running
+    /// jar's metadata is read here, so another mod's container answers no
+    /// (and the interpreter counts that answer where it cannot stand behind it).
+    pub(super) fn mod_container_instance_of(&self, marker: &str, wanted: &str) -> bool {
+        let Some((id, _)) = mod_container_parts(marker) else {
+            return false;
+        };
+        match wanted {
+            "net/neoforged/fml/ModContainer" => true,
+            FML_MOD_CONTAINER => self
+                .resource_bytes
+                .get("META-INF/neoforge.mods.toml")
+                .is_some_and(|bytes| {
+                    javafml_mod_ids(&String::from_utf8_lossy(bytes)).contains(&id)
+                }),
+            _ => false,
+        }
+    }
+}
+
+/// The `modId`s a `neoforge.mods.toml` declares when its top-level
+/// `modLoader` is `javafml`; none for any other language loader.
+fn javafml_mod_ids(text: &str) -> Vec<&str> {
+    let mut javafml = false;
+    let mut in_mods = false;
+    let mut top_level = true;
+    let mut ids = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            top_level = false;
+            in_mods = line.starts_with("[[mods]]");
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        match key.trim() {
+            "modLoader" if top_level => javafml = value == "javafml",
+            "modId" if in_mods => ids.push(value),
+            _ => {}
+        }
+    }
+    if javafml { ids } else { Vec::new() }
 }
 
 fn enum_name(marker: &str) -> &str {

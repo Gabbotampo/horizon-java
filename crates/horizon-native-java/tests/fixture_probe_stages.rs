@@ -24,7 +24,8 @@ fn two_stage_jar(tag: &str, server_throws: bool) -> PathBuf {
     )
     .unwrap();
     let body = if server_throws {
-        "throw new IllegalStateException(\"server stage\");"
+        // One call the runtime does not model, counted before the throw.
+        "java.util.concurrent.locks.LockSupport.parkNanos(1L); throw new IllegalStateException(\"server stage\");"
     } else {
         "if (Common.ran != 1) throw new IllegalStateException(\"main did not run first\");"
     };
@@ -108,4 +109,11 @@ fn a_failing_stage_beside_a_running_one_is_partial() {
     // missed `main` entirely, and here it fails outright.
     let report = probe(&two_stage_jar("server-only", true), "server");
     assert_eq!(report["status"], "error");
+    // What the stage counted before it threw stays in the report: a refused
+    // run's unknown calls are what explain it.
+    assert_eq!(report["unknown_host_call_count"], 1, "{report}");
+    assert_eq!(
+        report["unknown_host_calls"],
+        serde_json::json!([["java/util/concurrent/locks/LockSupport#parkNanos(J)V", 1]])
+    );
 }
