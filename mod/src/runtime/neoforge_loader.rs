@@ -403,6 +403,15 @@ impl StdHost {
     }
 }
 
+/// Whether the runtime knows the whole type of a mod container marker:
+/// FancyModLoader 12.0.12's `MinecraftModLanguageProvider` builds the
+/// `minecraft` container as a `MinecraftModContainer` (a `ModContainer` and
+/// nothing more). Another mod's container depends on its language loader,
+/// which only the running jar's metadata tells.
+pub(crate) fn container_type_known(marker: &str) -> bool {
+    mod_container_parts(marker).is_some_and(|(id, _)| id == "minecraft")
+}
+
 /// The `modId`s a `neoforge.mods.toml` declares when its top-level
 /// `modLoader` is `javafml`; none for any other language loader.
 fn javafml_mod_ids(text: &str) -> Vec<&str> {
