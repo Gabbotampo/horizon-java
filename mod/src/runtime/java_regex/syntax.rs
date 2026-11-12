@@ -25,8 +25,23 @@ pub(crate) const MODELLED_FLAGS: i32 = CASE_INSENSITIVE | MULTILINE | LITERAL | 
 
 /// Repetition counts above this are counted rather than modelled.
 const MAX_COUNT: u32 = 100_000;
-/// Nesting deeper than this is counted (Java's own limit is its stack).
+/// Nesting deeper than this is counted (Java's own limit is its stack:
+/// JDK 27 overflowed parsing 818 nested groups, `-Xint` on a 512 KB thread).
 const MAX_DEPTH: usize = 64;
+/// Pattern size, in atoms and compiled nodes. `Pattern.compile` walks the
+/// node chain recursively (`study()`) and turns the `StackOverflowError`
+/// into "Stack overflow during pattern compilation"; JDK 27 (`-Xint`,
+/// 512 KB thread) overflowed from about 4,031 of its nodes: `.`×4,031,
+/// `(a)`×1,344, `(?:a|b)`×1,165, `x{2}`×2,912. The fewest nodes this engine
+/// compiles at one of those floors is 2,912 (`x{2}`, one node each), so a
+/// pattern over 1,000 atoms or nodes is counted, 2.9 times below.
+pub(crate) const MAX_NODES: usize = 1_000;
+/// Items in one bracket class, nested classes and `&&` operands included.
+/// Java tests a character through one predicate per range, nested class,
+/// predefined class, non-Latin-1 character and `&&` operand, each calling
+/// the one before; JDK 27 (`-Xint`, 512 KB) overflowed from 1,941 of them.
+/// A class over 500 items is counted, 3.9 times below.
+pub(crate) const MAX_CLASS_ITEMS: usize = 500;
 
 /// One character test.
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +196,9 @@ pub(crate) fn parse(pattern: &str, flags: i32) -> Result<Parsed, Unsupported> {
         return unsupported("a supplementary character in the pattern");
     }
     if flags & LITERAL != 0 {
+        if chars.len() > MAX_NODES {
+            return unsupported("a pattern longer than Java's compile stack is sure to allow");
+        }
         let ci = flags & CASE_INSENSITIVE != 0;
         let ast = Ast::Concat(
             chars
@@ -201,6 +219,8 @@ pub(crate) fn parse(pattern: &str, flags: i32) -> Result<Parsed, Unsupported> {
         groups: 0,
         closed: Vec::new(),
         names: Vec::new(),
+        atoms: 0,
+        class_items: 0,
     };
     let ast = parser.alternation(0)?;
     if parser.at != parser.p.len() {
@@ -222,6 +242,10 @@ struct Parser {
     /// `closed[n - 1]`: whether group `n` has been closed so far.
     closed: Vec<bool>,
     names: Vec<(String, usize)>,
+    /// Atoms parsed so far ([`MAX_NODES`]).
+    atoms: usize,
+    /// Items in the bracket class being parsed ([`MAX_CLASS_ITEMS`]).
+    class_items: usize,
 }
 
 /// One parsed atom and whether a quantifier may follow it.
@@ -292,6 +316,7 @@ impl Parser {
                     }
                     continue;
                 };
+                self.spend_atoms(quoted.len() + 1)?;
                 let ci = self.ci();
                 nodes.extend(quoted.into_iter().map(|q| Ast::One(Class::Char(q, ci))));
                 let atom = Atom {
@@ -308,6 +333,7 @@ impl Parser {
                 }
                 continue;
             };
+            self.spend_atoms(1)?;
             nodes.push(self.quantified(atom)?);
         }
         Ok(match nodes.len() {
@@ -315,6 +341,16 @@ impl Parser {
             1 => nodes.pop().unwrap_or(Ast::Empty),
             _ => Ast::Concat(nodes),
         })
+    }
+
+    /// Counts `n` more atoms against [`MAX_NODES`], so an oversized pattern
+    /// stops while it is read rather than after it is built.
+    fn spend_atoms(&mut self, n: usize) -> Result<(), Unsupported> {
+        self.atoms += n;
+        if self.atoms > MAX_NODES {
+            return unsupported("a pattern longer than Java's compile stack is sure to allow");
+        }
+        Ok(())
     }
 
     fn quantifier_follows(&self) -> bool {
@@ -341,7 +377,10 @@ impl Parser {
             '.' => one(Class::Dot {
                 dotall: self.flags & DOTALL != 0,
             }),
-            '[' => one(self.class(depth)?),
+            '[' => {
+                self.class_items = 0;
+                one(self.class(depth)?)
+            }
             '(' => self.group(depth),
             '^' => zero_width(Ast::Assert(if self.flags & MULTILINE != 0 {
                 Assert::Caret
@@ -658,6 +697,10 @@ impl Parser {
         // does (`[X&&YZ]`, `[X&&[Y][Z]]`), anything mixed is counted.
         let (mut operand_bare, mut operand_nested) = (false, false);
         loop {
+            self.class_items += 1;
+            if self.class_items > MAX_CLASS_ITEMS {
+                return unsupported("a class longer than Java's stack is sure to allow");
+            }
             match self.next()? {
                 ']' => break,
                 '[' => {

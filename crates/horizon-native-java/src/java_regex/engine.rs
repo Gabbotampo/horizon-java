@@ -33,25 +33,32 @@ impl Limits {
     /// 512 KB thread, about 1,000–1,500 on a cold 1 MB thread, and several
     /// thousand once C2 has compiled the nodes. Past the shallowest of those
     /// there is no single Java answer, so a search that goes deeper is
-    /// counted. `DEPTH` is set well below the node depth this engine reaches
+    /// counted. `depth` is set well below the node depth this engine reaches
     /// on the shortest input JDK 27 overflows on in every measured setting
-    /// (see `deep_searches_are_counted_where_java_can_overflow`).
+    /// (see `deep_searches_are_counted_where_java_can_overflow` and
+    /// `long_patterns_stop_well_below_java_overflows`). The pattern's own
+    /// size is bounded at parse time ([`super::syntax::MAX_NODES`],
+    /// [`super::syntax::MAX_CLASS_ITEMS`]).
     pub(crate) const JAVA: Limits = Limits {
         depth: MAX_DEPTH,
         stack: MAX_STACK,
     };
 }
 
-/// See [`Limits::JAVA`]. JDK 27 overflowed from 2,678 of this engine's
-/// nodes at the shallowest (`(?:a|b)*?c`, `-Xint`, 512 KB thread); this is
-/// 2.7 times below that, so a shape whose Java frames are heavier than the
-/// measured ones still stays clear of Java's own limit.
+/// See [`Limits::JAVA`]. Measured against JDK 27's shortest overflow
+/// (`-Xint`, 512 KB thread, the lowest of the settings tried): loop shapes
+/// overflowed from 2,678 of this engine's nodes (`(?:a|b)*?c`), 2.68 times
+/// this bound; long patterns are answered at most 1/2.91 of the size Java
+/// overflows on (`x{2}` × n, through [`super::syntax::MAX_NODES`]). A
+/// `Curly` counts two levels ([`Matcher::curly_frame`]); counted as one, a
+/// run of `a{0,2}` was answered up to 1/1.55 of Java's overflow.
 pub(crate) const MAX_DEPTH: usize = 1_000;
 /// A safety net under [`MAX_DEPTH`]: stack bytes a search may use before it
 /// is counted, whatever its depth. An unoptimized build used at most
-/// ~1.13 KB per node on the measured shapes (an optimized one ~250 B), so
-/// `MAX_DEPTH` nodes fit inside it and a 2 MB thread keeps ~750 KB for its
-/// callers; the net only binds for a shape with larger frames than those.
+/// ~1.13 KB per level on the measured shapes (~850 B for a `Curly`'s two;
+/// an optimized one ~250 B), so `MAX_DEPTH` levels fit inside it and a 2 MB
+/// thread keeps ~750 KB for its callers; the net only binds for a shape with
+/// larger frames than those, and tests pin that the depth binds first.
 const MAX_STACK: usize = 1_280 << 10;
 
 type R<T> = Result<T, Unsupported>;
@@ -444,6 +451,11 @@ pub(crate) fn compile(parsed: Parsed) -> R<Program> {
     };
     let end = compiler.push(Node::End(End::Main));
     let start = compiler.compile(&parsed.ast, end)?;
+    if compiler.nodes.len() > super::syntax::MAX_NODES {
+        return Err(Unsupported(
+            "a pattern longer than Java's compile stack is sure to allow".into(),
+        ));
+    }
     Ok(Program {
         nodes: compiler.nodes,
         start,
@@ -684,7 +696,7 @@ impl<'a> Matcher<'a> {
                 max,
                 greed,
                 next,
-            } => self.curly(class, *min, *max, *greed, *next, i),
+            } => self.curly_frame(class, *min, *max, *greed, *next, i),
             Node::GroupHead { local, next } => self.group_head(*local, *next, i),
             Node::GroupTail { local, group, next } => self.group_tail(*local, *group, *next, i),
             Node::Branch { alternatives, next } => self.branch(alternatives, *next, i),
@@ -923,6 +935,31 @@ impl<'a> Matcher<'a> {
                 (left != right) != negate
             }
         })
+    }
+
+    /// [`Matcher::curly`] counted as two levels: Java spends two frames on
+    /// a `Curly` (`match` and `match0`/`match1`), so a run of single-char
+    /// quantifiers (`a{0,2}` × n) overflows Java at about 1,540 of them,
+    /// against ~2,700 nodes for other shapes. Weighted, the margin under
+    /// Java's floor is the same for both.
+    #[inline(never)]
+    fn curly_frame(
+        &mut self,
+        class: &Class,
+        min: u32,
+        max: Option<u32>,
+        greed: Greed,
+        next: usize,
+        i: usize,
+    ) -> R<bool> {
+        if self.depth >= self.limits.depth {
+            return Err(self.refusal());
+        }
+        self.depth += 1;
+        self.peak_depth = self.peak_depth.max(self.depth);
+        let result = self.curly(class, min, max, greed, next, i);
+        self.depth -= 1;
+        result
     }
 
     /// Java's `Curly` over one character class.
