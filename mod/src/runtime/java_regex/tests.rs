@@ -431,6 +431,13 @@ fn measure_depth_against_java_overflows() {
                 depth: usize::MAX,
                 stack: usize::MAX,
             };
+            let long_units = ["a{0,2}", "a*?", "x{0}", "a{1}", "[ab]{1,1}", "a?"];
+            for unit in long_units {
+                let pattern = unit.repeat(400);
+                let text: Vec<char> = "a".repeat(400).chars().collect();
+                let (answer, depth, bytes) = probe_depth(&pattern, &text, false, free);
+                println!("{unit:24}×400 depth={depth} bytes_per_node={} answer={answer:?}", bytes / depth.max(1));
+            }
             for (pattern, unit, prefix, suffix, find, java, _) in JAVA_OVERFLOWS {
                 let n = java.unwrap_or(2_000);
                 let text = overflow_input(unit, prefix, suffix, n);
@@ -465,9 +472,12 @@ fn deep_searches_are_counted_where_java_can_overflow() {
                 if let Some(n) = java {
                     let text = overflow_input(unit, prefix, suffix, *n);
                     let (answer, _, _) = probe_depth(pattern, &text, *find, Limits::JAVA);
+                    // Counted for its depth, not by the stack safety net, so
+                    // an unoptimized build counts exactly what an optimized
+                    // one counts.
                     assert!(
-                        answer.is_err(),
-                        "{pattern} answered at Java's overflow ({n})"
+                        matches!(&answer, Err(Unsupported(reason)) if reason.contains("deeper than Java")),
+                        "{pattern} at Java's overflow ({n}): {answer:?}"
                     );
                 }
                 let text = overflow_input(unit, prefix, suffix, 200_000);
@@ -665,6 +675,218 @@ fn second_review_cases_answer_like_java_or_are_counted() {
             ),
         }
     }
+}
+
+/// The third independent review of #81: JDK 27 recurses over the pattern
+/// itself, at compile time (`study()`, rethrown as `PatternSyntaxException:
+/// Stack overflow during pattern compilation`) and through a class's
+/// predicate chain (`StackOverflowError`), whatever the input. Each of its
+/// examples threw on JDK 27 (`-Xint`, 512 KB thread) and must be counted;
+/// the same shapes a few times smaller still answer.
+#[test]
+fn oversized_patterns_are_counted_where_java_throws() {
+    let class = |items: String| format!("[{items}]");
+    let non_latin1: String = (0..1950u32)
+        .map(|i| char::from_u32(0x100 + i).unwrap())
+        .collect();
+    let escaped_non_latin1: String = (0..1950u32)
+        .map(|i| format!("\\x{{{:x}}}", 0x100 + i))
+        .collect();
+    let throws: Vec<(String, String)> = vec![
+        ("(a)".repeat(1350), "z".into()),
+        ("(?:a|b)".repeat(1200), "z".into()),
+        ("a.".repeat(2050), "z".into()),
+        ("a\\b".repeat(2050), "a".repeat(2050)),
+        ("x{2}".repeat(2950), "z".into()),
+        (".".repeat(4050), "z".into()),
+        ("[a]".repeat(4050), "z".into()),
+        ("\\w".repeat(4050), "z".into()),
+        ("a+".repeat(4050), "z".into()),
+        ("(?=a)".repeat(4050), "".into()),
+        (class(non_latin1), "a".into()),
+        (class(format!("\\w{escaped_non_latin1}")), "a".into()),
+        (class(format!("{}a-z", "a-z&&".repeat(1949))), "a".into()),
+        (class(format!("{}[a]", "[a]&&".repeat(1999))), "a".into()),
+        (
+            class(format!(
+                "{}\\x{{100}}-\\x{{fff}}",
+                "\\x{100}-\\x{fff}&&".repeat(2999)
+            )),
+            "a".into(),
+        ),
+    ];
+    for (pattern, input) in &throws {
+        assert!(
+            matches(pattern, input).is_err(),
+            "{:.40}… ({} chars) answered where JDK 27 throws",
+            pattern,
+            pattern.len()
+        );
+        assert!(super::replace(input, pattern, "X", true).is_err());
+        assert!(string_split(input, pattern, 0).is_err());
+    }
+    // Well inside Java's limits: answered, as JDK 27 answers them.
+    assert_eq!(matches(&"(a)".repeat(300), "z"), Ok(false));
+    assert_eq!(matches(&".".repeat(900), &"z".repeat(900)), Ok(true));
+    assert_eq!(matches(&class("a-z&&".repeat(200) + "a-z"), "a"), Ok(true));
+}
+
+/// Long patterns: the shortest JDK 27 overflowed on (`-Xint`, 512 KB
+/// thread, the lowest of four settings), as a count of `unit`s, in compile
+/// (`study()`), class predicate chains or matching. (name, pattern for n,
+/// input for n, Java's n)
+#[allow(clippy::type_complexity)]
+fn long_pattern_overflows() -> Vec<(
+    &'static str,
+    Box<dyn Fn(usize) -> String>,
+    Box<dyn Fn(usize) -> String>,
+    usize,
+)> {
+    let seq =
+        |unit: &'static str| -> Box<dyn Fn(usize) -> String> { Box::new(move |n| unit.repeat(n)) };
+    let fixed =
+        |text: &'static str| -> Box<dyn Fn(usize) -> String> { Box::new(move |_| text.to_owned()) };
+    let each =
+        |unit: &'static str| -> Box<dyn Fn(usize) -> String> { Box::new(move |n| unit.repeat(n)) };
+    let class = |unit: &'static str, last: &'static str| -> Box<dyn Fn(usize) -> String> {
+        Box::new(move |n| format!("[{}{last}]", unit.repeat(n)))
+    };
+    vec![
+        ("compile .", seq("."), fixed("z"), 4031),
+        ("compile (a)", seq("(a)"), fixed("z"), 1344),
+        ("compile (?:a|b)", seq("(?:a|b)"), fixed("z"), 1165),
+        ("compile a.", seq("a."), fixed("z"), 2016),
+        ("compile x{2}", seq("x{2}"), fixed("z"), 2912),
+        ("compile [a]", seq("[a]"), fixed("z"), 4031),
+        ("compile a+", seq("a+"), fixed("z"), 4031),
+        ("compile (?=a)", seq("(?=a)"), fixed("z"), 4031),
+        ("compile (?:a)", seq("(?:a)"), fixed("z"), 1344),
+        (
+            "nested groups",
+            Box::new(|n| "(".repeat(n) + "a" + &")".repeat(n)),
+            fixed("z"),
+            818,
+        ),
+        ("class a-z&&", class("a-z&&", "a-z"), fixed("a"), 1941),
+        ("class [a]&&", class("[a]&&", "[a]"), fixed("a"), 1942),
+        (
+            "class ranges",
+            Box::new(|n| {
+                format!(
+                    "[{}]",
+                    (0..n)
+                        .map(|i| {
+                            let c = (b'a' + (i % 20) as u8) as char;
+                            format!("{c}-{c}")
+                        })
+                        .collect::<String>()
+                )
+            }),
+            fixed("~"),
+            1942,
+        ),
+        ("class [ab]", class("[ab]", ""), fixed("z"), 1943),
+        (
+            "class non-Latin-1",
+            Box::new(|n| {
+                format!(
+                    "[{}]",
+                    (0..n as u32)
+                        .map(|i| char::from_u32(0x100 + i).unwrap())
+                        .collect::<String>()
+                )
+            }),
+            fixed("a"),
+            1942,
+        ),
+        ("deep a{0,2}", seq("a{0,2}"), each("a"), 1543),
+        ("deep a*?", seq("a*?"), each("a"), 1639),
+        ("deep x{0}", seq("x{0}"), each("a"), 1543),
+        ("deep [ab]{1,1}", seq("[ab]{1,1}"), each("a"), 1541),
+        ("deep a(?<=a)", seq("a(?<=a)"), each("a"), 1455),
+        ("deep (?<!b)a", seq("(?<!b)a"), each("a"), 1455),
+        ("deep (?:|a)", seq("(?:|a)"), each("a"), 1029),
+        ("deep (a{0,2}?)", seq("(a{0,2}?)"), each("a"), 783),
+        ("deep (?:a|b)", seq("(?:a|b)"), each("a"), 648),
+        ("deep (a)", seq("(a)"), each("a"), 1049),
+        ("deep a?", seq("a?"), each("a"), 3492),
+        ("deep \\R", seq("\\R"), each("\n"), 3275),
+        ("deep .", seq("."), each("a"), 3274),
+        ("deep (?=a)a", seq("(?=a)a"), each("a"), 1588),
+    ]
+}
+
+/// Every long-pattern shape is answered only well below the size on which
+/// JDK 27 first threw: at least 2.5 times below its shallowest setting.
+/// Run with `--nocapture` for each shape's margin.
+#[test]
+fn long_patterns_stop_well_below_java_overflows() {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            let mut tightest = f64::MAX;
+            for (name, pattern, input, java) in long_pattern_overflows() {
+                let answered = |n: usize| matches(&pattern(n), &input(n)).is_ok();
+                assert!(answered(1), "{name}: not modelled at all");
+                assert!(
+                    !answered(java),
+                    "{name}: answered at Java's overflow ({java})"
+                );
+                let (mut lo, mut hi) = (1, java);
+                while lo + 1 < hi {
+                    let mid = (lo + hi) / 2;
+                    if answered(mid) { lo = mid } else { hi = mid }
+                }
+                let margin = java as f64 / lo as f64;
+                println!("{name:20} java {java:5}  answered to {lo:5}  margin {margin:.2}");
+                tightest = tightest.min(margin);
+                assert!(
+                    margin >= 2.5,
+                    "{name}: answered to {lo}, Java overflows at {java}"
+                );
+            }
+            println!("tightest margin {tightest:.2}");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// No pattern can take the process down, whatever its size: a 1 MB pattern
+/// of every shape is counted on a 2 MB thread (a test harness's default)
+/// in any build.
+#[test]
+fn megabyte_patterns_are_counted_on_a_small_stack() {
+    const SIZE: usize = 1 << 20;
+    let fill = |unit: &str| unit.repeat(SIZE / unit.len());
+    let shapes: Vec<String> = vec![
+        fill("."),
+        fill("a"),
+        fill("(a)"),
+        fill("(?:a|b)"),
+        fill("a{0,2}"),
+        fill("a|"),
+        fill("(?=a)"),
+        "(".repeat(SIZE / 2) + &")".repeat(SIZE / 2),
+        "(?:".repeat(SIZE / 4) + &")".repeat(SIZE / 4),
+        "[".repeat(SIZE / 2) + &"]".repeat(SIZE / 2),
+        format!("[{}]", fill("a-z&&")),
+        format!("[{}]", fill("[a]&&")),
+        format!("[{}]", fill("[ab]")),
+        format!("[{}]", fill("a")),
+        format!("\\Q{}\\E", fill("a")),
+        fill("\\Qa\\E"),
+    ];
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            for pattern in &shapes {
+                assert!(matches(pattern, "a").is_err(), "{:.20}… answered", pattern);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 /// `Pattern.quote` and `Matcher.quoteReplacement`, answers from OpenJDK 27.
