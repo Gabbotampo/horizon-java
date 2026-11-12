@@ -97,7 +97,7 @@ use runtime::brigadier::{
 };
 use runtime::events::{
     EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
-    GameListener,
+    GameListener, ServerFacts,
 };
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
@@ -105,6 +105,7 @@ use serde_json::json;
 mod attachments;
 mod content;
 mod runtime;
+mod server_facts;
 
 /// This mod's report, in its own `config/horizon_java/` folder.
 const REPORT: &str = "horizon_java/java-runtime.json";
@@ -146,6 +147,9 @@ struct State {
     tick_count: i32,
     /// Whether the open server is a dedicated one, from `server_about_to_start`.
     dedicated: bool,
+    /// The world folder and registries the host gives (`server_facts.rs`), read at
+    /// `server_about_to_start` and again as each level loads.
+    server: Arc<ServerFacts>,
 }
 
 /// What one game event's listeners decided, for the hook that fired it.
@@ -321,6 +325,11 @@ impl Hooks for HorizonJava {
         state.players.clear();
         state.levels.clear();
         state.tick_count = 0;
+        state.server = Arc::new(server_facts::server_facts(host));
+        log::info!(
+            "{LOG}: server facts at server start: {}",
+            server_facts::describe(&state.server)
+        );
         state.reset_server();
         let count = |verdict: &str| {
             state
@@ -654,6 +663,18 @@ impl Hooks for HorizonJava {
     /// A server level opened (Fabric's `ServerLevelEvents.LOAD`, NeoForge's `LevelEvent.Load`).
     fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
         self.refresh_levels(host);
+        // The world folder and the data-pack registries may only be complete once a level
+        // is open; a fact that did not change keeps its `Arc`.
+        let facts = server_facts::server_facts(host);
+        let mut state = self.lock();
+        if *state.server != facts {
+            log::info!(
+                "{LOG}: server facts at level load: {}",
+                server_facts::describe(&facts)
+            );
+            state.server = Arc::new(facts);
+        }
+        drop(state);
         let context = EventContext {
             level: Some(event.dimension.to_owned()),
             ..EventContext::default()
@@ -900,15 +921,21 @@ impl Hooks for HorizonJava {
     /// A player used the item in their hand (Fabric's `UseItemCallback`, NeoForge's
     /// `PlayerInteractEvent.RightClickItem`).
     fn right_click_item(&self, host: HostSide<'_>, event: &mut RightClickItemEvent<'_>) -> Flow {
-        if !matches!(host, HostSide::Server(_)) {
+        let HostSide::Server(host) = host else {
             return Flow::Continue;
-        }
+        };
         let click = event.click;
+        // `player.getItemInHand(hand)` is the hook's own stack; the other hand and the game
+        // mode are read from the host for this firing only.
+        let held = host
+            .player(click.player)
+            .and_then(|player| server_facts::held_items(host, player, click.hand, click.stack));
         let context = EventContext {
             level: Some(dimension_id(click.dimension).to_owned()),
             player: Some(click.player),
             pos: Some(click.pos),
             off_hand: Some(click.hand == Hand::Off),
+            held,
             ..EventContext::default()
         };
         let fired = self.fire_event(GameEvent::UseItem, self.dedicated(), context, |_| true);
@@ -1567,6 +1594,9 @@ fn level_entry(host: &dyn Host, level: LevelRef) -> Option<FacadeLevel> {
         id: level.dimension_id().to_owned(),
         game_time: level.game_time(host)?,
         day_time: level.day_time(host)?,
+        // `getWorldBorder()`'s bounds, refreshed with the clocks on every level tick, so a
+        // border the server moves is read as it is now.
+        world_border: level.world_border(host),
     })
 }
 
@@ -1577,8 +1607,8 @@ fn level_entry(host: &dyn Host, level: LevelRef) -> Option<FacadeLevel> {
 /// the Nether answers `getLevel()` with the Nether. The console's is the overworld, which is
 /// vanilla's console source level; a minecart's and a function's level is not in the hook and
 /// stays unknown (a `getLevel()` read is counted, never answered with the overworld). A
-/// player's dimension is not part of `CommandSource::Player` either, so it too stays unknown
-/// (`arismoko/horizon#2747`), counted rather than guessed.
+/// player's source is `player.createCommandSourceStack()`, whose level is `player.level()`:
+/// the level the host names for the player's entity, or unknown when it names none.
 fn runtime_source(source: &CommandSource, host: &dyn ServerHost) -> RuntimeSource {
     let level = source.permission().level();
     let levels = host.levels().list_levels();
@@ -1593,7 +1623,10 @@ fn runtime_source(source: &CommandSource, host: &dyn ServerHost) -> RuntimeSourc
             name: player.name(host).unwrap_or_else(|| "Player".to_owned()),
             level,
             player: Some(player.uuid()),
-            dimension: source_dimension(source, dimension_of),
+            dimension: player
+                .entity()
+                .level(host)
+                .map(|level| level.dimension_id().to_owned()),
         },
         _ => RuntimeSource {
             name: "Server".to_owned(),
@@ -1613,7 +1646,8 @@ fn source_dimension(
         // Vanilla's console source is the overworld's (MinecraftServer.overworld()).
         CommandSource::Console { .. } => Some("minecraft:overworld".to_owned()),
         CommandSource::CommandBlock { level, .. } => dimension(*level),
-        // Neither carries a level in the hook, and a player's is not part of its source.
+        // Neither carries a level in the hook; a player's is read from the host by
+        // `runtime_source`, not from the source.
         CommandSource::Player { .. }
         | CommandSource::CommandBlockMinecart { .. }
         | CommandSource::Function { .. } => None,
@@ -1807,6 +1841,7 @@ impl State {
             tick_count: self.tick_count,
             players: self.players.clone(),
             levels: self.levels.clone(),
+            server: Arc::clone(&self.server),
             ..EventFacade::default()
         }
     }
@@ -2186,6 +2221,7 @@ mod tests {
             id: "minecraft:the_nether".into(),
             game_time: 100,
             day_time: 40,
+            world_border: None,
         });
         let facade = state.facade();
         assert!(facade.dedicated);

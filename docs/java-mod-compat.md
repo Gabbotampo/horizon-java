@@ -681,7 +681,8 @@ generation moves on at `restoreFrom` and at logout, as a new `ServerPlayer` woul
   with the event listeners' façade): `getWorldPath(LevelResource)` is the world folder in the interpreter's virtual
   game folder with the resource id resolved under it as vanilla does (`/horizon/game/world/.` for `ROOT`; a jar's
   own `new LevelResource(id)` keeps its id), `getGameRules().get(GameRules.X)` the rule's current boxed value,
-  `registryAccess().lookupOrThrow(key)` a registry the game lists (`containsKey`, `keySet`, `size`; blocks,
+  `registryAccess().lookupOrThrow(key)` a registry the game lists (`containsKey`, `size`, and `keySet` in the
+  bucket order of vanilla's `byLocation` `HashMap`, rebuilt from the registration order; blocks,
   items, entity types, biomes and the other command registries, or blocks/items/entity types before the world
   opens), a level's `getGameTime`/`getDayTime`, and `ServerPlayNetworking.canSend(player, type)` whether that
   player's client takes the channel (every declared client-bound channel for a Horizon client, none for any other
