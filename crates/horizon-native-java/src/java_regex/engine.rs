@@ -17,8 +17,42 @@ use super::syntax::{Assert, Ast, Category, Class, Greed, Parsed, Posix};
 
 /// Node visits one operation (a whole `replaceAll`, say) may spend.
 const MAX_STEPS: usize = 2_000_000;
-/// The reason a search that needs more stack than it was given stops with.
-pub(crate) const STACK_REASON: &str = "a search nested past its stack budget";
+/// How deep a search may recurse, in nodes, and how much stack it may use.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    pub(crate) depth: usize,
+    pub(crate) stack: usize,
+}
+
+impl Limits {
+    /// Where an answer stops being Java's.
+    ///
+    /// Java's matcher recurses one frame (or a few) per node, as this one
+    /// does, and throws `StackOverflowError` when the thread's stack runs
+    /// out: from about 450 characters of `(?:(a)|b)*` under `-Xint` on a
+    /// 512 KB thread, about 1,000–1,500 on a cold 1 MB thread, and several
+    /// thousand once C2 has compiled the nodes. Past the shallowest of those
+    /// there is no single Java answer, so a search that goes deeper is
+    /// counted. `DEPTH` is set well below the node depth this engine reaches
+    /// on the shortest input JDK 27 overflows on in every measured setting
+    /// (see `deep_searches_are_counted_where_java_can_overflow`).
+    pub(crate) const JAVA: Limits = Limits {
+        depth: MAX_DEPTH,
+        stack: MAX_STACK,
+    };
+}
+
+/// See [`Limits::JAVA`]. JDK 27 overflowed from 2,678 of this engine's
+/// nodes at the shallowest (`(?:a|b)*?c`, `-Xint`, 512 KB thread); this is
+/// 2.7 times below that, so a shape whose Java frames are heavier than the
+/// measured ones still stays clear of Java's own limit.
+pub(crate) const MAX_DEPTH: usize = 1_000;
+/// A safety net under [`MAX_DEPTH`]: stack bytes a search may use before it
+/// is counted, whatever its depth. An unoptimized build used at most
+/// ~1.13 KB per node on the measured shapes (an optimized one ~250 B), so
+/// `MAX_DEPTH` nodes fit inside it and a 2 MB thread keeps ~750 KB for its
+/// callers; the net only binds for a shape with larger frames than those.
+const MAX_STACK: usize = 1_280 << 10;
 
 type R<T> = Result<T, Unsupported>;
 
@@ -520,12 +554,13 @@ pub(crate) struct Matcher<'a> {
     /// Whether `End::Main` requires the end of the input (`matches()`).
     anchor_end: bool,
     steps: usize,
-    /// The stack address the search started at, and how many bytes below it
-    /// the recursion may reach. Measured, not estimated, so the bound holds
-    /// for an unoptimized build's large frames and an optimized build's
-    /// small ones alike.
+    limits: Limits,
+    /// Current and deepest recursion, in nodes.
+    depth: usize,
+    pub(crate) peak_depth: usize,
+    /// The stack address the search started at, and the lowest one reached.
     stack_base: usize,
-    stack_budget: usize,
+    pub(crate) stack_low: usize,
 }
 
 /// The address of a fresh local: where the stack is now.
@@ -538,9 +573,10 @@ fn stack_position() -> usize {
 pub(crate) const UNSET: usize = usize::MAX;
 
 impl<'a> Matcher<'a> {
-    /// A matcher whose recursion may use `stack_budget` bytes of the
-    /// current thread's stack (stacks grow down on every supported target).
-    pub(crate) fn new(program: &'a Program, text: &'a [char], stack_budget: usize) -> Self {
+    /// A matcher bounded by `limits` (stacks grow down on every supported
+    /// target).
+    pub(crate) fn new(program: &'a Program, text: &'a [char], limits: Limits) -> Self {
+        let stack_base = stack_position();
         Self {
             program,
             text,
@@ -550,9 +586,18 @@ impl<'a> Matcher<'a> {
             behind_to: 0,
             anchor_end: false,
             steps: 0,
-            stack_base: stack_position(),
-            stack_budget,
+            limits,
+            depth: 0,
+            peak_depth: 0,
+            stack_base,
+            stack_low: stack_base,
         }
+    }
+
+    /// Stack bytes the deepest recursion so far used.
+    #[cfg(test)]
+    pub(crate) fn stack_base_minus_low(&self) -> usize {
+        self.stack_base - self.stack_low
     }
 
     /// Java's `Matcher.search(from)`: the leftmost match at or after `from`.
@@ -585,6 +630,30 @@ impl<'a> Matcher<'a> {
         self.groups.iter_mut().for_each(|value| *value = UNSET);
     }
 
+    /// Spends a step and checks the limits; `false` stops the search, and
+    /// [`Matcher::refusal`] says why.
+    #[inline(never)]
+    fn enter(&mut self) -> bool {
+        self.steps += 1;
+        let here = stack_position();
+        self.stack_low = self.stack_low.min(here);
+        self.steps <= MAX_STEPS
+            && self.depth < self.limits.depth
+            && self.stack_base.saturating_sub(here) <= self.limits.stack
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refusal(&self) -> Unsupported {
+        Unsupported(if self.steps > MAX_STEPS {
+            "a search over its step budget".into()
+        } else if self.depth >= self.limits.depth {
+            "a search nested deeper than Java's stack is sure to allow".into()
+        } else {
+            "a search past its stack budget".into()
+        })
+    }
+
     fn spend(&mut self) -> R<()> {
         self.steps += 1;
         if self.steps > MAX_STEPS {
@@ -593,37 +662,22 @@ impl<'a> Matcher<'a> {
         Ok(())
     }
 
-    /// Match node `id` at `i`. Recursion stops with [`STACK_REASON`] once it
-    /// has used its stack budget, before the thread's stack can run out.
+    /// Match node `id` at `i`. A search deeper than its limits is counted
+    /// (see [`Limits::JAVA`]); the depth is restored however the call returns.
+    ///
+    /// Each node kind lives in its own method so that, in an unoptimized
+    /// build, a level of recursion carries only the frame of the node it is
+    /// in: one `match` holding every kind's locals made each level ~2.8 KB,
+    /// too much for [`MAX_DEPTH`] levels on a small thread.
     fn at(&mut self, id: usize, i: usize) -> R<bool> {
-        self.spend()?;
-        if self.stack_base.saturating_sub(stack_position()) > self.stack_budget {
-            return Err(Unsupported(STACK_REASON.into()));
+        if !self.enter() {
+            return Err(self.refusal());
         }
-        self.node(id, i)
-    }
-
-    fn node(&mut self, id: usize, i: usize) -> R<bool> {
-        let program = self.program;
-        let text = self.text;
-        match &program.nodes[id] {
-            Node::End(End::Main) => {
-                if self.anchor_end && i != text.len() {
-                    return Ok(false);
-                }
-                self.last = i;
-                self.groups[1] = i;
-                Ok(true)
-            }
-            Node::End(End::Sub) => {
-                self.last = i;
-                Ok(true)
-            }
-            Node::End(End::Behind) => Ok(i == self.behind_to),
-            Node::One { class, next } => match text.get(i) {
-                Some(c) if test(class, *c)? => self.at(*next, i + 1),
-                _ => Ok(false),
-            },
+        self.depth += 1;
+        self.peak_depth = self.peak_depth.max(self.depth);
+        let result = match &self.program.nodes[id] {
+            Node::End(end) => Ok(self.end(*end, i)),
+            Node::One { class, next } => self.one(class, *next, i),
             Node::Curly {
                 class,
                 min,
@@ -631,40 +685,9 @@ impl<'a> Matcher<'a> {
                 greed,
                 next,
             } => self.curly(class, *min, *max, *greed, *next, i),
-            Node::GroupHead { local, next } => {
-                let saved = self.locals[*local];
-                self.locals[*local] = i;
-                let result = self.at(*next, i);
-                self.locals[*local] = saved;
-                result
-            }
-            Node::GroupTail { local, group, next } => {
-                let start = self.locals[*local];
-                let Some(group) = group else {
-                    return self.at(*next, i);
-                };
-                let (saved_start, saved_end) = (self.groups[2 * group], self.groups[2 * group + 1]);
-                self.groups[2 * group] = start;
-                self.groups[2 * group + 1] = i;
-                if self.at(*next, i)? {
-                    return Ok(true);
-                }
-                self.groups[2 * group] = saved_start;
-                self.groups[2 * group + 1] = saved_end;
-                Ok(false)
-            }
-            Node::Branch { alternatives, next } => {
-                for alternative in alternatives {
-                    let matched = match alternative {
-                        Some(entry) => self.at(*entry, i)?,
-                        None => self.at(*next, i)?,
-                    };
-                    if matched {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
+            Node::GroupHead { local, next } => self.group_head(*local, *next, i),
+            Node::GroupTail { local, group, next } => self.group_tail(*local, *group, *next, i),
+            Node::Branch { alternatives, next } => self.branch(alternatives, *next, i),
             Node::Prolog { looping } => self.loop_init(*looping, i),
             Node::Loop { .. } => self.loop_match(id, i),
             Node::Possessive {
@@ -672,84 +695,179 @@ impl<'a> Matcher<'a> {
                 min,
                 max,
                 next,
-            } => {
-                let mut i = i;
-                let mut count = 0;
-                while count < *min {
-                    if !self.at(*body, i)? {
-                        return Ok(false);
-                    }
-                    i = self.last;
-                    count += 1;
-                }
-                while max.is_none_or(|max| count < max) {
-                    if !self.at(*body, i)? || self.last == i {
-                        break;
-                    }
-                    i = self.last;
-                    count += 1;
-                }
-                self.at(*next, i)
-            }
+            } => self.possessive(*body, *min, *max, *next, i),
             Node::Look {
                 body,
                 negate,
                 behind,
                 next,
-            } => {
-                let matched = match behind {
-                    None => self.at(*body, i)?,
-                    Some((min, max)) => {
-                        let saved = self.behind_to;
-                        self.behind_to = i;
-                        let lowest = i.saturating_sub(*max);
-                        let mut matched = false;
-                        if let Some(mut j) = i.checked_sub(*min) {
-                            loop {
-                                if self.at(*body, j)? {
-                                    matched = true;
-                                    break;
-                                }
-                                if j == lowest {
-                                    break;
-                                }
-                                j -= 1;
-                            }
+            } => self.look(*body, *negate, *behind, *next, i),
+            Node::Atomic { body, next } => self.atomic(*body, *next, i),
+            Node::Backref { group, next } => self.backref(*group, *next, i),
+            Node::Assert { kind, next } => self.assert_then(*kind, *next, i),
+        };
+        self.depth -= 1;
+        result
+    }
+
+    #[inline(never)]
+    fn end(&mut self, end: End, i: usize) -> bool {
+        match end {
+            End::Main => {
+                if self.anchor_end && i != self.text.len() {
+                    return false;
+                }
+                self.last = i;
+                self.groups[1] = i;
+                true
+            }
+            End::Sub => {
+                self.last = i;
+                true
+            }
+            End::Behind => i == self.behind_to,
+        }
+    }
+
+    #[inline(never)]
+    fn one(&mut self, class: &Class, next: usize, i: usize) -> R<bool> {
+        match self.text.get(i) {
+            Some(c) if test(class, *c)? => self.at(next, i + 1),
+            _ => Ok(false),
+        }
+    }
+
+    #[inline(never)]
+    fn group_head(&mut self, local: usize, next: usize, i: usize) -> R<bool> {
+        let saved = self.locals[local];
+        self.locals[local] = i;
+        let result = self.at(next, i);
+        self.locals[local] = saved;
+        result
+    }
+
+    #[inline(never)]
+    fn group_tail(&mut self, local: usize, group: Option<usize>, next: usize, i: usize) -> R<bool> {
+        let start = self.locals[local];
+        let Some(group) = group else {
+            return self.at(next, i);
+        };
+        let (saved_start, saved_end) = (self.groups[2 * group], self.groups[2 * group + 1]);
+        self.groups[2 * group] = start;
+        self.groups[2 * group + 1] = i;
+        if self.at(next, i)? {
+            return Ok(true);
+        }
+        self.groups[2 * group] = saved_start;
+        self.groups[2 * group + 1] = saved_end;
+        Ok(false)
+    }
+
+    #[inline(never)]
+    fn branch(&mut self, alternatives: &[Option<usize>], next: usize, i: usize) -> R<bool> {
+        for alternative in alternatives {
+            if self.at(alternative.unwrap_or(next), i)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[inline(never)]
+    fn possessive(
+        &mut self,
+        body: usize,
+        min: u32,
+        max: Option<u32>,
+        next: usize,
+        i: usize,
+    ) -> R<bool> {
+        let mut i = i;
+        let mut count = 0;
+        while count < min {
+            if !self.at(body, i)? {
+                return Ok(false);
+            }
+            i = self.last;
+            count += 1;
+        }
+        while max.is_none_or(|max| count < max) {
+            if !self.at(body, i)? || self.last == i {
+                break;
+            }
+            i = self.last;
+            count += 1;
+        }
+        self.at(next, i)
+    }
+
+    #[inline(never)]
+    fn look(
+        &mut self,
+        body: usize,
+        negate: bool,
+        behind: Option<(usize, usize)>,
+        next: usize,
+        i: usize,
+    ) -> R<bool> {
+        let matched = match behind {
+            None => self.at(body, i)?,
+            Some((min, max)) => {
+                let saved = self.behind_to;
+                self.behind_to = i;
+                let lowest = i.saturating_sub(max);
+                let mut matched = false;
+                if let Some(mut j) = i.checked_sub(min) {
+                    loop {
+                        if self.at(body, j)? {
+                            matched = true;
+                            break;
                         }
-                        self.behind_to = saved;
-                        matched
+                        if j == lowest {
+                            break;
+                        }
+                        j -= 1;
                     }
-                };
-                if matched == *negate {
-                    return Ok(false);
                 }
-                self.at(*next, i)
+                self.behind_to = saved;
+                matched
             }
-            Node::Atomic { body, next } => {
-                if !self.at(*body, i)? {
-                    return Ok(false);
-                }
-                let end = self.last;
-                self.at(*next, end)
-            }
-            Node::Backref { group, next } => {
-                let (start, end) = (self.groups[2 * group], self.groups[2 * group + 1]);
-                if start == UNSET || end == UNSET {
-                    return Ok(false);
-                }
-                let length = end - start;
-                if i + length > text.len() || text[start..end] != text[i..i + length] {
-                    return Ok(false);
-                }
-                self.at(*next, i + length)
-            }
-            Node::Assert { kind, next } => {
-                if self.assert(*kind, i)? {
-                    self.at(*next, i)
-                } else {
-                    Ok(false)
-                }
-            }
+        };
+        if matched == negate {
+            return Ok(false);
+        }
+        self.at(next, i)
+    }
+
+    #[inline(never)]
+    fn atomic(&mut self, body: usize, next: usize, i: usize) -> R<bool> {
+        if !self.at(body, i)? {
+            return Ok(false);
+        }
+        let end = self.last;
+        self.at(next, end)
+    }
+
+    #[inline(never)]
+    fn backref(&mut self, group: usize, next: usize, i: usize) -> R<bool> {
+        let text = self.text;
+        let (start, end) = (self.groups[2 * group], self.groups[2 * group + 1]);
+        if start == UNSET || end == UNSET {
+            return Ok(false);
+        }
+        let length = end - start;
+        if i + length > text.len() || text[start..end] != text[i..i + length] {
+            return Ok(false);
+        }
+        self.at(next, i + length)
+    }
+
+    #[inline(never)]
+    fn assert_then(&mut self, kind: Assert, next: usize, i: usize) -> R<bool> {
+        if self.assert(kind, i)? {
+            self.at(next, i)
+        } else {
+            Ok(false)
         }
     }
 

@@ -228,6 +228,12 @@ CORE_CASES = [
     {"pattern": "[a&&[b]&x]", "inputs": ["1a2", "a", "&"], "replacements": ["-"]},
     {"pattern": "[ab&&[b]&c]", "inputs": ["abc&"], "replacements": ["-"]},
     {"pattern": "[a&&[a]b&&b]", "inputs": ["a", "b"], "replacements": ["-"]},
+    # The second review: `\R` in repeated groups, `\v-` in classes, `\c\Q`.
+    {"pattern": "(\\R){2,}", "inputs": ["line1\r\nline2", "a\n\nb"], "replacements": ["\n\n"]},
+    {"pattern": "(?:\\R)?\\n", "inputs": ["\r\n", "\n\n"], "replacements": ["<$0>"]},
+    {"pattern": "[\\v-z]", "inputs": ["a-b", "\u000b"], "replacements": ["X"]},
+    {"pattern": "[\\v-]", "inputs": ["\n-\u000b"], "replacements": ["X"]},
+    {"pattern": "[\\t-\\v]", "inputs": ["\t\n\u000b\r"], "replacements": ["X"]},
     {"pattern": "(?<name>[a-z]+)-(\\d+)", "inputs": ["item-12 and block-7"], "replacements": ["${name}:$2", "${nope}", "${1x}", "$3", "${}", "${name"]},
 ]
 
@@ -403,6 +409,24 @@ def targeted_cases() -> list[dict]:
         for quantifier in ["*", "+", "?", "{2}", "{0,2}", "*?", "+?", "*+"]:
             for ref in ["\\1", "\\2", "\\3", "a\\1", "\\1b"]:
                 cases.append({"pattern": atom + quantifier + ref, "inputs": ref_inputs, "replacements": ["X", "<$0>"]})
+    # The second review: `\R` in repeated groups, `\v` as a range endpoint,
+    # `\c` whose operand is a backslash.
+    line_inputs = ["", "\r", "\n", "\r\n", "\r\r\n", "\r\n\n", "x\r\nx\r\n", "a\r\nb", "\r\n\naba", "b\r\nbabx", "\u000b\r\n"]
+    for body in ["\\R", "(\\R)", "x\\R", "\\R\\R", "(?:\\R|a)", "\\Ra?"]:
+        for quantifier in ["*", "+", "?", "??", "{1}", "{0,1}", "{2}", "{2,}", "{1,3}", "*?", "+?", "*+", "?+"]:
+            for tail in ["", "\\n", "\\1", "a"]:
+                if tail == "\\1" and not body.startswith("("):
+                    continue
+                cases.append({"pattern": f"(?:{body}){quantifier}{tail}", "inputs": line_inputs, "replacements": ["<$0>"]})
+    ends = ["z", "a", "\\v", "\\t", "\\r", "\\x41", "\\u0045", "\\-", "\\\\", "\\]", "\\d", "\\W", "\\c[", "\\e", "]", "[ab]", "A-Z", "-"]
+    vt_inputs = ["a", "-", "\u000b", "\n", "\t", "\r", "&", "A", "z", "]", "\\", "a-b\u000bz"]
+    for end in ends:
+        for before in ["", "^", "a", "\\v", "\\s"]:
+            cases.append({"pattern": f"[{before}\\v-{end}]", "inputs": vt_inputs, "replacements": ["X"]})
+        cases.append({"pattern": f"[\\t-{end}]", "inputs": vt_inputs, "replacements": ["X"]})
+    for operand in ["\\Q.", "\\Qab", "\\Q*", "\\\\", "\\E", "[", "A"]:
+        for wrap in ["{}", "[{}]", "a{}"]:
+            cases.append({"pattern": wrap.format("\\c" + operand), "inputs": ["\u001cQ.", "!b", "\u001cQab", "Q7", "\u001c\\", "\u0001"], "replacements": ["<$0>"]})
     return cases
 
 
