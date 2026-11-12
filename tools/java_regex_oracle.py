@@ -3,6 +3,7 @@
 
     java_regex_oracle.py --cases cases.json --out answers.json
     java_regex_oracle.py --fuzz N [--seed S] --out answers.json
+    java_regex_oracle.py --targeted --out answers.json
     java_regex_oracle.py --emit-rust answers.json [--sample N] > oracle_cases.rs
     java_regex_oracle.py --table oracle_cases.rs [--patterns corpus.json]
 
@@ -218,6 +219,15 @@ CORE_CASES = [
     {"pattern": "\\R", "inputs": ["{\r\n  a\n\u2028b\r}", "\r\r\n"], "replacements": ["|"]},
     {"pattern": '^"desc[^"]{0,15}"\\s*:.*', "inputs": ['"desc_mode" : "x"', '"description_too_long_here" : 1']},
     {"pattern": "[a-z0-9_.-]*", "inputs": ["supermartijn642corelib", "Bad Id", ""]},
+    # Shapes the independent review of #81 found answered wrongly: back
+    # references into `GroupCurly`/zero-width groups and `&&` operands.
+    {"pattern": "(?:(\\w))*\\1", "inputs": ["ab", "a"], "replacements": ["X"]},
+    {"pattern": "(?:(a)b)*\\1", "inputs": ["abb"], "replacements": ["X"]},
+    {"pattern": "((a)(b))*\\2", "inputs": ["ab"], "replacements": ["X"]},
+    {"pattern": "((?=a))*\\1", "inputs": ["a", "ab"], "replacements": ["<$0>"]},
+    {"pattern": "[a&&[b]&x]", "inputs": ["1a2", "a", "&"], "replacements": ["-"]},
+    {"pattern": "[ab&&[b]&c]", "inputs": ["abc&"], "replacements": ["-"]},
+    {"pattern": "[a&&[a]b&&b]", "inputs": ["a", "b"], "replacements": ["-"]},
     {"pattern": "(?<name>[a-z]+)-(\\d+)", "inputs": ["item-12 and block-7"], "replacements": ["${name}:$2", "${nope}", "${1x}", "$3", "${}", "${name"]},
 ]
 
@@ -376,6 +386,26 @@ def fuzz_cases(count: int, seed: int) -> list[dict]:
     return cases
 
 
+def targeted_cases() -> list[dict]:
+    """Every `&&` operand shape and back references into repeated groups:
+    the two areas the independent review of #81 found answered wrongly."""
+    parts = ["a", "ab", "a-c", "[b]", "[^a]", "[ab][c]", "&", "-", "\\w", "\\^", "[a]b", "b[a]", "[b]&x", "[a-z]", "x"]
+    class_inputs = ["a", "b", "c", "x", "&", "-", "^", "[", "1a2&b-c^x"]
+    cases = []
+    for left in parts:
+        for right in parts:
+            for tail in ["", "&&b", "&&[b]", "&b", "&&[^c]x"]:
+                for negate in ["", "^"]:
+                    cases.append({"pattern": f"[{negate}{left}&&{right}{tail}]", "inputs": class_inputs, "replacements": ["-"]})
+    atoms = ["(\\w)", "(a)", "(a|b)", "(ab?)", "((a)(b))", "(?:(a)b)", "(?:x(a))", "(?:(\\w)(\\w))", "(a*)", "(?:(a)|b)", "((?=a))", "(b?)"]
+    ref_inputs = ["", "a", "ab", "aa", "abb", "aab", "xaa", "abab", "ba", "bab", "aaab"]
+    for atom in atoms:
+        for quantifier in ["*", "+", "?", "{2}", "{0,2}", "*?", "+?", "*+"]:
+            for ref in ["\\1", "\\2", "\\3", "a\\1", "\\1b"]:
+                cases.append({"pattern": atom + quantifier + ref, "inputs": ref_inputs, "replacements": ["X", "<$0>"]})
+    return cases
+
+
 # ---- Rust literals ----------------------------------------------------------
 
 
@@ -461,6 +491,7 @@ def main() -> int:
     parser.add_argument("--cases", type=Path, help="JSON list of {pattern, flags, inputs?, replacements?}")
     parser.add_argument("--patterns", type=Path, help="JSON list of pattern strings, tried on the corpus inputs")
     parser.add_argument("--fuzz", type=int, help="generate this many random cases")
+    parser.add_argument("--targeted", action="store_true", help="add the class and back-reference grid")
     parser.add_argument("--seed", type=int, default=27)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--emit-rust", type=Path, metavar="ANSWERS")
@@ -498,6 +529,8 @@ def main() -> int:
             cases.append({"pattern": pattern, "flags": 0, "inputs": CORPUS_INPUTS, "replacements": REPLACEMENTS})
     if args.fuzz:
         cases.extend(fuzz_cases(args.fuzz, args.seed))
+    if args.targeted:
+        cases.extend(targeted_cases())
     for case in cases:
         case.setdefault("inputs", CORPUS_INPUTS)
         case.setdefault("replacements", REPLACEMENTS)

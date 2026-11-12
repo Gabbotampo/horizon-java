@@ -285,6 +285,105 @@ fn outside_the_subset_is_counted_not_guessed() {
     }
 }
 
+/// The answer a call must give: Java's (from OpenJDK 27), or none at all
+/// (counted). A wrong answer fails.
+fn java_or_counted<T: PartialEq + std::fmt::Debug>(
+    what: &str,
+    ours: Result<T, Unsupported>,
+    java: T,
+) {
+    if let Ok(ours) = ours {
+        assert_eq!(ours, java, "{what}");
+    }
+}
+
+/// The independent review of #81 found these answered wrongly: back
+/// references to groups whose value Java keeps by `GroupCurly`/zero-width
+/// rules, and `&&` operands Java binds differently. Each must now be Java's
+/// answer or counted. Expected values from OpenJDK 27.
+#[test]
+fn review_cases_answer_like_java_or_are_counted() {
+    let matches_cases: &[(&str, &str, bool)] = &[
+        ("(?:(\\w))*\\1", "ab", true),
+        ("[a&&[b]&x]", "a", true),
+        ("[a&&[b]&]", "&", true),
+        ("[a-z&&[^aeiou]&]", "&", true),
+        ("[ab&&[b]&c]", "a", true),
+        ("[ab&&[b]&c]", "b", true),
+        ("[ab&&[b]&c]", "c", true),
+        ("[ab&&[b]&c]", "&", true),
+        ("[^a&&[b]&]", "a", false),
+        ("[^a&&[b]&]", "&", false),
+        ("[^a&&[b]&]", "b", true),
+        ("[a&&[a]b&&b]", "a", true),
+        ("[a&&[a]-&&\\^]", "a", true),
+        ("[\\[&&[[^b-d]\\x61\\^\\W\\W]-&&\\^]", "[", true),
+    ];
+    for (pattern, input, java) in matches_cases {
+        java_or_counted(
+            &format!("{pattern:?} matches {input:?}"),
+            matches(pattern, input),
+            *java,
+        );
+    }
+    let replace_cases: &[(&str, &str, &str, &str)] = &[
+        ("(?:(\\w))*\\1", "a", "X", "X"),
+        ("(?:(a)b)*\\1", "abb", "X", "Xbb"),
+        ("((a)(b))*\\2", "ab", "X", "Xb"),
+        ("(?:x(a))*xa\\1", "xaa", "X", "X"),
+        ("(?:(\\w)(\\w))*\\1", "aa", "X", "Xa"),
+        ("((?=a))*\\1", "a", "<$0>", "a"),
+        ("((?=a)){0,2}\\1", "ab", "<$0>", "ab"),
+        ("((?=a))*?\\1", "ab", "<$0>", "ab"),
+        ("((?<=a))*\\1", "ab", "<$0>", "ab"),
+        (
+            "b[\\]]|((?!(ab{2,}[^A-Z])\\n(x{2,})+x)(?:)){0,2}(?>(?:\\1)++(?>b|_+\\na))|x",
+            "a_ab\n",
+            "X",
+            "a_ab\n",
+        ),
+    ];
+    for (pattern, input, replacement, java) in replace_cases {
+        java_or_counted(
+            &format!("{pattern:?} replaceAll {input:?}"),
+            super::replace(input, pattern, replacement, true).map(|result| result.ok()),
+            Some((*java).to_owned()),
+        );
+    }
+    java_or_counted(
+        "[a&&[b]&x] split 1a2",
+        string_split("1a2", "[a&&[b]&x]", 0),
+        vec!["1".to_owned(), "2".to_owned()],
+    );
+}
+
+/// Deep searches on a 2 MB thread (a test harness's default) in any build:
+/// past the inline stack budget the search reruns on its own large-stack
+/// thread instead of overflowing. Each input matches on OpenJDK 27.
+#[test]
+fn deep_searches_do_not_overflow_a_small_stack() {
+    let alternating: String = (0..300)
+        .map(|i| if i % 2 == 0 { 'a' } else { 'b' })
+        .collect();
+    let literal: String = "xyz".repeat(834)[..2500].to_owned();
+    let cases = [
+        ("(a|b)*".to_owned(), alternating.clone()),
+        ("(?:a|b)*c".to_owned(), format!("{alternating}c")),
+        ("(?:ab)*".to_owned(), "ab".repeat(1000)),
+        (literal.clone(), literal),
+    ];
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            for (pattern, input) in &cases {
+                assert_eq!(matches(pattern, input), Ok(true), "{pattern:.20}");
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 /// `Pattern.quote` and `Matcher.quoteReplacement`, answers from OpenJDK 27.
 #[test]
 fn quoting_matches_the_jdk() {

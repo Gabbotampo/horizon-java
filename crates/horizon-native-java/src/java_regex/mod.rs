@@ -26,7 +26,8 @@
 //! not reproduce `PatternSyntaxException`'s text), a quantifier on a zero-width
 //! or compound atom, a group value whose bookkeeping in Java depends on an
 //! edge this module does not follow (see [`engine::Program::tainted`]), and a
-//! search past its step or depth budget. The caller turns that into an
+//! search past its step budget or its stack budget (128 KB of the caller's
+//! stack, then once more on a dedicated 64 MB thread, see [`with_stack`]). The caller turns that into an
 //! unknown host call, never a guessed answer.
 
 mod engine;
@@ -34,7 +35,35 @@ mod syntax;
 #[cfg(test)]
 mod tests;
 
-use engine::{Matcher, Program};
+use engine::{Matcher, Program, STACK_REASON};
+
+/// Stack a search may use on the caller's thread. The interpreter may run on
+/// a small thread (2 MB, a test harness's default) with its own frames
+/// already on it, so a search stays well inside that.
+const INLINE_STACK: usize = 128 << 10;
+/// A search that needs more runs once more on its own thread with this
+/// stack, of which it may use [`DEEP_STACK`]; past that it is counted.
+const DEEP_THREAD_STACK: usize = 64 << 20;
+const DEEP_STACK: usize = 48 << 20;
+
+/// Run `search` with the inline stack budget, and once more on a dedicated
+/// thread with a large stack when it ran out. The engine is deterministic,
+/// so the retry answers what an unbounded stack would have; a search that
+/// outgrows even that is counted like any other budget.
+fn with_stack<T: Send>(search: impl Fn(usize) -> R<T> + Sync) -> R<T> {
+    match search(INLINE_STACK) {
+        Err(Unsupported(reason)) if reason == STACK_REASON => std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("java-regex".into())
+                .stack_size(DEEP_THREAD_STACK)
+                .spawn_scoped(scope, || search(DEEP_STACK))
+                .map_err(|_| Unsupported("no thread for a deep search".into()))?
+                .join()
+                .unwrap_or_else(|_| Err(Unsupported("a deep search panicked".into())))
+        }),
+        other => other,
+    }
+}
 
 /// Why a call is outside the modelled subset; the caller counts it.
 #[derive(Debug, Clone, PartialEq)]
@@ -136,17 +165,28 @@ impl Regex {
     /// `Matcher.matches()` (`whole`) or `lookingAt()` on `input`.
     pub(crate) fn match_start(&self, input: &str, whole: bool) -> R<Option<Match>> {
         let chars = units(input)?;
-        let mut matcher = Matcher::new(&self.program, &chars);
-        Ok(matcher
-            .match_at_start(whole)?
-            .then(|| Match::from(&matcher, self)))
+        with_stack(|budget| {
+            let mut matcher = Matcher::new(&self.program, &chars, budget);
+            Ok(matcher
+                .match_at_start(whole)?
+                .then(|| Match::from(&matcher, self)))
+        })
     }
 
     /// `Matcher.find()` from a fresh matcher, repeated: every match in order,
     /// with Java's rule that a search after an empty match starts one `char`
     /// later. Stops after `limit` matches when one is given.
     pub(crate) fn find_all(&self, chars: &[char], limit: Option<usize>) -> R<Vec<Match>> {
-        let mut matcher = Matcher::new(&self.program, chars);
+        with_stack(|budget| self.find_all_within(chars, limit, budget))
+    }
+
+    fn find_all_within(
+        &self,
+        chars: &[char],
+        limit: Option<usize>,
+        budget: usize,
+    ) -> R<Vec<Match>> {
+        let mut matcher = Matcher::new(&self.program, chars, budget);
         let mut found = Vec::new();
         let (mut first, mut last) = (usize::MAX, 0usize);
         loop {
