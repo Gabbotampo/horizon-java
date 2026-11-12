@@ -74,6 +74,7 @@ mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
 mod jvm_dispatch;
+mod lambda_boxing;
 mod library_dispatch;
 mod map_compute;
 mod method_handles;
@@ -87,6 +88,8 @@ mod native_library;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
+mod neoforge_inject;
+pub mod neoforge_lifecycle;
 mod neoforge_loader;
 mod neoforge_subscribe;
 mod nested_jars;
@@ -3017,6 +3020,7 @@ impl StdHost {
     /// behavior; server integrations should select `SERVER`.
     pub fn with_environment_type(mut self, environment_type: impl Into<String>) -> Self {
         self.environment_type = environment_type.into();
+        self.neoforge_bus.server = self.environment_type == "SERVER";
         self
     }
 
@@ -3273,6 +3277,12 @@ impl StdHost {
 
     pub fn payload_registrations(&self) -> &[PayloadRegistration] {
         &self.payload_registrations
+    }
+
+    /// Counts every payload registration as an unknown host call, for an embedding with no
+    /// channel to route them on: the registration ran, but no packet will reach its handler.
+    pub fn count_unrouted_payloads(&mut self, why: &str) {
+        crate::runtime::neoforge_lifecycle::count_unrouted_payloads(self, why);
     }
 
     /// The registered payload channels as `(id, direction, codec)` for the
@@ -4061,6 +4071,7 @@ impl Host for StdHost {
         self.brigadier_instance_of(marker, wanted)
             || self.mod_container_instance_of(marker, wanted)
             || neoforge_bus::bus_instance_of(marker, wanted)
+            || neoforge_lifecycle::instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -5372,6 +5383,10 @@ impl Host for StdHost {
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
+            return Ok(value);
+        }
+        // The loading stages' event objects (`neoforge_lifecycle.rs`).
+        if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
@@ -10746,7 +10761,8 @@ fn box_callback_result<H: Host>(
     call_descriptor: &str,
 ) -> Result<Value, NativeError> {
     if !return_desc(call_descriptor).starts_with('L') {
-        return Ok(value);
+        // A primitive return unboxes a boxed result (`lambda_boxing.rs`).
+        return Ok(lambda_boxing::unbox_result(call_descriptor, value));
     }
     let Some(marker) = expect_ref(receiver) else {
         return Ok(value);
@@ -19421,6 +19437,9 @@ impl<H: Host> Runtime<'_, H> {
         if !args_consumed {
             target_args.extend_from_slice(args);
         }
+        // An erased `Integer` argument unboxed into an `int` parameter
+        // (`lambda_boxing.rs`).
+        jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut target_args);
         let expected = arg_count(&callback.target.descriptor);
         if target_args.len() != expected {
             return Err(NativeError::Metadata(format!(
@@ -22858,10 +22877,12 @@ impl<H: Host> Runtime<'_, H> {
             // site bound, the body is that method, not the interface's own
             // (absent) code — a config validator or a custom `Supplier` shape
             // would otherwise answer `null`.
+            // Its result is boxed or unboxed to the abstract method's return
+            // type, as the metafactory adapts it (`lambda_boxing.rs`).
             if let Some(receiver) = receiver.as_ref()
                 && let Some(value) = self.invoke_callback(receiver, args)?
             {
-                return Ok(value);
+                return box_callback_result(self, receiver, value, desc);
             }
             // A Fabric event's invoker is a host marker standing for the
             // jar's array-backed invoker, which the host does not run: the
@@ -24263,7 +24284,17 @@ impl<H: Host> Runtime<'_, H> {
                                         at,
                                         self.invoke_callback(receiver, &args)
                                     ) {
-                                        Some(value) => value,
+                                        // Boxed or unboxed to the interface
+                                        // method's return (`lambda_boxing.rs`).
+                                        Some(value) => invoke_or_catch!(
+                                            at,
+                                            box_callback_result(
+                                                self,
+                                                receiver,
+                                                value,
+                                                &resolved.descriptor
+                                            )
+                                        ),
                                         None => invoke_or_catch!(
                                             at,
                                             self.host.invoke_instance(&resolved, receiver, &args)
@@ -36789,6 +36820,26 @@ mandatory = true
         assert_eq!(
             host.payload_registrations().last().unwrap().direction,
             "configurationToClient"
+        );
+        // An embedding with no payload channel counts each one under its direction.
+        host.count_unrouted_payloads("no channel");
+        let counted: Vec<_> = host
+            .unknown_host_calls()
+            .into_iter()
+            .filter(|(key, _)| key.contains("(no channel)"))
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#configurationToClient (no channel)".to_owned(),
+                    1
+                ),
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#playToServer (no channel)".to_owned(),
+                    1
+                ),
+            ]
         );
     }
 

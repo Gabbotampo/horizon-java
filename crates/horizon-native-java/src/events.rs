@@ -869,10 +869,6 @@ const SUBSCRIBE_EVENT: &[&str] = &[
     "Lnet/neoforged/bus/api/SubscribeEvent;",
     "Lnet/minecraftforge/eventbus/api/SubscribeEvent;",
 ];
-const EVENT_BUS_SUBSCRIBER: &[&str] = &[
-    "Lnet/neoforged/fml/common/EventBusSubscriber;",
-    "Lnet/neoforged/fml/common/Mod$EventBusSubscriber;",
-];
 
 /// The game event and loader an event class names, if the game fires it.
 pub(crate) fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
@@ -1666,9 +1662,10 @@ impl StdHost {
         Value::Ref(Some(marker))
     }
 
-    /// Every listener this host recorded, with its event identity, plus the
-    /// static `@EventBusSubscriber` methods `jar` declares. `server` drops
-    /// subscribers marked `Dist.CLIENT`.
+    /// Every listener this host recorded, with its event identity. The static
+    /// `@EventBusSubscriber` methods are among the NeoForge bus listeners once
+    /// [`NativeJar::inject_event_subscribers`] ran, validated as FML injects
+    /// them (`neoforge_inject.rs`).
     pub fn game_listeners(&self, jar: &NativeJar, server: bool) -> GameListeners {
         let mut out = GameListeners::default();
         for invocation in &self.invocations {
@@ -1678,7 +1675,6 @@ impl StdHost {
         for listener in &self.neoforge_bus.listeners {
             push_neoforge_listener(listener, &mut out);
         }
-        subscriber_classes(jar, server, &mut out);
         if server {
             // A server never fires a client event: a common entrypoint's
             // client registrations count as events it does not fire.
@@ -2116,42 +2112,6 @@ fn subscribe_methods(
             combine: Combine::Void,
         });
     }
-}
-
-/// NeoForge's automatic subscribers: every `@EventBusSubscriber` class's
-/// static `@SubscribeEvent` methods, without a `register` call.
-fn subscriber_classes(jar: &NativeJar, server: bool, out: &mut GameListeners) {
-    for (name, file) in &jar.classes {
-        let Some(annotation) = file
-            .annotations
-            .iter()
-            .find(|a| EVENT_BUS_SUBSCRIBER.contains(&a.descriptor.as_str()))
-        else {
-            continue;
-        };
-        if server && subscriber_client_only(annotation) {
-            continue;
-        }
-        subscribe_methods(jar, name, None, out);
-    }
-}
-
-/// `@EventBusSubscriber(value = Dist.CLIENT)`: the class only loads on a client.
-fn subscriber_client_only(annotation: &crate::Annotation) -> bool {
-    fn names(value: &crate::AnnotationValue, out: &mut Vec<String>) {
-        match value {
-            crate::AnnotationValue::String(text) => out.push(text.clone()),
-            crate::AnnotationValue::Array(values) => {
-                values.iter().for_each(|value| names(value, out))
-            }
-            _ => {}
-        }
-    }
-    let mut dists = Vec::new();
-    if let Some(value) = annotation.values.get("value") {
-        names(value, &mut dists);
-    }
-    !dists.is_empty() && dists.iter().all(|dist| dist.ends_with(".CLIENT"))
 }
 
 /// The `InteractionHand` argument a firing names, or a marker whose every read

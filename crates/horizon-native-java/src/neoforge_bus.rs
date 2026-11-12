@@ -149,6 +149,11 @@ pub struct BusState {
     /// The `(bus, target)` pairs `register` added a listener for: `EventBus#register` @0–11
     /// returns at once for a target its `listeners` map already holds.
     pub(crate) registered: Vec<(String, Value)>,
+    /// The work `ParallelDispatchEvent#enqueueWork` queued for the running loading stage's
+    /// `DeferredWorkQueue` (`neoforge_lifecycle.rs`).
+    pub(crate) deferred: Vec<crate::neoforge_lifecycle::DeferredTask>,
+    /// The host is a dedicated server (`StdHost::with_environment_type`).
+    pub(crate) server: bool,
 }
 
 /// What the runtime knows about one event class: the generated table's facts for NeoForge's own,
@@ -171,6 +176,11 @@ fn table_facts(class: &str) -> Option<EventFacts> {
         mod_bus: flags & MOD_BUS != 0,
         superclass: superclass.to_owned(),
     })
+}
+
+/// The superclass NeoForge's table names for one of its event classes.
+pub(crate) fn table_superclass(class: &str) -> Option<String> {
+    table_facts(class).map(|facts| facts.superclass)
 }
 
 /// `Class#toString`: `class a.b.C$D` (every event class here is a class, not an interface).
@@ -340,7 +350,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         // 3. `getListenerList` @18–35 → `validateAbstractChain`.
         self.validate_abstract_chain(&facts.superclass)?;
-        if crate::events::bus_event(&class).is_none() {
+        if !crate::neoforge_lifecycle::delivered(&class, self.bus_on_server()) {
             return counted(&format!("no game event fires {class}"));
         }
         let Some(callback) = self.consumer_callback(&consumer, &class) else {
@@ -356,6 +366,13 @@ impl<H: Host> Runtime<'_, H> {
             consumer,
             callback,
         }))
+    }
+
+    /// Whether this host is a dedicated server: what a loading stage posts depends on the side.
+    pub(crate) fn bus_on_server(&mut self) -> bool {
+        self.host
+            .neoforge_bus()
+            .is_some_and(|(state, _)| state.server)
     }
 
     /// `validateAbstractChain(superclass)`, run when the superclass is abstract.
