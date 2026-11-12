@@ -88,6 +88,18 @@ public class Probe {
         static int peek() { return Recursive.a * 10 + Recursive.b; }
     }
 
+    static class Made {
+        static { Probe.mark("clinit"); }
+        Made(int x) { Probe.mark("init"); }
+    }
+
+    static class Walked {
+        static String caller = StackWalker.getInstance()
+            .walk(s -> s.map(f -> f.getMethodName()).limit(2)
+                .collect(java.util.stream.Collectors.joining(",")));
+        static String touch() { return caller; }
+    }
+
     static String describe(Throwable thrown) {
         if (thrown instanceof ExceptionInInitializerError) return "EIIE:" + thrown.getMessage();
         if (thrown instanceof NoClassDefFoundError) return "NCDFE:" + thrown.getMessage();
@@ -133,6 +145,18 @@ public class Probe {
     /** Same-thread re-entry sees the partially initialized class. */
     public static String recursiveInitializer() {
         return "seen=" + Recursive.seen + ",b=" + Recursive.b;
+    }
+
+    /** `new` initializes its class before the constructor's arguments run. */
+    public static String newInitializesBeforeItsArguments() {
+        order = "";
+        new Made(mark("arg"));
+        return order;
+    }
+
+    /** The `<clinit>` an `invokestatic` triggers runs in the caller's frame. */
+    public static String initializerRunsInTheCallersFrame() {
+        return Walked.touch();
     }
 }
 "##;
@@ -315,6 +339,28 @@ fn a_failing_superclass_makes_the_subclass_erroneous() {
 fn same_thread_reentry_sees_the_partially_initialized_class() {
     let fixture = Fixture::build("recursive");
     assert_eq!(fixture.text("recursiveInitializer"), "seen=10,b=2");
+}
+
+#[test]
+fn new_initializes_its_class_before_the_constructor_arguments() {
+    let fixture = Fixture::build("new-order");
+    assert_eq!(
+        fixture.text("newInitializesBeforeItsArguments"),
+        "clinit;arg;init;"
+    );
+}
+
+/// The JVM initializes a class at the caller's `invokestatic`, before the
+/// callee's frame exists, so the frame under `<clinit>` is the invoking
+/// method, not `touch`. Initializing inside the callee's frame also cost one nested
+/// frame per lazily initialized class against the interpreter's depth bound.
+#[test]
+fn a_static_call_initializes_its_class_in_the_callers_frame() {
+    let fixture = Fixture::build("init-frame");
+    assert_eq!(
+        fixture.text("initializerRunsInTheCallersFrame"),
+        "<clinit>,initializerRunsInTheCallersFrame"
+    );
 }
 
 #[test]
