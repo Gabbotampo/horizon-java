@@ -9917,7 +9917,9 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         "java/lang/ExceptionInInitializerError"
         | "java/lang/NoClassDefFoundError"
         | "java/lang/ClassFormatError"
-        | "java/lang/UnsatisfiedLinkError" => "java/lang/LinkageError",
+        | "java/lang/UnsatisfiedLinkError"
+        | "java/lang/IncompatibleClassChangeError" => "java/lang/LinkageError",
+        "java/lang/AbstractMethodError" => "java/lang/IncompatibleClassChangeError",
         "java/lang/StackOverflowError"
         | "java/lang/OutOfMemoryError"
         | "java/lang/InternalError"
@@ -19327,7 +19329,8 @@ impl<H: Host> Runtime<'_, H> {
             // (`jvm_dispatch.rs`); a JDK body over its data is counted
             // (`jar_operands.rs`). The handle kind is not recorded, so the
             // reference is dispatched as an interface call would be.
-            if let Some(owner) = self.jvm_selected_jar_body(&callback.target, 0xb9, Some(&receiver))
+            if let Some(owner) =
+                self.jvm_selected_jar_body(&callback.target, 0xb9, Some(&receiver))?
             {
                 return self
                     .invoke(
@@ -22298,41 +22301,21 @@ impl<H: Host> Runtime<'_, H> {
     /// method `Impl` inherits from an interface default, such as
     /// NightConfig's `ConfigParser.parse(String)`. Without this the walk ended
     /// at `java/lang/Object` and the host answered a neutral `null` for a body
-    /// the jar ships. Interfaces are searched breadth first from the classes'
-    /// own declarations, so a sub-interface's override is found before the
-    /// default it overrides; the search is bounded by
-    /// [`MAX_SUPERCLASS_WALK`] interfaces.
+    /// the jar ships. The default is the maximally specific one (JVMS
+    /// §5.4.3.3, `jvm_dispatch.rs`), so a sub-interface's override beats the
+    /// default it overrides wherever either is declared.
     fn inherited_default_owner(
         &self,
         chain: &[String],
         name: &str,
         descriptor: &str,
     ) -> Option<String> {
-        let mut queue = std::collections::VecDeque::new();
-        for class in chain {
-            if let Some(file) = self.class(class) {
-                queue.extend(file.interface_names());
-            }
+        // JVMS §5.4.3.3's maximally specific default (`jvm_dispatch.rs`); a
+        // conflict or an abstract-only set selects nothing here.
+        match self.maximally_specific_default(chain, name, descriptor) {
+            jvm_dispatch::DefaultSelection::Selected(owner) => Some(owner),
+            _ => None,
         }
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(interface) = queue.pop_front() {
-            if seen.len() >= MAX_SUPERCLASS_WALK {
-                break;
-            }
-            if !seen.insert(interface.clone()) {
-                continue;
-            }
-            let Some(file) = self.class(&interface) else {
-                continue;
-            };
-            if file.method(name, descriptor).is_some_and(|method| {
-                method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0
-            }) {
-                return Some(interface);
-            }
-            queue.extend(file.interface_names());
-        }
-        None
     }
 
     /// The program counter of this frame's handler that catches `thrown` at
@@ -23992,7 +23975,7 @@ impl<H: Host> Runtime<'_, H> {
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
                     } else if let Some(owner) =
-                        self.jvm_selected_jar_body(&r, op, receiver.as_ref())
+                        invoke_or_catch!(at, self.jvm_selected_jar_body(&r, op, receiver.as_ref()))
                     {
                         // The receiver's own body, before any host model
                         // (`jvm_dispatch.rs`).
