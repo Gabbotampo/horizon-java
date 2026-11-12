@@ -116,7 +116,9 @@ public final class Probe {
         }
         Field link = Holder.class.getField("link");
         Holder other = new Holder();
-        out.append("link:").append(put(link, new Holder(), other) .equals("null") ? "null" : "set")
+        Holder target = new Holder();
+        link.set(target, other);
+        out.append("link:").append(link.get(target) == other)
             .append(',').append(put(link, new Holder(), new Other()));
         return out.toString();
     }
@@ -308,7 +310,7 @@ f:IllegalArgumentException:Can not set float field demo.Holder.f to java.lang.Bo
 d:IllegalArgumentException:Can not set double field demo.Holder.d to java.lang.Boolean,5.0,-7.0,113.0,42.0,9.0,IllegalArgumentException:Can not set double field demo.Holder.d to null value
 boxed:IllegalArgumentException:Can not set java.lang.Integer field demo.Holder.boxed to java.lang.Boolean,IllegalArgumentException:Can not set java.lang.Integer field demo.Holder.boxed to java.lang.Byte,IllegalArgumentException:Can not set java.lang.Integer field demo.Holder.boxed to java.lang.Short,IllegalArgumentException:Can not set java.lang.Integer field demo.Holder.boxed to java.lang.Character,42,IllegalArgumentException:Can not set java.lang.Integer field demo.Holder.boxed to java.lang.Long,null
 any:true,5,-7,q,42,9,null
-link:set,IllegalArgumentException:Can not set demo.Holder field demo.Holder.link to demo.Other"#,
+link:true,IllegalArgumentException:Can not set demo.Holder field demo.Holder.link to demo.Other"#,
     ),
     ("demo/Probe", "wideBoxes", r#"0.10000000149011612,0.1"#),
     (
