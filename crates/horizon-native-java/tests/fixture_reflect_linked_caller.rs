@@ -220,11 +220,12 @@ fn bundled_library_reflection_matches_the_jdk() {
 }
 
 /// Counted, not answered: a private field read from the library without
-/// `setAccessible`. OpenJDK 27 throws `IllegalAccessException`, whose text
+/// `setAccessible`. OpenJDK 25 throws `IllegalAccessException`, whose text
 /// names the modules only when they are named: `class lib.Loader cannot
-/// access a member of class demo.Config with private access` on the class
+/// access a member of class demo.Config with modifiers "private"` on the class
 /// path, `class lib.Loader (in module lib) cannot access a member of class
-/// demo.Config (in module demo) with private access` as automatic modules.
+/// demo.Config (in module demo) with modifiers "private"` as automatic modules
+/// (OpenJDK 27 ends both `with private access`).
 #[test]
 fn bundled_library_failed_access_is_counted() {
     let fixture = fixture("reflect-linked-unchecked", &[]);

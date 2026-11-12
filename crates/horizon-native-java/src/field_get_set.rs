@@ -58,9 +58,10 @@
 //!   answer does not depend on the value's class (any object into a writable
 //!   `Object` field, a `Float`/`Double` box into a writable `double` field, a
 //!   runtime list into a `List` field) is decided without it;
-//! * with `override`, no final instance field of a normal class is written:
-//!   that write goes through JDK 27's final-field mutation policy, which the
-//!   launch flags decide.
+//! * with `override`, no final instance field of a normal class is written.
+//!   OpenJDK 25, the Java 26.3 runs mods on, writes it silently; from JDK 26
+//!   the write goes through JEP 500's final-field mutation policy, which the
+//!   launch flags decide. Counting it stays correct under either.
 
 use super::field_access::{FIELD, package_of};
 use super::reflect_override::{FIELD_PREFIX, canonical_field};

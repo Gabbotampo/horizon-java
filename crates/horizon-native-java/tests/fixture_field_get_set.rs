@@ -383,7 +383,8 @@ fn field_get_set_matches_the_jdk() {
 /// Counted, not answered: a private field read from another package is an
 /// `IllegalAccessException` whose text names the modules when they are named
 /// (NeoForge) and not otherwise (Fabric: `class demo.sub.Outside cannot access
-/// a member of class demo.Holder with private access` on OpenJDK 27); the
+/// a member of class demo.Holder with modifiers "private"` on OpenJDK 25, the
+/// Java 26.3 runs mods on; OpenJDK 27 ends it `with private access`); the
 /// runtime does not know which loader it runs under.
 #[test]
 fn failed_access_check_is_counted() {
@@ -397,9 +398,10 @@ fn failed_access_check_is_counted() {
 }
 
 /// Counted, not answered: after `setAccessible(true)` a final instance field
-/// of a normal class is written through JDK 27's final-field mutation policy
-/// (OpenJDK 27 with default flags writes it and prints a warning; with
-/// `--illegal-final-field-mutation=deny` it throws).
+/// of a normal class is written. OpenJDK 25 (the Java 26.3 runs mods on)
+/// writes it silently; from JDK 26 the write goes through JEP 500's
+/// final-field mutation policy (OpenJDK 27 with default flags writes it and
+/// prints a warning; with `--illegal-final-field-mutation=deny` it throws).
 #[test]
 fn final_field_write_after_set_accessible_is_counted() {
     let fixture = fixture("field-get-set-final");
