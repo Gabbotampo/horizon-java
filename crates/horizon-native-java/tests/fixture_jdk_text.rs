@@ -217,7 +217,7 @@ fn characters_and_unicode_blocks_answer_from_java_25s_tables() {
 }
 
 #[test]
-fn builders_answer_as_jdk_27() {
+fn builders_answer_as_java_25() {
     let jar = jar("builders");
     let mut host = StdHost::new();
     assert_eq!(

@@ -60,7 +60,7 @@ fn heap_sized(name: &str, args: &[Arg]) -> bool {
     let big = |arg: Option<&Arg>| matches!(arg, Some(Arg::Int(size)) if *size > 1 << 24);
     match name {
         "<init>" | "ensureCapacity" | "setLength" => big(args.first()),
-        // JDK 27 overflows the length here (`repeat("z", Integer.MAX_VALUE)`
+        // Java 25 (and 27) overflow the length here (`repeat("z", Integer.MAX_VALUE)`
         // leaves the builder one unit shorter instead of throwing).
         "repeat" => big(args.get(1)),
         _ => false,

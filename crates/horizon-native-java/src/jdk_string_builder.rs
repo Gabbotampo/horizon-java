@@ -1,4 +1,4 @@
-//! `StringBuilder` and `StringBuffer`, as JDK 27's `AbstractStringBuilder`
+//! `StringBuilder` and `StringBuffer`, as Java 25's `AbstractStringBuilder`
 //! behaves, over a builder this invocation constructed.
 //!
 //! A builder's text lives in [`Runtime::string_builders`] (keyed by the
@@ -11,15 +11,18 @@
 //! called through `CharSequence` or `Appendable` on such a builder.
 //!
 //! Every check and message is the JDK's, read from the bytecode
-//! (`javap -c -p java.lang.AbstractStringBuilder`) and confirmed on OpenJDK
-//! 27: `checkIndex` throws `StringIndexOutOfBoundsException: Index i out of
+//! (`javap -c -p java.lang.AbstractStringBuilder`) and confirmed on Java 25,
+//! the runtime Minecraft 26.3 ships. JDK 27's bytecode is the same for every
+//! member this models (25 only adds the package-private concat helpers `mix`
+//! and `prepend`), and both answer the differential identically.
+//! `checkIndex` throws `StringIndexOutOfBoundsException: Index i out of
 //! bounds for length n`; `checkFromToIndex` `Range [a, b) out of bounds for
 //! length n`, as a `StringIndexOutOfBoundsException` or a plain
 //! `IndexOutOfBoundsException` depending on the formatter the method passes
 //! (the `CharSequence` ranges and `codePointCount` use the plain one); an
 //! `insert` offset is checked as the range `[offset, count)`; `delete` and
 //! `replace` clamp `end` to the length before checking; null arguments raise
-//! the helpful `NullPointerException` text JDK 27 prints (its classes keep
+//! the helpful `NullPointerException` text Java 25 prints (its classes keep
 //! parameter names, so the messages name `str`, `seq`, `dst`, `tgtStr`).
 //! `float`/`double` text is `Float.toString`/`Double.toString`
 //! ([`crate::jdk_float_text`]).
@@ -242,7 +245,7 @@ fn text_arg(at: &[Arg], index: usize) -> Result<Option<&str>, Outcome> {
     }
 }
 
-/// The helpful message JDK 27 prints for `str.length` on a null `char[]`.
+/// The helpful message Java 25 prints for `str.length` on a null `char[]`.
 fn null_array(name: &str) -> Outcome {
     throw(
         NPE,
