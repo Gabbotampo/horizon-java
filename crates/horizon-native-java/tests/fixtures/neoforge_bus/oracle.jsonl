@@ -3,6 +3,19 @@
 {"case":"cancel_two_mods","out":["cancels","uncancels","skipped","uncancels","runs-again","runs-again","cancels-last"],"canceled":true}
 {"case":"unregister","out":["kept"]}
 {"case":"not_fired","out":["setup"]}
+{"case":"subscribe_tick","out":["object-high","lambda-first","object-normal","lambda-last","static-low"]}
+{"case":"subscribe_death","out":["static-cancels","object-death"],"canceled":true}
+{"case":"subscribe_pre","out":["static-pre"]}
+{"case":"unsubscribe","out":["kept-high","kept-normal"]}
+{"case":"refused_register_0","bus":"game","result":"java.lang.IllegalArgumentException: Expected @SubscribeEvent method public void demo.Refused$OneInstance.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post) to be static\nbecause register() was called with a class type.\nEither make the method static, or call register() with an instance of class demo.Refused$OneInstance.\n"}
+{"case":"refused_register_1","bus":"game","result":"java.lang.IllegalArgumentException: Expected @SubscribeEvent method public static void demo.Refused$OneStatic.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post) to NOT be static\nbecause register() was called with an instance type.\nEither make the method non-static, or call register(OneStatic.class).\n"}
+{"case":"refused_register_2","bus":"game","result":"java.lang.IllegalArgumentException: class demo.Refused$Nothing has no @SubscribeEvent methods, but register was called anyway.\nThe event bus only recognizes listener methods that have the @SubscribeEvent annotation.\n"}
+{"case":"refused_register_3","bus":"game","result":"java.lang.IllegalArgumentException: Attempting to register a listener object of type class demo.Refused$Child,\nhowever its supertype class demo.Refused$Parent has a @SubscribeEvent method: public void demo.Refused$Parent.inherited(net.neoforged.neoforge.event.tick.ServerTickEvent$Post).\nThis is not allowed! Only the listener object can have @SubscribeEvent methods.\n"}
+{"case":"refused_register_4","bus":"game","result":"java.lang.IllegalArgumentException: Method public static void demo.Refused$TwoArguments.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post,int) has @SubscribeEvent annotation. It has 2 arguments, but event handler methods require a single argument only."}
+{"case":"refused_register_5","bus":"game","result":"java.lang.IllegalArgumentException: Method public static void demo.Refused$NotAnEvent.on(java.lang.String) has @SubscribeEvent annotation, but takes an argument that is not an Event subtype : class java.lang.String"}
+{"case":"refused_register_6","bus":"game","result":"java.lang.IllegalArgumentException: Method protected static synchronized void demo.Refused$ModBusOnly.on(net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent) has @SubscribeEvent annotation, but takes an argument that is not valid for this busclass net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent"}
+{"case":"refused_register_7","bus":"game","result":"java.lang.IllegalArgumentException: Cannot register listeners for abstract class net.neoforged.neoforge.event.tick.ServerTickEvent. Register a listener to one of its subclasses instead!"}
+{"case":"mod_entry","out":["entry-commands"]}
 {"case":"refused_0","bus":"game","result":"java.lang.IllegalArgumentException: Listener for event class net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent takes an argument that is not valid for this bus"}
 {"case":"refused_1","bus":"mod","result":"java.lang.IllegalArgumentException: Listener for event class net.neoforged.neoforge.event.tick.ServerTickEvent$Post takes an argument that is not valid for this bus"}
 {"case":"refused_2","bus":"game","result":"java.lang.IllegalArgumentException: Cannot register listeners for abstract class net.neoforged.neoforge.event.tick.ServerTickEvent. Register a listener to one of its subclasses instead!"}

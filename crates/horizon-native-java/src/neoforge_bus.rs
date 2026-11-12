@@ -98,20 +98,25 @@ pub(crate) fn mod_bus(id: Option<&str>) -> Value {
     }))
 }
 
+/// The marker a bus call's receiver is, `""` for none.
+pub(crate) fn bus_name(receiver: Option<&Value>) -> String {
+    receiver.and_then(expect_ref).cloned().unwrap_or_default()
+}
+
 /// A bus marker is an `IEventBus`.
 pub(crate) fn bus_instance_of(marker: &str, wanted: &str) -> bool {
     wanted == BUS && (marker == GAME_BUS || marker.starts_with(MOD_BUS_PREFIX))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BusKind {
+pub(crate) enum BusKind {
     Mod,
     Game,
     /// A value the runtime cannot trace to either (departure B1).
     Unknown,
 }
 
-fn bus_kind(receiver: Option<&Value>) -> BusKind {
+pub(crate) fn bus_kind(receiver: Option<&Value>) -> BusKind {
     match receiver.and_then(expect_ref) {
         Some(text) if text == GAME_BUS => BusKind::Game,
         Some(text) if text == MOD_BUS_PREFIX || text.starts_with("neoforge-bus/mod/") => {
@@ -129,8 +134,11 @@ pub(crate) struct BusListener {
     /// An index into [`crate::events::order::PRIORITIES`].
     pub priority: u8,
     pub receive_canceled: bool,
-    /// The `Consumer` object, which `unregister` names.
+    /// The `Consumer` object (`addListener`) or the registered object or class (`register`),
+    /// which `unregister` names.
     pub consumer: Value,
+    /// The bus it is on (its marker), since `unregister` acts on one bus.
+    pub bus: String,
     pub callback: ListenerCallback,
 }
 
@@ -138,15 +146,18 @@ pub(crate) struct BusListener {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BusState {
     pub(crate) listeners: Vec<BusListener>,
+    /// The `(bus, target)` pairs `register` added a listener for: `EventBus#register` @0–11
+    /// returns at once for a target its `listeners` map already holds.
+    pub(crate) registered: Vec<(String, Value)>,
 }
 
 /// What the runtime knows about one event class: the generated table's facts for NeoForge's own,
 /// the class file's for a jar's.
-struct EventFacts {
-    is_abstract: bool,
-    cancellable: bool,
-    mod_bus: bool,
-    superclass: String,
+pub(crate) struct EventFacts {
+    pub(crate) is_abstract: bool,
+    pub(crate) cancellable: bool,
+    pub(crate) mod_bus: bool,
+    pub(crate) superclass: String,
 }
 
 fn table_facts(class: &str) -> Option<EventFacts> {
@@ -163,11 +174,11 @@ fn table_facts(class: &str) -> Option<EventFacts> {
 }
 
 /// `Class#toString`: `class a.b.C$D` (every event class here is a class, not an interface).
-fn class_text(internal: &str) -> String {
+pub(crate) fn class_text(internal: &str) -> String {
     format!("class {}", internal.replace('/', "."))
 }
 
-fn illegal_argument(message: String) -> NativeError {
+pub(crate) fn illegal_argument(message: String) -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/IllegalArgumentException".into(),
         message: Some(message),
@@ -228,7 +239,8 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 match self.add_listener(&shape, bus_kind(receiver), args)? {
-                    Ok(listener) => {
+                    Ok(mut listener) => {
+                        listener.bus = bus_name(receiver);
                         if let Some((state, _)) = self.host.neoforge_bus() {
                             state.listeners.push(listener);
                         }
@@ -237,13 +249,22 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Ok(Some(Value::Void))
             }
-            // `EventBus#unregister` @0–16: the listeners registered under that object go; the
+            // `register(Object)`: `neoforge_subscribe.rs`.
+            "register" if r.descriptor == "(Ljava/lang/Object;)V" => {
+                self.bus_register(r, receiver, args)?;
+                Ok(Some(Value::Void))
+            }
+            // `EventBus#unregister` @0–16: the listeners this bus holds under that object go; the
             // host's own record of older registrations is cleared by the rest of the chain.
             "unregister" if r.descriptor == "(Ljava/lang/Object;)V" => {
+                let bus = bus_name(receiver);
                 if let (Some(target), Some((state, _))) = (args.first(), self.host.neoforge_bus()) {
                     state
                         .listeners
-                        .retain(|listener| &listener.consumer != target);
+                        .retain(|listener| &listener.consumer != target || listener.bus != bus);
+                    state
+                        .registered
+                        .retain(|(on, registered)| registered != target || *on != bus);
                 }
                 Ok(None)
             }
@@ -251,7 +272,7 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    fn count_bus_call(&mut self, r: &MethodRef, why: &str) {
+    pub(crate) fn count_bus_call(&mut self, r: &MethodRef, why: &str) {
         if let Some((_, unknown)) = self.host.neoforge_bus() {
             *unknown
                 .entry(format!("{}#{}{} ({why})", r.owner, r.name, r.descriptor))
@@ -326,6 +347,7 @@ impl<H: Host> Runtime<'_, H> {
             return counted("listener callback cannot run");
         };
         Ok(Ok(BusListener {
+            bus: String::new(),
             class,
             priority,
             // `ListenerList.unwrapListeners`: on a class that is not `ICancellableEvent` the
@@ -337,7 +359,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `validateAbstractChain(superclass)`, run when the superclass is abstract.
-    fn validate_abstract_chain(&self, superclass: &str) -> Result<(), NativeError> {
+    pub(crate) fn validate_abstract_chain(&self, superclass: &str) -> Result<(), NativeError> {
         let mut at = superclass.to_owned();
         for _ in 0..64 {
             if at == EVENT {
@@ -365,7 +387,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The facts of an event class: NeoForge's from the table, a jar's (or linked jar's) from its
     /// class file, as long as its superclass chain reaches `Event`.
-    fn event_facts(&self, class: &str) -> Option<EventFacts> {
+    pub(crate) fn event_facts(&self, class: &str) -> Option<EventFacts> {
         if let Some(facts) = table_facts(class) {
             return Some(facts);
         }

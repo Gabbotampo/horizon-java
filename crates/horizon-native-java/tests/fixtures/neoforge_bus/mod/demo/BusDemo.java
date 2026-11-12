@@ -73,6 +73,46 @@ public class BusDemo {
         gameBus.addListener((DemoEvent e) -> System.out.println("demo"));
     }
 
+    /// `register` between two `addListener`s: an object's instance methods, a class's static ones,
+    /// and a second `register` of the same object, which NeoForge ignores.
+    public static void subscribe(IEventBus bus) {
+        bus.addListener((ServerTickEvent.Post e) -> System.out.println("lambda-first"));
+        Subscribers object = new Subscribers("object");
+        bus.register(object);
+        bus.register(StaticSubscribers.class);
+        bus.register(object);
+        bus.addListener((ServerTickEvent.Post e) -> System.out.println("lambda-last"));
+        bus.addListener(EventPriority.LOWEST, (LivingDeathEvent e) -> System.out.println("lambda-death"));
+    }
+
+    /// `unregister` of a registered object takes all of its methods.
+    public static void unsubscribe(IEventBus bus) {
+        Subscribers gone = new Subscribers("gone");
+        bus.register(gone);
+        bus.register(new Subscribers("kept"));
+        bus.unregister(gone);
+    }
+
+    /// The `register` calls NeoForge refuses, and what it says.
+    public static String refusedRegister(IEventBus bus, int which) {
+        try {
+            switch (which) {
+                case 0 -> bus.register(Refused.OneInstance.class);
+                case 1 -> bus.register(new Refused.OneStatic());
+                case 2 -> bus.register(new Refused.Nothing());
+                case 3 -> bus.register(new Refused.Child());
+                case 4 -> bus.register(Refused.TwoArguments.class);
+                case 5 -> bus.register(Refused.NotAnEvent.class);
+                case 6 -> bus.register(Refused.ModBusOnly.class);
+                case 7 -> bus.register(Refused.Abstract.class);
+                default -> {}
+            }
+            return "accepted";
+        } catch (IllegalArgumentException e) {
+            return e.getClass().getName() + ": " + e.getMessage();
+        }
+    }
+
     /// The registrations NeoForge refuses, and what it says.
     public static String refused(IEventBus bus, int which) {
         try {

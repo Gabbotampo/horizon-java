@@ -17,6 +17,27 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent;
 /// the way `FMLModContainer.<init>` @31-62 builds it (its exception handler only logs).
 /// See README.md for the classpath.
 public class BusOracle {
+    /// A fresh bus with `NeoForge.EVENT_BUS`'s own class checker (`NeoForge.lambda$static$0`, the
+    /// real method, called reflectively): the real game bus is one static, and these cases need
+    /// empty ones.
+    static IEventBus gameBus() {
+        try {
+            java.lang.reflect.Method check = NeoForge.class.getDeclaredMethod("lambda$static$0", Class.class);
+            check.setAccessible(true);
+            return BusBuilder.builder().classChecker(type -> {
+                try {
+                    check.invoke(null, type);
+                } catch (java.lang.reflect.InvocationTargetException e) {
+                    throw (IllegalArgumentException) e.getCause();
+                } catch (IllegalAccessException e) {
+                    throw new AssertionError(e);
+                }
+            }).build();
+        } catch (NoSuchMethodException e) {
+            throw new AssertionError(e);
+        }
+    }
+
     static IEventBus modBus() {
         return BusBuilder.builder().markerType(IModBusEvent.class).allowPerPhasePost().build();
     }
@@ -61,6 +82,20 @@ public class BusOracle {
         IEventBus mod = modBus();
         BusDemo.notFired(mod, game);
         System.out.println("{\"case\":\"not_fired\"," + post(mod, new FMLCommonSetupEvent()) + "}");
+        IEventBus subscribed = gameBus();
+        BusDemo.subscribe(subscribed);
+        System.out.println("{\"case\":\"subscribe_tick\"," + post(subscribed, new ServerTickEvent.Post()) + "}");
+        System.out.println("{\"case\":\"subscribe_death\"," + post(subscribed, new LivingDeathEvent()) + "}");
+        System.out.println("{\"case\":\"subscribe_pre\"," + post(subscribed, new ServerTickEvent.Pre()) + "}");
+        IEventBus unsubscribed = BusBuilder.builder().build();
+        BusDemo.unsubscribe(unsubscribed);
+        System.out.println("{\"case\":\"unsubscribe\"," + post(unsubscribed, new ServerTickEvent.Post()) + "}");
+        for (int which = 0; which < 8; which++) {
+            System.out.println("{\"case\":\"refused_register_" + which + "\",\"bus\":\"game\",\"result\":"
+                + quote(BusDemo.refusedRegister(gameBus(), which)) + "}");
+        }
+        new demo.ModEntry(modBus());
+        System.out.println("{\"case\":\"mod_entry\"," + post(game, new net.neoforged.neoforge.event.RegisterCommandsEvent()) + "}");
         String[] buses = {"game", "mod", "game", "game"};
         for (int which = 0; which < 4; which++) {
             IEventBus bus = buses[which].equals("game") ? game : modBus();

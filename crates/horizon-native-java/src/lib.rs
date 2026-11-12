@@ -82,6 +82,7 @@ pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
 mod neoforge_loader;
+mod neoforge_subscribe;
 mod nested_jars;
 mod night_config;
 mod null_checks;
