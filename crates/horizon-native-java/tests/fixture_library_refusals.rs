@@ -16,9 +16,12 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
+
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
 
 /// Generic reflection a config library builds its model from (DazzleConf,
 /// servercore), and the `TypeToken` subclass idiom (WorldEdit's piston).
@@ -498,10 +501,7 @@ impl Fixture {
     /// Compile `sources` and pack the `demo/` classes; anything else is a
     /// stub that stands for a class the platform provides.
     fn build(test: &str, sources: &[(&str, &str)]) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = unique_suffix();
         let root = std::env::temp_dir().join(format!(
             "horizon-native-java-libref-{test}-{}-{unique}",
             std::process::id()

@@ -4,6 +4,10 @@
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
@@ -25,10 +29,7 @@ fn a_real_provider_reports_knot_transformer_initialization() {
     let root = std::env::temp_dir().join(format!(
         "horizon-knot-init-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).unwrap();
     let jar = root.join("knotinitfixture.jar");

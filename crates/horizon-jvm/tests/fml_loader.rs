@@ -10,6 +10,10 @@ use std::{
 };
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 const MOD_SOURCE: &str = r#"
 package demo;
 import net.neoforged.bus.api.IEventBus;
@@ -84,10 +88,7 @@ fn fml_loader_runs_a_real_mod_when_installed() {
     let root = std::env::temp_dir().join(format!(
         "horizon-fml-it-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     let src = root.join("demo/RealMod.java");
     let classes = root.join("classes");

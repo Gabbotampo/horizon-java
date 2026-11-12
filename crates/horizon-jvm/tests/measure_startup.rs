@@ -13,6 +13,10 @@ use std::{
 };
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 const MOD_SOURCE: &str = r#"
 package demo;
 public final class Measured {
@@ -114,10 +118,7 @@ fn a_fixture_is_measured_with_startup_time_and_peak_rss() {
     let root = std::env::temp_dir().join(format!(
         "horizon-jvm-measure-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).unwrap();
     let Some(jar) = fixture(&root, "measured.jar", MOD_SOURCE, "Measured") else {
@@ -177,10 +178,7 @@ fn a_fixture_past_the_bound_is_killed_and_fails_the_measurement() {
     let root = std::env::temp_dir().join(format!(
         "horizon-jvm-measure-slow-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).unwrap();
     let Some(jar) = fixture(&root, "slow.jar", SLOW_SOURCE, "Slow") else {

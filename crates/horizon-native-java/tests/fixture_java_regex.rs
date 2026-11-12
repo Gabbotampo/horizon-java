@@ -10,14 +10,12 @@
 //! (OpenJDK 27), it printed the lines in `EXPECTED` verbatim.
 
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
-use std::{
-    fs,
-    io::Write,
-    path::PathBuf,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
+
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
 
 const PROBE: &str = r##"package demo;
 
@@ -162,10 +160,7 @@ const EXPECTED: &[(&str, &str)] = &[
 ];
 
 fn fixture() -> (PathBuf, NativeJar) {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let unique = unique_suffix();
     let root = std::env::temp_dir().join(format!(
         "horizon-native-java-regex-{}-{unique}",
         std::process::id()

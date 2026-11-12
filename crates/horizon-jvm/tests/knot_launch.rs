@@ -16,6 +16,10 @@
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 /// The marker constant the probe transformer rewrites (same length, so the
 /// class file keeps its constant-pool layout).
 const RAW: &str = "KNOT-RAW";
@@ -96,10 +100,7 @@ fn a_real_provider_hands_knot_to_the_launcher_and_transforms_a_class() {
     let root = std::env::temp_dir().join(format!(
         "horizon-knot-launch-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).unwrap();
     let Some(marker_class) = compile_marker(&root) else {

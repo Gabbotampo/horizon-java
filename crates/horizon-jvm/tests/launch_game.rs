@@ -15,6 +15,10 @@
 use std::{fs, io::Write, path::PathBuf, process::Command, time::Instant};
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
@@ -35,10 +39,7 @@ fn temp_root(tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "horizon-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).unwrap();
     root

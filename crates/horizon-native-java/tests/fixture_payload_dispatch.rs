@@ -7,6 +7,10 @@ use horizon_native_java::{
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 fn javac() -> std::path::PathBuf {
     std::env::var_os("JAVA_HOME")
         .map(|home| std::path::PathBuf::from(home).join("bin/javac"))
@@ -110,10 +114,7 @@ fn a_received_frame_calls_the_registered_handler() {
     let root = std::env::temp_dir().join(format!(
         "horizon-native-payload-dispatch-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     let _ = fs::remove_dir_all(&root);
     let jar_path = build_mod(&root);

@@ -2,6 +2,10 @@
 
 use std::{fs, path::PathBuf, process::Command};
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 fn mapping_path() -> Option<PathBuf> {
     let value = std::env::var_os("HORIZON_MAPPINGS")?;
     std::env::split_paths(&value).find(|path| path.is_file())
@@ -123,10 +127,7 @@ fn tempfile_root() -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "horizon-jvm-readiness-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).expect("temporary readiness root");
     root

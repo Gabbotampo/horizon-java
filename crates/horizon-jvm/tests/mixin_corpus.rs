@@ -15,6 +15,10 @@
 
 use std::{fs, path::PathBuf, process::Command};
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
@@ -75,10 +79,7 @@ fn real_corpus_mods_apply_their_mixins_in_a_launch() {
         let root = std::env::temp_dir().join(format!(
             "horizon-mixin-corpus-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            unique_suffix()
         ));
         fs::create_dir_all(&root).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_horizon-jvm"))

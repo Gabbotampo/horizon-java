@@ -13,9 +13,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
+
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
 
 const SOURCE: &str = r#"package demo;
 
@@ -263,10 +266,7 @@ impl Fixture {
     /// Compile the shared Java source into a Fabric-shaped jar.  Each test builds its own jar so
     /// parallel tests never share a scratch directory.
     fn build(test: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = unique_suffix();
         let root = std::env::temp_dir().join(format!(
             "horizon-native-java-reflect-{test}-{}-{unique}",
             std::process::id()

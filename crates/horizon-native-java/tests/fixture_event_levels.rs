@@ -18,9 +18,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
+
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
 
 const ENTRY: &str = r##"package demo;
 
@@ -117,10 +120,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn build(test: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = unique_suffix();
         let root = std::env::temp_dir().join(format!(
             "horizon-native-java-levels-{test}-{}-{unique}",
             std::process::id()

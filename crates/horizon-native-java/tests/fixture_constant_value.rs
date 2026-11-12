@@ -17,9 +17,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
+
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
 
 const CONSTS_V1: &str = r##"package demo;
 
@@ -141,10 +144,7 @@ fn javac(classes: &Path, sources: &[(&str, &str)], root: &Path, phase: &str) {
 
 /// Compile V1, recompile V2 over it, and pack `demo/` as a Fabric jar.
 fn fixture() -> (PathBuf, NativeJar) {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let unique = unique_suffix();
     let root = std::env::temp_dir().join(format!(
         "horizon-native-java-constant-value-{}-{unique}",
         std::process::id()

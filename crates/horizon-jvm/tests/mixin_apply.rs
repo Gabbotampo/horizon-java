@@ -16,6 +16,10 @@
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 const TARGET: &str = r#"package applyprobe;
 
 public final class Target {
@@ -159,10 +163,7 @@ fn a_real_provider_applies_a_mod_mixin_through_knot() {
     let root = std::env::temp_dir().join(format!(
         "horizon-mixin-apply-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).unwrap();
     let Some(classes) = compile_fixture(&root, &mixin_jar) else {

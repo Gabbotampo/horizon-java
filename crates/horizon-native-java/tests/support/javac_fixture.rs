@@ -12,9 +12,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
+
+#[path = "unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
 
 pub struct Fixture {
     root: PathBuf,
@@ -67,10 +70,7 @@ impl Fixture {
         extra: &[(&str, &[u8])],
         with_lib: bool,
     ) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = unique_suffix();
         let root = std::env::temp_dir().join(format!(
             "horizon-native-java-{test}-{}-{unique}",
             std::process::id()

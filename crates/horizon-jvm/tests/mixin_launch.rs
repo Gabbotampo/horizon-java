@@ -23,6 +23,10 @@
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 const TARGET: &str = r#"package launchprobe;
 
 public final class Target {
@@ -115,10 +119,7 @@ fn temp_root(tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "horizon-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     fs::create_dir_all(&root).unwrap();
     root

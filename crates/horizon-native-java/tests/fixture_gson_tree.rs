@@ -22,9 +22,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
+
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
 
 /// Signature-only copies of the gson-2.14.0 members the probe calls. The
 /// bodies never run: the classes stay out of the fixture jar.
@@ -511,10 +514,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn build(test: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = unique_suffix();
         let root = std::env::temp_dir().join(format!(
             "horizon-native-java-gson-tree-{test}-{}-{unique}",
             std::process::id()

@@ -6,6 +6,10 @@
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
 
+#[path = "support/unique_dir.rs"]
+mod unique_dir;
+use unique_dir::unique_suffix;
+
 const MOD_SOURCE: &str = r#"
 package demo;
 public final class Real implements net.fabricmc.api.ModInitializer,
@@ -42,10 +46,7 @@ fn a_real_game_jar_enters_the_production_provider() {
     let root = std::env::temp_dir().join(format!(
         "horizon-fabric-provider-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        unique_suffix()
     ));
     let source = root.join("demo/Real.java");
     let classes = root.join("classes");
