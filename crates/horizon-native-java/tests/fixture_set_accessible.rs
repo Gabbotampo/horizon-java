@@ -336,10 +336,11 @@ fn set_accessible_matches_the_jdk() {
 }
 
 /// Counted, not answered: `Field#get` on a private field from another
-/// package without `setAccessible`. OpenJDK 27 throws `IllegalAccessException:
+/// package without `setAccessible`. OpenJDK 25 throws `IllegalAccessException:
 /// class demo.sub.Outside cannot access a member of class demo.Holder with
-/// private access` (Fabric's unnamed module; NeoForge's text names the
-/// modules). This read used to be answered `7` without any check.
+/// modifiers "private"` (Fabric's unnamed module; NeoForge's text names the
+/// modules; OpenJDK 27 ends it `with private access`). This read used to be
+/// answered `7` without any check.
 #[test]
 fn failed_access_get_is_counted() {
     let fixture = fixture("set-accessible-unchecked");
