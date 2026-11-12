@@ -34,27 +34,36 @@
 //!    the field's type; a reference field takes any value of its type.
 //! 6. A static field ignores the receiver entirely.
 //!
-//! Decided only when nothing the answer rests on is invisible; otherwise the
-//! call goes on (a typed getter or setter is counted at the host; `get` and
-//! `set` keep reaching the older unchecked path in `invoke_reflect_method`):
+//! Decided only when nothing the answer rests on is invisible. Every other
+//! call on a `Field` the reflection lookups handed out is counted at the host,
+//! `get` and `set` included: none is answered without the JDK's checks.
 //!
 //! * the field marker carries its flags and the declaring class is one of the
 //!   running jar's own classes (fields of game, JDK or linked-jar classes are
 //!   never modelled here);
-//! * the access check passes. A failed check is an `IllegalAccessException`
-//!   whose text names the caller's and the declaring class's modules when they
-//!   are named (NeoForge) and not when they are not (Fabric); the runtime does
-//!   not know which loader runs it;
-//! * the receiver's class and the stored value's class are known: a jar object
-//!   or a typed box. `Float` and `Double` boxes share one value, so they are
-//!   decided only where both answer the same (a `double` field);
-//! * after `setAccessible` on the field (any copy of it: markers do not tell
-//!   `Field` objects apart), only where `override` cannot change the answer:
-//!   the check without it passes, and no final instance field of a normal class
-//!   is written (with `override` that write goes through JDK 27's final-field
-//!   mutation policy, which the launch flags decide).
+//! * the `Field` object's own `override` is known (`reflect_override`);
+//! * without `override`, the access check passes, the declaring jar's module
+//!   is open to the caller under both loaders (`reflect_override`'s module
+//!   docs: a caller from the same jar, or any caller when the jar has no
+//!   `module-info.class`), and the caller's class is one the runtime holds. A
+//!   failed check is an `IllegalAccessException` whose text names the
+//!   caller's and the declaring class's modules when they are named (NeoForge)
+//!   and not when they are not (Fabric); the runtime does not know which
+//!   loader runs it, so that is counted. "Same package" is the package name:
+//!   the same name in two jars is one runtime package under Knot's single
+//!   loader, and cannot happen under FML, which forbids split packages;
+//! * the receiver's class and the stored value's class are known: a jar
+//!   object, a typed box, a plain string (the rule `instanceof String` uses,
+//!   `value_class`), or a JDK object `jdk_supertypes` lists. A store whose
+//!   answer does not depend on the value's class (any object into a writable
+//!   `Object` field, a `Float`/`Double` box into a writable `double` field, a
+//!   runtime list into a `List` field) is decided without it;
+//! * with `override`, no final instance field of a normal class is written:
+//!   that write goes through JDK 27's final-field mutation policy, which the
+//!   launch flags decide.
 
-use super::field_access::{FIELD, TOUCHED, package_of};
+use super::field_access::{FIELD, package_of};
+use super::reflect_override::{FIELD_PREFIX, canonical_field};
 use super::*;
 
 const ACC_STATIC: u16 = 0x0008;
@@ -236,6 +245,16 @@ fn class_get_name(descriptor: &str) -> String {
         .replace('/', ".")
 }
 
+/// The class of an object `new` made of a JDK class `jdk_supertypes` lists
+/// (`java/util/ArrayList#3`).
+fn jdk_object_class(marker: &str) -> Option<&str> {
+    let (class, number) = marker.split_once('#')?;
+    (!number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && jdk_supertypes::is_listed(class))
+    .then_some(class)
+}
+
 fn thrown(class: &str, message: String) -> NativeError {
     NativeError::UncaughtException {
         class: class.into(),
@@ -369,9 +388,10 @@ fn box_assignable(field_class: &str, box_class: &str) -> Option<bool> {
 }
 
 impl<H: Host> Runtime<'_, H> {
-    /// Answer one `Field#get*`/`set*` call where JDK 27's answer can be read
-    /// off the classes the runtime holds. `None` leaves it to the rest of the
-    /// dispatch (counted, or the older unchecked `get`/`set`).
+    /// Answer one `Field#get*`/`set*` call on a `Field` the reflection
+    /// lookups handed out where JDK 27's answer can be read off the classes
+    /// the runtime holds, and count every other one at the host. `None` only
+    /// for a receiver that is no such `Field` (the rest of the dispatch).
     pub(super) fn invoke_field_get_set(
         &mut self,
         r: &MethodRef,
@@ -385,11 +405,32 @@ impl<H: Host> Runtime<'_, H> {
         let Some(op) = Op::parse(&r.name, &r.descriptor) else {
             return Ok(None);
         };
-        let Some(marker) = receiver.and_then(expect_ref).cloned() else {
+        let Some(receiver) = receiver.filter(|receiver| {
+            expect_ref(receiver).is_some_and(|marker| marker.starts_with(FIELD_PREFIX))
+        }) else {
             return Ok(None);
         };
-        let Some((declaring, member)) = marker
-            .strip_prefix("reflect-field/")
+        if let Some(value) = self.decide_field_get_set(op, receiver, args, caller)? {
+            return Ok(Some(value));
+        }
+        // Undecided: counted, never answered without the JDK's checks.
+        self.host.invoke_instance(r, receiver, args).map(Some)
+    }
+
+    /// [`Self::invoke_field_get_set`]'s answer, or `None` when it rests on
+    /// something the runtime cannot see (module docs).
+    fn decide_field_get_set(
+        &mut self,
+        op: Op,
+        receiver: &Value,
+        args: &[Value],
+        caller: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(marker) = expect_ref(receiver).cloned() else {
+            return Ok(None);
+        };
+        let Some((declaring, member)) = canonical_field(&marker)
+            .strip_prefix(FIELD_PREFIX)
             .and_then(|rest| rest.split_once('#'))
         else {
             return Ok(None);
@@ -413,17 +454,16 @@ impl<H: Host> Runtime<'_, H> {
             descriptor,
             access,
         };
-        let touched = self.fields.contains_key(&format!("{marker}|{TOUCHED}"));
+        // This `Field` object's own `override` (`reflect_override`).
+        let Some(overridden) = self.field_override(&marker) else {
+            return Ok(None);
+        };
         let object = args.first().cloned().unwrap_or(Value::Ref(None));
 
         // 1. `checkAccess`, without `override`.
-        let target_class = if field.is_static() {
+        let target_class = if field.is_static() || overridden {
             None
         } else if matches!(object, Value::Ref(None)) {
-            // With `override` the null reaches the accessor instead.
-            if touched {
-                return Ok(None);
-            }
             return Err(thrown(
                 "java/lang/NullPointerException",
                 "Cannot invoke \"Object.getClass()\" because \"obj\" is null".into(),
@@ -434,8 +474,9 @@ impl<H: Host> Runtime<'_, H> {
                 None => return Ok(None),
             }
         };
-        if caller != declaring {
-            if !self.classes.contains_key(caller) {
+        if !overridden && caller != declaring {
+            // The member rules read the caller's superclasses and nest.
+            if !self.module_open_to(declaring, caller) || self.class(caller).is_none() {
                 return Ok(None);
             }
             let Some(class_flags) = self.class(declaring).and_then(checkcast::class_access) else {
@@ -462,7 +503,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         // With `override`, a final instance field of a normal class is written
         // through the final-field mutation policy (JEP 500): the JVM's flags.
-        if touched
+        if overridden
             && matches!(op, Op::Set(_))
             && field.is_final()
             && !field.is_static()
@@ -473,6 +514,9 @@ impl<H: Host> Runtime<'_, H> {
 
         // 2. The accessor: making it initializes the declaring class.
         self.ensure_initialized(declaring)?;
+        if overridden && !field.is_static() && matches!(object, Value::Ref(None)) {
+            return self.null_object_with_override(&field, op, args);
+        }
         match op {
             Op::Get(getter) => self.reflect_get(&field, &object, getter),
             Op::Set(None) => {
@@ -484,6 +528,57 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 self.reflect_set_primitive(&field, &object, setter, &value)
+            }
+        }
+    }
+
+    /// An instance field reached with a `null` object after
+    /// `setAccessible(true)`: `checkAccess`, which reads `obj.getClass()`, is
+    /// skipped, so the accessor sees the null. OpenJDK 27: a conversion the
+    /// accessor does not have still throws first; otherwise a getter or a
+    /// typed setter throws the method handle's `NullPointerException`, which
+    /// has no message, and `set(Object)` throws from `ensureObj`
+    /// (`Cannot invoke "Object.getClass()" because "o" is null`).
+    fn null_object_with_override(
+        &self,
+        field: &Target<'_>,
+        op: Op,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let of = Prim::of_descriptor(field.descriptor);
+        let npe = |message: Option<&str>| NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: message.map(str::to_owned),
+            frame: None,
+        };
+        match op {
+            Op::Get(Some(getter)) if !of.is_some_and(|of| of.widens_to(getter)) => {
+                Err(field.get_conversion(getter.name()))
+            }
+            Op::Get(_) => Err(npe(None)),
+            Op::Set(None) => Err(npe(Some(
+                "Cannot invoke \"Object.getClass()\" because \"o\" is null",
+            ))),
+            Op::Set(Some(setter)) => {
+                let Some(value) = args.get(1).and_then(|value| primitive(value, setter)) else {
+                    return Ok(None);
+                };
+                if !of.is_some_and(|of| setter.widens_to(of)) {
+                    return Err(thrown(
+                        ILLEGAL_ARGUMENT,
+                        field.set_message(&format!(
+                            "({}){}",
+                            setter.name(),
+                            value_text(&value, setter)
+                        )),
+                    ));
+                }
+                // A read-only (record) field runs `ensureObj` before its
+                // final-field exception; not observed on the JDK here.
+                if field.is_final() {
+                    return Ok(None);
+                }
+                Err(npe(None))
             }
         }
     }
@@ -578,6 +673,15 @@ impl<H: Host> Runtime<'_, H> {
             Value::Ref(None) => None,
             other => match self.object_class_name(other) {
                 Some(class) => Some(class),
+                // The value's class is unknown, which only the messages and
+                // the type checks read. A writable `Object` field takes any
+                // object, and a writable `double` field unboxes a `Float` and
+                // a `Double` box (which share `Value::Float`) to the same
+                // value, so neither store depends on it.
+                None if !field.is_final() && self.stores_without_class(field, other) => {
+                    self.store(field, object, other.clone());
+                    return Ok(Some(Value::Void));
+                }
                 None => return Ok(None),
             },
         };
@@ -594,9 +698,6 @@ impl<H: Host> Runtime<'_, H> {
             match unbox(value) {
                 Some((from, unboxed)) if from.widens_to(of) => widen(&unboxed, of),
                 Some(_) => return Err(thrown(ILLEGAL_ARGUMENT, field.set_message(&class))),
-                // A float box widens to a double field whether it was a
-                // `Float` or a `Double`; any other target tells them apart.
-                None if of == Prim::Double && matches!(value, Value::Float(_)) => value.clone(),
                 None => return Ok(None),
             }
         } else {
@@ -623,17 +724,50 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(Value::Void))
     }
 
-    /// Whether `value` (a box of known class or a jar object) can be stored in
-    /// a field of class `field_class`. `None` where that is not decidable.
+    /// Whether a writable `field` takes `value` whatever the value's class:
+    /// an `Object` field takes any object; a `double` field unboxes a `Float`
+    /// and a `Double` box (which share `Value::Float`) to the same value; a
+    /// field of an interface every runtime list, set or map marker implements
+    /// (`List`, `Collection`...) takes one.
+    fn stores_without_class(&self, field: &Target<'_>, value: &Value) -> bool {
+        if matches!(value, Value::Void) {
+            return false;
+        }
+        if field.descriptor == "D" {
+            return matches!(value, Value::Float(_));
+        }
+        let Some(field_class) = field
+            .descriptor
+            .strip_prefix('L')
+            .and_then(|name| name.strip_suffix(';'))
+        else {
+            return false;
+        };
+        field_class == "java/lang/Object"
+            || expect_ref(value)
+                .is_some_and(|marker| jdk_supertypes::collection_marker_is(marker, field_class))
+    }
+
+    /// Whether `value` (a box of known class, a plain string, a JDK object
+    /// `jdk_supertypes` lists or a jar object) can be stored in a field of
+    /// class `field_class`. `None` where that is not decidable.
     fn reference_assignable(&self, value: &Value, field_class: &str) -> Option<bool> {
         if field_class == "java/lang/Object" {
             return Some(true);
         }
+        if let Some(marker) = expect_ref(value) {
+            // `String` is final: a string is an instance of its own
+            // supertypes and nothing else.
+            if value_class::is_plain_string(marker) {
+                return Some(value_class::string_instance_of(marker, field_class));
+            }
+            if let Some(class) = jdk_object_class(marker) {
+                return jdk_supertypes::jdk_instance_of(class, field_class);
+            }
+        }
         if let Some((of, _)) = unbox(value) {
-            return box_assignable(field_class, of.box_class()).or_else(|| {
-                // A JDK box is never an instance of a jar type.
-                self.classes.contains_key(field_class).then_some(false)
-            });
+            return box_assignable(field_class, of.box_class())
+                .or_else(|| jdk_supertypes::jdk_instance_of(of.box_class(), field_class));
         }
         // A jar object into a jar type.
         if self.classes.contains_key(field_class) {
@@ -647,13 +781,21 @@ impl<H: Host> Runtime<'_, H> {
             .then_some(false)
     }
 
-    /// The dotted `getClass().getName()` of a jar object or a typed box.
+    /// The dotted `getClass().getName()` of a jar object, a typed box, a
+    /// plain string (by the rule `instanceof String` uses) or a JDK object
+    /// `jdk_supertypes` lists.
     fn object_class_name(&self, value: &Value) -> Option<String> {
         if let Some((of, _)) = unbox(value) {
             return Some(of.box_class().replace('/', "."));
         }
-        self.known_object_class(value)
-            .map(|class| class.replace('/', "."))
+        if let Some(class) = self.known_object_class(value) {
+            return Some(class.replace('/', "."));
+        }
+        let marker = expect_ref(value)?;
+        if let Some(class) = jdk_object_class(marker) {
+            return Some(class.replace('/', "."));
+        }
+        value_class::is_plain_string(marker).then(|| "java.lang.String".to_owned())
     }
 
     /// The accessor's receiver check: none for a static field; otherwise an
@@ -688,9 +830,12 @@ impl<H: Host> Runtime<'_, H> {
         let value = held.unwrap_or_else(|| Value::default_for(field.descriptor));
         Ok(match Prim::of_descriptor(field.descriptor) {
             Some(of) => primitive(&value, of),
+            // A reference field hands back the object in its slot, whatever
+            // its class: a box the value model keeps as `Long`/`Float`/`Int`
+            // is still the object `set` stored.
             None => match value {
-                Value::Ref(_) => Some(value),
-                _ => None,
+                Value::Void => None,
+                _ => Some(value),
             },
         })
     }
