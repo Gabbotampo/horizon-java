@@ -133,12 +133,14 @@ fn floats_and_doubles_print_as_java_25_prints_them() {
 }
 
 #[test]
-fn characters_and_unicode_blocks_answer_from_jdk_27s_tables() {
+fn characters_and_unicode_blocks_answer_from_java_25s_tables() {
     let jar = jar("characters");
     let mut host = StdHost::new();
+    // `isLetter(0x10EC5)` is `false`: U+10EC5 is assigned in Unicode 17.0
+    // (JDK 26+, which answers `true`), not in Java 25's Unicode 16.0.
     assert_eq!(
         call(&jar, &mut host, "characters"),
-        text("true 12 15 453 false b true 26 true 105")
+        text("true 12 15 453 false b false 26 true 105")
     );
     let blocks = call(&jar, &mut host, "blocks");
     assert_eq!(

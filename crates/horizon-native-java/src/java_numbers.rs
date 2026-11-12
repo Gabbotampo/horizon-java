@@ -8,7 +8,7 @@
 //! every failure is the JDK's `NumberFormatException` with its message.
 //!
 //! `Character.digit` (and every other `Character` query) answers from the
-//! table generated from JDK 27 (`jdk_character.rs`).
+//! table generated from Java 25, the game's runtime (`jdk_character.rs`).
 
 use crate::{MethodRef, NativeError, Value, expect_ref};
 
