@@ -74,6 +74,7 @@ mod jdk_supertypes;
 mod jdk_text_oracle;
 mod jvm_dispatch;
 mod library_dispatch;
+mod list_equality;
 mod map_compute;
 mod method_handles;
 mod mixin_extras;
@@ -2152,6 +2153,12 @@ pub trait Host {
     /// that keeps no collection state has nothing to replace.
     fn replace_mutable_collection(&mut self, _value: &Value, _values: Vec<Value>) {}
 
+    /// The collection an unmodifiable view (`Collections.unmodifiableList`)
+    /// reads, by the view's marker.
+    fn unmodifiable_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -3999,6 +4006,10 @@ impl Host for StdHost {
         if let Some(marker) = expect_ref(value) {
             self.mutable_collections.insert(marker.to_owned(), values);
         }
+    }
+
+    fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
+        self.unmodifiable_collections.get(marker).cloned().flatten()
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -23884,7 +23895,7 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_object_methods(&r, op, receiver.as_ref(), &args)
                     ) {
                         // `equals`/`hashCode` as the JVM runs them
-                        // (`object_methods.rs`).
+                        // (`object_methods.rs`, `list_equality.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
