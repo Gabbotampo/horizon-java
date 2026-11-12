@@ -25,8 +25,10 @@
 //! - **Registries.** `registryAccess()` (server, level or player) is one
 //!   registry-access marker; `lookupOrThrow(key)` answers a registry marker
 //!   for a registry the game listed, whose `containsKey`, `keySet` and `size`
-//!   answer from the ids it holds. A registry the game did not list refuses:
-//!   unknown to Horizon is not the same as missing in vanilla.
+//!   answer from the ids it holds; `keySet` iterates in vanilla's `HashMap`
+//!   order, rebuilt from the registration order the game gives. A registry
+//!   the game did not list refuses: unknown to Horizon is not the same as
+//!   missing in vanilla.
 //! - **Networking.** `ServerPlayNetworking.canSend(player, type)` answers
 //!   whether that player's client takes the channel ([`ServerFacts::client_channels`]).
 //!
@@ -82,6 +84,11 @@ pub struct ServerFacts {
     pub game_rules: BTreeMap<String, GameRuleValue>,
     /// Registries the game lists by id (`minecraft:block`) → their entry ids.
     pub registries: BTreeMap<String, Arc<BTreeSet<String>>>,
+    /// The same registries' ids in the order vanilla registers them
+    /// (`MappedRegistry.register`), which decides `keySet()`'s `HashMap`
+    /// iteration order (`hash_map_order.rs`). A listed registry with no order
+    /// here refuses `keySet()` rather than answering some other order.
+    pub registration_order: BTreeMap<String, Arc<Vec<String>>>,
     /// Per player UUID, the payload channels that player's client takes.
     /// A player with no entry takes none (a vanilla client).
     pub client_channels: BTreeMap<u128, BTreeSet<String>>,
@@ -409,8 +416,26 @@ pub(crate) fn answer(
                     wanted.is_some_and(|wanted| entries.contains(&wanted)),
                 )))
             }
+            // `Collections.unmodifiableSet(byLocation.keySet())`: the ids in
+            // the bucket order of the `HashMap` vanilla registered them into.
             ("keySet", "()Ljava/util/Set;") => {
-                let keys: Vec<Value> = entries.iter().map(|id| identifier_parse(id)).collect();
+                let Some((order, indices)) = facts
+                    .registration_order
+                    .get(id)
+                    .filter(|order| order.len() == entries.len())
+                    .and_then(|order| {
+                        crate::runtime::hash_map_order::key_set_order(order, |id| {
+                            crate::runtime::hash_map_order::identifier_hash(id)
+                        })
+                        .map(|indices| (order, indices))
+                    })
+                else {
+                    return refuse(r);
+                };
+                let keys: Vec<Value> = indices
+                    .into_iter()
+                    .map(|index| identifier_parse(&order[index]))
+                    .collect();
                 Ok(collection_value("set", &keys))
             }
             _ => refuse(r),
@@ -746,6 +771,57 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `keySet()` iterates as vanilla's `byLocation` `HashMap` does, rebuilt
+    /// from the registration order (the expected order was printed by a
+    /// `HashMap<Identifier, _>` on a JVM, 26.3 server jar); a registry the game
+    /// listed without its order refuses rather than answering another order.
+    #[test]
+    fn a_registry_key_set_is_in_vanilla_hash_map_order() {
+        let ids = [
+            "minecraft:stone",
+            "demo:t1",
+            "demo:t90",
+            "demo:t18",
+            "demo:t102",
+            "demo:t29",
+            "demo:t113",
+            "demo:t1709",
+            "demo:t124",
+            "demo:t1808",
+        ]
+        .map(str::to_owned);
+        let mut facts = facts();
+        facts.registries.insert(
+            "minecraft:item".into(),
+            Arc::new(ids.iter().cloned().collect()),
+        );
+        facts
+            .registration_order
+            .insert("minecraft:item".into(), Arc::new(ids.to_vec()));
+        let key_set = call("net/minecraft/core/Registry", "keySet", "()Ljava/util/Set;");
+        let expected: Vec<Value> = [
+            "minecraft:stone",
+            "demo:t1",
+            "demo:t18",
+            "demo:t29",
+            "demo:t1709",
+            "demo:t1808",
+            "demo:t90",
+            "demo:t102",
+            "demo:t113",
+            "demo:t124",
+        ]
+        .iter()
+        .map(|id| identifier_parse(id))
+        .collect();
+        assert_eq!(
+            answer(&facts, "game/registry/minecraft:item", &key_set, &[]).unwrap(),
+            collection_value("set", &expected)
+        );
+        // `facts()` lists blocks with no registration order.
+        assert!(answer(&facts, "game/registry/minecraft:block", &key_set, &[]).is_err());
     }
 
     #[test]
