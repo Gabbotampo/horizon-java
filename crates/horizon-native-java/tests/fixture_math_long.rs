@@ -155,7 +155,9 @@ fn long_math_overloads_match_java() {
             "(JJ)J",
             &[Value::Long(i64::MAX), Value::Long(1)],
         ),
-        Err(NativeError::Arithmetic { .. })
+        Err(NativeError::UncaughtException { class, message, .. })
+            if class == "java/lang/ArithmeticException"
+                && message.as_deref() == Some("long overflow")
     ));
 
     let entry = jar.discover_entrypoint("main").unwrap();
