@@ -18,14 +18,19 @@
 //!   vanilla registers it in, which decides `keySet()`'s `HashMap` order.
 //! - **Held items.** The use-item hook's own stack for the clicked hand, the
 //!   other hand from `LivingRef::hand_item`, and `PlayerRef::is_creative`.
+//! - **Game rules.** `level.game_rules(host)` of an open level: every rule
+//!   the world has with its current value (rules are the server's, so any
+//!   level reads the same ones). Read again when a level loads and whenever
+//!   a rule changes (`game_rule_changed`), so `getGameRules().get(rule)`
+//!   answers the value a `/gamerule` just set.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use mod_api::{Hand, Host, ItemStack, PlayerRef, ServerHost};
 
-use crate::runtime::events::{FacadeStack, HeldItems, ServerFacts};
+use crate::runtime::events::{FacadeStack, GameRuleValue, HeldItems, ServerFacts};
 
 /// The interpreter's virtual game folder (`FabricLoader.getGameDir()`).
 const GAME_DIR: &str = "/horizon/game";
@@ -39,6 +44,7 @@ pub(crate) fn server_facts(host: &dyn ServerHost) -> ServerFacts {
         .and_then(|world| virtual_world_dir(&host.instance_dir(), &world));
     let mut facts = ServerFacts {
         world_dir,
+        game_rules: game_rules(host),
         ..ServerFacts::default()
     };
     let lists: [(&str, Vec<String>); 5] = [
@@ -84,6 +90,41 @@ pub(crate) fn server_facts(host: &dyn ServerHost) -> ServerFacts {
     facts
 }
 
+/// Every game rule the world has now, by vanilla's id without the namespace
+/// (`keep_inventory`), as the façade keys them. Empty when no level is open
+/// (at `server_about_to_start`) or the host cannot read one, so
+/// `getGameRules()` refuses instead of answering defaults.
+pub(crate) fn game_rules(host: &dyn ServerHost) -> BTreeMap<String, GameRuleValue> {
+    host.levels()
+        .list_levels()
+        .into_iter()
+        .find_map(|level| level.game_rules(host).ok())
+        .map(rule_facts)
+        .unwrap_or_default()
+}
+
+/// The host's `(minecraft:id, value)` list as the façade keys it. A rule
+/// outside the `minecraft` namespace (a native mod's) is left out: no
+/// `GameRules` field names it.
+pub(crate) fn rule_facts(
+    rules: Vec<(String, mod_api::GameRuleValue)>,
+) -> BTreeMap<String, GameRuleValue> {
+    rules
+        .into_iter()
+        .filter_map(|(id, value)| {
+            let id = id.strip_prefix("minecraft:")?.to_owned();
+            let value = match value {
+                mod_api::GameRuleValue::Bool(value) => GameRuleValue::Bool(value),
+                mod_api::GameRuleValue::Int(value) => GameRuleValue::Int(value),
+                // A value kind this runtime does not know: left out, so its
+                // read refuses.
+                _ => return None,
+            };
+            Some((id, value))
+        })
+        .collect()
+}
+
 /// One log line's worth of what the façade can answer: the world folder (or
 /// that the host gave none yet) and each listed registry's size.
 pub(crate) fn describe(facts: &ServerFacts) -> String {
@@ -93,8 +134,9 @@ pub(crate) fn describe(facts: &ServerFacts) -> String {
         .map(|(id, entries)| format!("{id} {}", entries.len()))
         .collect();
     format!(
-        "world folder {}, registries [{}]",
+        "world folder {}, {} game rules, registries [{}]",
         facts.world_dir.as_deref().unwrap_or("unknown"),
+        facts.game_rules.len(),
         registries.join(", ")
     )
 }
@@ -192,6 +234,30 @@ mod tests {
         assert_eq!(
             virtual_world_dir(&instance, Path::new("/srv/worlds/survival")).as_deref(),
             Some("/horizon/game/survival")
+        );
+    }
+
+    /// The host names rules `minecraft:<id>`; the façade keys vanilla's by
+    /// the bare id, and a native mod's own rule is no `GameRules` field.
+    #[test]
+    fn host_rules_are_keyed_by_their_vanilla_id() {
+        let rules = rule_facts(vec![
+            (
+                "minecraft:keep_inventory".into(),
+                mod_api::GameRuleValue::Bool(true),
+            ),
+            (
+                "minecraft:random_tick_speed".into(),
+                mod_api::GameRuleValue::Int(7),
+            ),
+            ("example:active".into(), mod_api::GameRuleValue::Bool(true)),
+        ]);
+        assert_eq!(
+            rules,
+            BTreeMap::from([
+                ("keep_inventory".to_owned(), GameRuleValue::Bool(true)),
+                ("random_tick_speed".to_owned(), GameRuleValue::Int(7)),
+            ])
         );
     }
 
