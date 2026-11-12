@@ -389,27 +389,29 @@ answer on lists, not only on queues (`sequenced.rs`). A `javafml` mod's containe
 
 ## Re-measured (12 November 2026, `java.util.regex`)
 
-Old is `6e3684b` (main, with the Gson tree parser) and new is the same commit with Java's regex
-engine reimplemented (`java_regex/`, `regex_calls.rs`): `String#matches`, `replaceAll`,
-`replaceFirst` and `split` answer exactly like OpenJDK 27 for any pattern in the modelled subset
-and are counted otherwise. Same corpora, deps and command (fast-built probes).
+Old is `e02154f` (main, with sequenced lists and `ServiceLoader` providers) and new is the same
+commit with Java's regex engine reimplemented (`java_regex/`, `regex_calls.rs`): `String#matches`,
+`replaceAll`, `replaceFirst` and `split` answer exactly like OpenJDK 27 for any pattern in the
+modelled subset and are counted otherwise. Same corpora, deps and command (fast-built probes).
 
 | Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
 |---|---:|---:|---:|---:|---:|
-| wide (`corpus-xl`) | 31 → **33** | 42 → 47 | 4 → 4 | 39 → **32** | 896 → 4,926 |
-| mega | 60 → 60 | 87 → 95 | 4 → 4 | 101 → **93** | 2,468 → 10,243 |
-| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+| wide (`corpus-xl`) | 31 → **33** | 43 → 48 | 4 → 4 | 38 → **31** | 911 → 4,941 |
+| mega | 60 → 60 | 88 → 99 | 4 → 4 | 100 → **89** | 2,504 → 10,761 |
+| NeoForge | 21 → 21 | 26 → 26 | 0 → 0 | 38 → 38 | 278 → 278 |
 
 `cupboard` (4 → 0) and `structureessentials` (9 → 0) are now `ran-clean`: Cupboard's
 `splitLongDesc` `replaceFirst` (lookbehinds, a `$1` replacement) is answered. Seven maxhenkel
 rows (Simple Voice Chat ×3, Sound Physics Remastered ×2, Peek ×2, over both corpora) leave
 `refused`: `CommentedProperties#removeNewLines`' `split("\\r?\\n")` was outside the old
 literal-only split. Collective's `RegisterMod#register` (`replaceAll("\\[", "")`, which answered
-null) no longer stops eight Serilum rows (five in corpus-xl, three in mega).
-`litematica-printer` and `collectorsalbum` stay refused at a later point. The unknown totals rise
-because those jars now run their config writers: `Character$UnicodeBlock.of` and `BASIC_LATIN`
-(683–954 calls each per maxhenkel jar) and `StringBuilder#charAt` are 11,385 of the 11,805 added
-calls. No regex call is left in the ranking or in a
+null) no longer stops twelve Serilum rows: `collective` 8.67 itself (`ran-hollow`, 474), both
+`fullbrightnesstoggle` builds and both `stackrefill` builds among them. `collective` 8.42/8.46 stop
+earlier, in `RegisterMod.<clinit>` on the `HttpClient$Builder` null, and the NeoForge build in
+`ForgeModLoaderHelper#getGameDirectory`, as on main. `litematica-printer` and `collectorsalbum`
+stay refused at a later point. The unknown totals rise because those jars now run their config
+writers: `Character$UnicodeBlock.of` and `BASIC_LATIN` (683–954 calls each per maxhenkel jar) and
+`StringBuilder#charAt` are 11,729 of the 12,287 added calls. No regex call is left in the ranking or in a
 refusal, and none of these runs reaches a `Matcher` method. No verdict got worse.
 
 ## Known limits of this census
