@@ -57,6 +57,7 @@ mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
+mod mod_config_spec;
 mod mod_origin;
 pub mod neoforge_attachments;
 mod neoforge_loader;
@@ -24327,6 +24328,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_mod_config_spec(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
