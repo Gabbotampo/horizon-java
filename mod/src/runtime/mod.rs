@@ -45,6 +45,7 @@ mod field_get_set;
 mod frame_bound;
 mod game_codecs;
 mod game_hooks;
+mod game_rules;
 mod gson_model;
 mod gson_tree;
 mod guava_model;
