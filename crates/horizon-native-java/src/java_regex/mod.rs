@@ -27,8 +27,12 @@
 //! or compound atom, a group value whose bookkeeping in Java depends on an
 //! edge this module does not follow (see [`engine::Program::tainted`]), and a
 //! search past its step budget or deeper than Java's own stack is sure to
-//! allow (see [`engine::Limits::JAVA`]). The caller turns that into an
-//! unknown host call, never a guessed answer.
+//! allow (see [`engine::Limits::JAVA`]), a search that would need more of
+//! this thread's stack than is left ([`stack`]), a `split` past
+//! [`MAX_SPLIT_PARTS`] parts and a replacement result past
+//! [`MAX_OUTPUT_CHARS`]. Matches are streamed: a call holds only its current
+//! match, never one record per match. The caller turns a counted call into
+//! an unknown host call, never a guessed answer.
 
 // Only `matches` is wired into the runtime here; `replaceAll`/`replaceFirst`,
 // `split` and the quoting helpers are answered by the stacked
@@ -36,6 +40,7 @@
 #![allow(dead_code)]
 
 mod engine;
+mod stack;
 mod syntax;
 #[cfg(test)]
 mod tests;
@@ -81,18 +86,35 @@ fn text(chars: &[char]) -> String {
     chars.iter().collect()
 }
 
-/// A finished match: group bounds in `char`s.
+/// Most parts one `split` may build; past that the call is counted rather
+/// than holding an unbounded list.
+pub(crate) const MAX_SPLIT_PARTS: usize = 65_536;
+/// Most `char`s one `replaceAll`/`replaceFirst` may build. Java throws
+/// `OutOfMemoryError` past `Integer.MAX_VALUE` whatever its heap, and below
+/// that its answer depends on the heap; a result this size is counted
+/// rather than allocated in the game's process.
+pub(crate) const MAX_OUTPUT_CHARS: usize = 1 << 24;
+
+/// A match: group bounds in `char`s. While matches are streamed it borrows
+/// the matcher's bounds, so no call keeps more than the current match.
 #[derive(Debug, Clone)]
-pub(crate) struct Match {
-    groups: Vec<usize>,
-    tainted: Vec<bool>,
+pub(crate) struct Match<'a> {
+    groups: std::borrow::Cow<'a, [usize]>,
+    tainted: &'a [bool],
 }
 
-impl Match {
-    fn from(matcher: &Matcher<'_>, regex: &Regex) -> Self {
+impl<'a> Match<'a> {
+    fn borrowed(matcher: &'a Matcher<'_>, regex: &'a Regex) -> Self {
         Self {
-            groups: matcher.groups.clone(),
-            tainted: regex.program.tainted.clone(),
+            groups: std::borrow::Cow::Borrowed(&matcher.groups),
+            tainted: &regex.program.tainted,
+        }
+    }
+
+    fn owned(matcher: &Matcher<'_>, regex: &'a Regex) -> Self {
+        Self {
+            groups: std::borrow::Cow::Owned(matcher.groups.clone()),
+            tainted: &regex.program.tainted,
         }
     }
 
@@ -140,36 +162,49 @@ impl Regex {
     }
 
     /// `Matcher.matches()` (`whole`) or `lookingAt()` on `input`.
-    pub(crate) fn match_start(&self, input: &str, whole: bool) -> R<Option<Match>> {
+    pub(crate) fn match_start(&self, input: &str, whole: bool) -> R<Option<Match<'_>>> {
         let chars = units(input)?;
         let mut matcher = Matcher::new(&self.program, &chars, Limits::JAVA);
         Ok(matcher
             .match_at_start(whole)?
-            .then(|| Match::from(&matcher, self)))
+            .then(|| Match::owned(&matcher, self)))
     }
 
-    /// `Matcher.find()` from a fresh matcher, repeated: every match in order,
-    /// with Java's rule that a search after an empty match starts one `char`
-    /// later. Stops after `limit` matches when one is given.
-    pub(crate) fn find_all(&self, chars: &[char], limit: Option<usize>) -> R<Vec<Match>> {
+    /// `Matcher.find()` from a fresh matcher, repeated: each match in order
+    /// goes to `each`, with Java's rule that a search after an empty match
+    /// starts one `char` later, until `each` answers `false` or no match is
+    /// left. Only the current match is held.
+    fn for_each_match(&self, chars: &[char], mut each: impl FnMut(&Match<'_>) -> R<bool>) -> R<()> {
         let mut matcher = Matcher::new(&self.program, chars, Limits::JAVA);
-        let mut found = Vec::new();
         let (mut first, mut last) = (usize::MAX, 0usize);
         loop {
-            if limit.is_some_and(|limit| found.len() >= limit) {
-                return Ok(found);
-            }
             let mut from = last;
             if from == first {
                 from += 1;
             }
             if from > chars.len() || !matcher.search(from)? {
-                return Ok(found);
+                return Ok(());
             }
-            let found_match = Match::from(&matcher, self);
-            (first, last) = (found_match.start(), found_match.end());
-            found.push(found_match);
+            let found = Match::borrowed(&matcher, self);
+            (first, last) = (found.start(), found.end());
+            if !each(&found)? {
+                return Ok(());
+            }
         }
+    }
+
+    /// Every match (at most `limit`), owned: for tests that read them all.
+    #[cfg(test)]
+    pub(crate) fn find_all(&self, chars: &[char], limit: Option<usize>) -> R<Vec<Match<'_>>> {
+        let mut found = Vec::new();
+        self.for_each_match(chars, |m| {
+            found.push(Match {
+                groups: std::borrow::Cow::Owned(m.groups.to_vec()),
+                tainted: &self.program.tainted,
+            });
+            Ok(limit.is_none_or(|limit| found.len() < limit))
+        })?;
+        Ok(found)
     }
 
     /// `Matcher.replaceAll` (`all`) or `replaceFirst` on `input`.
@@ -181,21 +216,40 @@ impl Regex {
     ) -> R<Result<String, Thrown>> {
         let chars = units(input)?;
         let replacement = units(replacement)?;
-        let matches = self.find_all(&chars, (!all).then_some(1))?;
-        if matches.is_empty() {
-            // The replacement is never parsed when nothing matched.
-            return Ok(Ok(input.to_owned()));
-        }
-        let mut out = String::with_capacity(input.len());
+        // Each match is expanded as it is found (`appendReplacement`), so
+        // the replacement is never parsed when nothing matched.
+        let mut out = String::new();
+        let mut written = 0usize;
         let mut append_position = 0;
-        for found in &matches {
-            out.push_str(&text(&chars[append_position..found.start()]));
-            if let Err(thrown) = self.expand(&chars, found, &replacement, &mut out)? {
-                return Ok(Err(thrown));
+        let mut matched = false;
+        let mut thrown = None;
+        self.for_each_match(&chars, |found| {
+            matched = true;
+            let gap = &chars[append_position..found.start()];
+            written += gap.len();
+            out.extend(gap);
+            match self.expand(&chars, found, &replacement, &mut out, &mut written)? {
+                Ok(()) => {}
+                Err(error) => {
+                    thrown = Some(error);
+                    return Ok(false);
+                }
             }
             append_position = found.end();
+            Ok(all)
+        })?;
+        if let Some(thrown) = thrown {
+            return Ok(Err(thrown));
         }
-        out.push_str(&text(&chars[append_position..]));
+        if !matched {
+            return Ok(Ok(input.to_owned()));
+        }
+        let tail = &chars[append_position..];
+        written += tail.len();
+        if written > MAX_OUTPUT_CHARS {
+            return Err(too_long());
+        }
+        out.extend(tail);
         Ok(Ok(out))
     }
 
@@ -204,10 +258,14 @@ impl Regex {
     fn expand(
         &self,
         chars: &[char],
-        found: &Match,
+        found: &Match<'_>,
         replacement: &[char],
         out: &mut String,
+        written: &mut usize,
     ) -> R<Result<(), Thrown>> {
+        if *written > MAX_OUTPUT_CHARS {
+            return Err(too_long());
+        }
         let mut cursor = 0;
         while cursor < replacement.len() {
             let c = replacement[cursor];
@@ -216,11 +274,13 @@ impl Regex {
                 let Some(escaped) = replacement.get(cursor) else {
                     return Ok(Err(illegal_argument("character to be escaped is missing")));
                 };
+                *written += 1;
                 out.push(*escaped);
                 cursor += 1;
                 continue;
             }
             if c != '$' {
+                *written += 1;
                 out.push(c);
                 cursor += 1;
                 continue;
@@ -288,62 +348,83 @@ impl Regex {
                 }));
             }
             if let Some((start, end)) = found.group(group)? {
-                out.push_str(&text(&chars[start..end]));
+                *written += end - start;
+                if *written > MAX_OUTPUT_CHARS {
+                    return Err(too_long());
+                }
+                out.extend(&chars[start..end]);
             }
         }
         Ok(Ok(()))
     }
 
-    /// `Pattern.split(input, limit)`.
+    /// `Pattern.split(input, limit)`, built as the matches are found. Java
+    /// keeps searching once `limit` parts are made but adds nothing more, so
+    /// the search stops there; past [`MAX_SPLIT_PARTS`] the call is counted.
     pub(crate) fn split(&self, input: &str, limit: i32) -> R<Vec<String>> {
         let chars = units(input)?;
-        let matches = self.find_all(&chars, None)?;
-        Ok(split_at(
-            &chars,
-            matches.iter().map(|m| (m.start(), m.end())),
-            limit,
-        ))
+        let limited = limit > 0;
+        let mut index = 0;
+        let mut match_count: i64 = 0;
+        let mut parts = Vec::new();
+        let mut too_many = false;
+        self.for_each_match(&chars, |found| {
+            let (start, end) = (found.start(), found.end());
+            if !limited || match_count < i64::from(limit) - 1 {
+                // A zero-width match at the very beginning never produces an
+                // empty leading substring.
+                if index == 0 && start == 0 && start == end {
+                    return Ok(true);
+                }
+                if parts.len() >= MAX_SPLIT_PARTS {
+                    too_many = true;
+                    return Ok(false);
+                }
+                parts.push(text(&chars[index..start]));
+                index = end;
+                match_count += 1;
+                Ok(true)
+            } else {
+                // `match_count == limit - 1`: the rest is the last part.
+                parts.push(text(&chars[index..]));
+                index = end;
+                Ok(false)
+            }
+        })?;
+        if too_many {
+            return Err(Unsupported(format!(
+                "a split into more than {MAX_SPLIT_PARTS} parts"
+            )));
+        }
+        let finished = limited && parts.len() as i64 == i64::from(limit);
+        if index == 0 && !finished {
+            return Ok(vec![text(&chars)]);
+        }
+        if index == 0 {
+            // `limit` 1: the one part is the whole input.
+            return Ok(parts);
+        }
+        if !finished {
+            if parts.len() >= MAX_SPLIT_PARTS {
+                return Err(Unsupported(format!(
+                    "a split into more than {MAX_SPLIT_PARTS} parts"
+                )));
+            }
+            parts.push(text(&chars[index..]));
+        }
+        if limit == 0 {
+            while parts.last().is_some_and(String::is_empty) {
+                parts.pop();
+            }
+        }
+        Ok(parts)
     }
 }
 
-/// Java's `Pattern.split` over the matches' bounds.
-fn split_at(
-    chars: &[char],
-    matches: impl Iterator<Item = (usize, usize)>,
-    limit: i32,
-) -> Vec<String> {
-    let limited = limit > 0;
-    let mut index = 0;
-    let mut match_count: i64 = 0;
-    let mut parts = Vec::new();
-    for (start, end) in matches {
-        if !limited || match_count < i64::from(limit) - 1 {
-            // A zero-width match at the very beginning never produces an
-            // empty leading substring.
-            if index == 0 && start == 0 && start == end {
-                continue;
-            }
-            parts.push(text(&chars[index..start]));
-            index = end;
-            match_count += 1;
-        } else if match_count == i64::from(limit) - 1 {
-            parts.push(text(&chars[index..]));
-            index = end;
-            match_count += 1;
-        }
-    }
-    if index == 0 {
-        return vec![text(chars)];
-    }
-    if !limited || match_count < i64::from(limit) {
-        parts.push(text(&chars[index..]));
-    }
-    if limit == 0 {
-        while parts.last().is_some_and(String::is_empty) {
-            parts.pop();
-        }
-    }
-    parts
+fn too_long() -> Unsupported {
+    Unsupported(format!(
+        "a replacement result longer than {MAX_OUTPUT_CHARS} chars"
+    ))
 }
 
 /// `String.matches(regex)` / `Pattern.matches(regex, input)`.

@@ -45,6 +45,29 @@ impl Limits {
     };
 }
 
+/// Why a search deeper than [`MAX_DEPTH`] is counted.
+const DEPTH_REASON: &str = "a search nested deeper than Java's stack is sure to allow";
+
+/// The predicate frames Java stacks to test one character against `class`
+/// beyond the node's own: a bracket class is a chain of predicates, each
+/// union, intersection, negation, range, predefined class or nested class
+/// calling the one before (`CharPredicate.union`/`and`/`negate`). Latin-1
+/// singles share one `BitClass` in Java; they are counted too, which only
+/// over-estimates. A bare character costs nothing extra.
+fn class_frames(class: &Class) -> usize {
+    match class {
+        Class::Union(items) => {
+            1 + items
+                .iter()
+                .map(|item| 1 + class_frames(item))
+                .sum::<usize>()
+        }
+        Class::And(left, right) => 1 + class_frames(left) + class_frames(right),
+        Class::Not(inner) => 1 + class_frames(inner),
+        _ => 0,
+    }
+}
+
 /// See [`Limits::JAVA`]. Measured against JDK 27's shortest overflow
 /// (`-Xint`, 512 KB thread, the lowest of the settings tried): loop shapes
 /// overflowed from 2,678 of this engine's nodes (`(?:a|b)*?c`), 2.68 times
@@ -60,6 +83,14 @@ pub(crate) const MAX_DEPTH: usize = 1_000;
 /// thread keeps ~750 KB for its callers; the net only binds for a shape with
 /// larger frames than those, and tests pin that the depth binds first.
 const MAX_STACK: usize = 1_280 << 10;
+/// Stack kept free below a search, whatever its allowance: room for the
+/// frames that run after a search is refused (dropping, unwinding, a signal
+/// handler) on a thread the matcher shares with the interpreter.
+const STACK_RESERVE: usize = 128 << 10;
+/// The allowance where the platform does not report the thread's stack:
+/// what the interpreter promises to leave free on a 2 MiB thread
+/// (`MAX_JAR_CALL_DEPTH`) less [`STACK_RESERVE`].
+const UNKNOWN_STACK: usize = 512 << 10;
 
 type R<T> = Result<T, Unsupported>;
 
@@ -79,11 +110,15 @@ enum Node {
     End(End),
     One {
         class: Class,
+        /// [`class_frames`] of `class`.
+        frames: usize,
         next: usize,
     },
     /// A single-character repetition (Java's `Curly` over a `CharProperty`).
     Curly {
         class: Class,
+        /// [`class_frames`] of `class`.
+        frames: usize,
         min: u32,
         max: Option<u32>,
         greed: Greed,
@@ -289,6 +324,7 @@ impl Compiler<'_> {
             Ast::Empty => next,
             Ast::One(class) => self.push(Node::One {
                 class: class.clone(),
+                frames: class_frames(class),
                 next,
             }),
             Ast::Concat(items) => {
@@ -385,6 +421,7 @@ impl Compiler<'_> {
         if let Ast::One(class) = node {
             return Ok(self.push(Node::Curly {
                 class: class.clone(),
+                frames: class_frames(class),
                 min,
                 max,
                 greed,
@@ -577,7 +614,7 @@ pub(crate) struct Matcher<'a> {
 
 /// The address of a fresh local: where the stack is now.
 #[inline(always)]
-fn stack_position() -> usize {
+pub(crate) fn stack_position() -> usize {
     let marker = 0u8;
     std::hint::black_box(&marker) as *const u8 as usize
 }
@@ -589,6 +626,15 @@ impl<'a> Matcher<'a> {
     /// target).
     pub(crate) fn new(program: &'a Program, text: &'a [char], limits: Limits) -> Self {
         let stack_base = stack_position();
+        // The allowance is what is left of this thread's stack below here,
+        // less a reserve, never more than `limits.stack`: the interpreter's
+        // own frames above may already have used most of the thread.
+        let left = super::stack::remaining(stack_base)
+            .map_or(UNKNOWN_STACK, |left| left.saturating_sub(STACK_RESERVE));
+        let limits = Limits {
+            stack: limits.stack.min(left),
+            ..limits
+        };
         Self {
             program,
             text,
@@ -615,6 +661,13 @@ impl<'a> Matcher<'a> {
     /// Java's `Matcher.search(from)`: the leftmost match at or after `from`.
     /// Sets `groups` and answers whether one was found.
     pub(crate) fn search(&mut self, from: usize) -> R<bool> {
+        // Resetting every group's bounds is work too: a pattern with
+        // hundreds of groups over a long input is bounded by the same step
+        // budget as its matching (input length × group count).
+        self.steps += self.groups.len() / 2;
+        if self.steps > MAX_STEPS {
+            return Err(self.refusal());
+        }
         self.reset_groups();
         self.anchor_end = false;
         for start in from..=self.text.len() {
@@ -654,15 +707,26 @@ impl<'a> Matcher<'a> {
             && self.stack_base.saturating_sub(here) <= self.limits.stack
     }
 
+    /// Java tests a bracket class through a chain of predicates, one frame
+    /// each, on top of the frames the match is already in. A class of
+    /// `frames` such frames tested at the current depth must fit
+    /// [`Limits::depth`] too.
+    fn class_fits(&self, frames: usize) -> R<()> {
+        if self.depth + frames > self.limits.depth {
+            return Err(Unsupported(DEPTH_REASON.into()));
+        }
+        Ok(())
+    }
+
     #[cold]
     #[inline(never)]
     fn refusal(&self) -> Unsupported {
         Unsupported(if self.steps > MAX_STEPS {
             "a search over its step budget".into()
         } else if self.depth >= self.limits.depth {
-            "a search nested deeper than Java's stack is sure to allow".into()
+            DEPTH_REASON.into()
         } else {
-            "a search past its stack budget".into()
+            "a search past the stack left on this thread".into()
         })
     }
 
@@ -689,14 +753,19 @@ impl<'a> Matcher<'a> {
         self.peak_depth = self.peak_depth.max(self.depth);
         let result = match &self.program.nodes[id] {
             Node::End(end) => Ok(self.end(*end, i)),
-            Node::One { class, next } => self.one(class, *next, i),
+            Node::One {
+                class,
+                frames,
+                next,
+            } => self.one(class, *frames, *next, i),
             Node::Curly {
                 class,
+                frames,
                 min,
                 max,
                 greed,
                 next,
-            } => self.curly_frame(class, *min, *max, *greed, *next, i),
+            } => self.curly_frame(class, *frames, *min, *max, *greed, *next, i),
             Node::GroupHead { local, next } => self.group_head(*local, *next, i),
             Node::GroupTail { local, group, next } => self.group_tail(*local, *group, *next, i),
             Node::Branch { alternatives, next } => self.branch(alternatives, *next, i),
@@ -742,7 +811,8 @@ impl<'a> Matcher<'a> {
     }
 
     #[inline(never)]
-    fn one(&mut self, class: &Class, next: usize, i: usize) -> R<bool> {
+    fn one(&mut self, class: &Class, frames: usize, next: usize, i: usize) -> R<bool> {
+        self.class_fits(frames)?;
         match self.text.get(i) {
             Some(c) if test(class, *c)? => self.at(next, i + 1),
             _ => Ok(false),
@@ -943,9 +1013,11 @@ impl<'a> Matcher<'a> {
     /// against ~2,700 nodes for other shapes. Weighted, the margin under
     /// Java's floor is the same for both.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn curly_frame(
         &mut self,
         class: &Class,
+        frames: usize,
         min: u32,
         max: Option<u32>,
         greed: Greed,
@@ -955,6 +1027,7 @@ impl<'a> Matcher<'a> {
         if self.depth >= self.limits.depth {
             return Err(self.refusal());
         }
+        self.class_fits(frames + 1)?;
         self.depth += 1;
         self.peak_depth = self.peak_depth.max(self.depth);
         let result = self.curly(class, min, max, greed, next, i);

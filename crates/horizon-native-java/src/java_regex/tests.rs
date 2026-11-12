@@ -748,6 +748,23 @@ fn long_pattern_overflows() -> Vec<(
         |text: &'static str| -> Box<dyn Fn(usize) -> String> { Box::new(move |_| text.to_owned()) };
     let each =
         |unit: &'static str| -> Box<dyn Fn(usize) -> String> { Box::new(move |n| unit.repeat(n)) };
+    let big_class = || -> String {
+        format!(
+            "[{}]",
+            (0..499u32)
+                .map(|i| char::from_u32(0x100 + i).unwrap())
+                .collect::<String>()
+        )
+    };
+    let fixed_class = move |lead: &'static str| -> Box<dyn Fn(usize) -> String> {
+        Box::new(move |_| format!("{lead}{}", big_class()))
+    };
+    let seq_class = move |unit: &'static str| -> Box<dyn Fn(usize) -> String> {
+        Box::new(move |n| format!("{}{}", unit.repeat(n), big_class()))
+    };
+    let each_then = |unit: &'static str, last: &'static str| -> Box<dyn Fn(usize) -> String> {
+        Box::new(move |n| unit.repeat(n) + last)
+    };
     let class = |unit: &'static str, last: &'static str| -> Box<dyn Fn(usize) -> String> {
         Box::new(move |n| format!("[{}{last}]", unit.repeat(n)))
     };
@@ -813,6 +830,68 @@ fn long_pattern_overflows() -> Vec<(
         ("deep \\R", seq("\\R"), each("\n"), 3275),
         ("deep .", seq("."), each("a"), 3274),
         ("deep (?=a)a", seq("(?=a)a"), each("a"), 1588),
+        // A 499-item non-Latin-1 class tested at the deepest point: Java
+        // stacks its predicate chain on top of the match's frames.
+        (
+            "(?:(?:a|b)|c)*?[499]",
+            fixed_class("(?:(?:a|b)|c)*?"),
+            each_then("a", "\u{100}"),
+            238,
+        ),
+        (
+            "(?:a(?<=a)|b)*?[499]",
+            fixed_class("(?:a(?<=a)|b)*?"),
+            each_then("a", "\u{100}"),
+            328,
+        ),
+        (
+            "(a|b)*[499]",
+            fixed_class("(a|b)*"),
+            each_then("a", "\u{100}"),
+            398,
+        ),
+        (
+            "(?:a|b)*[499]",
+            fixed_class("(?:a|b)*"),
+            each_then("a", "\u{100}"),
+            398,
+        ),
+        (
+            "((?:a|b)c?)*[499]",
+            fixed_class("((?:a|b)c?)*"),
+            each_then("a", "\u{100}"),
+            264,
+        ),
+        (
+            "(?:(a)|b)*[499]",
+            fixed_class("(?:(a)|b)*"),
+            each_then("a", "\u{100}"),
+            293,
+        ),
+        (
+            ". × n [499]",
+            seq_class("."),
+            each_then("a", "\u{100}"),
+            2436,
+        ),
+        (
+            "a{0,2} × n [499]",
+            seq_class("a{0,2}"),
+            each_then("a", "\u{100}"),
+            1147,
+        ),
+        (
+            "(a) × n [499]",
+            seq_class("(a)"),
+            each_then("a", "\u{100}"),
+            780,
+        ),
+        (
+            "(?:a|b) × n [499]",
+            seq_class("(?:a|b)"),
+            each_then("a", "\u{100}"),
+            482,
+        ),
     ]
 }
 
@@ -847,6 +926,88 @@ fn long_patterns_stop_well_below_java_overflows() {
             }
             println!("tightest margin {tightest:.2}");
         })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// The final review's memory repro: a pattern of 498 empty groups and an
+/// empty alternative matches between every pair of characters. Matches are
+/// streamed (only the current one is held), and resetting 499 groups per
+/// search is charged to the step budget, so 400,000 characters are counted
+/// instead of building ~3 GB of match records. JDK 27 answers it
+/// (`xaxa…x`); a short input still answers the same.
+#[test]
+fn many_matches_with_many_groups_are_streamed_or_counted() {
+    let pattern = format!("|{}", "()".repeat(498));
+    let regex = Regex::compile(&pattern, 0).expect("modelled");
+    let long = "a".repeat(400_000);
+    assert!(regex.replace(&long, "x", true).is_err());
+    assert!(regex.split(&long, 0).is_err());
+    let short = "a".repeat(1_000);
+    let expected = format!("x{}", "ax".repeat(1_000));
+    assert_eq!(regex.replace(&short, "x", true), Ok(Ok(expected)));
+    assert_eq!(regex.split(&short, 0).map(|parts| parts.len()), Ok(1_000));
+    // A split past `MAX_SPLIT_PARTS` stops there and is counted; a limit
+    // stops the search once it is reached, as Java adds nothing after it.
+    let wide = "a".repeat(100_000);
+    assert!(string_split(&wide, "", 0).is_err());
+    assert_eq!(
+        string_split(&wide, "", 3).map(|parts| parts.iter().map(String::len).collect::<Vec<_>>()),
+        Ok(vec![1, 1, 99_998])
+    );
+}
+
+/// A result Java cannot hold (`OutOfMemoryError` past `Integer.MAX_VALUE`
+/// chars, whatever its heap) or the game should not allocate is counted,
+/// not built: 2,000 × 1,100,000 chars here.
+#[test]
+fn an_oversized_replacement_result_is_counted() {
+    let huge = "x".repeat(1_100_000);
+    assert!(super::replace(&"a".repeat(2_000), "a", &huge, true).is_err());
+    assert_eq!(
+        super::replace("aa", "a", "xy", true),
+        Ok(Ok("xyxy".to_owned()))
+    );
+}
+
+/// The final review's stack repro: the matcher shares its thread with the
+/// interpreter, whose unoptimized frames take ~100 KB each. Called from
+/// under 0–17 such frames on a 2 MB thread (17 leave almost nothing), the
+/// deepest search the bound allows either answers like JDK 27 (`true`) or
+/// is counted when the stack left cannot hold it; it never overflows.
+#[test]
+fn a_search_under_deep_caller_frames_never_overflows() {
+    fn nested(frames: usize, out: &mut Vec<Result<bool, Unsupported>>) {
+        let ballast = [0u8; 100 << 10];
+        std::hint::black_box(&ballast);
+        if frames == 0 {
+            out.push(matches("(?:a|b)*", &"a".repeat(199)));
+        } else {
+            nested(frames - 1, out);
+        }
+        std::hint::black_box(&ballast);
+    }
+    for frames in 0..=17 {
+        let answers = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let mut out = Vec::new();
+                nested(frames, &mut out);
+                out
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match &answers[0] {
+            Ok(answer) => assert!(*answer, "{frames} frames"),
+            Err(Unsupported(reason)) => assert!(reason.contains("stack"), "{frames}: {reason}"),
+        }
+    }
+    // With nothing above it, the same search answers.
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| assert_eq!(matches("(?:a|b)*", &"a".repeat(199)), Ok(true)))
         .unwrap()
         .join()
         .unwrap();
