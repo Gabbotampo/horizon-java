@@ -357,31 +357,314 @@ fn review_cases_answer_like_java_or_are_counted() {
     );
 }
 
-/// Deep searches on a 2 MB thread (a test harness's default) in any build:
-/// past the inline stack budget the search reruns on its own large-stack
-/// thread instead of overflowing. Each input matches on OpenJDK 27.
+/// Shapes whose recursion grows with the input, and the shortest input
+/// length (in characters) on which OpenJDK 27 threw `StackOverflowError`
+/// over seven settings: `-Xint`, C1 and tiered (cold and warm), on 1 MB and
+/// 512 KB threads (`-Xint` on 512 KB was the lowest for every shape).
+/// `None`: Java runs the shape iteratively and never overflowed (tried up
+/// to 524,288 characters).
+/// (pattern, repeated unit, prefix, suffix, `find` rather than `matches`,
+/// Java's shortest overflowing length, Java's answer on 100 characters)
+const JAVA_OVERFLOWS: &[(&str, &str, &str, &str, bool, Option<usize>, bool)] = &[
+    ("(a|b)*", "ab", "", "", false, Some(535), true),
+    ("^(?:\\w|-)+$", "a-", "", "", false, Some(535), true),
+    ("(?:\\s|,)+", " ,", "", "", false, Some(535), true),
+    ("((?:a|b)c?)*", "abc", "", "", false, Some(530), true),
+    ("(?:a|b)*?c", "ab", "", "c", false, Some(535), true),
+    ("(?:(?!x).)*", "ab", "", "", false, None, true),
+    (
+        "\"(?:\\\\.|[^\"\\\\])*\"",
+        "a\\\"",
+        "\"",
+        "\"",
+        false,
+        Some(737),
+        true,
+    ),
+    ("(\\w+\\s?)*", "ab ", "", "", false, Some(1870), true),
+    ("(?:a|b)+$", "ab", "", "", true, Some(535), true),
+    ("(?:ab|cd)*", "abcd", "", "", false, Some(1038), true),
+    ("(?:a(?=b)|b)*", "ab", "", "", false, Some(490), true),
+    ("(?:a|b)*+", "ab", "", "", false, None, true),
+    ("(?:a|b)*c", "ab", "", "", true, Some(535), false),
+    ("(?:[a-z]|\\d)*", "a1", "", "", false, Some(535), true),
+    ("(?:(a)|b)*", "ab", "", "", false, Some(454), true),
+    ("(?:ab)*", "ab", "", "", false, None, true),
+];
+
+fn overflow_input(unit: &str, prefix: &str, suffix: &str, n: usize) -> Vec<char> {
+    let mut text: Vec<char> = prefix.chars().collect();
+    text.extend(unit.chars().cycle().take(n));
+    text.extend(suffix.chars());
+    text
+}
+
+/// One search with the given limits: its answer and the deepest recursion
+/// and stack it used.
+fn probe_depth(
+    pattern: &str,
+    text: &[char],
+    find: bool,
+    limits: super::engine::Limits,
+) -> (Result<bool, Unsupported>, usize, usize) {
+    let regex = Regex::compile(pattern, 0).expect("modelled");
+    let mut matcher = super::engine::Matcher::new(&regex.program, text, limits);
+    let answer = if find {
+        matcher.search(0)
+    } else {
+        matcher.match_at_start(true)
+    };
+    let bytes = matcher.stack_base_minus_low();
+    (answer, matcher.peak_depth, bytes)
+}
+
+/// Prints, for each shape, the node depth this engine reaches on the
+/// shortest input Java overflowed on and the stack bytes per node of this
+/// build. `MAX_DEPTH` is chosen from this table.
 #[test]
-fn deep_searches_do_not_overflow_a_small_stack() {
-    let alternating: String = (0..300)
-        .map(|i| if i % 2 == 0 { 'a' } else { 'b' })
-        .collect();
-    let literal: String = "xyz".repeat(834)[..2500].to_owned();
-    let cases = [
-        ("(a|b)*".to_owned(), alternating.clone()),
-        ("(?:a|b)*c".to_owned(), format!("{alternating}c")),
-        ("(?:ab)*".to_owned(), "ab".repeat(1000)),
-        (literal.clone(), literal),
-    ];
+#[ignore = "a measurement, run with --nocapture"]
+fn measure_depth_against_java_overflows() {
     std::thread::Builder::new()
-        .stack_size(2 << 20)
-        .spawn(move || {
-            for (pattern, input) in &cases {
-                assert_eq!(matches(pattern, input), Ok(true), "{pattern:.20}");
+        .stack_size(1 << 30)
+        .spawn(|| {
+            let free = super::engine::Limits {
+                depth: usize::MAX,
+                stack: usize::MAX,
+            };
+            for (pattern, unit, prefix, suffix, find, java, _) in JAVA_OVERFLOWS {
+                let n = java.unwrap_or(2_000);
+                let text = overflow_input(unit, prefix, suffix, n);
+                let (answer, depth, bytes) = probe_depth(pattern, &text, *find, free);
+                println!(
+                    "{pattern:24} java_n={java:?} depth={depth} per_char={:.2} bytes_per_node={} answer={answer:?}",
+                    depth as f64 / n as f64,
+                    bytes / depth.max(1),
+                );
             }
         })
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// Every deep shape on a 2 MB thread (a test harness's default) in any
+/// build, with no thread of its own: answered like JDK 27 on 100 characters,
+/// counted from the shortest input JDK 27 overflowed on, and never more
+/// than a counted answer on 200,000 characters. The bound sits at least
+/// twice below the depth those Java overflows correspond to.
+#[test]
+fn deep_searches_are_counted_where_java_can_overflow() {
+    use super::engine::{Limits, MAX_DEPTH};
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            for (pattern, unit, prefix, suffix, find, java, short) in JAVA_OVERFLOWS {
+                let text = overflow_input(unit, prefix, suffix, 100);
+                let (answer, _, _) = probe_depth(pattern, &text, *find, Limits::JAVA);
+                assert_eq!(answer, Ok(*short), "{pattern} on 100 characters");
+                if let Some(n) = java {
+                    let text = overflow_input(unit, prefix, suffix, *n);
+                    let (answer, _, _) = probe_depth(pattern, &text, *find, Limits::JAVA);
+                    assert!(
+                        answer.is_err(),
+                        "{pattern} answered at Java's overflow ({n})"
+                    );
+                }
+                let text = overflow_input(unit, prefix, suffix, 200_000);
+                let _ = probe_depth(pattern, &text, *find, Limits::JAVA);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    // The margin, measured without limits on a large stack.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(|| {
+            let free = Limits {
+                depth: usize::MAX,
+                stack: usize::MAX,
+            };
+            for (pattern, unit, prefix, suffix, find, java, _) in JAVA_OVERFLOWS {
+                let Some(n) = java else { continue };
+                let text = overflow_input(unit, prefix, suffix, *n);
+                let (_, depth, _) = probe_depth(pattern, &text, *find, free);
+                assert!(
+                    depth >= 2 * MAX_DEPTH,
+                    "{pattern}: Java overflowed at depth {depth}"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// The second independent review of #81: `\R` in a repeated group (Java's
+/// `GroupCurly` makes each iteration atomic), `\v` as a range endpoint
+/// (U+000B), and `\c` whose operand is `\` (`\Q` opens a quote first).
+/// (pattern, input, call, replacement, OpenJDK 27's answer: `OK <value>`,
+/// with split parts joined by `|`, or `PSE` for a rejected pattern). Each
+/// must be Java's answer or counted; the shapes now modelled must answer.
+#[test]
+fn second_review_cases_answer_like_java_or_are_counted() {
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "(\\R){2,}",
+            "line1\u{d}\u{a}line2",
+            "replaceAll",
+            "\u{a}\u{a}",
+            "OK line1\u{d}\u{a}line2",
+        ),
+        (
+            "(?:\\R){2,}",
+            "a\u{d}\u{a}b",
+            "split",
+            "",
+            "OK a\u{d}\u{a}b",
+        ),
+        ("(?:\\R){2}", "\u{d}\u{a}", "matches", "", "OK false"),
+        ("(?:\\R){1}\\n", "\u{d}\u{a}", "matches", "", "OK false"),
+        (
+            "(?:\\R)*\\n",
+            "\u{d}\u{a}",
+            "replaceAll",
+            "<$0>",
+            "OK \u{d}<\u{a}>",
+        ),
+        (
+            "(?:x\\R)*\\n",
+            "x\u{d}\u{a}x\u{d}\u{a}",
+            "replaceAll",
+            "<$0>",
+            "OK x\u{d}<\u{a}>x\u{d}<\u{a}>",
+        ),
+        (
+            "(\\R){0,2}\\1",
+            "\u{d}\u{a}\u{a}aba",
+            "replaceAll",
+            "<$0>",
+            "OK \u{d}<\u{a}\u{a}>aba",
+        ),
+        ("(?:\\R)*\\n", "\u{d}\u{a}", "matches", "", "OK false"),
+        ("(\\R)*\\n", "\u{d}\u{a}", "matches", "", "OK false"),
+        ("(\\R)+\\n", "\u{d}\u{a}", "matches", "", "OK false"),
+        (
+            "(?:\\R){2}\\n",
+            "\u{d}\u{d}\u{a}",
+            "matches",
+            "",
+            "OK false",
+        ),
+        ("(?:\\R)*?\\n", "\u{d}\u{a}", "matches", "", "OK false"),
+        ("(?:\\R){1,3}\\n", "\u{d}\u{a}", "matches", "", "OK false"),
+        (
+            "(?:x\\R)*\\n",
+            "x\u{d}\u{a}x\u{d}\u{a}",
+            "matches",
+            "",
+            "OK false",
+        ),
+        ("(\\R){2}", "\u{d}\u{a}", "matches", "", "OK false"),
+        (
+            "((?:\\R){2})\\n",
+            "\u{d}\u{d}\u{a}",
+            "matches",
+            "",
+            "OK false",
+        ),
+        (
+            "(?:\\R\\R)*\\n",
+            "\u{d}\u{d}\u{a}",
+            "matches",
+            "",
+            "OK false",
+        ),
+        (
+            "b(?:(?:\\R){2}){1}([ab]a)+",
+            "b\u{d}\u{a}babx",
+            "replaceAll",
+            "<$0>",
+            "OK b\u{d}\u{a}babx",
+        ),
+        ("(?:\\R)?\\n", "\u{d}\u{a}", "matches", "", "OK true"),
+        ("(\\R)??\\n", "\u{d}\u{a}", "matches", "", "OK true"),
+        ("\\R\\n", "\u{d}\u{a}", "matches", "", "OK true"),
+        ("[\\v-z]", "a-b", "replaceAll", "X", "OK XXX"),
+        ("[\\v-\\W]", "a", "matches", "", "PSE"),
+        ("[\\v-z]", "a", "matches", "", "OK true"),
+        ("[\\v-]", "\u{a}", "matches", "", "OK false"),
+        ("[\\v-]", "-", "matches", "", "OK true"),
+        ("[\\v-]", "\u{b}", "matches", "", "OK true"),
+        ("[^\\v-z]", "a", "matches", "", "OK false"),
+        ("[\\v-\\v]", "-", "matches", "", "OK false"),
+        ("[\\v-\\v]", "\u{b}", "matches", "", "OK true"),
+        ("[\\t-\\v]", "\u{a}", "matches", "", "OK true"),
+        ("[\\v-\\r]", "-", "matches", "", "OK false"),
+        ("[\\v-\\r]", "\u{c}", "matches", "", "OK true"),
+        ("[\\v-A-Z]", "B", "matches", "", "OK false"),
+        ("[\\v-\\-]", "&", "matches", "", "OK true"),
+        ("[\\v-\\x41]", "&", "matches", "", "OK true"),
+        ("[\\v-\\u0045]", "A", "matches", "", "OK true"),
+        ("[\\v-a-]", "A", "matches", "", "OK true"),
+        ("[\\v-b-d]", "a", "matches", "", "OK true"),
+        ("[\\v-z\\v]", "a", "matches", "", "OK true"),
+        ("[\\v-\u{e9}]", "a", "matches", "", "OK true"),
+        ("[\\v-\\d]", "a", "matches", "", "PSE"),
+        ("[\\v-\\c[]", "-", "matches", "", "OK false"),
+        ("[\\v-\\e]", "-", "matches", "", "OK false"),
+        ("[\\v-\\f]", "-", "matches", "", "OK false"),
+        ("[^\\v-]", "\u{a}", "matches", "", "OK true"),
+        ("[a\\v]", "\u{a}", "matches", "", "OK true"),
+        ("[\\v]", "\u{b}", "matches", "", "OK true"),
+        (
+            "\\pN{0,2}[b-c\\v-\\\\]",
+            "9N0&",
+            "replaceAll",
+            "<$0>",
+            "OK <9N><0&>",
+        ),
+        ("\\c\\Q.", "\u{1c}Q.", "matches", "", "OK false"),
+        ("\\c\\Qab", "!b", "matches", "", "OK true"),
+        (
+            "a\\c\\Q*",
+            "\u{1c}Qab",
+            "replaceAll",
+            "<$0>",
+            "OK \u{1c}Q<a>b",
+        ),
+        ("[\\c\\Q]", "Q7", "replaceAll", "<$0>", "OK Q7"),
+        ("\\c\\\\", "\u{1c}\\", "matches", "", "PSE"),
+    ];
+    let answered = [
+        "[\\v-z]",
+        "[\\v-]",
+        "[^\\v-z]",
+        "[\\v-\\v]",
+        "[\\t-\\v]",
+        "[\\v-\\r]",
+        "[\\v-A-Z]",
+        "[\\v-\\x41]",
+        "(?:\\R)?\\n",
+        "(\\R)??\\n",
+        "\\R\\n",
+    ];
+    for (pattern, input, call, replacement, java) in cases {
+        let ours = match *call {
+            "matches" => matches(pattern, input).map(|m| m.to_string()),
+            "replaceAll" => super::replace(input, pattern, replacement, true)
+                .map(|result| result.unwrap_or_else(|thrown| format!("{thrown:?}"))),
+            _ => string_split(input, pattern, 0).map(|parts| parts.join("|")),
+        };
+        match (java.strip_prefix("OK "), ours) {
+            (Some(java), Ok(ours)) => assert_eq!(ours, java, "{pattern:?} {call} {input:?}"),
+            (None, Ok(ours)) => panic!("{pattern:?}: Java {java}, answered {ours:?}"),
+            (_, Err(_)) => assert!(
+                !answered.contains(pattern),
+                "{pattern:?} {call} {input:?} is modelled but was counted"
+            ),
+        }
+    }
 }
 
 /// `Pattern.quote` and `Matcher.quoteReplacement`, answers from OpenJDK 27.

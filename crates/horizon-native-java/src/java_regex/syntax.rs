@@ -126,6 +126,37 @@ pub(crate) enum Ast {
     Assert(Assert),
 }
 
+/// The node `\R` parses to (see `escape_atom`).
+fn is_line_break(ast: &Ast) -> bool {
+    let Ast::Group(None, body) = ast else {
+        return false;
+    };
+    let Ast::Alt(alternatives) = body.as_ref() else {
+        return false;
+    };
+    matches!(
+        alternatives.as_slice(),
+        [Ast::Concat(crlf), Ast::One(Class::Union(_))]
+            if matches!(
+                crlf.as_slice(),
+                [Ast::One(Class::Char('\r', false)), Ast::One(Class::Char('\n', false))]
+            )
+    )
+}
+
+/// Whether `ast` holds a `\R` anywhere.
+fn contains_line_break(ast: &Ast) -> bool {
+    is_line_break(ast)
+        || match ast {
+            Ast::Empty | Ast::One(_) | Ast::Backref(_) | Ast::Assert(_) => false,
+            Ast::Concat(items) | Ast::Alt(items) => items.iter().any(contains_line_break),
+            Ast::Group(_, node)
+            | Ast::Repeat { node, .. }
+            | Ast::Look { node, .. }
+            | Ast::Atomic(node) => contains_line_break(node),
+        }
+}
+
 /// A parsed pattern.
 #[derive(Debug, Clone)]
 pub(crate) struct Parsed {
@@ -483,6 +514,13 @@ impl Parser {
                 literal(char::from_u32(value).ok_or_else(|| Unsupported("\\u".into()))?)
             }
             'c' => {
+                // Java first rewrites `\Q...\E` over the whole pattern, reading
+                // backslashes in pairs, so in `\c\Q` the `\Q` opens a quote
+                // before `\c` takes its operand. Whatever follows, a `\`
+                // operand is counted.
+                if self.peek() == Some('\\') {
+                    return unsupported("\\c with a '\\' operand");
+                }
                 let control = self.next()? as u32 ^ 64;
                 literal(char::from_u32(control).ok_or_else(|| Unsupported("\\c".into()))?)
             }
@@ -683,6 +721,13 @@ impl Parser {
         let ci = self.ci();
         let start = if c == '\\' {
             self.at += 1;
+            // `Pattern.escape(inclass, create, isrange)` keeps `\v` as U+000B
+            // when a `-` follows it (Java's pre-1.8 meaning), so `[\v-z]` is
+            // the range U+000B..z and `[\v-]` holds U+000B and `-`.
+            if self.peek() == Some('v') && self.peek_at(1) == Some('-') {
+                self.at += 1;
+                return self.range_from('\u{0B}', ci);
+            }
             if matches!(
                 self.peek(),
                 Some('Q' | 'E' | 'b' | 'B' | 'R' | 'k' | 'A' | 'z' | 'Z' | 'G' | 'X' | 'N')
@@ -706,6 +751,12 @@ impl Parser {
             self.at += 1;
             c
         };
+        self.range_from(start, ci)
+    }
+
+    /// The rest of a class item that began with the character `start`: a
+    /// range when a `-` and an end follow, else `start` alone.
+    fn range_from(&mut self, start: char, ci: bool) -> Result<Class, Unsupported> {
         if self.peek() != Some('-') {
             return Ok(Class::Char(start, ci));
         }
@@ -718,13 +769,20 @@ impl Parser {
                 self.at += 1;
                 let end = if end == '\\' {
                     self.at += 1;
-                    if !matches!(self.peek(), Some(c) if !c.is_ascii_alphanumeric() || matches!(c, 't' | 'n' | 'r' | 'f' | 'a' | 'e' | 'x' | 'u' | '0' | 'c'))
-                    {
-                        return unsupported("a range ending in a class escape");
-                    }
-                    match self.escape_class()? {
-                        Class::Char(end, _) => end,
-                        _ => return unsupported("a range ending in a class escape"),
+                    // A range end is read with `isrange` set too: `\v` there
+                    // is U+000B (`[\t-\v]`).
+                    if self.peek() == Some('v') {
+                        self.at += 1;
+                        '\u{0B}'
+                    } else {
+                        if !matches!(self.peek(), Some(c) if !c.is_ascii_alphanumeric() || matches!(c, 't' | 'n' | 'r' | 'f' | 'a' | 'e' | 'x' | 'u' | '0' | 'c'))
+                        {
+                            return unsupported("a range ending in a class escape");
+                        }
+                        match self.escape_class()? {
+                            Class::Char(end, _) => end,
+                            _ => return unsupported("a range ending in a class escape"),
+                        }
                     }
                 } else {
                     self.at += 1;
@@ -880,6 +938,9 @@ impl Parser {
 
     /// The quantifier after `atom`, if any.
     fn quantified(&mut self, atom: Atom) -> Result<Ast, Unsupported> {
+        // Java turns `?` and `??` on a group into a `Branch`; every other
+        // quantifier on it is a `Curly`/`GroupCurly`/`Loop`.
+        let question = self.peek() == Some('?');
         let (min, max) = match self.peek() {
             Some('*') => {
                 self.at += 1;
@@ -932,6 +993,14 @@ impl Parser {
         };
         if self.quantifier_follows() {
             return unsupported("a quantifier after a quantifier");
+        }
+        // `LineEnding.study` (`\R`) leaves a group "deterministic", so Java
+        // repeats a group around it with `GroupCurly`, whose iterations are
+        // atomic: `\R` there never gives `\r\n` back to match `\r` alone.
+        // This engine's loop would backtrack into it, so only the `Branch`
+        // forms are answered.
+        if (!question || greed == Greed::Possessive) && contains_line_break(&atom.ast) {
+            return unsupported("a quantified group around \\R");
         }
         Ok(Ast::Repeat {
             node: Box::new(atom.ast),
