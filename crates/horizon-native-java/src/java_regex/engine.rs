@@ -17,8 +17,8 @@ use super::syntax::{Assert, Ast, Category, Class, Greed, Parsed, Posix};
 
 /// Node visits one operation (a whole `replaceAll`, say) may spend.
 const MAX_STEPS: usize = 2_000_000;
-/// Recursion depth of one match; a deeper search is counted.
-const MAX_DEPTH: usize = 2_000;
+/// The reason a search that needs more stack than it was given stops with.
+pub(crate) const STACK_REASON: &str = "a search nested past its stack budget";
 
 type R<T> = Result<T, Unsupported>;
 
@@ -122,9 +122,23 @@ pub(crate) struct Program {
     pub(crate) tainted: Vec<bool>,
 }
 
-struct Compiler {
+struct Compiler<'t> {
     nodes: Vec<Node>,
     locals: usize,
+    tainted: &'t [bool],
+}
+
+/// Whether `ast` can only ever match nothing, whatever it sees: anchors,
+/// lookarounds and empty groups. Java repeats such a group with rules this
+/// module does not model.
+fn zero_width_only(ast: &Ast) -> bool {
+    match ast {
+        Ast::Empty | Ast::Assert(_) | Ast::Look { .. } => true,
+        Ast::One(_) | Ast::Backref(_) => false,
+        Ast::Concat(items) | Ast::Alt(items) => items.iter().all(zero_width_only),
+        Ast::Group(_, node) | Ast::Atomic(node) => zero_width_only(node),
+        Ast::Repeat { node, max, .. } => *max == Some(0) || zero_width_only(node),
+    }
 }
 
 /// Whether `ast` can match without consuming a character.
@@ -217,7 +231,7 @@ fn behind_bounds(ast: &Ast) -> Option<(usize, usize)> {
     }
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn push(&mut self, node: Node) -> usize {
         self.nodes.push(node);
         self.nodes.len() - 1
@@ -293,10 +307,19 @@ impl Compiler {
                 let body = self.compile(node, end)?;
                 self.push(Node::Atomic { body, next })
             }
-            Ast::Backref(group) => self.push(Node::Backref {
-                group: *group,
-                next,
-            }),
+            Ast::Backref(group) => {
+                // A back reference reads the group while matching, so a value
+                // this module does not promise would change the match itself.
+                if self.tainted.get(*group).copied().unwrap_or(true) {
+                    return Err(Unsupported(format!(
+                        "a back reference to group {group}, whose value Java keeps by rules this module does not follow"
+                    )));
+                }
+                self.push(Node::Backref {
+                    group: *group,
+                    next,
+                })
+            }
             Ast::Assert(kind) => self.push(Node::Assert { kind: *kind, next }),
         })
     }
@@ -330,9 +353,10 @@ impl Compiler {
         let Ast::Group(group, body) = node else {
             return Err(Unsupported("a quantifier on a compound atom".into()));
         };
-        if behind_bounds(body) == Some((0, 0)) {
-            // A body that only ever matches nothing (`()*`, `(\b)+`) takes a
-            // `GroupCurly` path in Java that this module does not model.
+        if zero_width_only(body) {
+            // A body that only ever matches nothing (`()*`, `(\b)+`,
+            // `((?=a))*`) takes a `GroupCurly` path in Java that this module
+            // does not model.
             return Err(Unsupported("a quantified zero-width group".into()));
         }
         if greed == Greed::Possessive {
@@ -382,6 +406,7 @@ pub(crate) fn compile(parsed: Parsed) -> R<Program> {
     let mut compiler = Compiler {
         nodes: Vec::new(),
         locals: 0,
+        tainted: &tainted,
     };
     let end = compiler.push(Node::End(End::Main));
     let start = compiler.compile(&parsed.ast, end)?;
@@ -495,13 +520,27 @@ pub(crate) struct Matcher<'a> {
     /// Whether `End::Main` requires the end of the input (`matches()`).
     anchor_end: bool,
     steps: usize,
-    depth: usize,
+    /// The stack address the search started at, and how many bytes below it
+    /// the recursion may reach. Measured, not estimated, so the bound holds
+    /// for an unoptimized build's large frames and an optimized build's
+    /// small ones alike.
+    stack_base: usize,
+    stack_budget: usize,
+}
+
+/// The address of a fresh local: where the stack is now.
+#[inline(always)]
+fn stack_position() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
 }
 
 pub(crate) const UNSET: usize = usize::MAX;
 
 impl<'a> Matcher<'a> {
-    pub(crate) fn new(program: &'a Program, text: &'a [char]) -> Self {
+    /// A matcher whose recursion may use `stack_budget` bytes of the
+    /// current thread's stack (stacks grow down on every supported target).
+    pub(crate) fn new(program: &'a Program, text: &'a [char], stack_budget: usize) -> Self {
         Self {
             program,
             text,
@@ -511,7 +550,8 @@ impl<'a> Matcher<'a> {
             behind_to: 0,
             anchor_end: false,
             steps: 0,
-            depth: 0,
+            stack_base: stack_position(),
+            stack_budget,
         }
     }
 
@@ -553,18 +593,14 @@ impl<'a> Matcher<'a> {
         Ok(())
     }
 
-    /// Match node `id` at `i`. Recursion is bounded; the counters are
-    /// restored however the call returns.
+    /// Match node `id` at `i`. Recursion stops with [`STACK_REASON`] once it
+    /// has used its stack budget, before the thread's stack can run out.
     fn at(&mut self, id: usize, i: usize) -> R<bool> {
         self.spend()?;
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            self.depth -= 1;
-            return Err(Unsupported("a search nested past its depth budget".into()));
+        if self.stack_base.saturating_sub(stack_position()) > self.stack_budget {
+            return Err(Unsupported(STACK_REASON.into()));
         }
-        let result = self.node(id, i);
-        self.depth -= 1;
-        result
+        self.node(id, i)
     }
 
     fn node(&mut self, id: usize, i: usize) -> R<bool> {

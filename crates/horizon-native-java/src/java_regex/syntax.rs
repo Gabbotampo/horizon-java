@@ -612,15 +612,37 @@ impl Parser {
             left.push(Class::Char(']', self.ci()));
         }
         let mut intersection: Option<Class> = None;
+        // Inside an `&&` operand, whether a bare item / a nested class has
+        // been seen. Java parses an operand's bare run with a nested class
+        // parser that takes later `&&`s itself, and keeps adding literals
+        // after a nested operand to the class already on the left of the
+        // intersection; only the two plain shapes bind the way this parser
+        // does (`[X&&YZ]`, `[X&&[Y][Z]]`), anything mixed is counted.
+        let (mut operand_bare, mut operand_nested) = (false, false);
         loop {
             match self.next()? {
                 ']' => break,
-                '[' => left.push(self.class(depth + 1)?),
+                '[' => {
+                    if intersection.is_some() && operand_bare {
+                        return unsupported("a nested class after a bare item in an '&&' operand");
+                    }
+                    left.push(self.class(depth + 1)?);
+                    if intersection.is_some() {
+                        operand_nested = true;
+                        let closes = self.peek() == Some(']')
+                            || self.peek() == Some('[')
+                            || (self.peek() == Some('&') && self.peek_at(1) == Some('&'));
+                        if !closes {
+                            return unsupported("a nested '&&' operand followed by more items");
+                        }
+                    }
+                }
                 '&' if self.peek() == Some('&') => {
                     self.at += 1;
                     if left.is_empty() || matches!(self.peek(), Some('&' | ']')) {
                         return unsupported("an '&&' with an empty side");
                     }
+                    (operand_bare, operand_nested) = (false, false);
                     let side = Class::Union(std::mem::take(&mut left));
                     intersection = Some(match intersection.take() {
                         Some(previous) => Class::And(Box::new(previous), Box::new(side)),
@@ -628,6 +650,10 @@ impl Parser {
                     });
                 }
                 c => {
+                    if intersection.is_some() && operand_nested {
+                        return unsupported("a bare item after a nested class in an '&&' operand");
+                    }
+                    operand_bare = true;
                     self.at -= 1;
                     let item = self.class_item(c)?;
                     left.push(item);
