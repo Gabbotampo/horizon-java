@@ -521,6 +521,15 @@ fn neoforge_listeners_run_by_event_class_and_honour_set_canceled() {
     let mut host = StdHost::new();
     jar.execute("demo.NeoMod", None, "neoforge", &mut host)
         .unwrap();
+    // FML injects the `@EventBusSubscriber`s after the `@Mod` constructor.
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
     let found = host.game_listeners(&jar, true);
     let named: Vec<(GameEvent, EventLoader)> = found
         .listeners
@@ -650,6 +659,15 @@ fn neoforge_clone_answers_was_death_and_refuses_the_original() {
     let mut host = StdHost::new();
     jar.execute("demo.NeoMod", None, "neoforge", &mut host)
         .unwrap();
+    // FML injects the `@EventBusSubscriber`s after the `@Mod` constructor.
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
     let found = host.game_listeners(&jar, true);
     let of = |class: &str| {
         found
