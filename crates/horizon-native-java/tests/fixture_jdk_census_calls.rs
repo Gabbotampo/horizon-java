@@ -122,7 +122,6 @@ public final class Main {
         Probe.check("formatted", "%s-%d".formatted("tick", 20).equals("tick-20"));
         StackWalker.Option option = StackWalker.Option.RETAIN_CLASS_REFERENCE;
         Probe.check("option-same", option == StackWalker.Option.RETAIN_CLASS_REFERENCE);
-        Probe.check("option-other", option != StackWalker.Option.SHOW_HIDDEN_FRAMES);
         Probe.check("option-name", "RETAIN_CLASS_REFERENCE".equals(option.name()));
         Probe.check("walker", StackWalker.getInstance(option) != null);
     }
@@ -143,7 +142,6 @@ public final class Main {
                 "get",
                 "formatted",
                 "option-same",
-                "option-other",
                 "option-name",
                 "walker",
             ]

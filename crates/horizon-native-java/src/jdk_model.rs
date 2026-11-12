@@ -126,18 +126,16 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             "ALL" | "TRACE" | "DEBUG" | "INFO" | "WARNING" | "ERROR" | "OFF"
         )
         .then(|| Value::Ref(Some(format!("enum/java/lang/System$Logger$Level/{name}")))),
-        // `StackWalker.Option`'s constants. `getInstance` answers the same
-        // walker for any option set (its frames always carry their class), so
-        // an option is only handed to it or compared; the marker keeps the
+        // `StackWalker.Option.RETAIN_CLASS_REFERENCE` only. The walker model
+        // keeps each frame's class and method and has no hidden or
+        // reflection frames, which is what a walker with that option alone
+        // answers. The other three options change the answers (no
+        // `getCallerClass` without `RETAIN_CLASS_REFERENCE`, no method name
+        // with `DROP_METHOD_INFO`, extra frames with `SHOW_*_FRAMES`), so
+        // their reads stay unanswered and counted. The marker keeps the
         // enum's own name for `name()`/`toString`.
-        "java/lang/StackWalker$Option" => matches!(
-            name,
-            "RETAIN_CLASS_REFERENCE"
-                | "DROP_METHOD_INFO"
-                | "SHOW_REFLECT_FRAMES"
-                | "SHOW_HIDDEN_FRAMES"
-        )
-        .then(|| Value::Ref(Some(format!("enum/java/lang/StackWalker$Option/{name}")))),
+        "java/lang/StackWalker$Option" => (name == "RETAIN_CLASS_REFERENCE")
+            .then(|| Value::Ref(Some(format!("enum/java/lang/StackWalker$Option/{name}")))),
         _ => None,
     }
 }
@@ -1679,6 +1677,29 @@ mod tests {
 
     fn text(value: &str) -> Value {
         Value::Ref(Some(value.into()))
+    }
+
+    /// Only `RETAIN_CLASS_REFERENCE` matches what the walker model answers;
+    /// the options that change the JDK's answers stay unanswered.
+    #[test]
+    fn only_retain_class_reference_is_answered() {
+        assert_eq!(
+            static_field("java/lang/StackWalker$Option", "RETAIN_CLASS_REFERENCE"),
+            Some(text(
+                "enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE"
+            ))
+        );
+        for name in [
+            "DROP_METHOD_INFO",
+            "SHOW_REFLECT_FRAMES",
+            "SHOW_HIDDEN_FRAMES",
+        ] {
+            assert_eq!(
+                static_field("java/lang/StackWalker$Option", name),
+                None,
+                "{name}"
+            );
+        }
     }
 
     #[test]
