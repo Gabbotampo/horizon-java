@@ -2,9 +2,14 @@
 // calls, Double/Float.toString and Character queries, as JSON the Rust tests
 // replay (`crates/horizon-native-java/src/jdk_text_oracle.rs`):
 //
-//     /usr/lib/jvm/java-27-openjdk/bin/java -XX:-OmitStackTraceInFastThrow \
+//     $JAVA25/bin/java -XX:-OmitStackTraceInFastThrow \
 //         tools/jdk_tables/TextOracle.java 300 27 \
 //         > crates/horizon-native-java/src/jdk_text_oracle.json
+//
+// `$JAVA25` is a Java 25 JDK: Minecraft 26.3's launcher manifest pins
+// `"javaVersion": {"component": "java-runtime-epsilon", "majorVersion": 25}`,
+// so Java 25 is what a mod's JDK calls answer with. The committed sample was
+// written by Eclipse Adoptium 25.0.5+8-LTS; the file records the build.
 //
 // `-XX:-OmitStackTraceInFastThrow`: after enough identical implicit
 // `NullPointerException`s HotSpot throws a preallocated one with no message,
@@ -369,7 +374,9 @@ public class TextOracle {
             int cp = random.nextInt(3) == 0 ? random.nextInt(0x300) : random.nextInt(0x110000);
             characters.add(characterCase(cp));
         }
-        System.out.println("{\"jdk\":\"" + System.getProperty("java.version") + "\",\"seed\":" + args[1] + ",");
+        System.out.println("{\"jdk\":\"" + System.getProperty("java.version") + "\",\"jdk_build\":\""
+            + System.getProperty("java.vendor") + " " + System.getProperty("java.runtime.version")
+            + "\",\"seed\":" + args[1] + ",");
         System.out.println("\"builders\":[\n" + String.join(",\n", builders) + "\n],");
         System.out.println("\"doubles\":[\n" + String.join(",\n", doubles) + "\n],");
         System.out.println("\"floats\":[\n" + String.join(",\n", floats) + "\n],");

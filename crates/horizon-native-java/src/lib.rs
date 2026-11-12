@@ -10353,7 +10353,7 @@ fn format_integer_us(value: i64) -> String {
     }
 }
 
-/// `Double.toString(value)`, exactly as JDK 27 prints it (`jdk_float_text.rs`).
+/// `Double.toString(value)`, exactly as Java 25 prints it (`jdk_float_text.rs`).
 fn format_java_float(value: f64) -> String {
     jdk_float_text::double_to_string(value)
 }

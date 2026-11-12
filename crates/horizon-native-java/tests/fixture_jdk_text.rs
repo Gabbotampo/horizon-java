@@ -3,8 +3,9 @@
 //! descriptors, the `invokedynamic` concat and the constant pool are javac's
 //! own.
 //!
-//! Every expected string is what the same class printed on OpenJDK 27
-//! (`javac --release 17`, then `java`).
+//! Every expected string is what the same class printed on Java 25
+//! (Eclipse Adoptium 25.0.5+8-LTS; `javac --release 17`, then `java`), the
+//! runtime Minecraft 26.3 ships.
 
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
@@ -118,7 +119,7 @@ fn string_constants_decode_as_javac_encoded_them() {
 }
 
 #[test]
-fn floats_and_doubles_print_as_jdk_27_prints_them() {
+fn floats_and_doubles_print_as_java_25_prints_them() {
     let jar = jar("numbers");
     let mut host = StdHost::new();
     // `-219738.625f` is a tie between two shortest candidates (the JDK keeps

@@ -1,4 +1,4 @@
-//! Replays what OpenJDK 27 answered (`jdk_text_oracle.json`, written by
+//! Replays what Java 25 answered (`jdk_text_oracle.json`, written by
 //! `tools/jdk_tables/TextOracle.java`) through the runtime's own models, one
 //! section each ([`SECTIONS`]): `Double.toString`/`Float.toString`
 //! (`jdk_float_text.rs`) and the `Character` statics (`jdk_character.rs`).
@@ -9,6 +9,10 @@
 //! input; nothing is derived from the code under test. The committed file is
 //! a 300-case sample; the ignored test replays a larger run of the same
 //! generator from `HORIZON_JDK_TEXT_ORACLE`.
+//!
+//! Java 25 is the spec: Minecraft 26.3's launcher manifest pins it
+//! (`java-runtime-epsilon`, major version 25), and the sample's `jdk_build`
+//! names the exact build that wrote it.
 
 use serde_json::Value as Json;
 
@@ -155,9 +159,15 @@ fn check_all(oracle: &Json) -> (Vec<String>, Vec<String>) {
 }
 
 #[test]
-fn the_committed_sample_answers_as_jdk_27() {
+fn the_committed_sample_answers_as_java_25() {
     let oracle: Json = serde_json::from_str(SAMPLE).unwrap();
-    assert_eq!(oracle["jdk"], "27");
+    assert!(
+        oracle["jdk"]
+            .as_str()
+            .is_some_and(|jdk| jdk.starts_with("25.")),
+        "the sample must come from Java 25, the game's runtime: {}",
+        oracle["jdk_build"]
+    );
     let (failures, sizes) = check_all(&oracle);
     assert!(failures.is_empty(), "{sizes:?}:\n{}", failures.join("\n"));
 }
