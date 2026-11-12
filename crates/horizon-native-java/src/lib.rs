@@ -4772,7 +4772,7 @@ impl Host for StdHost {
                 })
             }
             // `Pattern.matches(regex, input)` is `String.matches` spelled
-            // statically; the same bounded subset answers it.
+            // statically; `java_regex` answers it exactly or it is counted.
             (
                 "java/util/regex/Pattern",
                 "matches",
@@ -4780,13 +4780,10 @@ impl Host for StdHost {
             ) => {
                 let pattern = expect_string(Self::argument(r, args, 0)?);
                 let input = expect_string(Self::argument(r, args, 1)?);
-                java_regex::full_match(pattern, input)
-                    .map(|matched| Value::Int(i32::from(matched)))
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!(
-                            "Pattern.matches pattern {pattern:?} is outside the native regex subset"
-                        ))
-                    })
+                match java_regex::matches(pattern, input) {
+                    Ok(matched) => Ok(Value::Int(i32::from(matched))),
+                    Err(_) => self.unknown_host_call(r),
+                }
             }
             ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
                 Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
@@ -7580,16 +7577,13 @@ impl Host for StdHost {
                 Ok(Value::Int(expect_string(receiver).trim().is_empty() as i32))
             }
             // Whole-input regex validation (`id.matches("[a-z0-9_.-]*")`).
-            // A pattern outside the bounded subset is named, never guessed.
+            // A pattern outside the modelled subset is counted, never guessed.
             ("java/lang/String", "matches", "(Ljava/lang/String;)Z") => {
                 let pattern = expect_string(Self::argument(r, args, 0)?);
-                java_regex::full_match(pattern, expect_string(receiver))
-                    .map(|matched| Value::Int(i32::from(matched)))
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!(
-                            "String.matches pattern {pattern:?} is outside the native regex subset"
-                        ))
-                    })
+                match java_regex::matches(pattern, expect_string(receiver)) {
+                    Ok(matched) => Ok(Value::Int(i32::from(matched))),
+                    Err(_) => self.unknown_host_call(r),
+                }
             }
             ("java/lang/String", "substring", "(I)Ljava/lang/String;") => {
                 let start = expect_int(r, Self::argument(r, args, 0)?)?;
