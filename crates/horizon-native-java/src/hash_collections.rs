@@ -320,6 +320,11 @@ impl<H: Host> Runtime<'_, H> {
         // a copy constructor, which then inherits the unknown order).
         let mut tainted_argument = false;
         for arg in args.iter() {
+            // A `Set.of`/`Map.of` of two or more iterates in a random order.
+            if self.random_order(arg) {
+                tainted_argument = true;
+                continue;
+            }
             if self.hash_table_kind(arg).is_none() {
                 continue;
             }
@@ -419,7 +424,7 @@ impl<H: Host> Runtime<'_, H> {
     /// that order: a host model that copies, prints or iterates it. Jar code
     /// (whose own calls on the collection are checked one by one) and the
     /// helpers that only pass the reference on or compare it cannot.
-    fn shows_argument_order(&self, r: &MethodRef) -> bool {
+    pub(crate) fn shows_argument_order(&self, r: &MethodRef) -> bool {
         if self
             .member_owner(&r.owner, &r.name, &r.descriptor)
             .is_some_and(|(_, jar)| jar)
@@ -528,7 +533,7 @@ impl<H: Host> Runtime<'_, H> {
                         Some(unknown)
                     })
                     .unwrap_or(false);
-                table.tainted |= tainted;
+                table.tainted |= tainted || self.random_order(&source);
                 if kind.map {
                     self.put_all(receiver, &mut table, &source)
                 } else {

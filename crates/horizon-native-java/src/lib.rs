@@ -51,6 +51,7 @@ mod hash_map_order;
 mod hash_table;
 mod heap;
 mod hook_shapes;
+mod immutable_collections;
 mod jar_compare;
 mod jar_operands;
 mod jar_text;
@@ -2192,6 +2193,14 @@ pub trait Host {
 
     fn store_red_black_tree(&mut self, _marker: &str, _tree: tree_map::RedBlackTree) {}
 
+    /// The probe layout of a `Set.of`/`Map.of` (`immutable_collections.rs`),
+    /// taken out until [`Self::store_probe_table`] puts it back.
+    fn take_probe_table(&mut self, _marker: &str) -> Option<immutable_collections::ProbeTable> {
+        None
+    }
+
+    fn store_probe_table(&mut self, _marker: &str, _table: immutable_collections::ProbeTable) {}
+
     /// Remember that `marker` is the copy a map's `keySet()`/`values()`/
     /// `entrySet()` answered, whose mutators cannot reach the map.
     fn note_view_copy(&mut self, _marker: &str) {}
@@ -2573,6 +2582,8 @@ pub struct StdHost {
     collection_comparators: BTreeMap<String, Value>,
     /// The red-black trees of tree maps and sets, by marker.
     red_black_trees: BTreeMap<String, tree_map::RedBlackTree>,
+    /// The probe layouts of `Set.of`/`Map.of` collections, by marker.
+    probe_tables: BTreeMap<String, immutable_collections::ProbeTable>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
     view_copies: BTreeSet<String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
@@ -2700,6 +2711,7 @@ impl StdHost {
             hash_tables: BTreeMap::new(),
             collection_comparators: BTreeMap::new(),
             red_black_trees: BTreeMap::new(),
+            probe_tables: BTreeMap::new(),
             view_copies: BTreeSet::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
@@ -4095,6 +4107,14 @@ impl Host for StdHost {
         self.red_black_trees.insert(marker.to_owned(), tree);
     }
 
+    fn take_probe_table(&mut self, marker: &str) -> Option<immutable_collections::ProbeTable> {
+        self.probe_tables.remove(marker)
+    }
+
+    fn store_probe_table(&mut self, marker: &str, table: immutable_collections::ProbeTable) {
+        self.probe_tables.insert(marker.to_owned(), table);
+    }
+
     fn note_view_copy(&mut self, marker: &str) {
         self.view_copies.insert(marker.to_owned());
     }
@@ -4782,7 +4802,7 @@ impl Host for StdHost {
                 "java/util/stream/Collectors",
                 "toUnmodifiableSet",
                 "()Ljava/util/stream/Collector;",
-            ) => Ok(Value::Ref(Some("collector/ordered-set".into()))),
+            ) => Ok(Value::Ref(Some("collector/unmodifiable-set".into()))),
             (
                 "java/util/stream/Collectors",
                 "toUnmodifiableList",
@@ -22669,6 +22689,12 @@ impl<H: Host> Runtime<'_, H> {
                     // `HashSet::new` (`hash_bulk.rs`).
                     "collector/set" => self.hash_set_collect(&values)?,
                     "collector/ordered-set" => collection_value("set", &values),
+                    // `Set.of(toSet().toArray())` (`immutable_collections.rs`).
+                    "collector/unmodifiable-set" => {
+                        let set = self.hash_set_collect(&values)?;
+                        let elements = self.collection_elements(&set)?;
+                        self.set_of(&elements)?
+                    }
                     collector if collector.starts_with("collector/joining/") => {
                         let payload = collector
                             .strip_prefix("collector/joining/")
@@ -23987,6 +24013,13 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A model handed a jar object it has no state for
                         // counts it instead of answering (`jar_operands.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_immutable_collection(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // `Set.of`/`Map.of` and `IdentityHashMap`
+                        // (`immutable_collections.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
