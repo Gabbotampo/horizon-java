@@ -134,6 +134,17 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Ok(Some(Value::Ref(Some(name.clone()))));
         }
+        // A JDK skeleton's `toString` (`AbstractCollection`, `AbstractMap`,
+        // `SimpleEntry`) prints the jar object's own elements, which the host
+        // does not hold: counted (`jar_operands.rs`).
+        if let Some(declaring) = jar_operands::skeleton_declaring(&owner, "toString", TO_STRING) {
+            let to_string = MethodRef {
+                owner: declaring.to_owned(),
+                name: "toString".into(),
+                descriptor: TO_STRING.into(),
+            };
+            return self.host.unknown_operand_call(&to_string).map(Some);
+        }
         // `Object.toString()` (an identity hash), an enum constant this run
         // has no name for, or a platform superclass's method: the host answers
         // what it models and counts the rest.
