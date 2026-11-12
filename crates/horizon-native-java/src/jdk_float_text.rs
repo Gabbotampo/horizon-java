@@ -1,5 +1,6 @@
-//! `Double.toString` and `Float.toString` as JDK 19+ (and so JDK 27) print
-//! them.
+//! `Double.toString` and `Float.toString` as JDK 19+ prints them, so as
+//! Java 25, the runtime Minecraft 26.3 ships (JDK 27 prints the same digits
+//! for all 100,000 values of the differential).
 //!
 //! Since JDK 19 (Raffaello Giulietti's `DoubleToDecimal`/`FloatToDecimal`)
 //! the javadoc pins the digits exactly. With `R` the decimals that round to

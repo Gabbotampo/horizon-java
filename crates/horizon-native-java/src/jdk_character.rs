@@ -1,8 +1,12 @@
-//! `java.lang.Character`'s static methods, answered as JDK 27 answers them.
+//! `java.lang.Character`'s static methods, answered as Java 25 answers them:
+//! Minecraft 26.3's launcher manifest pins Java 25 (`java-runtime-epsilon`),
+//! so its Unicode 16.0 tables are what a mod's `Character` calls see. JDK 26+
+//! moved to Unicode 17.0 and answers 5,486 code points differently (none
+//! below U+0100).
 //!
 //! Every Unicode property comes from [`crate::jdk_character_table`], which
-//! `tools/jdk_tables/CharacterTable.java` dumps from JDK 27's own
-//! `Character` class (Unicode 17), one run per stretch of code points with the
+//! `tools/jdk_tables/CharacterTable.java` dumps from Java 25's own
+//! `Character` class (Unicode 16.0), one run per stretch of code points with the
 //! same answers. The generator checks, for every code point, the identities
 //! this module derives from the table instead of storing them:
 //!
@@ -15,7 +19,7 @@
 //!
 //! The arithmetic members (`isISOControl`, the surrogate helpers, `forDigit`,
 //! `charCount`, `toCodePoint`, `compare`, `reverseBytes`) follow the JDK
-//! source's formulas. A code point outside `[0, 0x10FFFF]` gets what JDK 27's
+//! source's formulas. A code point outside `[0, 0x10FFFF]` gets what Java 25's
 //! `CharacterData.of` gives it (`CharacterDataUndefined`): unassigned, no
 //! properties, mapped to itself, directionality `-1`.
 //!
@@ -35,7 +39,7 @@ const DECIMAL_DIGIT_NUMBER: u8 = 9;
 const SPACE_SEPARATOR: u8 = 12;
 const PARAGRAPH_SEPARATOR: u8 = 14;
 
-/// What JDK 27 answers for a code point outside the Unicode range.
+/// What Java 25 answers for a code point outside the Unicode range.
 const UNDEFINED: Row = (UNASSIGNED, 0, -1, 0, 0, 0, -1, -1);
 
 /// The table row of `code_point`.
@@ -129,7 +133,7 @@ fn int_argument(args: &[Value], at: usize) -> Option<i32> {
     }
 }
 
-/// A `java.lang.Character` static call JDK 27 answers from its tables or
+/// A `java.lang.Character` static call Java 25 answers from its tables or
 /// formulas, or `None` for any other call (and for the ones this module
 /// leaves counted: see the module docs).
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {

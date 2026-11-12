@@ -3,8 +3,9 @@
 //! from a javac-built class, so the descriptors, the `invokedynamic` concat,
 //! the exception tables and the constant pool are javac's own.
 //!
-//! Every expected string is what the same class printed on OpenJDK 27
-//! (`javac --release 17`, then `java`).
+//! Every expected string is what the same class printed on Java 25
+//! (Eclipse Adoptium 25.0.5+8-LTS; `javac --release 17`, then `java`), the
+//! runtime Minecraft 26.3 ships.
 
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
@@ -182,7 +183,7 @@ fn string_constants_decode_as_javac_encoded_them() {
 }
 
 #[test]
-fn floats_and_doubles_print_as_jdk_27_prints_them() {
+fn floats_and_doubles_print_as_java_25_prints_them() {
     let jar = jar("numbers");
     let mut host = StdHost::new();
     // `-219738.625f` is a tie between two shortest candidates (the JDK keeps
@@ -196,12 +197,14 @@ fn floats_and_doubles_print_as_jdk_27_prints_them() {
 }
 
 #[test]
-fn characters_and_unicode_blocks_answer_from_jdk_27s_tables() {
+fn characters_and_unicode_blocks_answer_from_java_25s_tables() {
     let jar = jar("characters");
     let mut host = StdHost::new();
+    // `isLetter(0x10EC5)` is `false`: U+10EC5 is assigned in Unicode 17.0
+    // (JDK 26+, which answers `true`), not in Java 25's Unicode 16.0.
     assert_eq!(
         call(&jar, &mut host, "characters"),
-        text("true 12 15 453 false b true 26 true 105")
+        text("true 12 15 453 false b false 26 true 105")
     );
     let blocks = call(&jar, &mut host, "blocks");
     assert_eq!(
