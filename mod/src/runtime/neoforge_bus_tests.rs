@@ -213,8 +213,9 @@ fn unregister_removes_that_consumer_only() {
 #[test]
 fn listeners_for_events_nothing_fires_are_counted() {
     // NeoForge accepts both (oracle.jsonl, case "not_fired": a real mod bus runs `setup` when FML
-    // posts `FMLCommonSetupEvent`). Nothing in the runtime posts either, so neither is a listener
-    // the game holds, and each registration is an unknown host call named after its event.
+    // posts `FMLCommonSetupEvent`). The common-setup stage posts it here too
+    // (`neoforge_lifecycle.rs`), so that listener is held; nothing posts the jar's own event, so
+    // that registration is an unknown host call named after its event.
     let mut fixture = Fixture::new();
     fixture
         .call(
@@ -225,20 +226,23 @@ fn listeners_for_events_nothing_fires_are_counted() {
         .unwrap();
     let listeners = fixture.host.game_listeners(&fixture.jar, true);
     assert!(listeners.listeners.is_empty(), "{:?}", listeners.listeners);
-    let mut keys: Vec<_> = fixture.host.unknown_host_calls().into_iter().collect();
-    keys.sort();
     assert_eq!(
-        keys,
-        [
-            (
-                "net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V (no game event fires demo/DemoEvent)".to_owned(),
-                1
-            ),
-            (
-                "net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V (no game event fires net/neoforged/fml/event/lifecycle/FMLCommonSetupEvent)".to_owned(),
-                1
-            ),
-        ]
+        fixture.host.unknown_host_calls(),
+        [(
+            "net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V (no game event fires demo/DemoEvent)".to_owned(),
+            1
+        )]
+    );
+    let _ = fixture.host.take_stdout();
+    let failures = fixture.jar.run_loading_stage(
+        crate::runtime::neoforge_lifecycle::LoadingStage::CommonSetup,
+        &mut fixture.host,
+        &fixture.budget,
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(
+        fixture.host.take_stdout().lines().collect::<Vec<_>>(),
+        ["setup"]
     );
 }
 
@@ -382,13 +386,6 @@ fn a_mod_constructor_registers_its_own_instance() {
     );
 }
 
-/// The unknown-call key `inject` counts a subscriber on an event nothing fires under.
-fn inject_count(event: &str) -> String {
-    format!(
-        "net/neoforged/fml/javafmlmod/AutomaticEventSubscriber#inject(Lnet/neoforged/fml/ModContainer;Lnet/neoforged/neoforgespi/language/ModFileScanData;Ljava/lang/Module;)V (no game event fires {event})"
-    )
-}
-
 #[test]
 fn injected_subscribers_join_the_constructors_listeners_in_priority_order() {
     // The `@Mod` constructor registers first, then FML injects the container's
@@ -413,15 +410,18 @@ fn injected_subscribers_join_the_constructors_listeners_in_priority_order() {
         fixture.fire(GameEvent::ServerTickEnd).0,
         ["ctor-highest", "ctor-high", "auto-high"]
     );
-    // oracle.jsonl, case "inject_setup": the real mod bus runs `auto-setup` when FML posts
-    // `FMLCommonSetupEvent`. The runtime does not post it, so the subscriber is counted under its
-    // event, as every other registration path counts one.
+    // oracle.jsonl, case "inject_setup": the mod bus runs `auto-setup` when the common-setup stage
+    // posts `FMLCommonSetupEvent`.
+    assert_eq!(fixture.host.unknown_host_call_count(), 0);
+    let failures = fixture.jar.run_loading_stage(
+        crate::runtime::neoforge_lifecycle::LoadingStage::CommonSetup,
+        &mut fixture.host,
+        &fixture.budget,
+    );
+    assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(
-        fixture.host.unknown_host_calls(),
-        [(
-            inject_count("net/neoforged/fml/event/lifecycle/FMLCommonSetupEvent"),
-            1
-        )]
+        fixture.host.take_stdout().lines().collect::<Vec<_>>(),
+        ["auto-setup"]
     );
 }
 

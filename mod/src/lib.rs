@@ -175,6 +175,11 @@ struct LoadedJar {
     commands: Vec<JavaCommand>,
     native_commands: Vec<Command>,
     commands_registered: bool,
+    /// Entrypoint stages that ran, and every failure of the jar's load so far (entrypoints,
+    /// `@EventBusSubscriber` injection, loading stages): the verdict is recomputed from them once
+    /// the loading stages ran (`content.rs`).
+    stages_ran: usize,
+    failures: Vec<String>,
 }
 
 /// One Java command this bridge can run: its usage, the literal path that selects it, the
@@ -2185,6 +2190,8 @@ fn load_jar(
         commands: Vec::new(),
         native_commands: Vec::new(),
         commands_registered: false,
+        stages_ran: ran,
+        failures,
     })
 }
 
@@ -2547,6 +2554,8 @@ mod tests {
                     commands: Vec::new(),
                     native_commands: Vec::new(),
                     commands_registered: false,
+                    stages_ran: 1,
+                    failures: Vec::new(),
                 }
             })
             .collect();
