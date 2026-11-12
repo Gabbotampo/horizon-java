@@ -45,6 +45,7 @@ mod gson_model;
 mod guava_model;
 mod heap;
 mod hook_shapes;
+mod jar_text;
 mod java_format;
 mod java_format_args;
 mod java_identifier;
@@ -7648,12 +7649,39 @@ impl Host for StdHost {
                     (expect_ref(receiver) == expect_ref(other)) as i32,
                 ))
             }
+            // An object (`class#n`) prints its model's `toString`; one no
+            // model prints is an identity hash or a body the host does not
+            // have, so it is counted, never answered with its marker (#69).
+            ("java/lang/Object", "toString", "()Ljava/lang/String;")
+                if expect_ref(receiver)
+                    .is_some_and(|marker| jar_text::object_marker_class(marker).is_some()) =>
+            {
+                // `Object`'s own model is this arm: asking it would recurse.
+                let modelled = expect_ref(receiver)
+                    .and_then(|marker| java_tostring::owner(marker))
+                    .is_some_and(|owner| owner != "java/lang/Object");
+                match modelled
+                    .then(|| self.modelled_to_string(receiver))
+                    .flatten()
+                {
+                    Some(text) => Ok(Value::Ref(Some(text))),
+                    None => self.unknown_host_call(r),
+                }
+            }
             ("java/lang/String", "toString", "()Ljava/lang/String;")
             | ("java/lang/Object", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
                 expect_ref(receiver)
                     .cloned()
                     .unwrap_or_else(|| "null".into()),
             ))),
+            // A jar constant the runtime has no name for (`class#n`): its
+            // marker's tail is not its name.
+            ("java/lang/Enum", "name" | "toString", "()Ljava/lang/String;")
+                if expect_ref(receiver)
+                    .is_some_and(|marker| jar_text::object_marker_class(marker).is_some()) =>
+            {
+                self.unknown_host_call(r)
+            }
             ("java/lang/Enum", "name", "()Ljava/lang/String;")
             | ("java/lang/Enum", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
@@ -11070,7 +11098,14 @@ fn object_text(host: &mut StdHost, value: &Value) -> String {
     match value {
         Value::Ref(Some(marker)) => jdk_model::boxed_text(marker, "Ljava/lang/Object;")
             .or_else(|| host.modelled_to_string(value))
-            .unwrap_or_else(|| marker.clone()),
+            .unwrap_or_else(|| {
+                // An object no model prints (a jar object, an identity hash)
+                // is counted; the element keeps its marker in the text.
+                if jar_text::object_marker_class(marker).is_some() {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                }
+                marker.clone()
+            }),
         other => value_text(other),
     }
 }
@@ -22209,7 +22244,11 @@ impl<H: Host> Runtime<'_, H> {
         match (name, captured.len()) {
             ("toString", 1) => {
                 let mut text = String::new();
-                text.push_str(class.rsplit('/').next().unwrap_or(class));
+                // `getSimpleName()`: `Point`, not `Probe$Point`.
+                match file.nested_simple_name() {
+                    Some(Some(simple)) => text.push_str(&simple),
+                    _ => text.push_str(class.rsplit('/').next().unwrap_or(class)),
+                }
                 text.push('[');
                 for (position, component) in components.iter().enumerate() {
                     if position > 0 {
@@ -22219,7 +22258,7 @@ impl<H: Host> Runtime<'_, H> {
                         self.record_component(file, class, component, receiver)?;
                     text.push_str(component);
                     text.push('=');
-                    text.push_str(&java_value_text(&value, &descriptor));
+                    text.push_str(&self.value_of_text(&value, &descriptor, class, "toString")?);
                 }
                 text.push(']');
                 Ok(Some(Value::Ref(Some(text))))
@@ -24147,6 +24186,12 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_jar_text(&r, op, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // A jar object's `toString` (`jar_text.rs`).
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_compound_tag(&r, receiver.as_ref(), &args))
                     {
@@ -24437,7 +24482,14 @@ impl<H: Host> Runtime<'_, H> {
                     // build keys, ids and exception messages through these
                     // sites, and a marker there is not the string Java returns.
                     if let Some((recipe, constants)) = file.string_concat_recipe(index) {
-                        let arguments = descriptor_arguments(&descriptor);
+                        let mut arguments = descriptor_arguments(&descriptor);
+                        // An object operand concatenates as its own
+                        // `toString` (`jar_text.rs`), then reads as a `String`.
+                        let mut captured = captured;
+                        invoke_or_catch!(
+                            at,
+                            self.concat_object_texts(&mut captured, &mut arguments, class, method)
+                        );
                         // A `StringBuilder` operand concatenates as its text
                         // (`String.valueOf` calls its `toString`), not as the
                         // builder's object marker.
