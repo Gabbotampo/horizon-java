@@ -44,7 +44,7 @@ const ACC_INTERFACE: u16 = 0x0200;
 
 /// The class file's own access flags, read back from its bytes (the parsed
 /// model keeps none). `None` for a class built in memory without bytes.
-fn class_access(file: &ClassFile) -> Option<u16> {
+pub(super) fn class_access(file: &ClassFile) -> Option<u16> {
     if file.raw.is_empty() {
         return None;
     }
@@ -94,6 +94,36 @@ impl<H: Host> Runtime<'_, H> {
                     .map(|_| ())
             }
         }
+    }
+
+    /// `value instanceof target` where `checkcast` could decide it, `None`
+    /// where it would count the cast. `null` is never an instance.
+    pub(super) fn known_instance_of(&self, value: &Value, target: &str) -> Option<bool> {
+        if matches!(value, Value::Ref(None)) {
+            return Some(false);
+        }
+        let target_is_interface = self
+            .class(target)
+            .and_then(class_access)
+            .map(|access| access & ACC_INTERFACE != 0);
+        match self.cast_verdict(value, target, target_is_interface).0 {
+            Verdict::Yes => Some(true),
+            Verdict::No => Some(false),
+            Verdict::Unknown => None,
+        }
+    }
+
+    /// The class of a jar (or linked) object or enum constant marker, as
+    /// `checkcast` reads it; `None` for any other value.
+    pub(super) fn known_object_class(&self, value: &Value) -> Option<String> {
+        let marker = expect_ref(value)?;
+        marker
+            .strip_prefix("enum/")
+            .and_then(|rest| rest.rsplit_once('/').map(|(class, _)| class))
+            .or_else(|| marker.split_once('#').map(|(class, _)| class))
+            .or(Some(marker.as_str()))
+            .filter(|class| self.class(class).is_some())
+            .map(str::to_owned)
     }
 
     fn cast_verdict(
