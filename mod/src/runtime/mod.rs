@@ -48,7 +48,9 @@ mod game_hooks;
 mod gson_model;
 mod gson_tree;
 mod guava_model;
+mod hash_collections;
 mod hash_map_order;
+mod hash_table;
 mod heap;
 mod hook_shapes;
 mod jar_operands;
@@ -2159,6 +2161,27 @@ pub trait Host {
         None
     }
 
+    /// Whether the host keeps a collection row for `marker`.
+    fn has_mutable_collection(&self, _marker: &str) -> bool {
+        false
+    }
+
+    /// The bucket table (`hash_table.rs`) of a hash collection, taken out
+    /// until [`Self::store_hash_table`] puts it back.
+    fn take_hash_table(&mut self, _marker: &str) -> Option<hash_table::HashTable> {
+        None
+    }
+
+    fn store_hash_table(&mut self, _marker: &str, _table: hash_table::HashTable) {}
+
+    /// Remember that `marker` is the copy a map's `keySet()`/`values()`/
+    /// `entrySet()` answered, whose mutators cannot reach the map.
+    fn note_view_copy(&mut self, _marker: &str) {}
+
+    fn is_view_copy(&self, _marker: &str) -> bool {
+        false
+    }
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -2525,6 +2548,11 @@ pub struct StdHost {
     /// `List.reversed()` views: view marker → (its list, whether it writes
     /// through) (`sequenced.rs`).
     reversed_views: BTreeMap<String, (String, bool)>,
+    /// The bucket table a JDK hash collection would have, by marker
+    /// (`hash_table.rs`, `hash_collections.rs`).
+    hash_tables: BTreeMap<String, hash_table::HashTable>,
+    /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
+    view_copies: BTreeSet<String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2647,6 +2675,8 @@ impl StdHost {
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
+            hash_tables: BTreeMap::new(),
+            view_copies: BTreeSet::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -4010,6 +4040,26 @@ impl Host for StdHost {
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn has_mutable_collection(&self, marker: &str) -> bool {
+        self.mutable_collections.contains_key(marker)
+    }
+
+    fn take_hash_table(&mut self, marker: &str) -> Option<hash_table::HashTable> {
+        self.hash_tables.remove(marker)
+    }
+
+    fn store_hash_table(&mut self, marker: &str, table: hash_table::HashTable) {
+        self.hash_tables.insert(marker.to_owned(), table);
+    }
+
+    fn note_view_copy(&mut self, marker: &str) {
+        self.view_copies.insert(marker.to_owned());
+    }
+
+    fn is_view_copy(&self, marker: &str) -> bool {
+        self.view_copies.contains(marker)
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -23889,6 +23939,13 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A model handed a jar object it has no state for
                         // counts it instead of answering (`jar_operands.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_hash_collection(&r, op, receiver.as_ref(), &mut args)
+                    ) {
+                        // `HashMap`/`HashSet` order and lookups
+                        // (`hash_collections.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

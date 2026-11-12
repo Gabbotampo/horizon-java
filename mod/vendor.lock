@@ -185,10 +185,20 @@
       "source": "crates/horizon-native-java/src/guava_model.rs",
       "source_sha256": "6a0c971d4d41707bf33ce66b0ef522ce96249d01fcbada58fe794abae467c062"
     },
+    "hash_collections.rs": {
+      "sha256": "590b3ad8a79e4afc80830c593de303477985ffc1dedc136e541f2fdc2f698dbf",
+      "source": "crates/horizon-native-java/src/hash_collections.rs",
+      "source_sha256": "3e7fd22508669d037ee9d4a75dd70c9ff894f882962ae9698a0cc46a77d3f687"
+    },
     "hash_map_order.rs": {
       "sha256": "526f983baaab6ce53d68a889aeba70bc43b3904e97ee60a7b40ee652d5d543cf",
       "source": "crates/horizon-native-java/src/hash_map_order.rs",
       "source_sha256": "526f983baaab6ce53d68a889aeba70bc43b3904e97ee60a7b40ee652d5d543cf"
+    },
+    "hash_table.rs": {
+      "sha256": "b055f144aa34f8b68f668d8990c26d4434f470c61c7de3846b5c43da2340c0a9",
+      "source": "crates/horizon-native-java/src/hash_table.rs",
+      "source_sha256": "eae33d348779b4ddafbb0e6a922e4602179c8470a6f6d8b5c2c325bbd6f5db1c"
     },
     "heap.rs": {
       "sha256": "18263e22283fd7210e9f6bdea34fce0926c82bc8bf7e979d6608014d771559cc",
@@ -366,9 +376,9 @@
       "source_sha256": "0e0b0a4ba3bcbca80ec0bd892b737d65e7577b0ddeffc1d08c59ae9b1cbc1d2b"
     },
     "mod.rs": {
-      "sha256": "9f4be29f2f7def504cf16cee7649a5535280bd0a74cdbe3061b0d9f8230d5ff3",
+      "sha256": "41d74ca8cb8d049ccfad6ee83e1ea67bc07b7e628a3d124f598f9982d77650da",
       "source": "crates/horizon-native-java/src/lib.rs",
-      "source_sha256": "84ea0311a73b6985e318c388148f050b9064f3d50d5979032d23d92b9a743d1c"
+      "source_sha256": "ea51b9644ec4d634c596ab3e0ab2ec5d35e95c8b64d86ee7d153542e88e09c26"
     },
     "mod_config_register.rs": {
       "sha256": "9791c6644e749c7e35d73f7d39f892ebf11366c3091878ddce2892cf0ea8ba3f",
@@ -446,9 +456,9 @@
       "source_sha256": "8042d626f10590864d814433a6b5aa2c44981032ea4ed716a6887fb402514577"
     },
     "object_methods.rs": {
-      "sha256": "2e8d01d74b1f2915b625724bafe01b285812f3397178d385ac8fe5844c21af9d",
+      "sha256": "25c593186d28320b44e73642a8eef62aedab81dacef376a2b8598e9be4203760",
       "source": "crates/horizon-native-java/src/object_methods.rs",
-      "source_sha256": "2e8d01d74b1f2915b625724bafe01b285812f3397178d385ac8fe5844c21af9d"
+      "source_sha256": "25c593186d28320b44e73642a8eef62aedab81dacef376a2b8598e9be4203760"
     },
     "references.rs": {
       "sha256": "35c216f9fbc094ece6a28c9bcceb138de76ee21289924d9f7dffeadcc17cac26",
