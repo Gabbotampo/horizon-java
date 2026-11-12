@@ -5,8 +5,8 @@
 //! `EventBus#register`, in order (`javap -c -p net.neoforged.bus.EventBus`):
 //!
 //! 1. @0–11: a target the bus already holds is ignored (`listeners.containsKey(target)`).
-//! 2. @12–87: a `java.lang.reflect.Method` target registers that one method (FML's
-//!    `@EventBusSubscriber` path); not reached by a jar's own code here, and counted.
+//! 2. @12–87: a `java.lang.reflect.Method` target registers that one method: FML's
+//!    `@EventBusSubscriber` path (`neoforge_inject.rs`), never a jar's own call here.
 //! 3. @88–118: the class is the target itself (a `Class`) or the target's class, and
 //!    `checkSupertypes` refuses one whose superclasses or interfaces declare a `@SubscribeEvent`
 //!    method ("Attempting to register a listener object of type ...").
@@ -204,7 +204,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `registerListener(target, method)` and `register(eventType, target, method)`.
-    fn register_method(
+    pub(crate) fn register_method(
         &mut self,
         r: &MethodRef,
         bus: &str,
@@ -320,7 +320,7 @@ impl<H: Host> Runtime<'_, H> {
     /// Whether `Event.class.isAssignableFrom(class)` is surely false: the chain of jar classes
     /// ends in the JDK's, the game's or NeoForge's own classes, none of which is an event outside
     /// the table (departure R4 for the rest).
-    fn surely_not_an_event(&self, class: &str) -> bool {
+    pub(crate) fn surely_not_an_event(&self, class: &str) -> bool {
         let mut at = class.to_owned();
         for _ in 0..32 {
             match self.class(&at) {
@@ -360,7 +360,7 @@ impl<H: Host> Runtime<'_, H> {
     /// `Method#toString`: modifiers (`Modifier.methodModifiers()`, with `default` for an
     /// interface's default method), the return type, the declaring class and name, the parameter
     /// types joined by `,`, and `throws` with the `Exceptions` attribute's classes.
-    fn method_text(&self, class: &str, method: &Method) -> String {
+    pub(crate) fn method_text(&self, class: &str, method: &Method) -> String {
         let file = self.class(class);
         let interface = file
             .and_then(crate::runtime::jdk_model::class_access_flags)
