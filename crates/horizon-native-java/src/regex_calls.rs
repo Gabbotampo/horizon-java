@@ -41,16 +41,17 @@ pub(crate) fn split_java_string(
 }
 
 impl<H: Host> Runtime<'_, H> {
-    /// A `CharSequence` argument's text: a `StringBuilder`'s contents, or the
-    /// string itself.
+    /// A `CharSequence` argument's text: a tracked `StringBuilder`'s
+    /// contents, or the string itself. Any other object (a jar's own
+    /// `CharSequence`, a host marker) has text this runtime cannot read, so
+    /// it answers `None` and the call is counted rather than matched against
+    /// the marker.
     fn char_sequence(&self, value: &Value) -> Option<String> {
         let marker = expect_ref(value)?;
-        Some(
-            self.string_builders
-                .get(marker)
-                .cloned()
-                .unwrap_or_else(|| marker.clone()),
-        )
+        if let Some(text) = self.string_builders.get(marker) {
+            return Some(text.clone());
+        }
+        crate::value_class::is_plain_string(marker).then(|| marker.clone())
     }
 
     /// The regex surface; `Ok(None)` leaves the call to the rest of the

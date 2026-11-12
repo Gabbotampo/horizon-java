@@ -79,6 +79,25 @@ public final class Probe {
         return out + "|" + "ab".replaceAll("z", "$9");
     }
 
+    /** A StringBuilder input is read as its text. */
+    public static String builderInput() {
+        return String.valueOf(Pattern.matches("a+b", new StringBuilder("aa").append('b')));
+    }
+
+    /** A jar's own CharSequence: its text is not tracked, so the call is counted. */
+    public static String jarCharSequence() {
+        return String.valueOf(Pattern.matches("a+", new Seq("aaa")));
+    }
+
+    static final class Seq implements CharSequence {
+        private final String text;
+        Seq(String text) { this.text = text; }
+        public int length() { return text.length(); }
+        public char charAt(int index) { return text.charAt(index); }
+        public CharSequence subSequence(int start, int end) { return text.subSequence(start, end); }
+        public String toString() { return text; }
+    }
+
     /** A property outside the modelled subset: counted, never guessed. */
     public static String unsupported() {
         return String.valueOf("abc".replaceAll("\\p{IsAlphabetic}", "x"));
@@ -103,6 +122,7 @@ const EXPECTED: &[(&str, &str)] = &[
         "badReplacement",
         "IndexOutOfBoundsException:No group 2|character to be escaped is missing|ab",
     ),
+    ("builderInput", "true"),
 ];
 
 fn fixture() -> (PathBuf, NativeJar) {
@@ -135,10 +155,12 @@ fn fixture() -> (PathBuf, NativeJar) {
         .unwrap();
     zip.write_all(br#"{"id":"regex-fixture","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#)
         .unwrap();
-    zip.start_file("demo/Probe.class", SimpleFileOptions::default())
-        .unwrap();
-    zip.write_all(&fs::read(classes.join("demo/Probe.class")).unwrap())
-        .unwrap();
+    for class in ["Probe", "Probe$Seq"] {
+        zip.start_file(format!("demo/{class}.class"), SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&fs::read(classes.join(format!("demo/{class}.class"))).unwrap())
+            .unwrap();
+    }
     zip.finish().unwrap();
     let jar = NativeJar::from_path(&jar_path).unwrap();
     (root, jar)
@@ -185,6 +207,24 @@ fn a_pattern_outside_the_subset_is_counted() {
         unknown,
         [(
             "java/lang/String#replaceAll(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"
+                .to_owned(),
+            1
+        )]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `Pattern.matches` on a jar's own `CharSequence`: the JDK answers `true`
+/// (it reads the object's characters), the runtime does not track them, so
+/// the call is counted instead of matching the object's marker.
+#[test]
+fn an_untracked_char_sequence_is_counted() {
+    let (root, jar) = fixture();
+    let (_, unknown) = call(&jar, "jarCharSequence");
+    assert_eq!(
+        unknown,
+        [(
+            "java/util/regex/Pattern#matches(Ljava/lang/String;Ljava/lang/CharSequence;)Z"
                 .to_owned(),
             1
         )]
