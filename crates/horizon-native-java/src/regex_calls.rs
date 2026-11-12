@@ -11,11 +11,6 @@
 use crate::java_regex::{self, Thrown};
 use crate::{Host, MethodRef, NativeError, Runtime, StdHost, Value, expect_int, expect_ref};
 
-/// Split results are caller-visible arrays, so a pattern that matches at
-/// every character of a long string must not turn into an unbounded
-/// allocation.
-const MAX_SPLIT_PARTS: usize = 65_536;
-
 fn thrown(thrown: Thrown) -> NativeError {
     NativeError::UncaughtException {
         class: thrown.class.into(),
@@ -30,14 +25,10 @@ pub(crate) fn split_java_string(
     pattern: &str,
     limit: i32,
 ) -> Result<Vec<String>, String> {
-    let parts = java_regex::string_split(input, pattern, limit)
-        .map_err(|unsupported| format!("pattern {pattern:?}: {}", unsupported.0))?;
-    if parts.len() > MAX_SPLIT_PARTS {
-        return Err(format!(
-            "produced more than {MAX_SPLIT_PARTS} parts in one call"
-        ));
-    }
-    Ok(parts)
+    // The engine stops a split past `java_regex::MAX_SPLIT_PARTS` parts
+    // while it builds them, so a caller-visible array never grows unbounded.
+    java_regex::string_split(input, pattern, limit)
+        .map_err(|unsupported| format!("pattern {pattern:?}: {}", unsupported.0))
 }
 
 impl<H: Host> Runtime<'_, H> {

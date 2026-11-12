@@ -117,6 +117,14 @@ public final class Probe {
         return String.valueOf("abc".replaceAll("\\p{IsAlphabetic}", "x"));
     }
 
+    /** `matches` from under `n` more jar frames. */
+    public static String deep(int n, String pattern, String input) {
+        if (n == 0) {
+            return String.valueOf(input.matches(pattern));
+        }
+        return deep(n - 1, pattern, input);
+    }
+
     /** A 2,999-operand `&&` class: JDK 27 overflows its stack on it. */
     public static String hugeClass() {
         StringBuilder pattern = new StringBuilder("[");
@@ -276,5 +284,57 @@ fn an_oversized_class_is_counted_not_a_crash() {
             1
         )]
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// The final review's stack repro: `String.matches` with the deepest search
+/// the bound allows (`(?:a|b)*` on 199 chars) from under 0–11 jar frames,
+/// on a 2 MiB thread. Unoptimized interpreter frames take ~100 KB each, and
+/// at 8 of them the matcher's old fixed allowance overflowed the thread.
+/// Each depth now answers `true` like JDK 27, or counts the call when the
+/// stack left cannot hold the search; none aborts.
+#[test]
+fn matches_under_deep_jar_frames_never_overflows() {
+    let (root, jar) = fixture();
+    let jar = std::sync::Arc::new(jar);
+    for depth in 0..=11 {
+        let jar = std::sync::Arc::clone(&jar);
+        let (answer, unknown) = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let mut host = jar.seed_host(StdHost::new());
+                let answer = jar
+                    .invoke_method_with_args(
+                        "demo/Probe",
+                        "deep",
+                        "(ILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                        None,
+                        &[
+                            Value::Int(depth),
+                            Value::Ref(Some("(?:a|b)*".into())),
+                            Value::Ref(Some("a".repeat(199))),
+                        ],
+                        &mut host,
+                    )
+                    .unwrap_or_else(|error| panic!("deep({depth}) failed: {error}"));
+                (answer, host.unknown_host_calls())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        println!("deep({depth}): {answer:?}, counted {unknown:?}");
+        if unknown.is_empty() {
+            assert_eq!(answer, Value::Ref(Some("true".into())), "deep({depth})");
+        } else {
+            assert_eq!(
+                unknown,
+                [(
+                    "java/lang/String#matches(Ljava/lang/String;)Z".to_owned(),
+                    1
+                )],
+                "deep({depth})"
+            );
+        }
+    }
     let _ = fs::remove_dir_all(root);
 }
