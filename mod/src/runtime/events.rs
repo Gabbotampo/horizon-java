@@ -1336,12 +1336,12 @@ impl StdHost {
             };
         }
         // The server-wide markers (rules, registries, a rule, a level
-        // resource) answer from the firing's server facts; outside a firing
-        // there are none, and the call refuses.
+        // resource) answer from the firing's server facts. Outside a firing
+        // there are none, so only what a marker holds by itself answers (a rule's id and default, a resource's id).
         if facade_server::owns(text) {
             return Some(match self.game_event.as_deref() {
                 Some(firing) => facade_server::answer(&firing.facade.server, text, r, args),
-                None => Err(NativeError::UnknownHostCall(r.clone())),
+                None => facade_server::answer(&ServerFacts::default(), text, r, args),
             });
         }
         if let Some(answer) = self.world_facade_call(text, r, args) {

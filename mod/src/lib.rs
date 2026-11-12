@@ -81,15 +81,16 @@ use attachments::Lifecycle;
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
     Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
-    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
-    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent,
-    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
-    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
-    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, GameRuleChangedEvent,
+    Hand, Hooks, Host, HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent,
+    LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent,
+    LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent,
+    LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
+    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent,
+    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
+    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
+    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
+    Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -684,6 +685,18 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+    }
+
+    /// A server game rule changed (`/gamerule`, the rules screen, `server.properties`): the
+    /// façade's `GameRules.get(rule)` answers the world's values, so they are read again.
+    fn game_rule_changed(&self, host: &mut dyn ServerHost, _event: &mut GameRuleChangedEvent<'_>) {
+        let rules = server_facts::game_rules(host);
+        let mut state = self.lock();
+        if state.server.game_rules != rules {
+            let mut facts = ServerFacts::clone(&state.server);
+            facts.game_rules = rules;
+            state.server = Arc::new(facts);
+        }
     }
 
     /// A server level closed (Fabric's `ServerLevelEvents.UNLOAD`, NeoForge's
