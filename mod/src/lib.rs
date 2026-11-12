@@ -97,7 +97,7 @@ use runtime::brigadier::{
 };
 use runtime::events::{
     EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
-    GameListener, ServerFacts,
+    GameListener, PhaseOrdering, ServerFacts, dispatch_order,
 };
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
@@ -169,6 +169,8 @@ struct LoadedJar {
     jar: Arc<NativeJar>,
     host: StdHost,
     listeners: Vec<GameListener>,
+    /// The jar's Fabric `addPhaseOrdering` calls, which order every jar's listeners of that field.
+    orderings: Vec<PhaseOrdering>,
     /// Commands the jar registered through the Brigadier façade, translated once.
     commands: Vec<JavaCommand>,
     native_commands: Vec<Command>,
@@ -447,14 +449,9 @@ impl Hooks for HorizonJava {
                     EventContext::default(),
                 );
                 let before = loaded.host.unknown_host_call_count();
-                let (ran, failed) = run_listeners(
-                    &loaded.row.id,
-                    &loaded.jar,
-                    &mut loaded.host,
-                    &loaded.listeners,
-                    &mut firing,
-                    &|_| true,
-                );
+                let order = listener_order(std::slice::from_ref(&*loaded), &firing, &|_| true);
+                let (ran, failed) =
+                    run_listeners(std::slice::from_mut(loaded), &order, &mut firing)[0];
                 let listener_unknown = loaded.host.unknown_host_call_count().saturating_sub(before);
                 let before = loaded.host.unknown_host_call_count();
                 let (native, commands, refused) =
@@ -1191,26 +1188,35 @@ impl HorizonJava {
         let mut facade = state.facade();
         facade.dedicated = dedicated;
         let mut firing = EventFiring::new(event, Arc::new(facade), context);
-        let (mut ran, mut failed, mut unknown) = (0, 0, 0);
+        // Every jar's batch opens first: the listeners then run as one event, in the loaders'
+        // order across every jar (a NeoForge priority or a Fabric phase is global, as one bus or
+        // one `Event` field is in a real game), and the batches close after.
+        let mut opened = Vec::with_capacity(state.jars.len());
+        let mut before = Vec::with_capacity(state.jars.len());
         for loaded in &mut state.jars {
-            let id = loaded.row.id.clone();
             // Every jar's host hears about the level this firing names, whether or not it has a
             // listener for the event: `MinecraftServer.getAllLevels()` answers from what the
             // game announced, and a jar that only listens for `server_started` must still see
             // the levels loaded before it.
             loaded.host.note_firing_levels(&firing);
-            let opened = server.as_deref_mut().and_then(|server| {
-                attachments::open(server, &id, &loaded.jar, &mut loaded.host, lifecycle)
-            });
-            let before = loaded.host.unknown_host_call_count();
-            let (jar_ran, jar_failed) = run_listeners(
-                &id,
-                &loaded.jar,
-                &mut loaded.host,
-                &loaded.listeners,
-                &mut firing,
-                &wanted,
-            );
+            opened.push(server.as_deref_mut().and_then(|server| {
+                attachments::open(
+                    server,
+                    &loaded.row.id,
+                    &loaded.jar,
+                    &mut loaded.host,
+                    lifecycle,
+                )
+            }));
+            before.push(loaded.host.unknown_host_call_count());
+        }
+        let order = listener_order(&state.jars, &firing, &wanted);
+        let counts = run_listeners(&mut state.jars, &order, &mut firing);
+        let (mut ran, mut failed, mut unknown) = (0, 0, 0);
+        for (((loaded, opened), before), (jar_ran, jar_failed)) in
+            state.jars.iter_mut().zip(opened).zip(before).zip(counts)
+        {
+            let id = loaded.row.id.clone();
             match server.as_deref_mut() {
                 Some(server) => attachments::close(
                     server,
@@ -1429,34 +1435,61 @@ fn interaction_result(result: Option<&str>) -> InteractionResult {
     }
 }
 
-/// Runs the listeners of this jar that `wanted` keeps, in registration order, against one shared
-/// firing.
-fn run_listeners(
-    id: &str,
-    jar: &NativeJar,
-    host: &mut StdHost,
-    listeners: &[GameListener],
-    firing: &mut EventFiring,
+/// The `(jar, slot)` listeners of `firing`'s event that `wanted` keeps, in the order the loaders
+/// run them ([`dispatch_order`]): Fabric phases (with every jar's `addPhaseOrdering`), then
+/// NeoForge/Forge `EventPriority`, then the jars' load order and each jar's registration order.
+fn listener_order(
+    jars: &[LoadedJar],
+    firing: &EventFiring,
     wanted: &dyn Fn(&GameListener) -> bool,
-) -> (usize, usize) {
-    let (mut ran, mut failed) = (0, 0);
-    let event = firing.event;
-    for listener in listeners
+) -> Vec<(usize, usize)> {
+    let entries: Vec<(usize, usize, &GameListener)> = jars
         .iter()
-        .filter(|listener| listener.event == event && wanted(listener))
-    {
+        .enumerate()
+        .flat_map(|(at, loaded)| {
+            loaded
+                .listeners
+                .iter()
+                .enumerate()
+                .map(move |(slot, listener)| (at, slot, listener))
+        })
+        .filter(|(_, _, listener)| listener.event == firing.event && wanted(listener))
+        .collect();
+    let orderings: Vec<&PhaseOrdering> = jars.iter().flat_map(|jar| &jar.orderings).collect();
+    dispatch_order(&entries, &orderings)
+}
+
+/// Runs the `(jar, slot)` listeners in `order` against one shared firing, each on its own jar's
+/// host, and answers each jar's `(ran, failed)`. A listener that decides the event (a Fabric
+/// `boolean` or `InteractionResult` invoker's answer) ends the firing for every jar.
+fn run_listeners(
+    jars: &mut [LoadedJar],
+    order: &[(usize, usize)],
+    firing: &mut EventFiring,
+) -> Vec<(usize, usize)> {
+    let mut counts = vec![(0, 0); jars.len()];
+    let event = firing.event;
+    for &(at, slot) in order {
+        let LoadedJar {
+            row,
+            jar,
+            host,
+            listeners,
+            ..
+        } = &mut jars[at];
+        let (id, listener) = (&row.id, &listeners[slot]);
         let outcome = caught(&format!("{} listener from {}", id, listener.source), || {
             jar.run_game_listener(listener, firing, host, &ExecutionBudget::within(JAR_BUDGET))
         });
         match outcome {
             Ok(Ok(run)) => {
-                ran += usize::from(run.ran);
+                counts[at].0 += usize::from(run.ran);
                 if run.stop {
                     break;
                 }
             }
             Ok(Err(error)) => {
-                failed += 1;
+                counts[at].1 += 1;
                 log::warn!(
                     "{LOG}: {id}: {} listener from {} failed: {error}",
                     event.name(),
@@ -1464,7 +1497,7 @@ fn run_listeners(
                 );
             }
             Err(panic) => {
-                failed += 1;
+                counts[at].1 += 1;
                 log::warn!(
                     "{LOG}: {id}: {} listener from {} failed: panicked: {panic}",
                     event.name(),
@@ -1473,7 +1506,7 @@ fn run_listeners(
             }
         }
     }
-    (ran, failed)
+    counts
 }
 
 /// Runs one Java callback, turning a panic into a named failure.
@@ -2100,7 +2133,8 @@ fn load_jar(
         });
     }
     let unknown = host.unknown_host_call_count();
-    let listeners = host.game_listeners(&jar, true).listeners;
+    let registered = host.game_listeners(&jar, true);
+    let (listeners, orderings) = (registered.listeners, registered.phase_orderings);
     Ok(LoadedJar {
         row: JarRow {
             file,
@@ -2125,6 +2159,7 @@ fn load_jar(
         jar,
         host,
         listeners,
+        orderings,
         commands: Vec::new(),
         native_commands: Vec::new(),
         commands_registered: false,
@@ -2447,6 +2482,69 @@ mod tests {
             zip.finish().unwrap();
         }
         Arc::new(NativeJar::from_bytes(&bytes.into_inner()).unwrap())
+    }
+
+    /// Two NeoForge jars listening to one event run as one bus: `EventPriority` first, then the
+    /// jars' load order, so a cancellation in one jar decides what the other's listeners see.
+    /// Each jar registers the runtime bus fixture's `BusDemo.cancel` listeners
+    /// (`crates/horizon-native-java/tests/fixtures/neoforge_bus`); the expected lines are that
+    /// fixture's `oracle.jsonl` case `cancel_two_mods` (the same two registrations on one real
+    /// bus-8.0.5 bus, OpenJDK 25.0.5): `cancels, uncancels, skipped, uncancels, runs-again,
+    /// runs-again, cancels-last`, split by jar (within one priority the first jar's listener comes
+    /// first). Jar after jar, the second jar would have printed `uncancels, runs-again,
+    /// cancels-last`.
+    #[test]
+    fn listeners_of_every_jar_run_in_one_priority_order() {
+        use crate::runtime::neoforge_bus::fixture_tests::fixture_jar_bytes;
+        use crate::runtime::{MethodRef, Value};
+        let budget = ExecutionBudget::within(Duration::from_secs(20));
+        let mut jars: Vec<LoadedJar> = ["first", "second"]
+            .into_iter()
+            .map(|id| {
+                let jar = Arc::new(NativeJar::from_bytes(fixture_jar_bytes()).unwrap());
+                let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+                jar.invoke_persistent(
+                    &MethodRef {
+                        owner: "demo/BusDemo".into(),
+                        name: "cancel".into(),
+                        descriptor: "(Lnet/neoforged/bus/api/IEventBus;)V".into(),
+                    },
+                    None,
+                    &[Value::Ref(Some(runtime::neoforge_bus::GAME_BUS.into()))],
+                    &mut host,
+                    &budget,
+                )
+                .unwrap();
+                let registered = host.game_listeners(&jar, true);
+                LoadedJar {
+                    row: JarRow::refused(&format!("{id}.jar"), id.to_owned(), String::new()),
+                    jar,
+                    host,
+                    listeners: registered.listeners,
+                    orderings: registered.phase_orderings,
+                    commands: Vec::new(),
+                    native_commands: Vec::new(),
+                    commands_registered: false,
+                }
+            })
+            .collect();
+        let mut firing = EventFiring::new(
+            GameEvent::LivingAllowDeath,
+            Arc::new(EventFacade::default()),
+            EventContext::default(),
+        );
+        let order = listener_order(&jars, &firing, &|_| true);
+        let counts = run_listeners(&mut jars, &order, &mut firing);
+        let lines = |jar: &mut LoadedJar| -> Vec<String> {
+            jar.host.take_stdout().lines().map(str::to_owned).collect()
+        };
+        assert_eq!(
+            lines(&mut jars[0]),
+            ["cancels", "uncancels", "runs-again", "cancels-last"]
+        );
+        assert_eq!(lines(&mut jars[1]), ["skipped", "uncancels", "runs-again"]);
+        assert_eq!(counts, [(4, 0), (3, 0)]);
+        assert!(firing.cancelled);
     }
 
     /// The verdict and reason `load_jar` gives a jar, whether it loaded or was refused.
