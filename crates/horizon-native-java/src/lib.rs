@@ -82,6 +82,7 @@ pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
 mod neoforge_inject;
+pub mod neoforge_lifecycle;
 mod neoforge_loader;
 mod neoforge_subscribe;
 mod nested_jars;
@@ -3005,6 +3006,7 @@ impl StdHost {
     /// behavior; server integrations should select `SERVER`.
     pub fn with_environment_type(mut self, environment_type: impl Into<String>) -> Self {
         self.environment_type = environment_type.into();
+        self.neoforge_bus.server = self.environment_type == "SERVER";
         self
     }
 
@@ -4045,6 +4047,7 @@ impl Host for StdHost {
         self.brigadier_instance_of(marker, wanted)
             || self.mod_container_instance_of(marker, wanted)
             || neoforge_bus::bus_instance_of(marker, wanted)
+            || neoforge_lifecycle::instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -5356,6 +5359,10 @@ impl Host for StdHost {
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
+            return Ok(value);
+        }
+        // The loading stages' event objects (`neoforge_lifecycle.rs`).
+        if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).

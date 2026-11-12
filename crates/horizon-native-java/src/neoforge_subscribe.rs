@@ -275,7 +275,7 @@ impl<H: Host> Runtime<'_, H> {
         {
             state.registered.push((bus.to_owned(), target.clone()));
         }
-        if crate::events::bus_event(&event).is_none() {
+        if !crate::neoforge_lifecycle::delivered(&event, self.bus_on_server()) {
             self.count_bus_call(r, &format!("no game event fires {event}"));
             return Ok(());
         }
