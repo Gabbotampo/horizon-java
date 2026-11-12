@@ -76,6 +76,19 @@ server stage, the census labels **112** `ran-clean`: 31, 59 and 22; see
 The sample stops at 40; the other 130 run-clean jars register nothing and would only repeat the
 control rows. Every jar is 26.3-era and was selected from the census, not from its name.
 
+**Three dependencies added, 12 November 2026 (43 jars).** Survey #3 refused three sampled jars
+for a dependency the sample left out. Each dependency is already in the corpus and now sits in
+its dependent's batch:
+
+| added | for | batch | corpus file | licence |
+|---|---|---|---|---|
+| `melody` | `fancymenu` (beside `konkrete`) | b1 | `neoforge/melody_neoforge_1.0.17_MC_26.3.jar` | MIT |
+| `libjf` | `respackopts` (`libjf-base`, `libjf-data-manipulation-v0`, `libjf-config-core-v2` are its nested jars) | b4 | `corpus-xl/libjf-26.3.1.jar` | LGPL-3.0-or-later |
+| `ResourcefulConfig` | `structure_layout_optimizer` | b10 | `corpus-xl/ResourcefulConfig-6.0.2.jar` | MIT |
+
+The licences are the jars' own metadata, and Modrinth's project pages agree. The corpus is
+never committed, so these are run locally only. `libjf` has no entrypoint.
+
 ### There were no content jars to sample
 
 None of the 172 run-clean jars declares a block or an item through the runtime's typed registry
@@ -363,7 +376,11 @@ the declared dependency was unreachable.
 Jars now run dependencies before dependents (`cupboard` before `structureessentials`,
 `collective` before `stackrefill`), and the missing-dependency refusal names every absent id.
 Host-provided ids (`minecraft`, `java`, `fabricloader`, `fabric-api`, `neoforge`, `forge`) are not
-required to be jars.
+required to be jars. Since 12 November 2026 the list also includes the Fabric API module ids whose
+entry points the host's Fabric API surface answers: `fabric-api-base`,
+`fabric-lifecycle-events-v1`, `fabric-command-api-v2` and `fabric-resource-loader-v1`
+(`dependencies.rs` names each module's modelled classes). spark and libjf require exactly these
+modules, and both were refused for them. Any other module id still has to be a jar.
 
 ## Follow-up: client `@Mod` classes on a server
 
