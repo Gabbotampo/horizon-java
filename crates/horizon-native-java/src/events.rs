@@ -56,6 +56,7 @@ use crate::{
 };
 
 pub use crate::facade_server::{GameRuleValue, ServerFacts};
+pub use crate::facade_world::{FacadeStack, HeldItems};
 
 /// One game event the game can fire, whatever loader named it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -990,6 +991,10 @@ pub struct FacadeLevel {
     pub id: String,
     pub game_time: i64,
     pub day_time: i64,
+    /// The level's world border as `[min_x, min_z, max_x, max_z]`, vanilla's
+    /// `getMinX()`... (`facade_world.rs`); `None` when the game gave none, so
+    /// `getWorldBorder()` refuses.
+    pub world_border: Option<[f64; 4]>,
 }
 
 /// A non-player entity as the façade shows it.
@@ -1058,6 +1063,9 @@ pub struct EventContext {
     /// The level a player left (`AFTER_PLAYER_CHANGE_LEVEL`'s origin);
     /// `level` is the destination.
     pub origin: Option<String>,
+    /// What `player` holds and their game mode, read by the hook for this
+    /// firing (`facade_world.rs`). `None` makes those reads refuse.
+    pub held: Option<HeldItems>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1336,6 +1344,9 @@ impl StdHost {
                 None => Err(NativeError::UnknownHostCall(r.clone())),
             });
         }
+        if let Some(answer) = self.world_facade_call(text, r, args) {
+            return Some(answer);
+        }
         if let Some(hit) = text.strip_prefix("game/block-hit/") {
             return Some(
                 block_hit_answer(hit, r).ok_or_else(|| NativeError::UnknownHostCall(r.clone())),
@@ -1507,6 +1518,9 @@ impl StdHost {
                     ("getServer", _) => Some(marker(SERVER.into())),
                     ("getGameTime", "J") => Some(Value::Long(level?.game_time)),
                     ("getDayTime", "J") => Some(Value::Long(level?.day_time)),
+                    ("getWorldBorder", "Lnet/minecraft/world/level/border/WorldBorder;") => level?
+                        .world_border
+                        .map(|_| crate::facade_world::border_marker(id)),
                     ("isClientSide", "Z") => flag(false),
                     ("dimension", _) => Some(dimension_key(id)),
                     ("players", _) => {
@@ -1532,6 +1546,15 @@ impl StdHost {
                     ("getUUID", _) => return uuid_value(&uuid_text(*uuid)).ok(),
                     ("getStringUUID", _) => return Some(marker(uuid_text(*uuid))),
                     _ => {}
+                }
+                if let Some(answer) = crate::facade_world::player_member(
+                    context.player,
+                    context.held.as_ref(),
+                    *uuid,
+                    r,
+                    args,
+                ) {
+                    return answer;
                 }
                 let p = player(*uuid)?;
                 match (name, returns) {
@@ -1595,6 +1618,44 @@ impl StdHost {
             },
             Facade::Opaque => None,
         }
+    }
+
+    /// A call on a world-border, held-stack or item marker
+    /// (`facade_world.rs`), or `None` for any other receiver. Outside a firing
+    /// they refuse: their facts belong to the firing that handed them out.
+    fn world_facade_call(
+        &self,
+        text: &str,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        use crate::facade_world::{ITEM, STACK, WORLD_BORDER};
+        let firing = self.game_event.as_deref();
+        if let Some(dimension) = text.strip_prefix(WORLD_BORDER) {
+            let bounds = firing.and_then(|firing| {
+                firing
+                    .facade
+                    .levels
+                    .iter()
+                    .chain(&self.levels)
+                    .find(|level| level.id == dimension)
+                    .and_then(|level| level.world_border)
+            });
+            return Some(crate::facade_world::border_answer(text, bounds, r, args));
+        }
+        if let Some(rest) = text.strip_prefix(STACK) {
+            let context = firing.map(|firing| &firing.context);
+            return Some(crate::facade_world::stack_answer(
+                text,
+                rest,
+                context.and_then(|context| context.player),
+                context.and_then(|context| context.held.as_ref()),
+                r,
+                args,
+            ));
+        }
+        let id = text.strip_prefix(ITEM)?;
+        Some(crate::facade_world::item_answer(text, id, r, args))
     }
 
     /// A fresh list marker holding `values`, through the host's own
