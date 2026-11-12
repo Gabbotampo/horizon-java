@@ -81,15 +81,16 @@ use attachments::Lifecycle;
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
     Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, Hand, Hooks, Host,
-    HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
-    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
-    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent,
-    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
-    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
-    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, GameRuleChangedEvent,
+    Hand, Hooks, Host, HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent,
+    LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent,
+    LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent,
+    LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
+    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent,
+    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
+    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
+    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
+    Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -175,6 +176,11 @@ struct LoadedJar {
     commands: Vec<JavaCommand>,
     native_commands: Vec<Command>,
     commands_registered: bool,
+    /// Entrypoint stages that ran, and every failure of the jar's load so far (entrypoints,
+    /// `@EventBusSubscriber` injection, loading stages): the verdict is recomputed from them once
+    /// the loading stages ran (`content.rs`).
+    stages_ran: usize,
+    failures: Vec<String>,
 }
 
 /// One Java command this bridge can run: its usage, the literal path that selects it, the
@@ -684,6 +690,18 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+    }
+
+    /// A server game rule changed (`/gamerule`, the rules screen, `server.properties`): the
+    /// façade's `GameRules.get(rule)` answers the world's values, so they are read again.
+    fn game_rule_changed(&self, host: &mut dyn ServerHost, _event: &mut GameRuleChangedEvent<'_>) {
+        let rules = server_facts::game_rules(host);
+        let mut state = self.lock();
+        if state.server.game_rules != rules {
+            let mut facts = ServerFacts::clone(&state.server);
+            facts.game_rules = rules;
+            state.server = Arc::new(facts);
+        }
     }
 
     /// A server level closed (Fabric's `ServerLevelEvents.UNLOAD`, NeoForge's
@@ -2056,6 +2074,7 @@ fn load_jar(
     file: String,
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
+    imc: &runtime::neoforge_imc::ImcBus,
 ) -> Result<LoadedJar, JarRow> {
     let id = jar_id(&jar, &file);
     let entrypoints = jar.role_entrypoints(false);
@@ -2068,6 +2087,8 @@ fn load_jar(
         return Err(JarRow::refused(&file, id, reason.to_owned()));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+    // Every jar of the game shares FML's `InterModComms` queues, from the constructors on.
+    imc.join(&file, &jar, &mut host);
     for (link, dependency) in links {
         if let Err(error) = host.link_jar(link.clone(), dependency) {
             return Err(JarRow::refused(
@@ -2080,6 +2101,7 @@ fn load_jar(
     let mut calls = 0;
     let mut ran = 0;
     let mut failures = Vec::new();
+    let mut failed_classes = Vec::new();
     for (kind, entry) in &entrypoints {
         if let Some(adapter) = entry.adapter.as_deref() {
             failures.push(format!(
@@ -2105,10 +2127,31 @@ fn load_jar(
                 calls += report.calls;
                 ran += 1;
             }
-            Ok(Err(error)) => failures.push(format!("{}: {error}", entry.class)),
+            Ok(Err(error)) => {
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{}: {error}", entry.class));
+            }
             // A caught panic is this stage failing: the remaining stages still run, and it counts
             // toward `ran-partial` exactly as an interpreter error does.
-            Err(panic) => failures.push(format!("{}: panicked: {panic}", entry.class)),
+            Err(panic) => {
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{}: panicked: {panic}", entry.class));
+            }
+        }
+    }
+    // FML injects each container's `@EventBusSubscriber` classes once its `@Mod` classes are
+    // built; a failed injection fails that container (`runtime::neoforge_inject`).
+    if ran > 0 {
+        let injected = caught(&format!("{id} @EventBusSubscriber injection"), || {
+            jar.inject_event_subscribers(
+                &mut host,
+                &runtime::ExecutionBudget::within(JAR_BUDGET),
+                &failed_classes,
+            )
+        });
+        match injected {
+            Ok(problems) => failures.extend(problems),
+            Err(panic) => failures.push(format!("@EventBusSubscriber injection panicked: {panic}")),
         }
     }
     if ran == 0 {
@@ -2163,6 +2206,8 @@ fn load_jar(
         commands: Vec::new(),
         native_commands: Vec::new(),
         commands_registered: false,
+        stages_ran: ran,
+        failures,
     })
 }
 
@@ -2525,6 +2570,8 @@ mod tests {
                     commands: Vec::new(),
                     native_commands: Vec::new(),
                     commands_registered: false,
+                    stages_ran: 1,
+                    failures: Vec::new(),
                 }
             })
             .collect();
@@ -2549,7 +2596,12 @@ mod tests {
 
     /// The verdict and reason `load_jar` gives a jar, whether it loaded or was refused.
     fn load_verdict(jar: Arc<NativeJar>) -> (&'static str, Option<String>) {
-        match load_jar("demo.jar".to_owned(), jar, &[]) {
+        match load_jar(
+            "demo.jar".to_owned(),
+            jar,
+            &[],
+            &runtime::neoforge_imc::ImcBus::new(),
+        ) {
             Ok(loaded) => (loaded.row.verdict, loaded.row.reason),
             Err(row) => (row.verdict, row.reason),
         }

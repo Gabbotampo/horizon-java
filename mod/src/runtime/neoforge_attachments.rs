@@ -1243,7 +1243,7 @@ fn register_entry<'a>(
 impl NativeJar {
     /// Runs `body` on a runtime over this jar's resident heap, as a listener's would, and keeps
     /// what it changed.
-    fn with_resident_runtime<R>(
+    pub(super) fn with_resident_runtime<R>(
         &self,
         host: &mut StdHost,
         budget: &ExecutionBudget,

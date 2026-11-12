@@ -780,6 +780,7 @@ fn main() -> ExitCode {
     let mut calls = 0;
     let mut ran = 0;
     let mut failures = Vec::new();
+    let mut failed_classes = Vec::new();
     for (index, entry) in entrypoints.iter().enumerate() {
         let stage = entry_stages.get(index).unwrap_or(&kind);
         if let Some(adapter) = entry.adapter.as_deref() {
@@ -794,7 +795,22 @@ fn main() -> ExitCode {
                 calls += report.calls;
                 ran += 1;
             }
-            Err(entry_error) => failures.push(format!("{stage} {}: {entry_error}", entry.class)),
+            Err(entry_error) => {
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{stage} {}: {entry_error}", entry.class));
+            }
+        }
+    }
+    // FML injects each container's `@EventBusSubscriber` classes once its `@Mod` classes are
+    // built (`neoforge_inject.rs`); a failed injection fails that container.
+    // Then NeoForge's loading stages, each followed by its deferred work
+    // (`neoforge_lifecycle.rs`): what the jar's lifecycle listeners do is part of its load.
+    if ran > 0 {
+        let budget = horizon_native_java::ExecutionBudget::UNBOUNDED;
+        failures.extend(jar.inject_event_subscribers(&mut host, &budget, &failed_classes));
+        for stage in horizon_native_java::neoforge_lifecycle::LoadingStage::ALL {
+            failures.extend(jar.run_loading_stage(stage, &mut host, &budget));
+            failures.extend(jar.run_deferred_work(&mut host, &budget));
         }
     }
     let error = (ran == 0).then(|| failures.join("; "));

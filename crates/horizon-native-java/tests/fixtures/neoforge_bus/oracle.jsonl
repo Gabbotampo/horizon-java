@@ -20,4 +20,11 @@
 {"case":"refused_1","bus":"mod","result":"java.lang.IllegalArgumentException: Listener for event class net.neoforged.neoforge.event.tick.ServerTickEvent$Post takes an argument that is not valid for this bus"}
 {"case":"refused_2","bus":"game","result":"java.lang.IllegalArgumentException: Cannot register listeners for abstract class net.neoforged.neoforge.event.tick.ServerTickEvent. Register a listener to one of its subclasses instead!"}
 {"case":"refused_3","bus":"game","result":"java.lang.IllegalArgumentException: Abstract event class demo.BadAbstract has a non-abstract superclass class demo.BadConcrete. The superclass must be made abstract."}
+{"case":"inject_init","out":["auto-clinit"]}
+{"case":"inject_tick","out":["ctor-highest","ctor-high","auto-high"]}
+{"case":"inject_setup","out":["auto-setup"]}
+{"case":"inject_refused_0","result":"java.lang.RuntimeException: java.lang.IllegalArgumentException: Method public void demo.InjectRefused$NotStatic.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post) annotated with @SubscribeEvent is not static"}
+{"case":"inject_refused_1","result":"java.lang.RuntimeException: java.lang.IllegalArgumentException: Method public static void demo.InjectRefused$TwoArguments.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post,int) annotated with @SubscribeEvent must have only one parameter that is an Event subtype"}
+{"case":"inject_refused_2","result":"java.lang.RuntimeException: java.lang.IllegalArgumentException: Method public static void demo.InjectRefused$NotAnEvent.on(java.lang.String) annotated with @SubscribeEvent must have only one parameter that is an Event subtype"}
+{"case":"inject_refused_3","result":"java.lang.RuntimeException: java.lang.IllegalArgumentException: Cannot register listeners for abstract class net.neoforged.neoforge.event.tick.ServerTickEvent. Register a listener to one of its subclasses instead!"}
 {"java":"OpenJDK 64-Bit Server VM 25.0.5+8-LTS"}
