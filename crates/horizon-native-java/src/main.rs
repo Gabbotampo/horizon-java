@@ -829,9 +829,17 @@ fn main() -> ExitCode {
         }
         Some(error) => {
             if json {
+                // What the entrypoints counted before they stopped: the calls
+                // a refused jar leaned on are exactly what explains it.
                 println!(
                     "{}",
-                    serde_json::json!({"status": "error", "stage": "execute", "error": error.to_string()})
+                    serde_json::json!({
+                        "status": "error",
+                        "stage": "execute",
+                        "error": error.to_string(),
+                        "unknown_host_call_count": host.unknown_host_call_count(),
+                        "unknown_host_calls": host.unknown_host_calls(),
+                    })
                 );
             } else {
                 eprintln!("native execution stopped: {error}");
