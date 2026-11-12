@@ -147,18 +147,18 @@ impl<H: Host> Runtime<'_, H> {
         // A null receiver or pattern is an NPE on the JVM, and config code
         // commonly catches it around an optional value; keep it a real throw
         // so the caller's handler runs instead of turning into a hard stop.
-        let receiver =
-            receiver
-                .and_then(expect_ref)
-                .ok_or_else(|| NativeError::UncaughtException {
-                    class: "java/lang/NullPointerException".into(),
-                    message: Some("String#split has a null receiver".into()),
-                    frame: None,
-                })?;
+        // A null pattern fails inside `String.split` on `regex.length()`,
+        // whose text JDK 27 gives exactly. A null receiver's text names the
+        // caller's variable (`because "<local1>" is null`); like every other
+        // call on null in this runtime it leaves that clause out
+        // (`null_checks`).
+        let receiver = receiver
+            .and_then(expect_ref)
+            .ok_or_else(|| crate::null_checks::invoke_on_null(r))?;
         let pattern = expect_ref(StdHost::argument(r, args, 0)?).ok_or_else(|| {
             NativeError::UncaughtException {
                 class: "java/lang/NullPointerException".into(),
-                message: Some("String#split has a null pattern".into()),
+                message: Some("Cannot invoke \"String.length()\" because \"regex\" is null".into()),
                 frame: None,
             }
         })?;

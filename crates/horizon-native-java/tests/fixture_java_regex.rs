@@ -79,6 +79,20 @@ public final class Probe {
         return out + "|" + "ab".replaceAll("z", "$9");
     }
 
+    static String none() {
+        return null;
+    }
+
+    /** A null split pattern: JDK 27's own NPE text, caught by the caller. */
+    public static String nullSplitPattern() {
+        String pattern = none();
+        try {
+            return String.valueOf("a,b".split(pattern).length);
+        } catch (NullPointerException e) {
+            return e.getMessage();
+        }
+    }
+
     /** A StringBuilder input is read as its text. */
     public static String builderInput() {
         return String.valueOf(Pattern.matches("a+b", new StringBuilder("aa").append('b')));
@@ -123,6 +137,10 @@ const EXPECTED: &[(&str, &str)] = &[
         "IndexOutOfBoundsException:No group 2|character to be escaped is missing|ab",
     ),
     ("builderInput", "true"),
+    (
+        "nullSplitPattern",
+        "Cannot invoke \"String.length()\" because \"regex\" is null",
+    ),
 ];
 
 fn fixture() -> (PathBuf, NativeJar) {
