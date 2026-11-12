@@ -143,6 +143,12 @@ enum Kind {
     Map,
 }
 
+/// Whether `marker` is a tree object this model built, whose whole type
+/// (`SUPERTYPES`) it therefore knows.
+pub(crate) fn is_tree(marker: &str) -> bool {
+    kind_of(marker).is_some()
+}
+
 fn kind_of(marker: &str) -> Option<Kind> {
     let (class, serial) = marker.split_once('#')?;
     if serial.is_empty() || !serial.bytes().all(|byte| byte.is_ascii_digit()) {

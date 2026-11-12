@@ -70,6 +70,7 @@ mod mixin_plugins;
 mod mod_config_register;
 mod mod_config_spec;
 mod mod_origin;
+mod native_library;
 pub mod neoforge_attachments;
 mod neoforge_loader;
 mod nested_jars;
@@ -4194,6 +4195,9 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(refusal) = native_library::refusal(r, args) {
+            return Err(refusal);
+        }
         if let Some(value) = self.neoforge_loader_call(r, args) {
             return Ok(value);
         }
@@ -5324,6 +5328,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(refusal) = native_library::refusal(r, args) {
+            return Err(refusal);
+        }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
             return Ok(value);
@@ -5373,9 +5380,19 @@ impl Host for StdHost {
             && r.name == "getClass"
             && r.descriptor == "()Ljava/lang/Class;"
         {
-            return Ok(
-                class_of_value(receiver).map_or(Value::Ref(None), |class| Value::Ref(Some(class)))
-            );
+            // A marker no model can name (a host object, a lambda, an array)
+            // is still an object of *some* class: the neutral `null` is a
+            // guess, so it is counted, not answered silently.
+            // A text `instanceof String` accepts is a `String` here too.
+            return match class_of_value(receiver) {
+                Some(class) => Ok(Value::Ref(Some(class))),
+                None if expect_ref(receiver)
+                    .is_some_and(|text| value_class::is_plain_string(text)) =>
+                {
+                    Ok(Value::Ref(Some("java/lang/String".into())))
+                }
+                None => self.unknown_host_call(r),
+            };
         }
         if let Some(value) = self.payload_type_registry_call(r, Some(receiver), args) {
             return Ok(value);
@@ -12514,6 +12531,15 @@ pub enum NativeError {
     },
     /// The fail-closed host mode rejected a call with no bounded model.
     UnknownHostCall(MethodRef),
+    /// The jar loads native code (`System.load`/`loadLibrary`), which the
+    /// bounded runtime cannot run. Not catchable by the jar
+    /// (`native_library.rs` says why).
+    NativeLibrary {
+        /// `owner#name` of the load call.
+        call: String,
+        /// The path or library name the jar passed.
+        library: String,
+    },
     Zip(String),
     Metadata(String),
 }
@@ -12524,6 +12550,10 @@ impl std::fmt::Display for NativeError {
                 f,
                 "unknown native host call {}#{}{}",
                 method.owner, method.name, method.descriptor
+            ),
+            Self::NativeLibrary { call, library } => write!(
+                f,
+                "loads a native library ({call} \"{library}\"); the native path cannot run native code"
             ),
             Self::UncaughtException {
                 class,
@@ -12585,6 +12615,7 @@ impl NativeError {
             {
                 Some(EntrypointSkip::KotlinRuntime)
             }
+            Self::NativeLibrary { .. } => Some(EntrypointSkip::NativeLibrary),
             _ => None,
         }
     }
@@ -12976,6 +13007,8 @@ pub enum EntrypointSkip {
     KotlinRuntime,
     /// An entrypoint adapter the native path does not implement.
     UnsupportedAdapter,
+    /// The entrypoint loads a native library (`System.load`/`loadLibrary`).
+    NativeLibrary,
 }
 
 impl EntrypointSkip {
@@ -12983,7 +13016,7 @@ impl EntrypointSkip {
     pub fn label(&self) -> &'static str {
         match self {
             Self::KotlinRuntime => "needs-loader",
-            Self::MissingClass | Self::UnsupportedAdapter => "native-gap",
+            Self::MissingClass | Self::UnsupportedAdapter | Self::NativeLibrary => "native-gap",
         }
     }
 
@@ -12998,6 +13031,9 @@ impl EntrypointSkip {
             }
             Self::UnsupportedAdapter => {
                 "the Fabric entrypoint adapter is not implemented by the native path"
+            }
+            Self::NativeLibrary => {
+                "the entrypoint loads a native library (System.load/loadLibrary); the native path runs bytecode only"
             }
         }
     }
@@ -24028,6 +24064,22 @@ impl<H: Host> Runtime<'_, H> {
                                 || (wanted == "java/lang/Class"
                                     && class_marker_like(marker, self.classes, &self.linked))
                         });
+                    // A `false` no model can stand behind is counted
+                    // (`checkcast.rs`), and the host's answer is the result.
+                    let matches = if !matches && self.instance_of_is_guess(&value, &wanted) {
+                        let check = MethodRef {
+                            owner: wanted.to_owned(),
+                            name: "<instanceof>".into(),
+                            descriptor: "(Ljava/lang/Object;)Z".into(),
+                        };
+                        let answer = invoke_or_catch!(
+                            at,
+                            self.host.invoke(&check, std::slice::from_ref(&value))
+                        );
+                        matches!(answer, Value::Int(flag) if flag != 0)
+                    } else {
+                        matches
+                    };
                     stack.push(Value::Int(i32::from(matches)));
                 }
                 0xc2 | 0xc3 => {
