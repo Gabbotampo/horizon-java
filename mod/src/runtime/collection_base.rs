@@ -50,6 +50,12 @@ impl<H: Host> Runtime<'_, H> {
         if self.class(class).is_none() {
             return Ok(None);
         }
+        // Only `AbstractCollection`/`AbstractMap` derive `isEmpty` from
+        // `size()`; a concrete JDK collection (`HashMap`, `ArrayList`) reads
+        // its own count, so a subclass's `size()` override does not change it.
+        if self.stateless_jar_object(receiver).is_none() {
+            return Ok(None);
+        }
         let Some((owner, _)) = self.member_owner(class, "size", "()I") else {
             return Ok(None);
         };
