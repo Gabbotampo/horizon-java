@@ -58,11 +58,14 @@ mod java_nbt;
 mod java_numbers;
 mod java_regex;
 mod java_tostring;
+mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
 mod jdk_stream;
 mod jdk_supertypes;
+#[cfg(test)]
+mod jdk_text_oracle;
 mod library_dispatch;
 mod map_compute;
 mod method_handles;
@@ -71,6 +74,7 @@ mod mixin_plugins;
 mod mod_config_register;
 mod mod_config_spec;
 mod mod_origin;
+mod modified_utf8;
 mod native_library;
 pub mod neoforge_attachments;
 mod neoforge_loader;
@@ -10353,76 +10357,14 @@ fn format_integer_us(value: i64) -> String {
     }
 }
 
-/// Render a `double` the way `Double.toString` does, from the shortest
-/// round-tripping digits (the same digits Java prints).
+/// `Double.toString(value)`, exactly as Java 25 prints it (`jdk_float_text.rs`).
 fn format_java_float(value: f64) -> String {
-    java_float_text(format!("{value:e}"))
+    jdk_float_text::double_to_string(value)
 }
 
-/// The `float` twin: the digits must round-trip through `f32`, so a `0.1F`
-/// prints `0.1` rather than the `f64` value of the stored `f32`.
+/// `Float.toString` of a `float` the interpreter holds widened to `double`.
 fn format_java_float32(value: f64) -> String {
-    java_float_text(format!("{:e}", value as f32))
-}
-
-/// Format a Rust `{:e}` string (`3.5e0`, `1.25e-4`) as Java's `toString`.
-///
-/// Java keeps the plain decimal form for `1e-3 <= |m| < 1e7` and uses
-/// scientific notation with one leading digit outside it, always keeping at
-/// least one fractional digit (`1.0`, `100.0`, `1.0E20`).
-fn java_float_text(scientific: String) -> String {
-    // Rust spells the non-finite values without an exponent.
-    match scientific.as_str() {
-        "NaN" => return "NaN".to_owned(),
-        "inf" => return "Infinity".to_owned(),
-        "-inf" => return "-Infinity".to_owned(),
-        _ => {}
-    }
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("`{:e}` always writes an exponent");
-    let exponent: i32 = exponent.parse().expect("`{:e}` writes a decimal exponent");
-    let negative = mantissa.starts_with('-');
-    let digits = mantissa
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect::<String>();
-    let mut output = String::new();
-    if negative {
-        output.push('-');
-    }
-    // The digits are `d[0].d[1..]`, so the decimal point sits after
-    // `exponent + 1` digits.
-    let point = exponent + 1;
-    if (-3..=6).contains(&exponent) {
-        if point <= 0 {
-            output.push_str("0.");
-            output.push_str(&"0".repeat((-point) as usize));
-            output.push_str(&digits);
-        } else {
-            let point = point as usize;
-            if point < digits.len() {
-                output.push_str(&digits[..point]);
-                output.push('.');
-                output.push_str(&digits[point..]);
-            } else {
-                output.push_str(&digits);
-                output.push_str(&"0".repeat(point - digits.len()));
-                output.push_str(".0");
-            }
-        }
-    } else {
-        output.push_str(&digits[..1]);
-        output.push('.');
-        if digits.len() > 1 {
-            output.push_str(&digits[1..]);
-        } else {
-            output.push('0');
-        }
-        output.push('E');
-        output.push_str(&exponent.to_string());
-    }
-    output
+    jdk_float_text::float_to_string(value)
 }
 
 /// The collection kind a reference return descriptor declares, when it is one
@@ -26154,7 +26096,7 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
         let c = match tag {
             1 => {
                 let length = r.u2()? as usize;
-                Cp::Utf8(String::from_utf8_lossy(r.bytes(length)?).into_owned())
+                Cp::Utf8(modified_utf8::decode(r.bytes(length)?))
             }
             3 => Cp::Integer(r.u4()? as i32),
             7 => Cp::Class(r.u2()?),
