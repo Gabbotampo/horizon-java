@@ -96,6 +96,7 @@ mod neoforge_subscribe;
 mod nested_jars;
 mod night_config;
 mod null_checks;
+mod open_options;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -9885,6 +9886,8 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         // SLF4J ships with the game; logging shims switch over its levels
         // (javac's `$SwitchMap` sizes its table from `values()`).
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
+        // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
+        "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
         _ => return None,
     })
 }
@@ -24108,6 +24111,12 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
                     ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        open_options::invoke(self, &r, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // `Files` writers' `StandardOpenOption`s (`open_options.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
