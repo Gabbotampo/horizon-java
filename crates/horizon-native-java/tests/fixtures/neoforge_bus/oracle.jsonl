@@ -1,0 +1,10 @@
+{"case":"order","out":["highest","captured","high-typed","static","typed","object","receives","plain-typed","bound","lowest"]}
+{"case":"cancel","out":["cancels","uncancels","runs-again","cancels-last"],"canceled":true}
+{"case":"cancel_two_mods","out":["cancels","uncancels","skipped","uncancels","runs-again","runs-again","cancels-last"],"canceled":true}
+{"case":"unregister","out":["kept"]}
+{"case":"not_fired","out":["setup"]}
+{"case":"refused_0","bus":"game","result":"java.lang.IllegalArgumentException: Listener for event class net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent takes an argument that is not valid for this bus"}
+{"case":"refused_1","bus":"mod","result":"java.lang.IllegalArgumentException: Listener for event class net.neoforged.neoforge.event.tick.ServerTickEvent$Post takes an argument that is not valid for this bus"}
+{"case":"refused_2","bus":"game","result":"java.lang.IllegalArgumentException: Cannot register listeners for abstract class net.neoforged.neoforge.event.tick.ServerTickEvent. Register a listener to one of its subclasses instead!"}
+{"case":"refused_3","bus":"game","result":"java.lang.IllegalArgumentException: Abstract event class demo.BadAbstract has a non-abstract superclass class demo.BadConcrete. The superclass must be made abstract."}
+{"java":"OpenJDK 64-Bit Server VM 25.0.5+8-LTS"}
