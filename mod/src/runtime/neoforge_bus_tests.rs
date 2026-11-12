@@ -283,3 +283,101 @@ fn refused_registrations_throw_neoforges_exceptions() {
         );
     }
 }
+
+#[test]
+fn register_takes_an_objects_instance_and_a_classs_static_subscribers() {
+    // `subscribe`: a lambda, `register(object)`, `register(StaticSubscribers.class)`, the same
+    // object again (ignored), two more lambdas; each event fired as the game fires it.
+    let mut fixture = Fixture::new();
+    fixture
+        .call("subscribe", &format!("({BUS})V"), &[game_bus()])
+        .unwrap();
+    // oracle.jsonl, cases "subscribe_tick", "subscribe_death", "subscribe_pre".
+    assert_eq!(
+        fixture.fire(GameEvent::ServerTickEnd).0,
+        [
+            "object-high",
+            "lambda-first",
+            "object-normal",
+            "lambda-last",
+            "static-low"
+        ]
+    );
+    assert_eq!(
+        fixture.fire(GameEvent::LivingAllowDeath),
+        (vec!["static-cancels".into(), "object-death".into()], true)
+    );
+    assert_eq!(fixture.fire(GameEvent::ServerTickStart).0, ["static-pre"]);
+    // `Subscribers.demo(DemoEvent)` is accepted (registered once: the second `register` of the
+    // object is ignored), and nothing fires the jar's own event.
+    assert_eq!(
+        fixture.host.unknown_host_calls(),
+        [(
+            "net/neoforged/bus/api/IEventBus#register(Ljava/lang/Object;)V (no game event fires demo/DemoEvent)".to_owned(),
+            1
+        )]
+    );
+}
+
+#[test]
+fn unregister_takes_every_method_of_a_registered_object() {
+    let mut fixture = Fixture::new();
+    fixture
+        .call("unsubscribe", &format!("({BUS})V"), &[game_bus()])
+        .unwrap();
+    // oracle.jsonl, case "unsubscribe".
+    assert_eq!(
+        fixture.fire(GameEvent::ServerTickEnd).0,
+        ["kept-high", "kept-normal"]
+    );
+}
+
+#[test]
+fn refused_registers_throw_neoforges_exceptions() {
+    // oracle.jsonl, cases "refused_register_0" to "refused_register_7", each on a fresh game bus.
+    let expected = [
+        "java.lang.IllegalArgumentException: Expected @SubscribeEvent method public void demo.Refused$OneInstance.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post) to be static\nbecause register() was called with a class type.\nEither make the method static, or call register() with an instance of class demo.Refused$OneInstance.\n",
+        "java.lang.IllegalArgumentException: Expected @SubscribeEvent method public static void demo.Refused$OneStatic.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post) to NOT be static\nbecause register() was called with an instance type.\nEither make the method non-static, or call register(OneStatic.class).\n",
+        "java.lang.IllegalArgumentException: class demo.Refused$Nothing has no @SubscribeEvent methods, but register was called anyway.\nThe event bus only recognizes listener methods that have the @SubscribeEvent annotation.\n",
+        "java.lang.IllegalArgumentException: Attempting to register a listener object of type class demo.Refused$Child,\nhowever its supertype class demo.Refused$Parent has a @SubscribeEvent method: public void demo.Refused$Parent.inherited(net.neoforged.neoforge.event.tick.ServerTickEvent$Post).\nThis is not allowed! Only the listener object can have @SubscribeEvent methods.\n",
+        "java.lang.IllegalArgumentException: Method public static void demo.Refused$TwoArguments.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post,int) has @SubscribeEvent annotation. It has 2 arguments, but event handler methods require a single argument only.",
+        "java.lang.IllegalArgumentException: Method public static void demo.Refused$NotAnEvent.on(java.lang.String) has @SubscribeEvent annotation, but takes an argument that is not an Event subtype : class java.lang.String",
+        "java.lang.IllegalArgumentException: Method protected static synchronized void demo.Refused$ModBusOnly.on(net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent) has @SubscribeEvent annotation, but takes an argument that is not valid for this busclass net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent",
+        "java.lang.IllegalArgumentException: Cannot register listeners for abstract class net.neoforged.neoforge.event.tick.ServerTickEvent. Register a listener to one of its subclasses instead!",
+    ];
+    for (which, expected) in expected.into_iter().enumerate() {
+        let mut fixture = Fixture::new();
+        let answer = fixture
+            .call(
+                "refusedRegister",
+                &format!("({BUS}I)Ljava/lang/String;"),
+                &[game_bus(), Value::Int(which as i32)],
+            )
+            .unwrap();
+        assert_eq!(answer, text(expected), "case {which}");
+        assert!(
+            fixture
+                .host
+                .game_listeners(&fixture.jar, true)
+                .listeners
+                .is_empty(),
+            "case {which} registered nothing"
+        );
+    }
+}
+
+#[test]
+fn a_mod_constructor_registers_its_own_instance() {
+    // `ModEntry`'s `@Mod` constructor runs `NeoForge.EVENT_BUS.register(this)`; FML builds it with
+    // its mod bus. oracle.jsonl, case "mod_entry".
+    let mut fixture = Fixture::new();
+    fixture
+        .jar
+        .execute("demo.ModEntry", None, "neoforge", &mut fixture.host)
+        .unwrap();
+    assert_eq!(fixture.host.unknown_host_call_count(), 0);
+    assert_eq!(
+        fixture.fire(GameEvent::RegisterCommands).0,
+        ["entry-commands"]
+    );
+}
