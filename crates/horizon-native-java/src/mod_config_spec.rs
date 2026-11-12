@@ -25,10 +25,13 @@
 //!   built")` until the builder built, then `IllegalStateException("Cannot get
 //!   config value before config is loaded.")`: NeoForge's `getRaw` checks the
 //!   spec's `loadedConfig`, and nothing here loads a config file. It never
-//!   answers the declared default. Once the spec has been handed to a host call
-//!   the runtime does not model (a `registerConfig`, `acceptConfig`, a loader
-//!   helper), the loader may have loaded it, so `get()` and `isLoaded()` are
-//!   counted as unknown host calls instead of answered.
+//!   answers the declared default. `ModContainer.registerConfig` of a
+//!   `LOCAL`, `CLIENT` or `SYNCED` config is answered without loading it,
+//!   because NeoForge loads those after the mod's constructor
+//!   (`mod_config_register.rs`). Once the spec has been handed to a host call
+//!   the runtime does not model (a `STARTUP` registration, `acceptConfig`, a
+//!   loader helper), the loader may have loaded it, so `get()` and
+//!   `isLoaded()` are counted as unknown host calls instead of answered.
 //! * `getDefault()` is the declared default: the constant, or the supplier run
 //!   again on every call, as NeoForge's `defaultSupplier.get()` does.
 //! * `defineInRange(..., Supplier, ...)` runs the supplier once at definition
@@ -70,17 +73,39 @@ const B_COMMENTS: &str = "mcs#comments";
 const B_TRANSLATION: &str = "mcs#translation";
 const B_RANGE: &str = "mcs#range";
 const B_RESTART: &str = "mcs#restart";
-const B_DEFINED: &str = "mcs#defined";
+pub(super) const B_DEFINED: &str = "mcs#defined";
 const B_BUILT: &str = "mcs#built";
 const B_SPEC: &str = "mcs#spec";
+/// The value markers a builder defined, in definition order (a JSON list).
+pub(super) const B_VALUES: &str = "mcs#values";
+/// Set once a builder call was left counted: the model no longer knows the
+/// builder's full contents, so nothing may answer from them.
+pub(super) const B_TAINTED: &str = "mcs#tainted";
 /// Field keys under a value marker.
-const V_BUILDER: &str = "mcs#builder";
+pub(super) const V_BUILDER: &str = "mcs#builder";
 const V_INDEX: &str = "mcs#index";
-const V_CONSTANT: &str = "mcs#constant";
+pub(super) const V_CONSTANT: &str = "mcs#constant";
 const V_SUPPLIER: &str = "mcs#supplier";
+/// The value's full path (the builder's path plus its own), a JSON list.
+pub(super) const V_PATH: &str = "mcs#path";
+/// `GAME` or `WORLD` when the value was defined after `gameRestart()` or
+/// `worldRestart()`; absent for `RestartType.NONE`.
+pub(super) const V_RESTART: &str = "mcs#restart";
+/// Which validator NeoForge's `define*` gave the value's `ValueSpec`
+/// ([`Check`]).
+pub(super) const V_CHECK: &str = "mcs#check";
+/// The mod's own predicate: the validator itself, or a list's element
+/// validator.
+pub(super) const V_VALIDATOR: &str = "mcs#validator";
+/// A range's bounds, as passed to `defineInRange`.
+pub(super) const V_MIN: &str = "mcs#min";
+pub(super) const V_MAX: &str = "mcs#max";
 /// Field keys under a spec marker.
-const S_BUILDER: &str = "mcs#of";
-const S_ESCAPED: &str = "mcs#escaped";
+pub(super) const S_BUILDER: &str = "mcs#of";
+pub(super) const S_ESCAPED: &str = "mcs#escaped";
+/// How many of its builder's values a spec holds: those defined before its
+/// `build()` (`Builder.build` copies `values` into the spec's value config).
+pub(super) const S_COUNT: &str = "mcs#count";
 /// Field keys under a pair marker.
 const P_LEFT: &str = "mcs#left";
 const P_RIGHT: &str = "mcs#right";
@@ -161,6 +186,57 @@ enum Number {
     Double,
 }
 
+/// The validator NeoForge's `define*` hands the value's `ValueSpec`, which
+/// `ModConfigSpec.validateSpec` runs on the value's own default when the spec
+/// is registered (`mod_config_register.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Check {
+    /// `define(path, T)`: `o != null && default.getClass().isAssignableFrom(o.getClass())`,
+    /// which the non-null default always passes.
+    Class,
+    /// The mod's own `Predicate` (`define(path, T | Supplier, Predicate)`).
+    Predicate,
+    /// `define(path, boolean | Supplier<Boolean>)`: a `Boolean`, or a
+    /// `String` equal to `true`/`false` ignoring case.
+    Boolean,
+    /// `defineInRange`: `Range.test`.
+    Range,
+    /// `defineInList`: `acceptable.contains(o)`.
+    InList,
+    /// `defineList*`: `o instanceof List && list.stream().allMatch(elementValidator)`.
+    List,
+    /// `defineEnum(path, V)`: every constant of `V` is acceptable.
+    Enum,
+}
+
+impl Check {
+    fn name(self) -> &'static str {
+        match self {
+            Check::Class => "class",
+            Check::Predicate => "predicate",
+            Check::Boolean => "boolean",
+            Check::Range => "range",
+            Check::InList => "in-list",
+            Check::List => "list",
+            Check::Enum => "enum",
+        }
+    }
+
+    pub(super) fn parse(name: &str) -> Option<Check> {
+        [
+            Check::Class,
+            Check::Predicate,
+            Check::Boolean,
+            Check::Range,
+            Check::InList,
+            Check::List,
+            Check::Enum,
+        ]
+        .into_iter()
+        .find(|check| check.name() == name)
+    }
+}
+
 fn define_shape(name: &str, descriptor: &str) -> Option<Shape> {
     let rest = descriptor
         .strip_prefix(PATH_STRING)
@@ -215,31 +291,40 @@ fn define_shape(name: &str, descriptor: &str) -> Option<Shape> {
 }
 
 impl<H: Host> Runtime<'_, H> {
-    fn mcs_get(&self, marker: &str, key: &str) -> Option<&Value> {
+    pub(super) fn mcs_get(&self, marker: &str, key: &str) -> Option<&Value> {
         self.fields.get(&format!("{marker}|{key}"))
     }
 
-    fn mcs_int(&self, marker: &str, key: &str) -> i32 {
+    pub(super) fn mcs_int(&self, marker: &str, key: &str) -> i32 {
         match self.mcs_get(marker, key) {
             Some(Value::Int(value)) => *value,
             _ => 0,
         }
     }
 
-    fn mcs_set(&mut self, marker: &str, key: &str, value: Value) {
+    pub(super) fn mcs_set(&mut self, marker: &str, key: &str, value: Value) {
         self.fields.insert(format!("{marker}|{key}"), value);
     }
 
     fn mcs_path(&self, builder: &str) -> Vec<String> {
-        self.mcs_get(builder, B_PATH)
+        self.mcs_list(builder, B_PATH)
+    }
+
+    /// A JSON list of strings kept under `marker`'s `key`; empty when unset.
+    pub(super) fn mcs_list(&self, marker: &str, key: &str) -> Vec<String> {
+        self.mcs_get(marker, key)
             .and_then(expect_ref)
             .and_then(|text| serde_json::from_str(text).ok())
             .unwrap_or_default()
     }
 
     fn mcs_set_path(&mut self, builder: &str, path: &[String]) {
-        let text = serde_json::to_string(path).unwrap_or_else(|_| "[]".into());
-        self.mcs_set(builder, B_PATH, Value::Ref(Some(text)));
+        self.mcs_set_list(builder, B_PATH, path);
+    }
+
+    pub(super) fn mcs_set_list(&mut self, marker: &str, key: &str, list: &[String]) {
+        let text = serde_json::to_string(list).unwrap_or_else(|_| "[]".into());
+        self.mcs_set(marker, key, Value::Ref(Some(text)));
     }
 
     /// The builder marker a receiver names, when this model made it.
@@ -346,11 +431,18 @@ impl<H: Host> Runtime<'_, H> {
             self.mcs_set(&marker, S_ESCAPED, Value::Int(1));
             return Ok(None);
         }
+        // `ModContainer.registerConfig` over a spec this model built
+        // (`mod_config_register.rs`): answered without marking the spec as
+        // possibly loaded, because NeoForge loads none of the types it
+        // answers until after the mod's constructor.
+        if let Some(answer) = self.mcs_register_config(r, receiver, args)? {
+            return Ok(Some(answer));
+        }
         self.mcs_note_escape(r, receiver, args);
         Ok(None)
     }
 
-    fn mcs_spec_escaped(&self, spec: &str) -> bool {
+    pub(super) fn mcs_spec_escaped(&self, spec: &str) -> bool {
         self.mcs_int(spec, S_ESCAPED) != 0
     }
 
@@ -392,6 +484,24 @@ impl<H: Host> Runtime<'_, H> {
         let Some(builder) = self.mcs_builder(receiver) else {
             return Ok(None);
         };
+        let answer = self.mcs_builder_member(r, &builder, args)?;
+        if answer.is_none() {
+            // The call goes to the host and is counted: whatever it did to
+            // the builder (a `define` the model does not cover adds a value
+            // NeoForge would register and validate) is unknown from here on.
+            self.mcs_set(&builder, B_TAINTED, Value::Int(1));
+        }
+        Ok(answer)
+    }
+
+    /// One `Builder` member on a builder this model made.
+    fn mcs_builder_member(
+        &mut self,
+        r: &MethodRef,
+        builder: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let builder = builder.to_owned();
         let this = Value::Ref(Some(builder.clone()));
         match (r.name.as_str(), r.descriptor.as_str()) {
             (
@@ -519,6 +629,7 @@ impl<H: Host> Runtime<'_, H> {
         // `values.forEach(value -> value.spec = spec)`: every value defined so
         // far now reads through this spec.
         let defined = self.mcs_int(builder, B_DEFINED);
+        self.mcs_set(&marker, S_COUNT, Value::Int(defined));
         self.mcs_set(builder, B_BUILT, Value::Int(defined));
         self.mcs_set(builder, B_SPEC, spec.clone());
         Ok(spec)
@@ -535,16 +646,19 @@ impl<H: Host> Runtime<'_, H> {
         if args.is_empty() {
             return Ok(None);
         }
-        // The path is only checked (a null or unreadable one stays counted):
-        // comment text and the spec's own entry table are not kept.
-        let readable = if r.descriptor.starts_with(PATH_STRING) {
-            expect_ref(&args[0]).is_some()
+        // A null or unreadable path stays counted. The path is kept for
+        // `validateSpec`'s order and messages; comment text is not kept.
+        let own_path = if r.descriptor.starts_with(PATH_STRING) {
+            match expect_ref(&args[0]) {
+                Some(text) => split_path(text),
+                None => return Ok(None),
+            }
         } else {
-            self.mcs_path_arg(&args[0]).is_some()
+            match self.mcs_path_arg(&args[0]) {
+                Some(path) => path,
+                None => return Ok(None),
+            }
         };
-        if !readable {
-            return Ok(None);
-        }
         let arg = |index: usize| args.get(index).cloned().unwrap_or(Value::Ref(None));
         // (default constant, default supplier, validator, element validator)
         let (constant, supplier, validator, element_validator): (
@@ -662,6 +776,17 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Err(npe("ElementValidator can not be null"));
         }
+        let check = match shape {
+            Shape::BoolConstant | Shape::BoolSupplier => Check::Boolean,
+            Shape::Constant { validator: false } => Check::Class,
+            Shape::Constant { validator: true } | Shape::Supplied => Check::Predicate,
+            Shape::RangeConstant(_) | Shape::RangeSupplied(_) => Check::Range,
+            Shape::InList { .. } => Check::InList,
+            Shape::List { .. } => Check::List,
+            Shape::Enum => Check::Enum,
+        };
+        // The `ValueSpec` takes the context's restart type.
+        let restart = self.mcs_get(builder, B_RESTART).cloned();
         // `define(List, ValueSpec, Supplier)`: a fresh context, and the value.
         self.mcs_reset_context(builder);
         let index = self.mcs_int(builder, B_DEFINED);
@@ -681,7 +806,44 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(supplier) = supplier {
             self.mcs_set(&marker, V_SUPPLIER, supplier);
         }
+        // What `validateSpec` reads back when the spec is registered.
+        let mut path = self.mcs_path(builder);
+        path.extend(own_path);
+        self.mcs_set_list(&marker, V_PATH, &path);
+        if let Some(restart) = restart {
+            self.mcs_set(&marker, V_RESTART, restart);
+        }
+        self.mcs_set(&marker, V_CHECK, Value::Ref(Some(check.name().into())));
+        match check {
+            Check::Predicate => self.mcs_set(&marker, V_VALIDATOR, validator),
+            Check::List => {
+                if let Some(element) = element_validator {
+                    self.mcs_set(&marker, V_VALIDATOR, element);
+                }
+            }
+            Check::Range => {
+                self.mcs_set(&marker, V_MIN, arg(2));
+                self.mcs_set(&marker, V_MAX, arg(3));
+            }
+            _ => {}
+        }
+        let mut values = self.mcs_list(builder, B_VALUES);
+        values.push(marker);
+        self.mcs_set_list(builder, B_VALUES, &values);
         Ok(Some(value))
+    }
+
+    /// `ConfigValue.getDefault()`: the declared constant, or the default
+    /// supplier run again. `None` when the supplier is not one the runtime
+    /// can run.
+    pub(super) fn mcs_default(&mut self, value: &str) -> Result<Option<Value>, NativeError> {
+        if let Some(constant) = self.mcs_get(value, V_CONSTANT) {
+            return Ok(Some(constant.clone()));
+        }
+        let Some(supplier) = self.mcs_get(value, V_SUPPLIER).cloned() else {
+            return Ok(None);
+        };
+        self.invoke_callback(&supplier, &[])
     }
 
     /// A member of a value this model defined.
@@ -692,15 +854,7 @@ impl<H: Host> Runtime<'_, H> {
             .cloned()
             .unwrap_or_default();
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("getDefault", "()Ljava/lang/Object;") => {
-                if let Some(constant) = self.mcs_get(value, V_CONSTANT) {
-                    return Ok(Some(constant.clone()));
-                }
-                let Some(supplier) = self.mcs_get(value, V_SUPPLIER).cloned() else {
-                    return Ok(None);
-                };
-                self.invoke_callback(&supplier, &[])
-            }
+            ("getDefault", "()Ljava/lang/Object;") => self.mcs_default(value),
             ("next", "()Lnet/neoforged/neoforge/common/ModConfigSpec$Builder;") => {
                 Ok(Some(Value::Ref(Some(builder))))
             }

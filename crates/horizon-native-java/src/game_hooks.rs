@@ -1181,6 +1181,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.empty_mutable_collection(kind)
     }
 
+    fn counted_unknown_calls(&self) -> usize {
+        self.inner.counted_unknown_calls()
+    }
+
     fn payload_type_id(&self, marker: &str) -> Option<String> {
         self.inner.payload_type_id(marker)
     }
