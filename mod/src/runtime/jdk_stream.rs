@@ -150,7 +150,7 @@ fn floating(value: &Value) -> Option<f64> {
 
 /// `Comparable.compareTo` for the values whose natural order the JDK defines
 /// and the runtime can read.
-fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
+pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
     if matches!(a, Value::Ref(None)) || matches!(b, Value::Ref(None)) {
         return Err(NativeError::UncaughtException {
             class: "java/lang/NullPointerException".into(),
@@ -221,7 +221,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     ) -> Result<i32, NativeError> {
         // `sorted(null)` and `List.sort(null)` mean natural order.
         let Some(marker) = expect_ref(comparator).cloned() else {
-            return natural_compare(a, b);
+            return self.natural_order(a, b);
         };
         let Some(body) = marker.strip_prefix(COMPARATOR_PREFIX) else {
             let result = self.apply_callback(comparator, &[a.clone(), b.clone()])?;
@@ -234,7 +234,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         };
         let (kind, rest) = body.split_once(':').unwrap_or((body, ""));
         match kind {
-            "natural" => natural_compare(a, b),
+            "natural" => self.natural_order(a, b),
             "reverse" => {
                 let inner = operands(rest)?
                     .into_iter()
@@ -249,7 +249,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                     .unwrap_or(Value::Ref(None));
                 let left = self.apply_callback(&key, std::slice::from_ref(a))?;
                 let right = self.apply_callback(&key, std::slice::from_ref(b))?;
-                natural_compare(&left, &right)
+                self.natural_order(&left, &right)
             }
             "keycmp" => {
                 let parts = operands(rest)?;
@@ -274,9 +274,9 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                 let (ka, va) = super::map_entry_parts(a)?;
                 let (kb, vb) = super::map_entry_parts(b)?;
                 if kind == "entry-key" {
-                    natural_compare(&ka, &kb)
+                    self.natural_order(&ka, &kb)
                 } else {
-                    natural_compare(&va, &vb)
+                    self.natural_order(&va, &vb)
                 }
             }
             _ => Err(NativeError::Metadata(format!(
@@ -362,11 +362,25 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         let Some(items) = self.host.mutable_collection_values(&list) else {
             return Ok(None);
         };
-        let values = items
+        let mut values = items
             .iter()
             .map(|item| super::parse_collection_value(item))
             .collect::<Result<Vec<_>, _>>()?;
-        let sorted = self.sort_values(values, &comparator)?;
+        // `ArrayList.sort` sorts its own array, which a comparator that
+        // throws leaves part-merged; `List.sort`'s default sorts a copy and
+        // writes nothing back then.
+        let in_place = self
+            .host_collection_class(&list)
+            .is_some_and(|class| class == "java/util/ArrayList");
+        let sorted = match self.sort_in_place(&mut values, &comparator) {
+            Ok(()) => values,
+            Err(error) => {
+                if in_place {
+                    self.host.replace_mutable_collection(&list, values);
+                }
+                return Err(error);
+            }
+        };
         let method = |name: &str, descriptor: &str| MethodRef {
             owner: "java/util/List".into(),
             name: name.into(),
@@ -381,32 +395,27 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         Ok(Some(Value::Void))
     }
 
-    /// A stable merge sort under `comparator`, as `List.sort` and
-    /// `Stream.sorted` are (TimSort keeps equal elements in order).
+    /// `Arrays.sort(values, comparator)`: TimSort (`tim_sort.rs`), which makes
+    /// the JDK's comparisons in the JDK's order. `null` is natural order.
     pub(crate) fn sort_values(
         &mut self,
         values: Vec<Value>,
         comparator: &Value,
     ) -> Result<Vec<Value>, NativeError> {
-        if values.len() <= 1 {
-            return Ok(values);
-        }
         let mut values = values;
-        let right = values.split_off(values.len() / 2);
-        let left = self.sort_values(values, comparator)?;
-        let right = self.sort_values(right, comparator)?;
-        let mut merged = Vec::with_capacity(left.len() + right.len());
-        let (mut left, mut right) = (left.into_iter().peekable(), right.into_iter().peekable());
-        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
-            if self.compare_with(comparator, a, b)? <= 0 {
-                merged.extend(left.next());
-            } else {
-                merged.extend(right.next());
-            }
-        }
-        merged.extend(left);
-        merged.extend(right);
-        Ok(merged)
+        self.sort_in_place(&mut values, comparator)?;
+        Ok(values)
+    }
+
+    /// TimSort `values` in place; a comparison that throws leaves them as
+    /// the JDK's array is left.
+    pub(crate) fn sort_in_place(
+        &mut self,
+        values: &mut [Value],
+        comparator: &Value,
+    ) -> Result<(), NativeError> {
+        let comparator = comparator.clone();
+        crate::runtime::tim_sort::sort(values, &mut |a, b| self.compare_with(&comparator, a, b))
     }
 
     /// `IntStream`/`LongStream` sources: `range`, `rangeClosed` and `of`.

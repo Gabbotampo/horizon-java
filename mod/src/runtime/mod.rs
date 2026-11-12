@@ -54,6 +54,7 @@ mod hash_map_order;
 mod hash_table;
 mod heap;
 mod hook_shapes;
+mod jar_compare;
 mod jar_operands;
 mod jar_text;
 mod java_format;
@@ -96,6 +97,7 @@ mod nested_jars;
 mod night_config;
 mod null_checks;
 mod object_methods;
+mod priority_queue;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -107,6 +109,7 @@ mod registry_contents;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
+mod tim_sort;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
@@ -2175,6 +2178,14 @@ pub trait Host {
 
     fn store_hash_table(&mut self, _marker: &str, _table: hash_table::HashTable) {}
 
+    /// The comparator a sorted collection or priority queue was built with
+    /// (`priority_queue.rs`), by marker; `None` is natural order.
+    fn collection_comparator(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
+    fn set_collection_comparator(&mut self, _marker: &str, _comparator: Value) {}
+
     /// Remember that `marker` is the copy a map's `keySet()`/`values()`/
     /// `entrySet()` answered, whose mutators cannot reach the map.
     fn note_view_copy(&mut self, _marker: &str) {}
@@ -2552,6 +2563,8 @@ pub struct StdHost {
     /// The bucket table a JDK hash collection would have, by marker
     /// (`hash_table.rs`, `hash_collections.rs`).
     hash_tables: BTreeMap<String, hash_table::HashTable>,
+    /// The comparators priority queues were built with, by marker.
+    collection_comparators: BTreeMap<String, Value>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
     view_copies: BTreeSet<String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
@@ -2677,6 +2690,7 @@ impl StdHost {
             unmodifiable_collections: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
             hash_tables: BTreeMap::new(),
+            collection_comparators: BTreeMap::new(),
             view_copies: BTreeSet::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
@@ -4053,6 +4067,15 @@ impl Host for StdHost {
 
     fn store_hash_table(&mut self, marker: &str, table: hash_table::HashTable) {
         self.hash_tables.insert(marker.to_owned(), table);
+    }
+
+    fn collection_comparator(&self, marker: &str) -> Option<Value> {
+        self.collection_comparators.get(marker).cloned()
+    }
+
+    fn set_collection_comparator(&mut self, marker: &str, comparator: Value) {
+        self.collection_comparators
+            .insert(marker.to_owned(), comparator);
     }
 
     fn note_view_copy(&mut self, marker: &str) {
@@ -19374,6 +19397,12 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return Ok(Some(value));
             }
+            // `Mode::name`/`Mode::ordinal`: the enum model the direct call uses.
+            if let Some(value) =
+                self.invoke_enum_member(&callback.target, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
                 && is_collection_owner(&callback.target.owner)
@@ -23951,6 +23980,12 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_priority_queue(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // `PriorityQueue`'s heap (`priority_queue.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_object_methods(&r, op, receiver.as_ref(), &args)
                     ) {
                         // `equals`/`hashCode` as the JVM runs them
@@ -24104,8 +24139,9 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         value
                     } else if let Some(value) =
-                        self.invoke_jdk_runtime(&r, receiver.as_ref(), &args)?
+                        invoke_or_catch!(at, self.invoke_jdk_runtime(&r, receiver.as_ref(), &args))
                     {
+                        // A sort's comparator may throw for the jar to catch.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
