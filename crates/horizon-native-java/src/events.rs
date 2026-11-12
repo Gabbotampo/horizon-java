@@ -875,7 +875,7 @@ const EVENT_BUS_SUBSCRIBER: &[&str] = &[
 ];
 
 /// The game event and loader an event class names, if the game fires it.
-fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
+pub(crate) fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
     let client = class
         .strip_prefix(NEOFORGE_CLIENT_EVENT_ROOT)
         .map(|rest| (rest, EventLoader::NeoForge))
@@ -1674,6 +1674,10 @@ impl StdHost {
         for invocation in &self.invocations {
             listeners_from(invocation, jar, &mut out);
         }
+        // NeoForge bus-8 `addListener`s, each already checked to name a fired class.
+        for listener in &self.neoforge_bus.listeners {
+            push_neoforge_listener(listener, &mut out);
+        }
         subscriber_classes(jar, server, &mut out);
         if server {
             // A server never fires a client event: a common entrypoint's
@@ -2028,6 +2032,23 @@ fn push_bus_listener(
         callback,
         receives_cancelled,
         order: ListenerOrder::Priority(priority),
+        shape: None,
+        combine: Combine::Void,
+    });
+}
+
+/// A NeoForge bus-8 listener (`neoforge_bus.rs`) as the listener the game fires.
+fn push_neoforge_listener(listener: &crate::neoforge_bus::BusListener, out: &mut GameListeners) {
+    let Some((event, loader)) = bus_event(&listener.class) else {
+        return;
+    };
+    out.listeners.push(GameListener {
+        event,
+        loader,
+        source: listener.class.clone(),
+        callback: listener.callback.clone(),
+        receives_cancelled: listener.receive_canceled,
+        order: ListenerOrder::Priority(listener.priority),
         shape: None,
         combine: Combine::Void,
     });
