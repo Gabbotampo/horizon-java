@@ -240,11 +240,14 @@ drops", and it travels through the same bake. Without the package the item is na
   `arismoko/horizon#2797`; the fix is to pass `hand: Hand` through that call and its event.
 - **A player's level (#2747).** `PlayerRef` names a player's identity, permission and messages, and
   `host.players().acting_player()` names the player a block or entity hook is about, but no read
-  gives the level that player stands in. So `CommandSourceStack.getLevel()` and the `Level`
-  argument of Fabric's `AttackBlockCallback`, `UseEntityCallback`, `PlayerBlockBreakEvents` and
-  NeoForge's `BreakBlockEvent`/`AttackEntityEvent`/`PlayerInteractEvent` cannot be filled: each call
-  that needs it is counted as an unknown host call instead of answering the overworld. Filed as
-  `arismoko/horizon#2747`; the acting player itself is already carried (M2c).
+  gives the level that player stands in. So the `Level` argument of Fabric's `AttackBlockCallback`,
+  `UseEntityCallback`, `PlayerBlockBreakEvents` and NeoForge's
+  `BreakBlockEvent`/`AttackEntityEvent`/`PlayerInteractEvent` cannot be filled: each call that needs
+  it is counted as an unknown host call instead of answering the overworld. Filed as
+  `arismoko/horizon#2747` (closed by #2784's `player_level`, after this pin); the acting player
+  itself is already carried (M2c). A player's command source does answer `getLevel()`: it is
+  `player.level()` in vanilla, and the pin reads it as the player's entity's level
+  (`EntitiesBackend::entity_level`, which the bridge already uses for the player list).
 
 - **The old player on `player_clone`.** Filed as [arismoko/horizon#3040](https://github.com/arismoko/horizon/issues/3040); the issue text, in the fork's template:
 
