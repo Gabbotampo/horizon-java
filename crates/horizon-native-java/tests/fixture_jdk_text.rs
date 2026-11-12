@@ -1,6 +1,7 @@
-//! `Double.toString`/`Float.toString` and modified-UTF-8 string constants
-//! from a javac-built class, so the descriptors, the `invokedynamic` concat
-//! and the constant pool are javac's own.
+//! `Double.toString`/`Float.toString`, modified-UTF-8 string constants,
+//! `Character` and `Character.UnicodeBlock` from a javac-built class, so the
+//! descriptors, the `invokedynamic` concat and the constant pool are javac's
+//! own.
 //!
 //! Every expected string is what the same class printed on Java 25
 //! (Eclipse Adoptium 25.0.5+8-LTS; `javac --release 17`, then `java`), the
@@ -25,6 +26,25 @@ public final class TextEntrypoint {
     sb.append(-219738.625f).append(' ').append(Double.MIN_VALUE).append(' ').append(1e23)
         .append(' ').append(2e-3f).append(' ').append(1.0E7).append(' ').append(0.1 + 0.2);
     return sb.toString();
+  }
+
+  public static String characters() {
+    return Character.isLetter('ß') + " " + Character.getNumericValue('Ⅻ') + " "
+        + Character.digit('f', 16) + " " + (int) Character.toTitleCase('ǆ') + " "
+        + Character.isWhitespace(' ') + " " + Character.forDigit(11, 16) + " "
+        + Character.isLetter(0x10EC5) + " " + Character.getType('$') + " "
+        + Character.isUpperCase('Ⅰ') + " " + Character.toLowerCase(0x130);
+  }
+
+  public static String blocks() {
+    int latin = 0;
+    String text = "abc é日";
+    for (int i = 0; i < text.length(); i++) {
+      if (Character.UnicodeBlock.of(text.charAt(i)) == Character.UnicodeBlock.BASIC_LATIN) {
+        latin++;
+      }
+    }
+    return latin + " " + Character.UnicodeBlock.of('é') + " " + Character.UnicodeBlock.of(0x10FFFF);
   }
 }
 "#;
@@ -108,6 +128,26 @@ fn floats_and_doubles_print_as_java_25_prints_them() {
     assert_eq!(
         call(&jar, &mut host, "numbers"),
         text("-219738.62 4.9E-324 1.0E23 0.002 1.0E7 0.30000000000000004")
+    );
+    assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
+}
+
+#[test]
+fn characters_and_unicode_blocks_answer_from_java_25s_tables() {
+    let jar = jar("characters");
+    let mut host = StdHost::new();
+    // `isLetter(0x10EC5)` is `false`: U+10EC5 is assigned in Unicode 17.0
+    // (JDK 26+, which answers `true`), not in Java 25's Unicode 16.0.
+    assert_eq!(
+        call(&jar, &mut host, "characters"),
+        text("true 12 15 453 false b false 26 true 105")
+    );
+    let blocks = call(&jar, &mut host, "blocks");
+    assert_eq!(
+        blocks,
+        text("4 LATIN_1_SUPPLEMENT SUPPLEMENTARY_PRIVATE_USE_AREA_B"),
+        "unknown calls: {:?}",
+        host.unknown_host_calls()
     );
     assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
 }

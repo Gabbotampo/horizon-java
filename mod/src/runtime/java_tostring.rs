@@ -40,6 +40,7 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("charset/", "java/nio/charset/Charset"),
         ("locale/", "java/util/Locale"),
         ("mod-origin/", "net/fabricmc/loader/api/metadata/ModOrigin"),
+        ("unicode-block/", "java/lang/Character$UnicodeBlock"),
     ];
     for (prefix, owner) in prefix {
         if marker.starts_with(prefix) {
