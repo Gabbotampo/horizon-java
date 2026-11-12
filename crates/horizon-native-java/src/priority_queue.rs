@@ -39,8 +39,9 @@ fn thrown(class: &str) -> NativeError {
 }
 
 impl<H: Host> Runtime<'_, H> {
-    /// `comparator.compare(a, b)`, or `a.compareTo(b)` without one.
-    fn heap_compare(
+    /// `comparator.compare(a, b)`, or `a.compareTo(b)` without one (`null`
+    /// throws `NullPointerException`, as `compareTo` on it does).
+    pub(crate) fn ordered_compare(
         &mut self,
         comparator: &Option<Value>,
         a: &Value,
@@ -62,7 +63,7 @@ impl<H: Host> Runtime<'_, H> {
         while k > 0 {
             let parent = (k - 1) >> 1;
             let e = heap.es[parent].clone();
-            if self.heap_compare(&heap.comparator, &x, &e)? >= 0 {
+            if self.ordered_compare(&heap.comparator, &x, &e)? >= 0 {
                 break;
             }
             heap.es[k] = e;
@@ -85,11 +86,12 @@ impl<H: Host> Runtime<'_, H> {
             let mut child = (k << 1) + 1;
             let mut c = heap.es[child].clone();
             let right = child + 1;
-            if right < n && self.heap_compare(&heap.comparator, &c, &heap.es[right].clone())? > 0 {
+            if right < n && self.ordered_compare(&heap.comparator, &c, &heap.es[right].clone())? > 0
+            {
                 child = right;
                 c = heap.es[child].clone();
             }
-            if self.heap_compare(&heap.comparator, &x, &c)? <= 0 {
+            if self.ordered_compare(&heap.comparator, &x, &c)? <= 0 {
                 break;
             }
             heap.es[k] = c;

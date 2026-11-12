@@ -1,0 +1,995 @@
+//! `java.util.TreeMap` and `TreeSet` as JDK 25 runs them.
+//!
+//! The host kept a tree map's entries in insertion order and found keys by
+//! marker: `TreeMap<Integer>` of 5,1,3 iterated `[5, 1, 3]`, and with a record
+//! key ordered by one component, `put` of a second key that `compareTo`s as
+//! equal added an entry instead of replacing the value. All uncounted.
+//!
+//! A tree map finds, orders and replaces keys only through `compareTo` (or
+//! its comparator), along the path of its red-black tree, so the calls depend
+//! on the tree's shape. This module keeps the tree the JDK would have: the
+//! `put` walk (an empty map first compares the key with itself, as
+//! `addEntryToEmptyMap` does), `fixAfterInsertion`'s recolouring and
+//! rotations, `deleteEntry` (a node with two children takes its successor's
+//! key) and `fixAfterDeletion`, the `getCeilingEntry`/`getFloorEntry`/
+//! `getHigherEntry`/`getLowerEntry` walks, and `buildFromSorted` for a copy
+//! of a sorted map or set (balanced, no comparisons). The host's list is the
+//! tree's in-order sequence.
+//!
+//! Answered here: the constructors, `put`/`putIfAbsent`/`get`/`containsKey`/
+//! `getOrDefault`/`remove`/`replace`/`containsValue`/`putAll`/`clear`, a
+//! set's `add`/`contains`/`remove`/`addAll`, `first*`/`last*`/`poll*`, the
+//! `floor`/`ceiling`/`higher`/`lower` lookups and `comparator()`. The
+//! navigable views (`headMap`, `subSet`, `descendingMap`...) are counted. A
+//! key another path added is placed by the next call while the order of its
+//! comparisons cannot show (pure keys, natural order); otherwise the tree's
+//! order is unknown and a call that shows it is counted.
+
+use super::*;
+use object_methods::CollectionKind;
+
+/// One node: its key and links.
+#[derive(Clone, Debug, PartialEq)]
+struct Node {
+    key: Value,
+    left: Option<usize>,
+    right: Option<usize>,
+    parent: Option<usize>,
+    red: bool,
+}
+
+/// A `TreeMap`'s red-black tree over the keys (the host keeps the values).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RedBlackTree {
+    nodes: Vec<Option<Node>>,
+    root: Option<usize>,
+    /// A key was added by a path that could not place it.
+    pub(crate) tainted: bool,
+}
+
+impl RedBlackTree {
+    fn node(&self, at: usize) -> &Node {
+        self.nodes[at].as_ref().expect("a live node")
+    }
+
+    fn node_mut(&mut self, at: usize) -> &mut Node {
+        self.nodes[at].as_mut().expect("a live node")
+    }
+
+    fn left(&self, at: Option<usize>) -> Option<usize> {
+        at.and_then(|at| self.node(at).left)
+    }
+
+    fn right(&self, at: Option<usize>) -> Option<usize> {
+        at.and_then(|at| self.node(at).right)
+    }
+
+    fn parent(&self, at: Option<usize>) -> Option<usize> {
+        at.and_then(|at| self.node(at).parent)
+    }
+
+    /// `colorOf`: `null` is black.
+    fn is_red(&self, at: Option<usize>) -> bool {
+        at.is_some_and(|at| self.node(at).red)
+    }
+
+    fn set_red(&mut self, at: Option<usize>, red: bool) {
+        if let Some(at) = at {
+            self.node_mut(at).red = red;
+        }
+    }
+
+    fn new_node(&mut self, key: Value, parent: Option<usize>) -> usize {
+        self.nodes.push(Some(Node {
+            key,
+            left: None,
+            right: None,
+            parent,
+            red: false,
+        }));
+        self.nodes.len() - 1
+    }
+
+    fn first(&self) -> Option<usize> {
+        let mut p = self.root?;
+        while let Some(left) = self.node(p).left {
+            p = left;
+        }
+        Some(p)
+    }
+
+    fn last(&self) -> Option<usize> {
+        let mut p = self.root?;
+        while let Some(right) = self.node(p).right {
+            p = right;
+        }
+        Some(p)
+    }
+
+    /// `successor(t)`.
+    fn successor(&self, t: usize) -> Option<usize> {
+        if let Some(mut p) = self.node(t).right {
+            while let Some(left) = self.node(p).left {
+                p = left;
+            }
+            return Some(p);
+        }
+        let (mut p, mut ch) = (self.node(t).parent, t);
+        while let Some(parent) = p {
+            if self.node(parent).right != Some(ch) {
+                break;
+            }
+            ch = parent;
+            p = self.node(parent).parent;
+        }
+        p
+    }
+
+    /// The keys in order.
+    pub(crate) fn keys(&self) -> Vec<Value> {
+        let mut keys = Vec::new();
+        let mut at = self.first();
+        while let Some(node) = at {
+            keys.push(self.node(node).key.clone());
+            at = self.successor(node);
+        }
+        keys
+    }
+
+    fn find_marker(&self, marker: &str) -> Option<usize> {
+        self.nodes.iter().position(|node| {
+            node.as_ref()
+                .is_some_and(|node| collection_item_marker(&node.key) == marker)
+        })
+    }
+
+    fn rotate_left(&mut self, p: Option<usize>) {
+        let Some(p) = p else { return };
+        let r = self.node(p).right.expect("rotateLeft needs a right child");
+        let r_left = self.node(r).left;
+        self.node_mut(p).right = r_left;
+        if let Some(rl) = r_left {
+            self.node_mut(rl).parent = Some(p);
+        }
+        let parent = self.node(p).parent;
+        self.node_mut(r).parent = parent;
+        match parent {
+            None => self.root = Some(r),
+            Some(parent) if self.node(parent).left == Some(p) => {
+                self.node_mut(parent).left = Some(r)
+            }
+            Some(parent) => self.node_mut(parent).right = Some(r),
+        }
+        self.node_mut(r).left = Some(p);
+        self.node_mut(p).parent = Some(r);
+    }
+
+    fn rotate_right(&mut self, p: Option<usize>) {
+        let Some(p) = p else { return };
+        let l = self.node(p).left.expect("rotateRight needs a left child");
+        let l_right = self.node(l).right;
+        self.node_mut(p).left = l_right;
+        if let Some(lr) = l_right {
+            self.node_mut(lr).parent = Some(p);
+        }
+        let parent = self.node(p).parent;
+        self.node_mut(l).parent = parent;
+        match parent {
+            None => self.root = Some(l),
+            Some(parent) if self.node(parent).right == Some(p) => {
+                self.node_mut(parent).right = Some(l)
+            }
+            Some(parent) => self.node_mut(parent).left = Some(l),
+        }
+        self.node_mut(l).right = Some(p);
+        self.node_mut(p).parent = Some(l);
+    }
+
+    /// `fixAfterInsertion(x)`.
+    fn fix_after_insertion(&mut self, x: usize) {
+        let mut x = Some(x);
+        self.set_red(x, true);
+        while x.is_some() && x != self.root && self.is_red(self.parent(x)) {
+            let grand = self.parent(self.parent(x));
+            if self.parent(x) == self.left(grand) {
+                let y = self.right(grand);
+                if self.is_red(y) {
+                    self.set_red(self.parent(x), false);
+                    self.set_red(y, false);
+                    self.set_red(grand, true);
+                    x = grand;
+                } else {
+                    if x == self.right(self.parent(x)) {
+                        x = self.parent(x);
+                        self.rotate_left(x);
+                    }
+                    self.set_red(self.parent(x), false);
+                    self.set_red(self.parent(self.parent(x)), true);
+                    self.rotate_right(self.parent(self.parent(x)));
+                }
+            } else {
+                let y = self.left(grand);
+                if self.is_red(y) {
+                    self.set_red(self.parent(x), false);
+                    self.set_red(y, false);
+                    self.set_red(grand, true);
+                    x = grand;
+                } else {
+                    if x == self.left(self.parent(x)) {
+                        x = self.parent(x);
+                        self.rotate_right(x);
+                    }
+                    self.set_red(self.parent(x), false);
+                    self.set_red(self.parent(self.parent(x)), true);
+                    self.rotate_left(self.parent(self.parent(x)));
+                }
+            }
+        }
+        let root = self.root;
+        self.set_red(root, false);
+    }
+
+    /// `addEntry(key, parent, addToLeft)`.
+    fn add_entry(&mut self, key: Value, parent: usize, to_left: bool) {
+        let at = self.new_node(key, Some(parent));
+        if to_left {
+            self.node_mut(parent).left = Some(at);
+        } else {
+            self.node_mut(parent).right = Some(at);
+        }
+        self.fix_after_insertion(at);
+    }
+
+    /// `deleteEntry(p)`.
+    fn delete_entry(&mut self, p: usize) {
+        let mut p = p;
+        if self.node(p).left.is_some() && self.node(p).right.is_some() {
+            let s = self
+                .successor(p)
+                .expect("a node with a right child has a successor");
+            let key = self.node(s).key.clone();
+            self.node_mut(p).key = key;
+            p = s;
+        }
+        let replacement = self.node(p).left.or(self.node(p).right);
+        let parent = self.node(p).parent;
+        if let Some(replacement) = replacement {
+            self.node_mut(replacement).parent = parent;
+            match parent {
+                None => self.root = Some(replacement),
+                Some(parent) if self.node(parent).left == Some(p) => {
+                    self.node_mut(parent).left = Some(replacement)
+                }
+                Some(parent) => self.node_mut(parent).right = Some(replacement),
+            }
+            let black = !self.node(p).red;
+            self.nodes[p] = None;
+            if black {
+                self.fix_after_deletion(replacement);
+            }
+        } else if parent.is_none() {
+            self.root = None;
+            self.nodes[p] = None;
+        } else {
+            if !self.node(p).red {
+                self.fix_after_deletion(p);
+            }
+            if let Some(parent) = self.node(p).parent {
+                if self.node(parent).left == Some(p) {
+                    self.node_mut(parent).left = None;
+                } else if self.node(parent).right == Some(p) {
+                    self.node_mut(parent).right = None;
+                }
+            }
+            self.nodes[p] = None;
+        }
+    }
+
+    /// `fixAfterDeletion(x)`.
+    fn fix_after_deletion(&mut self, x: usize) {
+        let mut x = Some(x);
+        while x != self.root && !self.is_red(x) {
+            if x == self.left(self.parent(x)) {
+                let mut sib = self.right(self.parent(x));
+                if self.is_red(sib) {
+                    self.set_red(sib, false);
+                    self.set_red(self.parent(x), true);
+                    self.rotate_left(self.parent(x));
+                    sib = self.right(self.parent(x));
+                }
+                if !self.is_red(self.left(sib)) && !self.is_red(self.right(sib)) {
+                    self.set_red(sib, true);
+                    x = self.parent(x);
+                } else {
+                    if !self.is_red(self.right(sib)) {
+                        self.set_red(self.left(sib), false);
+                        self.set_red(sib, true);
+                        self.rotate_right(sib);
+                        sib = self.right(self.parent(x));
+                    }
+                    let parent_red = self.is_red(self.parent(x));
+                    self.set_red(sib, parent_red);
+                    self.set_red(self.parent(x), false);
+                    self.set_red(self.right(sib), false);
+                    self.rotate_left(self.parent(x));
+                    x = self.root;
+                }
+            } else {
+                let mut sib = self.left(self.parent(x));
+                if self.is_red(sib) {
+                    self.set_red(sib, false);
+                    self.set_red(self.parent(x), true);
+                    self.rotate_right(self.parent(x));
+                    sib = self.left(self.parent(x));
+                }
+                if !self.is_red(self.right(sib)) && !self.is_red(self.left(sib)) {
+                    self.set_red(sib, true);
+                    x = self.parent(x);
+                } else {
+                    if !self.is_red(self.left(sib)) {
+                        self.set_red(self.right(sib), false);
+                        self.set_red(sib, true);
+                        self.rotate_left(sib);
+                        sib = self.left(self.parent(x));
+                    }
+                    let parent_red = self.is_red(self.parent(x));
+                    self.set_red(sib, parent_red);
+                    self.set_red(self.parent(x), false);
+                    self.set_red(self.left(sib), false);
+                    self.rotate_right(self.parent(x));
+                    x = self.root;
+                }
+            }
+        }
+        self.set_red(x, false);
+    }
+
+    /// `buildFromSorted`: a balanced tree over `keys` (in order), the nodes
+    /// at `computeRedLevel(size)` red.
+    fn build_from_sorted(keys: &[Value]) -> Self {
+        let mut tree = Self::default();
+        if keys.is_empty() {
+            return tree;
+        }
+        let red_level = 31 - (keys.len() as u32 + 1).leading_zeros() as usize;
+        tree.root = Some(tree.build(0, 0, keys.len() - 1, red_level, keys));
+        tree
+    }
+
+    fn build(
+        &mut self,
+        level: usize,
+        lo: usize,
+        hi: usize,
+        red_level: usize,
+        keys: &[Value],
+    ) -> usize {
+        let mid = (lo + hi) >> 1;
+        let left = (lo < mid).then(|| self.build(level + 1, lo, mid - 1, red_level, keys));
+        let middle = self.new_node(keys[mid].clone(), None);
+        self.node_mut(middle).red = level == red_level;
+        if let Some(left) = left {
+            self.node_mut(middle).left = Some(left);
+            self.node_mut(left).parent = Some(middle);
+        }
+        if mid < hi {
+            let right = self.build(level + 1, mid + 1, hi, red_level, keys);
+            self.node_mut(middle).right = Some(right);
+            self.node_mut(right).parent = Some(middle);
+        }
+        middle
+    }
+}
+
+/// Which navigation walk to run.
+#[derive(Clone, Copy, PartialEq)]
+enum Nearest {
+    Ceiling,
+    Floor,
+    Higher,
+    Lower,
+}
+
+fn thrown(class: &str) -> NativeError {
+    NativeError::UncaughtException {
+        class: class.into(),
+        message: None,
+        frame: None,
+    }
+}
+
+/// The views a tree map hands out, which this module does not model.
+fn navigable_view(name: &str) -> bool {
+    matches!(
+        name,
+        "headMap"
+            | "tailMap"
+            | "subMap"
+            | "headSet"
+            | "tailSet"
+            | "subSet"
+            | "descendingMap"
+            | "descendingKeySet"
+            | "descendingSet"
+            | "descendingIterator"
+            | "navigableKeySet"
+    )
+}
+
+impl<H: Host> Runtime<'_, H> {
+    /// Whether `value` is a host `TreeMap` (`Some(true)`) or `TreeSet`
+    /// (`Some(false)`), or a jar subclass's row of one.
+    fn tree_kind(&self, value: &Value) -> Option<bool> {
+        match self.host_collection_class(value)?.as_str() {
+            "java/util/TreeMap" => Some(true),
+            "java/util/TreeSet" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// `compare(a, b)`: the comparator, or `a.compareTo(b)`.
+    fn tree_compare(
+        &mut self,
+        comparator: &Option<Value>,
+        a: &Value,
+        b: &Value,
+    ) -> Result<i32, NativeError> {
+        self.ordered_compare(comparator, a, b)
+    }
+
+    /// The `put` walk: `Ok(Err(node))` for an equal key, `Ok(Ok((parent,
+    /// left)))` for where a new key goes (`None` parent: an empty tree).
+    #[allow(clippy::type_complexity)]
+    fn tree_search(
+        &mut self,
+        tree: &RedBlackTree,
+        comparator: &Option<Value>,
+        key: &Value,
+    ) -> Result<Result<Option<(usize, bool)>, usize>, NativeError> {
+        let Some(mut t) = tree.root else {
+            return Ok(Ok(None));
+        };
+        if comparator.is_none() && *key == Value::Ref(None) {
+            return Err(thrown("java/lang/NullPointerException"));
+        }
+        loop {
+            let cmp = self.tree_compare(comparator, key, &tree.node(t).key.clone())?;
+            let next = match cmp.cmp(&0) {
+                std::cmp::Ordering::Less => tree.node(t).left,
+                std::cmp::Ordering::Greater => tree.node(t).right,
+                std::cmp::Ordering::Equal => return Ok(Err(t)),
+            };
+            match next {
+                Some(next) => t = next,
+                None => return Ok(Ok(Some((t, cmp < 0)))),
+            }
+        }
+    }
+
+    /// `getEntry(key)`.
+    fn tree_get(
+        &mut self,
+        tree: &RedBlackTree,
+        comparator: &Option<Value>,
+        key: &Value,
+    ) -> Result<Option<usize>, NativeError> {
+        if tree.root.is_none() {
+            if comparator.is_none() && *key == Value::Ref(None) {
+                return Err(thrown("java/lang/NullPointerException"));
+            }
+            return Ok(None);
+        }
+        Ok(self.tree_search(tree, comparator, key)?.err())
+    }
+
+    /// The `getCeilingEntry`/`getFloorEntry`/`getHigherEntry`/
+    /// `getLowerEntry` walks.
+    fn tree_nearest(
+        &mut self,
+        tree: &RedBlackTree,
+        comparator: &Option<Value>,
+        key: &Value,
+        nearest: Nearest,
+    ) -> Result<Option<usize>, NativeError> {
+        let mut p = tree.root;
+        while let Some(at) = p {
+            let cmp = self.tree_compare(comparator, key, &tree.node(at).key.clone())?;
+            // Go left when the key is below this node (or not above it, for
+            // `higher`), right when above (or not below it, for `lower`).
+            let go_left = match nearest {
+                Nearest::Ceiling => cmp < 0,
+                Nearest::Higher => cmp < 0,
+                Nearest::Floor => cmp < 0,
+                Nearest::Lower => cmp <= 0,
+            };
+            let go_right = match nearest {
+                Nearest::Ceiling => cmp > 0,
+                Nearest::Higher => cmp >= 0,
+                Nearest::Floor => cmp > 0,
+                Nearest::Lower => cmp > 0,
+            };
+            let upward = matches!(nearest, Nearest::Ceiling | Nearest::Higher);
+            if go_left {
+                match tree.node(at).left {
+                    Some(left) => p = Some(left),
+                    // Ceiling/higher: this node. Floor/lower: the first
+                    // ancestor this subtree is right of.
+                    None if upward => return Ok(Some(at)),
+                    None => return Ok(Self::climb(tree, at, true)),
+                }
+            } else if go_right {
+                match tree.node(at).right {
+                    Some(right) => p = Some(right),
+                    None if upward => return Ok(Self::climb(tree, at, false)),
+                    None => return Ok(Some(at)),
+                }
+            } else {
+                return Ok(Some(at));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Climb while the child is its parent's left (`from_left`) or right
+    /// child; the parent reached, if any.
+    fn climb(tree: &RedBlackTree, at: usize, from_left: bool) -> Option<usize> {
+        let (mut parent, mut ch) = (tree.node(at).parent, at);
+        while let Some(p) = parent {
+            let side = if from_left {
+                tree.node(p).left
+            } else {
+                tree.node(p).right
+            };
+            if side != Some(ch) {
+                break;
+            }
+            ch = p;
+            parent = tree.node(p).parent;
+        }
+        parent
+    }
+
+    /// The tree of `value`, built from the host's list (in its order, as
+    /// `buildFromSorted` would) when this runtime did not see it built.
+    fn take_tree(&mut self, marker: &str, entries: &[Value], map: bool) -> RedBlackTree {
+        self.host.take_red_black_tree(marker).unwrap_or_else(|| {
+            let step = if map { 2 } else { 1 };
+            let keys: Vec<Value> = entries.iter().step_by(step).cloned().collect();
+            RedBlackTree::build_from_sorted(&keys)
+        })
+    }
+
+    /// Reconcile the tree with the host's list (entries another path added
+    /// or removed): removed keys are deleted, an added key is placed while
+    /// its comparisons cannot show (pure keys, natural order), else the
+    /// tree's order is unknown.
+    fn resync_tree(
+        &mut self,
+        tree: &mut RedBlackTree,
+        comparator: &Option<Value>,
+        entries: &[Value],
+        map: bool,
+    ) -> Result<(), NativeError> {
+        let step = if map { 2 } else { 1 };
+        let keys: Vec<&Value> = entries.iter().step_by(step).collect();
+        let present: std::collections::BTreeSet<String> =
+            keys.iter().map(|key| collection_item_marker(key)).collect();
+        for key in tree.keys() {
+            let marker = collection_item_marker(&key);
+            if !present.contains(&marker)
+                && let Some(node) = tree.find_marker(&marker)
+            {
+                tree.delete_entry(node);
+            }
+        }
+        for key in keys {
+            if tree.find_marker(&collection_item_marker(key)).is_some() {
+                continue;
+            }
+            // Only a string's or a box's `compareTo` runs unobserved.
+            if comparator.is_some() || self.equality_of(key) != object_methods::Equality::Platform {
+                tree.tainted = true;
+                continue;
+            }
+            match self.tree_search(tree, comparator, key)? {
+                Ok(None) => tree.root = Some(tree.new_node(key.clone(), None)),
+                Ok(Some((parent, left))) => tree.add_entry(key.clone(), parent, left),
+                Err(_) => tree.tainted = true,
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the host's list in the tree's order, with `values` (by key
+    /// marker) for a map.
+    fn write_tree(
+        &mut self,
+        receiver: &Value,
+        tree: &RedBlackTree,
+        map: bool,
+        values: &BTreeMap<String, Value>,
+    ) {
+        let mut entries = Vec::new();
+        for key in tree.keys() {
+            if map {
+                let value = values
+                    .get(&collection_item_marker(&key))
+                    .cloned()
+                    .unwrap_or(Value::Ref(None));
+                entries.extend([key, value]);
+            } else {
+                entries.push(key);
+            }
+        }
+        self.host.replace_mutable_collection(receiver, entries);
+    }
+
+    /// `TreeMap`/`TreeSet` members. `Ok(None)` leaves the call to the rest of
+    /// the dispatch.
+    pub(crate) fn invoke_tree_collection(
+        &mut self,
+        r: &MethodRef,
+        opcode: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb7 | 0xb9)) else {
+            return Ok(None);
+        };
+        if r.name == "<init>" {
+            return match r.owner.as_str() {
+                "java/util/TreeMap" => self.construct_tree(receiver, true, args),
+                "java/util/TreeSet" => self.construct_tree(receiver, false, args),
+                _ => Ok(None),
+            };
+        }
+        let Some(map) = self.tree_kind(receiver) else {
+            return Ok(None);
+        };
+        let Some(marker) = expect_ref(receiver).cloned() else {
+            return Ok(None);
+        };
+        if navigable_view(&r.name) {
+            return self.host.unknown_operand_call(r).map(|_| None);
+        }
+        let entries = self.collection_elements(receiver)?;
+        let comparator = self.host.collection_comparator(&marker);
+        let mut tree = self.take_tree(&marker, &entries, map);
+        let result = match self.resync_tree(&mut tree, &comparator, &entries, map) {
+            Ok(()) => self.tree_member(r, receiver, map, &mut tree, &comparator, entries, args),
+            Err(error) => Err(error),
+        };
+        self.host.store_red_black_tree(&marker, tree);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tree_member(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        map: bool,
+        tree: &mut RedBlackTree,
+        comparator: &Option<Value>,
+        entries: Vec<Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let step = if map { 2 } else { 1 };
+        let mut values: BTreeMap<String, Value> = entries
+            .chunks(step)
+            .map(|chunk| {
+                (
+                    collection_item_marker(&chunk[0]),
+                    chunk.get(1).cloned().unwrap_or(Value::Int(1)),
+                )
+            })
+            .collect();
+        let value_of = |values: &BTreeMap<String, Value>, key: &Value| {
+            values
+                .get(&collection_item_marker(key))
+                .cloned()
+                .unwrap_or(Value::Ref(None))
+        };
+        let key_of = |tree: &RedBlackTree, node: Option<usize>| {
+            node.map_or(Value::Ref(None), |node| tree.node(node).key.clone())
+        };
+        let boolean = |flag: bool| Some(Value::Int(i32::from(flag)));
+        let name = r.name.as_str();
+        if tree.tainted {
+            // Keys this tree could not place: the host answers, counted.
+            return self.host.unknown_operand_call(r).map(|_| None);
+        }
+        let answer = match (map, name, args) {
+            (true, "put" | "putIfAbsent", [key, value]) | (false, "add", [key @ value]) => {
+                let value = if map { value.clone() } else { Value::Int(1) };
+                match self.tree_search(tree, comparator, key)? {
+                    Ok(None) => {
+                        // `addEntryToEmptyMap`: `compare(key, key)` first.
+                        self.tree_compare(comparator, key, key)?;
+                        tree.root = Some(tree.new_node(key.clone(), None));
+                        values.insert(collection_item_marker(key), value);
+                        if map { Value::Ref(None) } else { Value::Int(1) }
+                    }
+                    Ok(Some((parent, left))) => {
+                        tree.add_entry(key.clone(), parent, left);
+                        values.insert(collection_item_marker(key), value);
+                        if map { Value::Ref(None) } else { Value::Int(1) }
+                    }
+                    Err(node) => {
+                        let stored = tree.node(node).key.clone();
+                        let old = value_of(&values, &stored);
+                        if map && (name == "put" || old == Value::Ref(None)) {
+                            values.insert(collection_item_marker(&stored), value);
+                        }
+                        if map { old } else { Value::Int(0) }
+                    }
+                }
+            }
+            (true, "get" | "containsKey", [key]) | (false, "contains", [key]) => {
+                let found = self.tree_get(tree, comparator, key)?;
+                match (name, found) {
+                    ("get", Some(node)) => value_of(&values, &tree.node(node).key.clone()),
+                    ("get", None) => Value::Ref(None),
+                    (_, found) => Value::Int(i32::from(found.is_some())),
+                }
+            }
+            (true, "getOrDefault", [key, default]) => {
+                // `Map.getOrDefault`: `get`, then `containsKey` for a null.
+                let found = self.tree_get(tree, comparator, key)?;
+                let value = found.map_or(Value::Ref(None), |node| {
+                    value_of(&values, &tree.node(node).key.clone())
+                });
+                if value != Value::Ref(None) {
+                    value
+                } else if self.tree_get(tree, comparator, key)?.is_some() {
+                    Value::Ref(None)
+                } else {
+                    default.clone()
+                }
+            }
+            (_, "remove", [key]) if r.descriptor.ends_with(")Ljava/lang/Object;") || !map => {
+                match self.tree_get(tree, comparator, key)? {
+                    Some(node) => {
+                        let stored = tree.node(node).key.clone();
+                        let old = values
+                            .remove(&collection_item_marker(&stored))
+                            .unwrap_or(Value::Ref(None));
+                        tree.delete_entry(node);
+                        if map { old } else { Value::Int(1) }
+                    }
+                    None if map => Value::Ref(None),
+                    None => Value::Int(0),
+                }
+            }
+            (true, "replace", [key, value]) if r.descriptor.ends_with(")Ljava/lang/Object;") => {
+                match self.tree_get(tree, comparator, key)? {
+                    Some(node) => {
+                        let stored = tree.node(node).key.clone();
+                        values
+                            .insert(collection_item_marker(&stored), value.clone())
+                            .unwrap_or(Value::Ref(None))
+                    }
+                    None => Value::Ref(None),
+                }
+            }
+            (true, "containsValue", [wanted]) => {
+                // `valEquals(value, e.value)` in key order.
+                let mut found = false;
+                for key in tree.keys() {
+                    let stored = value_of(&values, &key);
+                    let equal = if *wanted == Value::Ref(None) {
+                        stored == Value::Ref(None)
+                    } else {
+                        self.java_equals(wanted, &stored)?
+                    };
+                    if equal {
+                        found = true;
+                        break;
+                    }
+                }
+                Value::Int(i32::from(found))
+            }
+            (_, "clear", []) => {
+                *tree = RedBlackTree::default();
+                values.clear();
+                Value::Void
+            }
+            (_, "comparator", []) => comparator.clone().unwrap_or(Value::Ref(None)),
+            (_, "firstKey" | "lastKey" | "first" | "last", []) => {
+                let node = if name.starts_with("first") {
+                    tree.first()
+                } else {
+                    tree.last()
+                };
+                match node {
+                    Some(node) => tree.node(node).key.clone(),
+                    None => return Err(thrown("java/util/NoSuchElementException")),
+                }
+            }
+            (
+                _,
+                "firstEntry" | "lastEntry" | "pollFirstEntry" | "pollLastEntry" | "pollFirst"
+                | "pollLast",
+                [],
+            ) => {
+                let node = if name.contains("First") {
+                    tree.first()
+                } else {
+                    tree.last()
+                };
+                let Some(node) = node else {
+                    return Ok(Some(Value::Ref(None)));
+                };
+                let key = tree.node(node).key.clone();
+                let value = value_of(&values, &key);
+                if name.starts_with("poll") {
+                    values.remove(&collection_item_marker(&key));
+                    tree.delete_entry(node);
+                }
+                if name.ends_with("Entry") {
+                    map_entry_value(&key, &value)
+                } else {
+                    key
+                }
+            }
+            (
+                _,
+                "ceilingKey" | "floorKey" | "higherKey" | "lowerKey" | "ceiling" | "floor"
+                | "higher" | "lower" | "ceilingEntry" | "floorEntry" | "higherEntry" | "lowerEntry",
+                [key],
+            ) => {
+                let nearest = if name.starts_with("ceiling") {
+                    Nearest::Ceiling
+                } else if name.starts_with("floor") {
+                    Nearest::Floor
+                } else if name.starts_with("higher") {
+                    Nearest::Higher
+                } else {
+                    Nearest::Lower
+                };
+                if comparator.is_none() && *key == Value::Ref(None) {
+                    return Err(thrown("java/lang/NullPointerException"));
+                }
+                let node = self.tree_nearest(tree, comparator, key, nearest)?;
+                let found = key_of(tree, node);
+                if name.ends_with("Entry") {
+                    match node {
+                        Some(_) => map_entry_value(&found, &value_of(&values, &found)),
+                        None => Value::Ref(None),
+                    }
+                } else {
+                    found
+                }
+            }
+            (true, "putAll", [source]) | (false, "addAll", [source]) => {
+                let source = source.clone();
+                if self.host_collection_kind(&source).is_none() {
+                    return Ok(None);
+                }
+                let incoming = self.collection_elements(&source)?;
+                let sorted_source = self.tree_kind(&source) == Some(map)
+                    && self
+                        .host
+                        .collection_comparator(expect_ref(&source).map_or("", |m| m.as_str()))
+                        == *comparator;
+                if tree.root.is_none() && !incoming.is_empty() && sorted_source {
+                    // `buildFromSorted`/`addAllForTreeSet`: no comparisons.
+                    let keys: Vec<Value> = incoming.iter().step_by(step).cloned().collect();
+                    *tree = RedBlackTree::build_from_sorted(&keys);
+                    for chunk in incoming.chunks(step) {
+                        values.insert(
+                            collection_item_marker(&chunk[0]),
+                            chunk.get(1).cloned().unwrap_or(Value::Int(1)),
+                        );
+                    }
+                    if map { Value::Void } else { Value::Int(1) }
+                } else {
+                    let mut changed = false;
+                    for chunk in incoming.chunks(step) {
+                        let key = &chunk[0];
+                        let value = chunk.get(1).cloned().unwrap_or(Value::Int(1));
+                        match self.tree_search(tree, comparator, key)? {
+                            Ok(None) => {
+                                self.tree_compare(comparator, key, key)?;
+                                tree.root = Some(tree.new_node(key.clone(), None));
+                                values.insert(collection_item_marker(key), value);
+                                changed = true;
+                            }
+                            Ok(Some((parent, left))) => {
+                                tree.add_entry(key.clone(), parent, left);
+                                values.insert(collection_item_marker(key), value);
+                                changed = true;
+                            }
+                            Err(node) if map => {
+                                let stored = tree.node(node).key.clone();
+                                values.insert(collection_item_marker(&stored), value);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if map {
+                        Value::Void
+                    } else {
+                        Value::Int(i32::from(changed))
+                    }
+                }
+            }
+            _ => return Ok(None),
+        };
+        self.write_tree(receiver, tree, map, &values);
+        Ok(match answer {
+            Value::Int(flag) if r.descriptor.ends_with(")Z") => boolean(flag != 0),
+            answer => Some(answer),
+        })
+    }
+
+    /// The constructors: an optional comparator, or a source map/collection
+    /// (a sorted one of the same kind is copied with `buildFromSorted`).
+    fn construct_tree(
+        &mut self,
+        receiver: &Value,
+        map: bool,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(marker) = expect_ref(receiver).cloned() else {
+            return Ok(None);
+        };
+        let owner = if map {
+            "java/util/TreeMap"
+        } else {
+            "java/util/TreeSet"
+        };
+        let empty = MethodRef {
+            owner: owner.into(),
+            name: "<init>".into(),
+            descriptor: "()V".into(),
+        };
+        let source = match args {
+            [] => None,
+            [arg] if self.host_collection_kind(arg).is_some() => Some(arg.clone()),
+            [Value::Ref(None)] => return Err(thrown("java/lang/NullPointerException")),
+            [comparator] => {
+                self.host.invoke_instance(&empty, receiver, &[])?;
+                self.host
+                    .set_collection_comparator(&marker, comparator.clone());
+                self.host
+                    .store_red_black_tree(&marker, RedBlackTree::default());
+                return Ok(Some(Value::Void));
+            }
+            _ => return Ok(None),
+        };
+        self.host.invoke_instance(&empty, receiver, &[])?;
+        self.host
+            .store_red_black_tree(&marker, RedBlackTree::default());
+        let Some(source) = source else {
+            return Ok(Some(Value::Void));
+        };
+        // A sorted source lends its comparator (`TreeMap(SortedMap)`,
+        // `TreeSet(SortedSet)`); `TreeMap(Map)`/`TreeSet(Collection)` start
+        // with natural order and copy it with `putAll`/`addAll`.
+        let wanted = if map {
+            CollectionKind::Map
+        } else {
+            CollectionKind::Set
+        };
+        if self.tree_kind(&source) == Some(map)
+            && self.host_collection_kind(&source) == Some(wanted)
+            && let Some(comparator) =
+                expect_ref(&source).and_then(|source| self.host.collection_comparator(source))
+        {
+            self.host.set_collection_comparator(&marker, comparator);
+        }
+        let copy = MethodRef {
+            owner: owner.into(),
+            name: if map { "putAll" } else { "addAll" }.into(),
+            descriptor: if map {
+                "(Ljava/util/Map;)V"
+            } else {
+                "(Ljava/util/Collection;)Z"
+            }
+            .into(),
+        };
+        self.invoke_tree_collection(&copy, 0xb6, Some(receiver), std::slice::from_ref(&source))?;
+        Ok(Some(Value::Void))
+    }
+}

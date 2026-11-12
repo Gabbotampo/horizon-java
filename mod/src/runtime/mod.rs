@@ -110,6 +110,7 @@ mod sequenced;
 mod service_loader;
 mod stack_walk;
 mod tim_sort;
+mod tree_map;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
@@ -2186,6 +2187,14 @@ pub trait Host {
 
     fn set_collection_comparator(&mut self, _marker: &str, _comparator: Value) {}
 
+    /// The red-black tree of a `TreeMap`/`TreeSet` (`tree_map.rs`), taken
+    /// out until [`Self::store_red_black_tree`] puts it back.
+    fn take_red_black_tree(&mut self, _marker: &str) -> Option<tree_map::RedBlackTree> {
+        None
+    }
+
+    fn store_red_black_tree(&mut self, _marker: &str, _tree: tree_map::RedBlackTree) {}
+
     /// Remember that `marker` is the copy a map's `keySet()`/`values()`/
     /// `entrySet()` answered, whose mutators cannot reach the map.
     fn note_view_copy(&mut self, _marker: &str) {}
@@ -2565,6 +2574,8 @@ pub struct StdHost {
     hash_tables: BTreeMap<String, hash_table::HashTable>,
     /// The comparators priority queues were built with, by marker.
     collection_comparators: BTreeMap<String, Value>,
+    /// The red-black trees of tree maps and sets, by marker.
+    red_black_trees: BTreeMap<String, tree_map::RedBlackTree>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
     view_copies: BTreeSet<String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
@@ -2691,6 +2702,7 @@ impl StdHost {
             reversed_views: BTreeMap::new(),
             hash_tables: BTreeMap::new(),
             collection_comparators: BTreeMap::new(),
+            red_black_trees: BTreeMap::new(),
             view_copies: BTreeSet::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
@@ -4076,6 +4088,14 @@ impl Host for StdHost {
     fn set_collection_comparator(&mut self, marker: &str, comparator: Value) {
         self.collection_comparators
             .insert(marker.to_owned(), comparator);
+    }
+
+    fn take_red_black_tree(&mut self, marker: &str) -> Option<tree_map::RedBlackTree> {
+        self.red_black_trees.remove(marker)
+    }
+
+    fn store_red_black_tree(&mut self, marker: &str, tree: tree_map::RedBlackTree) {
+        self.red_black_trees.insert(marker.to_owned(), tree);
     }
 
     fn note_view_copy(&mut self, marker: &str) {
@@ -23983,6 +24003,12 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_priority_queue(&r, op, receiver.as_ref(), &args)
                     ) {
                         // `PriorityQueue`'s heap (`priority_queue.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_tree_collection(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // `TreeMap`/`TreeSet`'s red-black tree (`tree_map.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
