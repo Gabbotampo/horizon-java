@@ -36,6 +36,8 @@ use super::*;
 const ACC_PRIVATE: u16 = 0x0002;
 const ACC_PROTECTED: u16 = 0x0004;
 const ACC_PUBLIC: u16 = 0x0001;
+/// `ACC_STATIC`.
+const ACC_STATIC: u16 = 0x0008;
 
 /// The non-static, non-private methods each JDK skeleton class declares
 /// itself (not inherited), with its JDK superclass.
@@ -233,37 +235,49 @@ pub(crate) fn constructed_object_class(marker: &str) -> Option<&str> {
 
 impl<H: Host> Runtime<'_, H> {
     /// The jar or linked class whose body an `invokevirtual`/`invokeinterface`
-    /// of `r` on `receiver` selects, or `None` to leave the call to the model
-    /// chain (and then to [`Self::dispatch_owner`]).
+    /// of `r` on `receiver` selects, or `Ok(None)` to leave the call to the
+    /// model chain (and then to [`Self::dispatch_owner`]).
     ///
     /// The receiver must be an object this run constructed of a class the
-    /// runtime holds. Selection follows JVMS §5.4.6: the first class on the
-    /// receiver's superclass chain that declares a non-static, non-private
-    /// method of that name and descriptor which can override the resolved one
-    /// (a package-private resolved method is only overridden from its own
-    /// package), else, when the chain leaves the jar at a JDK superclass known
-    /// not to declare the member, a jar interface's default. A selected
-    /// abstract method answers `None` (the JVM throws `AbstractMethodError`;
-    /// the existing chain keeps its answer). A resolved method that is private
-    /// or static is not dispatched virtually at all.
+    /// runtime holds. Selection follows JVMS §5.4.6:
+    ///
+    /// 1. the most derived class on the receiver's superclass chain whose
+    ///    declaration overrides the resolved method. Overriding is JVMS
+    ///    §5.4.5's, transitive included: a package-private method is
+    ///    overridden only from its own package, unless an overrider in that
+    ///    package widened it to public or protected, after which any package
+    ///    overrides it;
+    /// 2. otherwise, when the chain leaves the jar at a JDK superclass known
+    ///    not to declare the member, the maximally specific superinterface
+    ///    default ([`Self::maximally_specific_default`]). Two of them throw
+    ///    `IncompatibleClassChangeError`; only abstract ones throw
+    ///    `AbstractMethodError`, with HotSpot's messages.
+    ///
+    /// A selected abstract class method answers `Ok(None)` (the existing
+    /// chain keeps its answer). A resolved method that is private or static
+    /// is not dispatched virtually at all.
     pub(crate) fn jvm_selected_jar_body(
         &self,
         r: &MethodRef,
         opcode: u8,
         receiver: Option<&Value>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, NativeError> {
         if !matches!(opcode, 0xb6 | 0xb9) || r.name.starts_with('<') {
-            return None;
+            return Ok(None);
         }
-        let class = constructed_object_class(expect_ref(receiver?)?)?;
+        let Some(class) = receiver
+            .and_then(expect_ref)
+            .and_then(|marker| constructed_object_class(marker))
+        else {
+            return Ok(None);
+        };
         // A jar's own copy of a host-modelled class (an unrelocated Gson) is
         // answered by the host's model, as `new` and every other path treat it.
-        if self.host.models_class(class) || library_modelled(class) {
-            return None;
+        if self.host.models_class(class) || library_modelled(class) || self.class(class).is_none() {
+            return Ok(None);
         }
-        self.class(class)?;
-        // The resolved method's access decides whether the call is virtual
-        // and which overrides count.
+        // The resolved method (JVMS §5.4.3.3): its access decides whether the
+        // call is virtual and which declarations override it.
         let resolved = self
             .member_owner(&r.owner, &r.name, &r.descriptor)
             .and_then(|(owner, jar)| jar.then_some(owner))
@@ -272,42 +286,181 @@ impl<H: Host> Runtime<'_, H> {
                 Some((owner, access))
             });
         if let Some((_, access)) = &resolved
-            && access & (ACC_PRIVATE | 0x0008) != 0
+            && access & (ACC_PRIVATE | ACC_STATIC) != 0
         {
-            return None;
+            return Ok(None);
         }
-        let package_private_in = resolved.as_ref().and_then(|(owner, access)| {
-            (access & (ACC_PUBLIC | ACC_PROTECTED) == 0).then(|| package_of(owner).to_owned())
-        });
-        let mut current = class.to_owned();
+        // The receiver's superclass chain while the runtime holds it, and the
+        // platform class it leaves the jar at.
         let mut chain = Vec::new();
+        let mut left_at = None;
+        let mut current = class.to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
-                // The chain left the jar. A JDK superclass that declares the
-                // member (or one the runtime cannot tell about) answers it
-                // through the model chain; otherwise a jar default wins.
-                if jdk_superclass_declares(&current, &r.name, &r.descriptor) != Some(false) {
-                    return None;
-                }
-                return self.inherited_default_owner(&chain, &r.name, &r.descriptor);
+                left_at = Some(current);
+                break;
             };
-            if let Some(method) = file.method(&r.name, &r.descriptor)
-                && !method.is_static()
-                && method.access & ACC_PRIVATE == 0
-                && package_private_in
-                    .as_deref()
-                    .is_none_or(|package| package == package_of(&current))
-            {
-                return method.code.is_some().then_some(current);
-            }
-            if file.super_name.is_empty() {
-                return None;
-            }
+            let superclass = file.super_name.clone();
             chain.push(current);
-            current = file.super_name.clone();
+            if superclass.is_empty() {
+                break;
+            }
+            current = superclass;
         }
-        None
+        let declaration = |class: &str| {
+            self.class(class)
+                .and_then(|file| file.method(&r.name, &r.descriptor))
+                .filter(|method| !method.is_static() && method.access & ACC_PRIVATE == 0)
+        };
+        let selected = match &resolved {
+            Some((owner, access)) if chain.contains(owner) => {
+                // Walk down from the resolved class, keeping every declaration
+                // that overrides it (with its package and whether it is
+                // public/protected); a declaration overrides when one of them
+                // is open to it.
+                let position = chain.iter().position(|class| class == owner).unwrap_or(0);
+                let mut overridden = vec![(package_of(owner), is_open(*access))];
+                let mut selected = owner.clone();
+                for class in chain[..position].iter().rev() {
+                    if let Some(method) = declaration(class)
+                        && overridden
+                            .iter()
+                            .any(|(package, open)| *open || *package == package_of(class))
+                    {
+                        overridden.push((package_of(class), is_open(method.access)));
+                        selected = class.clone();
+                    }
+                }
+                Some(selected)
+            }
+            // An interface's (public) method, or a platform one: the first
+            // declaration on the chain overrides it.
+            _ => chain
+                .iter()
+                .find(|class| declaration(class).is_some())
+                .cloned(),
+        };
+        if let Some(selected) = selected {
+            let has_body = declaration(&selected).is_some_and(|method| method.code.is_some());
+            return Ok(has_body.then_some(selected));
+        }
+        // A JDK superclass that declares the member (or one the runtime
+        // cannot tell about) answers it through the model chain.
+        if let Some(platform) = &left_at
+            && jdk_superclass_declares(platform, &r.name, &r.descriptor) != Some(false)
+        {
+            return Ok(None);
+        }
+        match self.maximally_specific_default(&chain, &r.name, &r.descriptor) {
+            DefaultSelection::Selected(owner) => Ok(Some(owner)),
+            DefaultSelection::None => Ok(None),
+            DefaultSelection::Conflict(owners) => Err(NativeError::UncaughtException {
+                class: "java/lang/IncompatibleClassChangeError".into(),
+                message: Some(format!(
+                    "Conflicting default methods: {}",
+                    owners
+                        .iter()
+                        .map(|owner| format!("{owner}.{}", r.name))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )),
+                frame: None,
+            }),
+            DefaultSelection::Abstract => Err(NativeError::UncaughtException {
+                class: "java/lang/AbstractMethodError".into(),
+                message: Some(format!(
+                    "Method {class}.{}{} is abstract",
+                    r.name, r.descriptor
+                )),
+                frame: None,
+            }),
+        }
     }
+
+    /// JVMS §5.4.3.3's maximally specific superinterface methods of the
+    /// classes in `chain` for `name descriptor`, and §5.4.6 step 3's choice
+    /// among them.
+    ///
+    /// Every superinterface the runtime holds is gathered (breadth first, in
+    /// declaration order, bounded by [`MAX_SUPERCLASS_WALK`] interfaces).
+    /// A declaration is maximally specific when no other declaring interface
+    /// extends its interface. Exactly one non-abstract maximally specific
+    /// method is selected; two or more conflict; abstract ones alone leave
+    /// nothing to run. Platform interfaces (`java/util/List`) have no class
+    /// file here, so their defaults are never candidates: the host answers
+    /// them.
+    pub(crate) fn maximally_specific_default(
+        &self,
+        chain: &[String],
+        name: &str,
+        descriptor: &str,
+    ) -> DefaultSelection {
+        let mut queue = std::collections::VecDeque::new();
+        for class in chain {
+            if let Some(file) = self.class(class) {
+                queue.extend(file.interface_names());
+            }
+        }
+        let mut interfaces = Vec::new();
+        while let Some(interface) = queue.pop_front() {
+            if interfaces.len() >= MAX_SUPERCLASS_WALK {
+                break;
+            }
+            if interfaces.contains(&interface) {
+                continue;
+            }
+            if let Some(file) = self.class(&interface) {
+                queue.extend(file.interface_names());
+                interfaces.push(interface);
+            }
+        }
+        let declaring = interfaces
+            .iter()
+            .filter_map(|interface| {
+                let method = self.class(interface)?.method(name, descriptor)?;
+                (!method.is_static() && method.access & ACC_PRIVATE == 0)
+                    .then(|| (interface.clone(), method.code.is_some()))
+            })
+            .collect::<Vec<_>>();
+        let maximal = declaring
+            .iter()
+            .filter(|(interface, _)| {
+                !declaring.iter().any(|(other, _)| {
+                    other != interface && self.interface_extends(other, interface)
+                })
+            })
+            .collect::<Vec<_>>();
+        let concrete = maximal
+            .iter()
+            .filter(|(_, has_body)| *has_body)
+            .map(|(interface, _)| interface.clone())
+            .collect::<Vec<_>>();
+        match concrete.len() {
+            1 => DefaultSelection::Selected(concrete.into_iter().next().unwrap_or_default()),
+            0 if maximal.is_empty() => DefaultSelection::None,
+            0 => DefaultSelection::Abstract,
+            _ => DefaultSelection::Conflict(concrete),
+        }
+    }
+}
+
+/// [`Runtime::maximally_specific_default`]'s outcome.
+pub(crate) enum DefaultSelection {
+    /// The one non-abstract maximally specific default.
+    Selected(String),
+    /// No superinterface the runtime holds declares the member.
+    None,
+    /// Two or more non-abstract maximally specific defaults, in the order
+    /// they were found.
+    Conflict(Vec<String>),
+    /// Only abstract maximally specific declarations.
+    Abstract,
+}
+
+/// Whether a method's access lets any package override it (public or
+/// protected).
+fn is_open(access: u16) -> bool {
+    access & (ACC_PUBLIC | ACC_PROTECTED) != 0
 }
 
 impl<H: Host> Runtime<'_, H> {
