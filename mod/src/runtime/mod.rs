@@ -39,6 +39,7 @@ mod fabric_registry;
 mod facade_saved_data;
 mod facade_server;
 mod facade_text;
+mod field_access;
 mod game_codecs;
 mod game_hooks;
 mod gson_model;
@@ -63,6 +64,7 @@ mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
+mod mod_config_spec;
 mod mod_origin;
 pub mod neoforge_attachments;
 mod neoforge_loader;
@@ -24246,6 +24248,16 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_mod_config_spec(&r, receiver.as_ref(), &args)
+                    ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_field_access(&r, receiver.as_ref(), &args, class)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
