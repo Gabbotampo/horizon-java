@@ -95,9 +95,8 @@ public class Probe {
 
     static class Walked {
         static String caller = StackWalker.getInstance()
-            .walk(s -> s.skip(1).findFirst())
-            .map(StackWalker.StackFrame::getMethodName)
-            .orElse("none");
+            .walk(s -> s.map(f -> f.getMethodName()).limit(2)
+                .collect(java.util.stream.Collectors.joining(",")));
         static String touch() { return caller; }
     }
 
@@ -352,15 +351,15 @@ fn new_initializes_its_class_before_the_constructor_arguments() {
 }
 
 /// The JVM initializes a class at the caller's `invokestatic`, before the
-/// callee's frame exists, so the `<clinit>`'s caller is the invoking method,
-/// not `touch`. Initializing inside the callee's frame also cost one nested
+/// callee's frame exists, so the frame under `<clinit>` is the invoking
+/// method, not `touch`. Initializing inside the callee's frame also cost one nested
 /// frame per lazily initialized class against the interpreter's depth bound.
 #[test]
 fn a_static_call_initializes_its_class_in_the_callers_frame() {
     let fixture = Fixture::build("init-frame");
     assert_eq!(
         fixture.text("initializerRunsInTheCallersFrame"),
-        "initializerRunsInTheCallersFrame"
+        "<clinit>,initializerRunsInTheCallersFrame"
     );
 }
 
