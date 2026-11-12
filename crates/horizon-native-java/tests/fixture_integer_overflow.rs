@@ -150,16 +150,15 @@ fn signed_add_subtract_multiply_and_increment_wrap_like_java() {
     assert_eq!(longs("longSubtract", i64::MIN, 1), Value::Long(i64::MAX));
     assert_eq!(
         longs("longMultiply", 6_364_136_223_846_793_005, 3),
-        Value::Long(6_364_136_223_846_793_005_i64.wrapping_mul(3))
+        // `6364136223846793005L * 3` on a JVM.
+        Value::Long(645_664_597_830_827_399)
     );
     assert_eq!(
         call(&jar, "increment", "(I)I", &[Value::Int(i32::MAX - 50)]),
-        Value::Int((i32::MAX - 50).wrapping_add(100))
+        // `(Integer.MAX_VALUE - 50) + 100` on a JVM.
+        Value::Int(-2_147_483_599)
     );
     let text = "horizon:overflowing_identifier";
-    let expected = text.encode_utf16().fold(0_i32, |hash, unit| {
-        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
-    });
     assert_eq!(
         call(
             &jar,
@@ -167,6 +166,7 @@ fn signed_add_subtract_multiply_and_increment_wrap_like_java() {
             "(Ljava/lang/String;)I",
             &[Value::Ref(Some(text.into()))]
         ),
-        Value::Int(expected)
+        // `"horizon:overflowing_identifier".hashCode()` on a JVM.
+        Value::Int(1_525_457_511)
     );
 }
