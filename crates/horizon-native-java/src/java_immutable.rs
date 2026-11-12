@@ -46,6 +46,11 @@ const MUTATORS: &[&str] = &[
     "replace",
 ];
 
+/// Whether `name` is one of the members above that change a collection.
+pub(crate) fn is_mutator(name: &str) -> bool {
+    MUTATORS.contains(&name)
+}
+
 fn throw(class: &str, message: Option<String>) -> NativeError {
     NativeError::UncaughtException {
         class: class.into(),
@@ -88,7 +93,7 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         | "java/util/Collections$UnmodifiableRandomAccessList" => LIST,
         "java/util/ImmutableCollections$SetN" | "java/util/Collections$UnmodifiableSet" => SET,
         "java/util/ImmutableCollections$MapN" | "java/util/Collections$UnmodifiableMap" => MAP,
-        _ => &[],
+        _ => crate::sequenced::supertypes(class),
     }
 }
 

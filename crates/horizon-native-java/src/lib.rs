@@ -80,6 +80,7 @@ mod reflect_generic;
 mod reflect_names;
 mod reflect_override;
 mod registry_contents;
+mod sequenced;
 mod service_loader;
 mod stack_walk;
 mod type_switch;
@@ -2477,6 +2478,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// `List.reversed()` views: view marker → (its list, whether it writes
+    /// through) (`sequenced.rs`).
+    reversed_views: BTreeMap<String, (String, bool)>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2597,6 +2601,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            reversed_views: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -2995,6 +3000,9 @@ impl StdHost {
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<String>> {
         let marker = expect_ref(receiver)?;
         if let Some(values) = self.view_values(marker) {
+            return Some(values);
+        }
+        if let Some(values) = self.reversed_view_values(marker) {
             return Some(values);
         }
         self.mutable_collections.get(marker).map(|values| {
@@ -4003,7 +4011,7 @@ impl Host for StdHost {
     /// The command façade's markers (a source, a node, a builder) answer
     /// `instanceof` for their Brigadier and vanilla types.
     fn host_instance_of(&self, marker: &str, wanted: &str) -> bool {
-        self.brigadier_instance_of(marker, wanted)
+        self.brigadier_instance_of(marker, wanted) || self.mod_container_instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -5373,11 +5381,10 @@ impl Host for StdHost {
             return value;
         }
         // `Object.getClass` is the bridge from a value marker back to the
-        // reflective class surface config code uses for field discovery.
-        if r.owner == "java/lang/Object"
-            && r.name == "getClass"
-            && r.descriptor == "()Ljava/lang/Class;"
-        {
+        // reflective class surface config code uses for field discovery. It is
+        // final, so javac's `List.getClass` (an interface-typed receiver) is the
+        // same method whatever owner the call names.
+        if r.name == "getClass" && r.descriptor == "()Ljava/lang/Class;" {
             // A marker no model can name (a host object, a lambda, an array)
             // is still an object of *some* class: the neutral `null` is a
             // guess, so it is counted, not answered silently.
@@ -5978,6 +5985,11 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // `getFirst`/`removeFirst`/`reversed()`... on a list, before the
+            // unmodifiable check: a view's `removeFirst` checks emptiness first.
+            if let Some(answer) = self.sequenced_member(r, receiver, marker, args) {
+                return answer;
+            }
             if let Some(answer) = self.unmodifiable_member(r, marker, args) {
                 return answer;
             }
@@ -6107,7 +6119,7 @@ impl Host for StdHost {
                         if matches!(r.name.as_str(), "pop" | "removeFirst") {
                             return Err(NativeError::UncaughtException {
                                 class: "java/util/NoSuchElementException".into(),
-                                message: Some("queue is empty".into()),
+                                message: None,
                                 frame: None,
                             });
                         }
@@ -6126,7 +6138,7 @@ impl Host for StdHost {
                         if r.name == "removeLast" {
                             return Err(NativeError::UncaughtException {
                                 class: "java/util/NoSuchElementException".into(),
-                                message: Some("queue is empty".into()),
+                                message: None,
                                 frame: None,
                             });
                         }
@@ -6145,7 +6157,7 @@ impl Host for StdHost {
                         if r.name == "getFirst" {
                             return Err(NativeError::UncaughtException {
                                 class: "java/util/NoSuchElementException".into(),
-                                message: Some("queue is empty".into()),
+                                message: None,
                                 frame: None,
                             });
                         }
@@ -6164,7 +6176,7 @@ impl Host for StdHost {
                         if r.name == "getLast" {
                             return Err(NativeError::UncaughtException {
                                 class: "java/util/NoSuchElementException".into(),
-                                message: Some("queue is empty".into()),
+                                message: None,
                                 frame: None,
                             });
                         }
@@ -6180,7 +6192,7 @@ impl Host for StdHost {
                     if values.is_empty() {
                         return Err(NativeError::UncaughtException {
                             class: "java/util/NoSuchElementException".into(),
-                            message: Some("queue is empty".into()),
+                            message: None,
                             frame: None,
                         });
                     }

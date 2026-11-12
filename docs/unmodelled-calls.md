@@ -369,6 +369,23 @@ get past the provider: NeoForge's now stops at `instanceof FMLModContainer`, Fab
 `MapCodecs#getEnumsByName`. `moderner-beta`, `servercore`, `ItemBorders`, `Highlighter` and
 `AdvancementPlaques` stay refused, now at a later throw, because their providers' constructors
 ran.
+## Re-measured (12 November 2026, sequenced lists and `FMLModContainer`)
+
+JDK 21's `getFirst`/`getLast`/`removeFirst`/`removeLast`/`addFirst`/`addLast`/`reversed` now
+answer on lists, not only on queues (`sequenced.rs`). A `javafml` mod's container is an
+`FMLModContainer`, and its `getEventBus()` returns the mod bus. Against `6e3684b`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → **43** | 4 → 4 | 39 → **38** | 896 → 909 |
+| mega | 60 → 60 | 87 → 87 | 4 → 4 | 101 → 101 | 2,468 → 2,468 |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 257 |
+
+- `241160-8893517` (Balm's netherportalfix) goes from refused to `ran-hollow` (13).
+- `ImmediatelyFast-NeoForge` gets its two `List#getFirst` answered and runs on (2 → 4).
+- Every `collective` build, and `fullbrightnesstoggle` through it, gets past
+  `ArrayBackedEvent#rebuildInvoker` and now stops at the `String#replaceAll` null in
+  `RegisterMod`.
 
 ## Known limits of this census
 
