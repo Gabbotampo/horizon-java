@@ -80,18 +80,27 @@ impl LoadPlan {
 /// `libjf-base` provides `libjf_base`, the spelling `respackopts`' NeoForge
 /// `[[dependencies]]` use; `respackopts` bundles its `muscript` the NeoForge
 /// way.
+///
+/// One departure: an id the host answers ([`HOST_PROVIDED_MODS`]) is not
+/// counted when only a bundled jar or a `provides` alias names it. `libjf-base` bundles `fabric-lifecycle-events-v1`; a real
+/// loader lets that copy satisfy `spark`'s dependency, but here the host's
+/// model answers it, and counting the copy would only link `libjf` into
+/// `spark`'s class path and order it first. Whether the id resolves is the
+/// same either way.
 fn mod_ids(jar: &NativeJar) -> Vec<String> {
+    let mut bundled = Vec::new();
+    let entry = |name: &str| jar.resource_bytes.get(name).cloned();
+    let mut budget = MAX_NESTED_MODS;
+    fabric_provided(&entry, 0, &mut budget, &mut bundled);
+    let mut budget = MAX_NESTED_MODS;
+    neoforge_provided(&entry, 0, &mut budget, &mut bundled);
     let mut ids: Vec<String> = [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
         .into_iter()
         .flatten()
         .map(str::to_owned)
+        .chain(bundled.into_iter().filter(|id| !is_host_provided(id)))
         .collect();
-    let entry = |name: &str| jar.resource_bytes.get(name).cloned();
-    let mut budget = MAX_NESTED_MODS;
-    fabric_provided(&entry, 0, &mut budget, &mut ids);
-    let mut budget = MAX_NESTED_MODS;
-    neoforge_provided(&entry, 0, &mut budget, &mut ids);
-    let mut ids: Vec<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+    ids = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
     ids.sort();
     ids.dedup();
     ids
@@ -261,6 +270,13 @@ fn neoforge_mod_ids(text: &str) -> Vec<String> {
     ids
 }
 
+/// Whether the host answers `id` itself ([`HOST_PROVIDED_MODS`]).
+fn is_host_provided(id: &str) -> bool {
+    HOST_PROVIDED_MODS
+        .iter()
+        .any(|host| host.eq_ignore_ascii_case(id))
+}
+
 /// Build the run order, link closure and missing-dependency rows for `jars`.
 pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
     let mut provided: BTreeMap<String, usize> = BTreeMap::new();
@@ -269,11 +285,6 @@ pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
             provided.entry(id).or_insert(index);
         }
     }
-    let is_host = |id: &str| {
-        HOST_PROVIDED_MODS
-            .iter()
-            .any(|host| host.eq_ignore_ascii_case(id))
-    };
 
     let mut missing = BTreeMap::new();
     let mut dependencies: Vec<Vec<usize>> = vec![Vec::new(); jars.len()];
@@ -288,7 +299,7 @@ pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
                     }
                 }
                 Some(_) => {}
-                None if is_host(required) => {}
+                None if is_host_provided(required) => {}
                 None => missing_here.push(required.clone()),
             }
         }
@@ -633,6 +644,27 @@ mod tests {
             &["dep_x".to_owned(), "unlisted_nf".to_owned()]
         );
         assert_eq!(plan.links_for(0), [1]);
+    }
+
+    /// The named departure in [`mod_ids`]: a bundled copy of a module the
+    /// host models does not make its bundle a dependency; the host answers.
+    #[test]
+    fn a_bundled_host_module_does_not_link_its_bundle() {
+        let events = fabric_jar(
+            r#"{"schemaVersion":1,"id":"fabric-lifecycle-events-v1","version":"1"}"#,
+            &[],
+        );
+        let library = NativeJar::from_bytes(&fabric_jar(
+            r#"{"schemaVersion":1,"id":"library","version":"1",
+                "jars":[{"file":"META-INF/jars/events.jar"}]}"#,
+            &[("META-INF/jars/events.jar", events)],
+        ))
+        .unwrap();
+        let dependent = jar("dependent", &["fabric-lifecycle-events-v1"]);
+        let jars = [("dependent.jar", &dependent), ("library.jar", &library)];
+        let plan = plan(&jars);
+        assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
+        assert!(plan.links_for(0).is_empty());
     }
 
     /// A top-level mod's own `provides` answers for it too (`selectMod` puts
