@@ -65,6 +65,7 @@ mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
+mod mod_config_register;
 mod mod_config_spec;
 mod mod_origin;
 pub mod neoforge_attachments;
@@ -2262,6 +2263,12 @@ pub trait Host {
         None
     }
 
+    /// How many unknown host calls this host has counted (each answered with
+    /// a neutral value), for a model that must not build a verdict on one.
+    fn counted_unknown_calls(&self) -> usize {
+        0
+    }
+
     /// The channel id a `CustomPacketPayload.Type` marker this host built
     /// names (`demo:sync`), for a networking call a wrapping host answers;
     /// `None` when the host built no such type.
@@ -3874,6 +3881,10 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    fn counted_unknown_calls(&self) -> usize {
+        self.unknown_host_call_count()
+    }
+
     fn neoforge_attachments(
         &mut self,
     ) -> Option<(
@@ -15759,7 +15770,7 @@ impl NativeJar {
                     })
                     .cloned()
                     .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
-                let constructor_args = neutral_args(&constructor.descriptor);
+                let constructor_args = self.entry_constructor_args(&class_name, &constructor);
                 runtime.invoke(
                     &class_name,
                     "<init>",

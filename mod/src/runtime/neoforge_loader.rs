@@ -8,7 +8,10 @@
 //! seeded. A question outside that set is left to the rest of the dispatch
 //! chain, which still reports and refuses it.
 
-use crate::runtime::{MethodRef, StdHost, Value, expect_ref, expect_string, is_always_loaded_mod};
+use crate::runtime::{
+    AnnotationValue, Method, MethodRef, NativeJar, StdHost, Value, expect_ref, expect_string,
+    is_always_loaded_mod, neutral_args,
+};
 
 /// `FMLEnvironment.dist` and `FMLEnvironment.getDist` answer one of these.
 const CLIENT: &str = "dist/CLIENT";
@@ -47,6 +50,50 @@ pub(crate) fn reflected_static_descriptor(
         ("net/neoforged/fml/loading/FMLEnvironment", "isProduction", 0) => Some("()Z"),
         ("net/neoforged/fml/ModList", "get", 0) => Some("()Lnet/neoforged/fml/ModList;"),
         _ => None,
+    }
+}
+
+impl NativeJar {
+    /// The arguments an entry class's constructor receives.
+    ///
+    /// FML constructs a `@Mod` class with its own mod's container: the
+    /// `ModContainer` parameter is the container of the mod the annotation
+    /// names, so `getModId()` answers that id and `registerConfig` names its
+    /// default file after it. Every other parameter (and every parameter of a
+    /// class without a readable `@Mod` id) keeps its neutral marker.
+    pub(crate) fn entry_constructor_args(&self, class: &str, constructor: &Method) -> Vec<Value> {
+        let mut args = neutral_args(&constructor.descriptor);
+        let Some(id) = self.mod_annotation_id(class) else {
+            return args;
+        };
+        // The version is the metadata's when the annotation names the jar's
+        // own mod, as `seed_host` seeds it; any other id is not described.
+        let version = if self.neoforge_id.as_deref() == Some(id) {
+            self.neoforge_version.as_deref().unwrap_or("unknown")
+        } else {
+            "unknown"
+        };
+        for arg in &mut args {
+            if matches!(arg, Value::Ref(Some(marker)) if marker == "Lnet/neoforged/fml/ModContainer;")
+            {
+                *arg = Value::Ref(Some(format!("neoforge-mod-container/{id}/{version}")));
+            }
+        }
+        args
+    }
+
+    /// The id a class's NeoForge `@Mod("id")` annotation names.
+    fn mod_annotation_id(&self, class: &str) -> Option<&str> {
+        let annotation = self
+            .classes
+            .get(class)?
+            .annotations
+            .iter()
+            .find(|annotation| annotation.descriptor == "Lnet/neoforged/fml/common/Mod;")?;
+        match annotation.values.get("value")? {
+            AnnotationValue::String(id) if !id.is_empty() && !id.contains('/') => Some(id),
+            _ => None,
+        }
     }
 }
 
@@ -102,9 +149,10 @@ impl StdHost {
                 name @ ("CLIENT" | "SERVER" | "COMMON" | "STARTUP" | "LOCAL" | "SYNCED"),
                 "Lnet/neoforged/fml/config/ModConfig$Type;",
             ) => Some(Value::Ref(Some(format!("fml-config-type/{name}")))),
-            // The loader's config tracker. It holds no config here: no
-            // `registerConfig` reached a load, so its three maps are empty
-            // rather than null (a null map is an NPE in the port's getters).
+            // The loader's config tracker. A jar reading it sees no config:
+            // its three maps are empty rather than null (a null map is an NPE
+            // in the port's getters). `registerConfig` keeps its own record
+            // (`mod_config_register.rs`), which these reads do not see.
             (
                 "net/neoforged/fml/config/ConfigTracker",
                 "INSTANCE",
@@ -295,16 +343,10 @@ impl StdHost {
                         .to_owned(),
                 )))
             }
-            // A config registration hands the loader a spec to load from the
-            // config directory. The bounded host has no loader-managed config
-            // file, so the call is accepted and the spec's own values keep
-            // answering their defaults; the tracker stays empty.
+            // `registerConfig` is answered by the runtime's config model
+            // (`mod_config_register.rs`) for a spec it built; any other
+            // registration reaches the host and is counted.
             (
-                "net/neoforged/fml/ModContainer",
-                "registerConfig",
-                "(Lnet/neoforged/fml/config/ModConfig$Type;Lnet/neoforged/fml/config/IConfigSpec;)V",
-            )
-            | (
                 "net/neoforged/fml/ModContainer",
                 "registerExtensionPoint",
                 "(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V",
