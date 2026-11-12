@@ -116,6 +116,16 @@ public final class Probe {
     public static String unsupported() {
         return String.valueOf("abc".replaceAll("\\p{IsAlphabetic}", "x"));
     }
+
+    /** A 2,999-operand `&&` class: JDK 27 overflows its stack on it. */
+    public static String hugeClass() {
+        StringBuilder pattern = new StringBuilder("[");
+        for (int i = 0; i < 2999; i++) {
+            pattern.append("a-z&&");
+        }
+        pattern.append("a-z]");
+        return String.valueOf("a".matches(pattern.toString()));
+    }
 }
 "##;
 
@@ -244,6 +254,25 @@ fn an_untracked_char_sequence_is_counted() {
         [(
             "java/util/regex/Pattern#matches(Ljava/lang/String;Ljava/lang/CharSequence;)Z"
                 .to_owned(),
+            1
+        )]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A class of 2,999 `&&` operands, built by the jar at run time. JDK 27's
+/// answer depends on its stack (`StackOverflowError` from ~1,941 operands
+/// on a 512 KB `-Xint` thread, `true` on a cold 1 MB tiered one), and this
+/// runtime's recursion over it once aborted the process. The call is
+/// counted, on the test harness's 2 MB thread, in any build.
+#[test]
+fn an_oversized_class_is_counted_not_a_crash() {
+    let (root, jar) = fixture();
+    let (_, unknown) = call(&jar, "hugeClass");
+    assert_eq!(
+        unknown,
+        [(
+            "java/lang/String#matches(Ljava/lang/String;)Z".to_owned(),
             1
         )]
     );
