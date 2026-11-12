@@ -3265,6 +3265,12 @@ impl StdHost {
         &self.payload_registrations
     }
 
+    /// Counts every payload registration as an unknown host call, for an embedding with no
+    /// channel to route them on: the registration ran, but no packet will reach its handler.
+    pub fn count_unrouted_payloads(&mut self, why: &str) {
+        crate::neoforge_lifecycle::count_unrouted_payloads(self, why);
+    }
+
     /// The registered payload channels as `(id, direction, codec)` for the
     /// game's transport: the `CustomPacketPayload.Type` marker resolves to the
     /// identifier it was built with, and a `codec/...` marker names the codec.
@@ -36739,6 +36745,26 @@ mandatory = true
         assert_eq!(
             host.payload_registrations().last().unwrap().direction,
             "configurationToClient"
+        );
+        // An embedding with no payload channel counts each one under its direction.
+        host.count_unrouted_payloads("no channel");
+        let counted: Vec<_> = host
+            .unknown_host_calls()
+            .into_iter()
+            .filter(|(key, _)| key.contains("(no channel)"))
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#configurationToClient (no channel)".to_owned(),
+                    1
+                ),
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#playToServer (no channel)".to_owned(),
+                    1
+                ),
+            ]
         );
     }
 
