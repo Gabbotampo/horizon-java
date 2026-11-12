@@ -43,6 +43,8 @@ mod gson_model;
 mod guava_model;
 mod heap;
 mod hook_shapes;
+mod java_format;
+mod java_format_args;
 mod java_identifier;
 mod java_immutable;
 mod java_nbt;
@@ -10166,150 +10168,31 @@ fn value_text(value: &Value) -> String {
     }
 }
 
-/// Implement the small deterministic `String.format` subset used by loader diagnostics.
+/// `String.format(format, args)` and `String.format(locale, format, args)`.
 ///
-/// Supported conversions are `%s`, `%d`, `%f`, `%b`, `%c`, `%%`, and `%n` with
-/// implicit, sequential arguments. Flags, widths, precisions, argument indexes,
-/// and locale-sensitive conversions return an explicit metadata error.
+/// The text comes from [`java_format`], which answers only what it reproduces
+/// exactly; any other call (a conversion it does not model, an argument it
+/// cannot class, or one the JDK throws on) goes to the host as an unknown,
+/// counted call instead of an approximation.
 fn format_java_string_call<H: Host>(
-    runtime: &Runtime<'_, H>,
+    runtime: &mut Runtime<'_, H>,
     r: &MethodRef,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let (format, values) = match r.descriptor.as_str() {
-        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;" => (
-            expect_string(
-                args.first()
-                    .ok_or_else(|| NativeError::Metadata("String.format missing format".into()))?,
-            ),
-            args.get(1),
-        ),
-        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;" => (
-            expect_string(
-                args.get(1)
-                    .ok_or_else(|| NativeError::Metadata("String.format missing format".into()))?,
-            ),
-            args.get(2),
-        ),
-        _ => {
-            return Err(NativeError::Metadata(format!(
-                "unsupported String.format descriptor {}",
-                r.descriptor
-            )));
+    let text = match (r.descriptor.as_str(), args) {
+        ("(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;", [format, values]) => {
+            runtime.java_format(None, format, values)
         }
+        (
+            "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+            [locale, format, values],
+        ) => runtime.java_format(Some(locale), format, values),
+        _ => None,
     };
-    let values =
-        values.ok_or_else(|| NativeError::Metadata("String.format missing arguments".into()))?;
-    let values = runtime
-        .array(values)
-        .map_err(|_| NativeError::Metadata("String.format arguments must be an Object[]".into()))?;
-    let mut output = String::with_capacity(format.len());
-    let mut next = 0usize;
-    let bytes = format.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            let ch = format[i..].chars().next().expect("valid format offset");
-            output.push(ch);
-            i += ch.len_utf8();
-            continue;
-        }
-        i += 1;
-        // `%[flags][width][.precision]conversion`: the `-` and `0` flags, a
-        // width and a precision are read here (`jdk_model::FormatSpec`);
-        // argument indexes and the other flags stay refused below.
-        let spec = jdk_model::FormatSpec::parse(bytes, &mut i)?;
-        let conversion = *bytes
-            .get(i)
-            .ok_or_else(|| NativeError::Metadata("unterminated String.format conversion".into()))?
-            as char;
-        i += 1;
-        let mut piece = String::new();
-        match conversion {
-            '%' => piece.push('%'),
-            'n' => piece.push('\n'),
-            's' => piece.push_str(&value_text(values.get(next).ok_or_else(|| {
-                NativeError::Metadata("String.format missing %s argument".into())
-            })?)),
-            'd' => {
-                let value = values.get(next).ok_or_else(|| {
-                    NativeError::Metadata("String.format missing %d argument".into())
-                })?;
-                // `%d` covers `Long` as well as `Integer`; a long keeps all 64
-                // bits instead of truncating.
-                let text = boxed_integer(value)
-                    .map(|value| value.to_string())
-                    .or_else(|| boxed_long(value).map(|value| value.to_string()))
-                    .ok_or_else(|| {
-                        NativeError::Metadata("String.format %d requires an integer".into())
-                    })?;
-                piece.push_str(&text);
-            }
-            'f' => {
-                let value = values.get(next).ok_or_else(|| {
-                    NativeError::Metadata("String.format missing %f argument".into())
-                })?;
-                let value = boxed_float(value).ok_or_else(|| {
-                    NativeError::Metadata("String.format %f requires a floating-point value".into())
-                })?;
-                piece.push_str(&match spec.precision {
-                    Some(precision) if value.is_finite() => {
-                        jdk_model::format_half_up(value, precision)
-                    }
-                    _ => format_java_decimal(value),
-                });
-            }
-            'b' => {
-                let value = values.get(next).ok_or_else(|| {
-                    NativeError::Metadata("String.format missing %b argument".into())
-                })?;
-                piece.push_str(if matches!(value, Value::Ref(None)) {
-                    "false"
-                } else {
-                    "true"
-                });
-            }
-            'c' => {
-                let value = values.get(next).ok_or_else(|| {
-                    NativeError::Metadata("String.format missing %c argument".into())
-                })?;
-                let value = boxed_integer(value)
-                    .and_then(|v| char::from_u32(v as u32))
-                    .ok_or_else(|| {
-                        NativeError::Metadata("String.format %c requires a character".into())
-                    })?;
-                piece.push(value);
-            }
-            'x' | 'X' => {
-                let value = values.get(next).ok_or_else(|| {
-                    NativeError::Metadata("String.format missing %x argument".into())
-                })?;
-                // Two's complement of the argument's own width, as the JDK
-                // prints a negative `int` or `long` in hex.
-                let text = boxed_integer(value)
-                    .map(|value| format!("{:x}", value as u32))
-                    .or_else(|| boxed_long(value).map(|value| format!("{:x}", value as u64)))
-                    .ok_or_else(|| {
-                        NativeError::Metadata("String.format %x requires an integer".into())
-                    })?;
-                piece.push_str(&if conversion == 'X' {
-                    text.to_ascii_uppercase()
-                } else {
-                    text
-                });
-            }
-            other => {
-                return Err(NativeError::Metadata(format!(
-                    "unsupported String.format conversion %{other}"
-                )));
-            }
-        }
-        output.push_str(&spec.pad(piece, conversion)?);
-        if !matches!(conversion, '%' | 'n') {
-            next += 1;
-        }
+    match text {
+        Some(text) => Ok(Value::Ref(Some(text))),
+        None => runtime.host.invoke(r, args),
     }
-    Ok(Value::Ref(Some(output)))
 }
 
 fn boxed_integer(value: &Value) -> Option<i32> {
@@ -10548,22 +10431,6 @@ fn format_integer_us(value: i64) -> String {
         format!("-{grouped}")
     } else {
         grouped
-    }
-}
-
-/// `String.format("%f")` without a precision is six fractional digits, as
-/// `java.util.Formatter` defaults to.
-fn format_java_decimal(value: f64) -> String {
-    if value.is_nan() {
-        "NaN".into()
-    } else if value.is_infinite() {
-        if value.is_sign_negative() {
-            "-Infinity".into()
-        } else {
-            "Infinity".into()
-        }
-    } else {
-        format!("{value:.6}")
     }
 }
 
@@ -21548,21 +21415,22 @@ impl<H: Host> Runtime<'_, H> {
                         Value::Void
                     }
                     ("printf", _) | ("format", _) => {
-                        let formatted = format_java_string_call(
-                            self,
-                            &MethodRef {
-                                owner: "java/lang/String".into(),
-                                name: "format".into(),
-                                descriptor:
-                                    "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
-                                        .into(),
-                            },
-                            args,
-                        )
-                        .map(|value| expect_string(&value).to_owned())
-                        .unwrap_or_default();
-                        self.io_write(&marker, &formatted);
-                        Value::Void
+                        // `printf(format, args)`/`printf(locale, format, args)`
+                        // write `String.format`'s text and return the stream.
+                        // A call the formatter cannot answer exactly stays
+                        // with the host, as an unknown call.
+                        let text = match args {
+                            [format, values] => self.java_format(None, format, values),
+                            [locale, format, values] => {
+                                self.java_format(Some(locale), format, values)
+                            }
+                            _ => None,
+                        };
+                        let Some(text) = text else {
+                            return Ok(None);
+                        };
+                        self.io_write(&marker, &text);
+                        receiver.cloned().unwrap_or(Value::Void)
                     }
                     ("flush", "()V") | ("close", "()V") => {
                         self.io_commit(&marker);
@@ -28782,7 +28650,7 @@ mod tests {
     #[test]
     fn string_format_supports_loader_diagnostic_subset() {
         let mut host = NullHost;
-        let runtime = Runtime {
+        let mut runtime = Runtime {
             classes: &BTreeMap::new(),
             linked: Arc::default(),
             host: &mut host,
@@ -28820,7 +28688,7 @@ mod tests {
             descriptor: "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;".into(),
         };
         let value = format_java_string_call(
-            &runtime,
+            &mut runtime,
             &method,
             &[
                 Value::Ref(Some("%d/%s%%".into())),
@@ -28832,9 +28700,9 @@ mod tests {
     }
 
     #[test]
-    fn string_format_pads_widths_and_refuses_argument_indexes() {
-        let mut host = NullHost;
-        let runtime = Runtime {
+    fn string_format_answers_like_the_jdk_or_leaves_the_call_to_the_host() {
+        let mut host = StdHost::new();
+        let mut runtime = Runtime {
             classes: &BTreeMap::new(),
             linked: Arc::default(),
             host: &mut host,
@@ -28842,7 +28710,17 @@ mod tests {
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
-            arrays: BTreeMap::from([("array/test/args/0".into(), vec![Value::Int(7)])]),
+            arrays: BTreeMap::from([
+                ("array/test/args/0".into(), vec![Value::Int(7)]),
+                (
+                    "array/test/args/1".into(),
+                    vec![
+                        Value::Ref(Some("boolean:false".into())),
+                        Value::Float(5e-7),
+                        Value::Ref(Some("short:-2".into())),
+                    ],
+                ),
+            ]),
             next_array: 0,
             next_object: 0,
             streams: BTreeMap::new(),
@@ -28868,31 +28746,44 @@ mod tests {
             name: "format".into(),
             descriptor: "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;".into(),
         };
-        let format = |pattern: &str| {
+        let mut format = |pattern: &str, args: &str| {
             format_java_string_call(
-                &runtime,
+                &mut runtime,
                 &method,
                 &[
                     Value::Ref(Some(pattern.into())),
-                    Value::Ref(Some("array/test/args/0".into())),
+                    Value::Ref(Some(args.into())),
                 ],
             )
+            .unwrap()
         };
-        // `String.format(pattern, 7)` on a JVM.
-        for (pattern, expected) in [("%03d", "007"), ("[%-3d]", "[7  ]"), ("%04x", "0007")] {
+        // `String.format(pattern, 7)` and `String.format(pattern,
+        // Boolean.FALSE, 5e-7, (short) -2)` on OpenJDK 27 and 17.
+        for (pattern, args, expected) in [
+            ("%03d", "array/test/args/0", "007"),
+            ("[%-3d]", "array/test/args/0", "[7  ]"),
+            ("%04x", "array/test/args/0", "0007"),
+            ("%1$d", "array/test/args/0", "7"),
+            ("%+d", "array/test/args/0", "+7"),
+            ("%b|%f|%x", "array/test/args/1", "false|0.000001|fffe"),
+        ] {
             assert_eq!(
-                format(pattern).unwrap(),
+                format(pattern, args),
                 Value::Ref(Some(expected.into())),
                 "{pattern}"
             );
         }
-        // Argument indexes and the other flags are refused, not approximated.
-        for pattern in ["%1$d", "%+d"] {
-            assert!(
-                matches!(format(pattern), Err(NativeError::Metadata(_))),
-                "{pattern}"
-            );
-        }
+        // `%a` of an `Integer` throws on the JDK: the call is the host's,
+        // counted, not an approximation.
+        assert_eq!(format("%a", "array/test/args/0"), Value::Ref(None));
+        assert_eq!(
+            host.unknown_host_calls(),
+            vec![(
+                "java/lang/String#format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                    .to_owned(),
+                1
+            )]
+        );
     }
 
     #[test]
@@ -31898,9 +31789,6 @@ mandatory = true
             .unwrap(),
             Value::Ref(Some("string-builder/fixture0.30000000000000004".into()))
         );
-        assert_eq!(format_java_decimal(1.5), "1.500000");
-        assert_eq!(format_java_decimal(f64::NAN), "NaN");
-        assert_eq!(format_java_decimal(f64::NEG_INFINITY), "-Infinity");
     }
 
     #[test]
