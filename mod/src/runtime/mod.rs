@@ -40,6 +40,7 @@ mod facade_saved_data;
 mod facade_server;
 mod facade_text;
 mod field_access;
+mod field_get_set;
 mod game_codecs;
 mod game_hooks;
 mod gson_model;

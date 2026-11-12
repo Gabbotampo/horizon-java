@@ -43,10 +43,10 @@
 
 use super::*;
 
-const FIELD: &str = "java/lang/reflect/Field";
+pub(super) const FIELD: &str = "java/lang/reflect/Field";
 const ACCESSIBLE: &str = "java/lang/reflect/AccessibleObject";
 /// A field marker some jar called `setAccessible` on.
-const TOUCHED: &str = "reflect#setAccessible";
+pub(super) const TOUCHED: &str = "reflect#setAccessible";
 
 const ACC_PUBLIC: u16 = 0x0001;
 const ACC_PRIVATE: u16 = 0x0002;
@@ -61,7 +61,7 @@ fn illegal_argument(message: String) -> NativeError {
     }
 }
 
-fn package_of(class: &str) -> &str {
+pub(super) fn package_of(class: &str) -> &str {
     class.rsplit_once('/').map_or("", |(package, _)| package)
 }
 
@@ -200,7 +200,7 @@ impl<H: Host> Runtime<'_, H> {
                 let object = args.first().cloned().unwrap_or(Value::Ref(None));
                 self.field_can_access(&marker, &object, caller)
             }
-            _ => Ok(None),
+            _ => self.invoke_field_get_set(r, receiver, args, caller),
         }
     }
 
@@ -289,7 +289,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `Reflection.verifyMemberAccess` past its same-class and module checks.
-    fn member_access(
+    pub(super) fn member_access(
         &self,
         caller: &str,
         declaring: &str,
