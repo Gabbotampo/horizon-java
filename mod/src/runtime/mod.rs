@@ -83,7 +83,10 @@ mod mod_origin;
 mod modified_utf8;
 mod native_library;
 pub mod neoforge_attachments;
+pub mod neoforge_bus;
+mod neoforge_event_classes;
 mod neoforge_loader;
+mod neoforge_subscribe;
 mod nested_jars;
 mod night_config;
 mod null_checks;
@@ -2087,6 +2090,14 @@ pub trait Host {
     )> {
         None
     }
+    /// The listeners NeoForge's buses hold and the unknown-call table registrations are counted
+    /// in (`neoforge_bus.rs`). A host that keeps neither answers `None`, and `addListener` stays
+    /// unmodelled.
+    fn neoforge_bus(
+        &mut self,
+    ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
+        None
+    }
     /// An instance field the interpreter does not hold, read with its
     /// receiver: a field of a host object (`player.connection` on a façade
     /// player). The default answers as hosts always did, without it.
@@ -2488,6 +2499,8 @@ pub struct StdHost {
     saved_data: facade_saved_data::SavedDataState,
     /// NeoForge data attachments on players (`neoforge_attachments.rs`).
     neoforge_attachments: neoforge_attachments::AttachmentState,
+    /// The listeners a jar added to NeoForge's buses (`neoforge_bus.rs`).
+    neoforge_bus: neoforge_bus::BusState,
     holders: BTreeMap<String, Value>,
     mutable_collections: BTreeMap<String, Vec<Value>>,
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
@@ -2613,6 +2626,7 @@ impl StdHost {
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             neoforge_attachments: neoforge_attachments::AttachmentState::default(),
+            neoforge_bus: neoforge_bus::BusState::default(),
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
@@ -3929,6 +3943,11 @@ impl Host for StdHost {
     )> {
         Some((&mut self.neoforge_attachments, &mut self.unknown_host_calls))
     }
+    fn neoforge_bus(
+        &mut self,
+    ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
+        Some((&mut self.neoforge_bus, &mut self.unknown_host_calls))
+    }
     fn write_console(&mut self, text: &str) {
         self.console_out.push_str(text);
     }
@@ -4026,7 +4045,9 @@ impl Host for StdHost {
     /// The command façade's markers (a source, a node, a builder) answer
     /// `instanceof` for their Brigadier and vanilla types.
     fn host_instance_of(&self, marker: &str, wanted: &str) -> bool {
-        self.brigadier_instance_of(marker, wanted) || self.mod_container_instance_of(marker, wanted)
+        self.brigadier_instance_of(marker, wanted)
+            || self.mod_container_instance_of(marker, wanted)
+            || neoforge_bus::bus_instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -8515,7 +8536,7 @@ impl Host for StdHost {
                 "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext",
                 "getModEventBus",
                 "()Lnet/neoforged/bus/api/IEventBus;",
-            ) => Ok(Value::Ref(Some("net/neoforged/bus/api/IEventBus".into()))),
+            ) => Ok(neoforge_bus::mod_bus(None)),
             (
                 "net/minecraftforge/fml/javafmlmod/FMLJavaModLoadingContext",
                 "getModEventBus",
@@ -23960,6 +23981,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_neoforge_attachment(&r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_neoforge_bus(&r, receiver.as_ref(), &args))
+                    {
+                        // NeoForge's `IEventBus#addListener` (`neoforge_bus.rs`).
                         value
                     } else if r.owner == "java/lang/String"
                         && r.name == "format"

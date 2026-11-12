@@ -78,6 +78,11 @@ impl NativeJar {
             {
                 *arg = Value::Ref(Some(format!("neoforge-mod-container/{id}/{version}")));
             }
+            // The bus FML passes is that container's mod bus.
+            if matches!(arg, Value::Ref(Some(marker)) if marker == "Lnet/neoforged/bus/api/IEventBus;")
+            {
+                *arg = crate::neoforge_bus::mod_bus(Some(id));
+            }
         }
         args
     }
@@ -124,15 +129,13 @@ impl StdHost {
             ) => {
                 fml_path_root(name).map(|path| Value::Ref(Some(format!("fml-path/{name}/{path}"))))
             }
-            // The loader's one game bus. `IEventBus.addListener`/`register`
-            // are already modelled over the marker, so a mod that subscribes
-            // here reaches the same recorded listeners as one that takes its
-            // bus from `getModEventBus()`.
+            // The loader's one game bus, told apart from each mod's bus:
+            // the two accept different events (`neoforge_bus.rs`).
             (
                 "net/neoforged/neoforge/common/NeoForge",
                 "EVENT_BUS",
                 "Lnet/neoforged/bus/api/IEventBus;",
-            ) => Some(Value::Ref(Some("net/neoforged/bus/api/IEventBus".into()))),
+            ) => Some(Value::Ref(Some(crate::neoforge_bus::GAME_BUS.into()))),
             (
                 "net/minecraftforge/common/MinecraftForge",
                 "EVENT_BUS",
@@ -274,7 +277,9 @@ impl StdHost {
                 | FML_MOD_CONTAINER,
                 "getEventBus" | "getModEventBus",
                 "()Lnet/neoforged/bus/api/IEventBus;",
-            ) => Some(Value::Ref(Some("net/neoforged/bus/api/IEventBus".into()))),
+            ) => Some(crate::neoforge_bus::mod_bus(
+                mod_container_parts(marker).map(|(id, _)| id),
+            )),
             (
                 "net/neoforged/fml/ModContainer" | "net/minecraftforge/fml/ModContainer",
                 "getModInfo",
