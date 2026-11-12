@@ -323,6 +323,26 @@ No verdict got worse. The Gson calls still counted are `Gson` writes through an 
 custom strategy (#49's rule), `toJsonTree`, `toJson(JsonElement, JsonWriter)`,
 `TypeToken#getType` and two `GsonBuilder#setPrettyPrinting` calls, all unchanged by this model.
 
+## Re-measured (12 November 2026, `ServiceLoader` providers)
+
+`ServiceLoader` now builds its providers the way JDK 27 does (`service_loader.rs`). Before,
+`Provider.get` split its marker at the first `/`, so every packaged service gave a wrong class
+name, and no provider was ever constructed. Against `6e3684b`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 896 → 898 |
+| mega | 60 → 60 | 87 → 87 | 4 → 4 | 101 → 101 | 2,468 → 2,500 |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+
+No verdict moved. The rises come from jars that now run further. `structure_layout_optimizer`
+(1 → 3) and `authme` (1 → 31) get past the formerly counted `ServiceLoader#forEach` into their
+next unmodelled calls (`Optionull#mapOrDefault`, `Class#getEnclosingClass`). Both `Bookshelf` builds
+get past the provider: NeoForge's now stops at `instanceof FMLModContainer`, Fabric's at
+`MapCodecs#getEnumsByName`. `moderner-beta`, `servercore`, `ItemBorders`, `Highlighter` and
+`AdvancementPlaques` stay refused, now at a later throw, because their providers' constructors
+ran.
+
 ## Known limits of this census
 
 - The probe executes a jar as shipped. A jar whose entrypoint only works with its own

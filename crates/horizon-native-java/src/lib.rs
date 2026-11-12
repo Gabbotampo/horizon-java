@@ -79,6 +79,7 @@ mod reflect_generic;
 mod reflect_names;
 mod reflect_override;
 mod registry_contents;
+mod service_loader;
 mod stack_walk;
 mod type_switch;
 mod value_class;
@@ -6737,12 +6738,13 @@ impl Host for StdHost {
             let marker = receiver_marker.as_deref().ok_or_else(|| {
                 NativeError::Metadata("malformed java/util/ServiceLoader$Provider marker".into())
             })?;
-            let Some(rest) = marker.strip_prefix("service-provider/") else {
+            // The interpreter answers a provider (`service_loader.rs`); this
+            // is the host's nominal fallback, the class name.
+            let Some((_, provider)) = service_loader::provider_parts(marker) else {
                 return Err(NativeError::Metadata(
                     "unsupported java/util/ServiceLoader$Provider marker".into(),
                 ));
             };
-            let provider = rest.split_once('/').map_or(rest, |(_, provider)| provider);
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("get" | "type", "()Ljava/lang/Object;" | "()Ljava/lang/Class;") => {
                     Ok(Value::Ref(Some(provider.to_owned())))
@@ -6757,7 +6759,7 @@ impl Host for StdHost {
             let marker = receiver_marker.as_deref().ok_or_else(|| {
                 NativeError::Metadata("malformed java/util/ServiceLoader marker".into())
             })?;
-            let service = marker.strip_prefix("service-loader/").ok_or_else(|| {
+            let service = service_loader::loader_service(marker).ok_or_else(|| {
                 NativeError::Metadata("unsupported java/util/ServiceLoader marker".into())
             })?;
             if r.name == "iterator" && r.descriptor == "()Ljava/util/Iterator;" {
@@ -9971,6 +9973,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/SecurityException"
         | "java/lang/ArrayStoreException"
         | "java/util/NoSuchElementException"
+        | "java/util/ConcurrentModificationException"
         | "java/io/UncheckedIOException" => "java/lang/RuntimeException",
         "java/lang/NumberFormatException"
         | "java/nio/charset/UnsupportedCharsetException"
@@ -9994,9 +9997,10 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/InterruptedException"
         | "java/lang/CloneNotSupportedException"
         | "java/util/concurrent/TimeoutException" => "java/lang/Exception",
-        "java/lang/AssertionError" | "java/lang/LinkageError" | "java/lang/VirtualMachineError" => {
-            "java/lang/Error"
-        }
+        "java/lang/AssertionError"
+        | "java/lang/LinkageError"
+        | "java/lang/VirtualMachineError"
+        | "java/util/ServiceConfigurationError" => "java/lang/Error",
         "java/lang/ExceptionInInitializerError"
         | "java/lang/NoClassDefFoundError"
         | "java/lang/ClassFormatError"
@@ -22748,27 +22752,6 @@ impl<H: Host> Runtime<'_, H> {
             );
             return Ok(Some(self.new_stream(class, method, values)));
         }
-        // `ServiceLoader.stream()` hands out one `Provider` per seeded
-        // service entry; the provider marker names its implementation class
-        // so the following `Provider.get` can build the real instance.
-        if r.owner == "java/util/ServiceLoader"
-            && r.name == "stream"
-            && r.descriptor == "()Ljava/util/stream/Stream;"
-        {
-            let Some(receiver) = receiver.and_then(expect_ref) else {
-                return Ok(None);
-            };
-            let Some(service) = receiver.strip_prefix("service-loader/") else {
-                return Ok(None);
-            };
-            let values = self
-                .host
-                .service_providers(service)
-                .into_iter()
-                .map(|provider| Value::Ref(Some(format!("service-provider/{service}/{provider}"))))
-                .collect::<Vec<_>>();
-            return Ok(Some(self.new_stream(class, method, values)));
-        }
         if !r.owner.starts_with("java/util/stream/") {
             return Ok(None);
         }
@@ -24232,6 +24215,12 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_service_loader(&r, receiver.as_ref(), &args)
+                    ) {
+                        // Providers built as the JDK builds them (`service_loader.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_jar_text(&r, op, receiver.as_ref(), &args, class, method)
