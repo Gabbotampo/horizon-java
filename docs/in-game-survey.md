@@ -1217,3 +1217,39 @@ replies still arrive as raw translation keys.
 Results stay on elysium under `~/ava/results/survey5-2026-11-13/` and are not committed: all 11
 batch JSONs and game logs, the `java-runtime.json` reports, the fixture and `b2` reruns, the
 per-merge probe sweep over all 43 jars, the build log and the scripts.
+
+## Follow-up: game rules in listeners (13 November 2026, elysium)
+
+#102 made appleskin's `ServerTickEvent.Post` listener run, and it failed on every tick at
+`MinecraftServer#getGameRules`: the façade answered rules only from `ServerFacts.game_rules`,
+which the bridge never filled. The bridge now reads every rule from the fork's
+`level.game_rules(host)` when a level loads and again on each `game_rule_changed`, so a
+`/gamerule` shows on the next read. The runtime holds the 59 rules of the 26.3 jar
+(`game_rules.rs`, checked against the real classes on JDK 25), so a `GameRules` field 26.3 does
+not declare stays counted, and `get(MAX_MINECART_SPEED)` in a world without
+`minecart_improvements` throws vanilla's `IllegalArgumentException`.
+
+Method as in the fifth survey: pinned `cf0113879e` staged as `~/ava/stage.sh` stages it,
+unpatched (log line `Horizon 0.1.0`), the `horizon_java` mod from main `de440c4` (before) and
+from this branch (after). Batch `gr0` is #102's NaturesCompass + curios + appleskin; `gr1` is
+appleskin alone with `/gamerule natural_health_regeneration false` after the player joins.
+
+| batch | jar | before (main) | after |
+|---|---|---|---|
+| gr0 | appleskin | 1 ran / **668 failed** (`getGameRules`) | **407 ran / 0 failed** |
+| gr0 | curios | 461 ran / 2 failed | 253 ran / 3 failed |
+| gr0 | NaturesCompass | 1337 ran / 0 failed | 813 ran / 0 failed |
+| gr1 | appleskin | 1 ran / 396 failed (`getGameRules`) | 121 ran / 320 failed (`ServerGamePacketListenerImpl#hasChannel`) |
+
+- The host gives 58 rules: vanilla's 59 without the feature-gated `max_minecart_speed`.
+- `gr1` shows the value is live: the listener runs clean until the command, then sees `false`,
+  differs from its cached `true` and takes its sync branch, which stops at `hasChannel`
+  (NeoForge's channel query, unmodelled, counted). Appleskin stores the new value only after the
+  send, so it retries every tick.
+- curios' third failure is a second `RightClickItem#getItemStack` refusal (already counted).
+  It is timing, not this change: with no failure logged per tick, the survey's 1.7 s held use of
+  bread completes (creative players can eat; bread takes 32 ticks) and a second use starts.
+- The entrypoint census (`tools/unmodelled_calls.py`, all three corpora) is identical before and
+  after: no entrypoint reaches a game rule.
+
+Results stay on elysium under `~/ava/results/gr-2026-11-13/`.
