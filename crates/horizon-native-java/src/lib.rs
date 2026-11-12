@@ -68,6 +68,7 @@ mod jdk_string_builder;
 mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
+mod jvm_dispatch;
 mod library_dispatch;
 mod map_compute;
 mod method_handles;
@@ -9901,7 +9902,9 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         "java/lang/ExceptionInInitializerError"
         | "java/lang/NoClassDefFoundError"
         | "java/lang/ClassFormatError"
-        | "java/lang/UnsatisfiedLinkError" => "java/lang/LinkageError",
+        | "java/lang/UnsatisfiedLinkError"
+        | "java/lang/IncompatibleClassChangeError" => "java/lang/LinkageError",
+        "java/lang/AbstractMethodError" => "java/lang/IncompatibleClassChangeError",
         "java/lang/StackOverflowError"
         | "java/lang/OutOfMemoryError"
         | "java/lang/InternalError"
@@ -22228,11 +22231,10 @@ impl<H: Host> Runtime<'_, H> {
                 // the host superclass is known not to declare it itself:
                 // `Object` and `Record` cannot (an interface may not default
                 // their public methods), and `Enum`'s own methods are final.
-                let host_cannot_declare = match current.as_str() {
-                    "java/lang/Object" | "java/lang/Record" => true,
-                    "java/lang/Enum" => !ENUM_DECLARED_METHODS.contains(&name),
-                    _ => false,
-                };
+                // The JDK's collection skeletons are known too (`jvm_dispatch.rs`).
+                let host_cannot_declare =
+                    jvm_dispatch::jdk_superclass_declares(&current, name, descriptor)
+                        == Some(false);
                 if host_cannot_declare
                     && let Some(owner) = self.inherited_default_owner(&chain, name, descriptor)
                 {
@@ -22255,41 +22257,21 @@ impl<H: Host> Runtime<'_, H> {
     /// method `Impl` inherits from an interface default, such as
     /// NightConfig's `ConfigParser.parse(String)`. Without this the walk ended
     /// at `java/lang/Object` and the host answered a neutral `null` for a body
-    /// the jar ships. Interfaces are searched breadth first from the classes'
-    /// own declarations, so a sub-interface's override is found before the
-    /// default it overrides; the search is bounded by
-    /// [`MAX_SUPERCLASS_WALK`] interfaces.
+    /// the jar ships. The default is the maximally specific one (JVMS
+    /// §5.4.3.3, `jvm_dispatch.rs`), so a sub-interface's override beats the
+    /// default it overrides wherever either is declared.
     fn inherited_default_owner(
         &self,
         chain: &[String],
         name: &str,
         descriptor: &str,
     ) -> Option<String> {
-        let mut queue = std::collections::VecDeque::new();
-        for class in chain {
-            if let Some(file) = self.class(class) {
-                queue.extend(file.interface_names());
-            }
+        // JVMS §5.4.3.3's maximally specific default (`jvm_dispatch.rs`); a
+        // conflict or an abstract-only set selects nothing here.
+        match self.maximally_specific_default(chain, name, descriptor) {
+            jvm_dispatch::DefaultSelection::Selected(owner) => Some(owner),
+            _ => None,
         }
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(interface) = queue.pop_front() {
-            if seen.len() >= MAX_SUPERCLASS_WALK {
-                break;
-            }
-            if !seen.insert(interface.clone()) {
-                continue;
-            }
-            let Some(file) = self.class(&interface) else {
-                continue;
-            };
-            if file.method(name, descriptor).is_some_and(|method| {
-                method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0
-            }) {
-                return Some(interface);
-            }
-            queue.extend(file.interface_names());
-        }
-        None
     }
 
     /// The program counter of this frame's handler that catches `thrown` at
@@ -23836,6 +23818,10 @@ impl<H: Host> Runtime<'_, H> {
                                 .and_then(|key| self.fields.get(&key).cloned())
                             {
                                 Some(value) => value,
+                                // JVMS §2.3: a jar field nothing wrote yet.
+                                None if self.reads_unwritten_jar_field(&r, &receiver) => {
+                                    Value::default_for(&r.descriptor)
+                                }
                                 None => self.host.get_field(&receiver, &r)?,
                             }
                         }
@@ -23944,6 +23930,16 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(owner) =
+                        invoke_or_catch!(at, self.jvm_selected_jar_body(&r, op, receiver.as_ref()))
+                    {
+                        // The receiver's own body, before any host model
+                        // (`jvm_dispatch.rs`).
+                        jar_body = true;
+                        invoke_or_catch!(
+                            at,
+                            self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
+                        )
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_service_loader(&r, receiver.as_ref(), &args)
