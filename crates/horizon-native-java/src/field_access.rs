@@ -13,7 +13,8 @@
 //!    instance of the declaring class (`IllegalArgumentException("null object
 //!    for <field>")`, `"object is not an instance of <class>"`); a static field
 //!    needs `null` (`"non-null object for <field>"`).
-//! 2. `override` (`setAccessible(true)`) answers `true`.
+//! 2. `override` (`setAccessible(true)` on this `Field` object, as
+//!    `reflect_override` tracks it) answers `true`.
 //! 3. `verifyMemberAccess(caller, declaring, target, modifiers)`: the same class
 //!    is allowed; then module access; a non-public declaring class needs the
 //!    same package; a public member is allowed; a private one needs nestmates;
@@ -28,25 +29,22 @@
 //!
 //! * the field marker must carry its access flags and the declaring class must
 //!   be one the runtime holds with its class-file bytes;
-//! * caller and declaring class must both be the running jar's own classes
-//!   (or the same class): one jar is one module on both loaders (Fabric's
-//!   unnamed module, a NeoForge mod's own module) and one class loader, so the
-//!   module check passes and "same package" is the package name. A class from a
-//!   linked jar may sit in another module whose exports the runtime does not
-//!   model;
+//! * the declaring class must be one of the running jar's own classes, and
+//!   its module open to the caller under both loaders (`reflect_override`: a
+//!   caller from the same jar, or any caller when the jar has no
+//!   `module-info.class`), so the module check passes; the caller's class
+//!   must be one the runtime holds. "Same package" is the package name (see
+//!   `field_get_set`'s docs);
 //! * the object's class must be decidable (`checkcast`'s rules);
-//! * the jar must not have called `setAccessible`/`trySetAccessible` on that
-//!   field: those calls are not modelled, so `override` may be set, and field
-//!   markers do not tell two `Field` objects for the same field apart;
+//! * the `Field` object's `override` must be known (`reflect_override`): a
+//!   field read back out of a collection is no particular copy, and its flag
+//!   is known only when every copy of the field agrees;
 //! * a private member's nest host must be readable (`NestHost` naming a class
 //!   the runtime holds).
 
 use super::*;
 
 pub(super) const FIELD: &str = "java/lang/reflect/Field";
-const ACCESSIBLE: &str = "java/lang/reflect/AccessibleObject";
-/// A field marker some jar called `setAccessible` on.
-pub(super) const TOUCHED: &str = "reflect#setAccessible";
 
 const ACC_PUBLIC: u16 = 0x0001;
 const ACC_PRIVATE: u16 = 0x0002;
@@ -161,8 +159,9 @@ fn class_attribute_classes(file: &ClassFile, wanted: &str) -> Result<Vec<String>
 
 impl<H: Host> Runtime<'_, H> {
     /// Answer `Field#canAccess(Object)` where the JDK's rules can be read off
-    /// the classes the runtime holds, and remember `setAccessible` calls.
-    /// `None` leaves the call to the rest of the dispatch (counted).
+    /// the classes the runtime holds, after `reflect_override`'s
+    /// `setAccessible` family. `None` leaves the call to the rest of the
+    /// dispatch (counted).
     pub(super) fn invoke_field_access(
         &mut self,
         r: &MethodRef,
@@ -170,29 +169,13 @@ impl<H: Host> Runtime<'_, H> {
         args: &[Value],
         caller: &str,
     ) -> Result<Option<Value>, NativeError> {
-        if !matches!(r.owner.as_str(), FIELD | ACCESSIBLE) {
+        if let Some(value) = self.invoke_reflect_override(r, receiver, args, caller)? {
+            return Ok(Some(value));
+        }
+        if r.owner != FIELD && r.owner != "java/lang/reflect/AccessibleObject" {
             return Ok(None);
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("setAccessible", "(Z)V") | ("trySetAccessible", "()Z") => {
-                if let Some(marker) = receiver.and_then(expect_ref).cloned() {
-                    self.fields
-                        .insert(format!("{marker}|{TOUCHED}"), Value::Int(1));
-                }
-                Ok(None)
-            }
-            ("setAccessible", "([Ljava/lang/reflect/AccessibleObject;Z)V") => {
-                let markers: Vec<String> = args
-                    .first()
-                    .and_then(|array| self.array(array).ok())
-                    .map(|items| items.iter().filter_map(expect_ref).cloned().collect())
-                    .unwrap_or_default();
-                for marker in markers {
-                    self.fields
-                        .insert(format!("{marker}|{TOUCHED}"), Value::Int(1));
-                }
-                Ok(None)
-            }
             ("canAccess", "(Ljava/lang/Object;)Z") => {
                 let Some(marker) = receiver.and_then(expect_ref).cloned() else {
                     return Ok(None);
@@ -210,7 +193,7 @@ impl<H: Host> Runtime<'_, H> {
         object: &Value,
         caller: &str,
     ) -> Result<Option<Value>, NativeError> {
-        let Some((declaring, member)) = marker
+        let Some((declaring, member)) = reflect_override::canonical_field(marker)
             .strip_prefix("reflect-field/")
             .and_then(|rest| rest.split_once('#'))
         else {
@@ -220,15 +203,17 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         // A marker without its flags (a `getDeclaredField` miss) carries
-        // none to check; one `setAccessible` touched may have `override` set.
+        // none to check.
         if !member
             .split(':')
             .nth(2)
             .is_some_and(|flags| !flags.is_empty())
-            || self.fields.contains_key(&format!("{marker}|{TOUCHED}"))
         {
             return Ok(None);
         }
+        let Some(overridden) = self.field_override(marker) else {
+            return Ok(None);
+        };
         let Some(class_flags) = self.class(declaring).and_then(checkcast::class_access) else {
             return Ok(None);
         };
@@ -259,17 +244,26 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 None => return Ok(None),
             }
+            // 2. `override`, before the object's class is ever read.
+            if overridden {
+                return Ok(Some(Value::Int(1)));
+            }
             match self.known_object_class(object) {
                 Some(class) => Some(class),
                 None => return Ok(None),
             }
         };
+        // 2. `override` (a static field).
+        if overridden {
+            return Ok(Some(Value::Int(1)));
+        }
         // 3. `verifyAccess`, which starts with the same-class shortcut.
         let allowed = if caller == declaring {
             true
         } else {
-            // One jar is one module and one loader (module docs above).
-            if !self.classes.contains_key(caller) || !self.classes.contains_key(declaring) {
+            // The declaring jar's module is open to the caller
+            // (`reflect_override`), and the caller's class is readable.
+            if !self.module_open_to(declaring, caller) || self.class(caller).is_none() {
                 return Ok(None);
             }
             let same_package = package_of(caller) == package_of(declaring);

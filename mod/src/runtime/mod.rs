@@ -60,6 +60,7 @@ mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
 mod jdk_stream;
+mod jdk_supertypes;
 mod library_dispatch;
 mod map_compute;
 mod method_handles;
@@ -78,6 +79,7 @@ mod reflect_constructors;
 mod reflect_enum;
 mod reflect_generic;
 mod reflect_names;
+mod reflect_override;
 mod registry_contents;
 mod stack_walk;
 mod type_switch;
@@ -2269,6 +2271,13 @@ pub trait Host {
         0
     }
 
+    /// Whether the running jar ships a `module-info.class` (`reflect_override`
+    /// reads it to know the jar's module is unnamed or automatic). `None` when
+    /// this host does not know the jar.
+    fn jar_module_descriptor(&self) -> Option<bool> {
+        None
+    }
+
     /// The channel id a `CustomPacketPayload.Type` marker this host built
     /// names (`demo:sync`), for a networking call a wrapping host answers;
     /// `None` when the host built no such type.
@@ -3883,6 +3892,10 @@ impl StdHost {
 impl Host for StdHost {
     fn counted_unknown_calls(&self) -> usize {
         self.unknown_host_call_count()
+    }
+
+    fn jar_module_descriptor(&self) -> Option<bool> {
+        reflect_override::module_descriptor_in(&self.resources)
     }
 
     fn neoforge_attachments(
@@ -5692,6 +5705,7 @@ impl Host for StdHost {
             let marker = receiver_marker.as_deref().ok_or_else(|| {
                 NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
             })?;
+            let marker = reflect_override::canonical_field(marker);
             let method = marker.strip_prefix("reflect-field/").ok_or_else(|| {
                 NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
             })?;
@@ -9664,7 +9678,8 @@ fn bounded_captured_markers(values: &[Value]) -> String {
 /// and a lookup compares like with like.
 fn collection_item_marker(value: &Value) -> String {
     match value {
-        Value::Ref(Some(value)) => format!("r{value}"),
+        // A `Field` copy is kept and compared as its field (`Field.equals`).
+        Value::Ref(Some(value)) => format!("r{}", reflect_override::canonical_field(value)),
         other => value_marker(other),
     }
 }
@@ -9674,7 +9689,13 @@ fn value_marker(value: &Value) -> String {
         Value::Int(value) => format!("i{value}"),
         Value::Long(value) => format!("l{value}"),
         Value::Float(value) => format!("f{}", format_java_float(*value)),
-        Value::Ref(Some(value)) => format!("r{}", value.replace('\\', "\\\\").replace(',', "\\,")),
+        // A `Field` copy is stored and compared as its field (`Field.equals`).
+        Value::Ref(Some(value)) => format!(
+            "r{}",
+            reflect_override::canonical_field(value)
+                .replace('\\', "\\\\")
+                .replace(',', "\\,")
+        ),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
     }
@@ -11790,7 +11811,7 @@ fn generic_type_bounds(bounds: &[GenericType]) -> Vec<GenericType> {
 }
 
 fn parse_field_marker(member: &str) -> (&str, Option<(&str, u16)>) {
-    let mut parts = member.split(':');
+    let mut parts = reflect_override::strip_field_copy(member).split(':');
     let name = parts.next().unwrap_or(member);
     let descriptor = parts.next();
     let access = parts.next().and_then(|access| access.parse().ok());
@@ -14324,6 +14345,13 @@ impl NativeJar {
                 .name()
                 .map_err(|e| NativeError::Zip(e.to_string()))?
                 .into_owned();
+            // A module descriptor's name is kept (not its bytes): it decides
+            // the jar's module under NeoForge (`reflect_override`).
+            if reflect_override::is_module_descriptor(&name) {
+                resources
+                    .entry(name.clone())
+                    .or_insert_with(|| format!("jar-resource/{name}"));
+            }
             if !name.ends_with('/') && !name.ends_with(".class") {
                 resources
                     .entry(name.clone())
@@ -20250,14 +20278,19 @@ impl<H: Host> Runtime<'_, H> {
                         .iter()
                         .filter(|field| declared || field.access & 1 != 0)
                         .map(|field| {
-                            Value::Ref(Some(format!(
+                            format!(
                                 "reflect-field/{class}#{}:{}:{}",
                                 field.name, field.descriptor, field.access
-                            )))
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            // One fresh `Field` per element, as `copyField` makes them.
+            let fields = fields
+                .into_iter()
+                .map(|field| self.field_copy(field))
+                .collect::<Vec<_>>();
             let marker = self.new_array("java/lang/reflect/Field", "getDeclaredFields");
             self.arrays.insert(marker.clone(), fields);
             return Ok(Some(Value::Ref(Some(marker))));
@@ -20283,7 +20316,7 @@ impl<H: Host> Runtime<'_, H> {
                     )
                 })
                 .unwrap_or_else(|| format!("reflect-field/{class}#{name}"));
-            return Ok(Some(Value::Ref(Some(marker))));
+            return Ok(Some(self.field_copy(marker)));
         }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getMethods" | "getDeclaredMethods")
@@ -36654,8 +36687,15 @@ mandatory = true
             .unwrap()
             .unwrap();
         let public_marker = expect_ref(&public_fields).unwrap();
-        let public = runtime.arrays.get(public_marker).unwrap();
-        assert_eq!(public, &[declared[0].clone()]);
+        let public = runtime.arrays.get(public_marker).unwrap().clone();
+        // The same field, as `Field.equals` sees it, but its own copy: JDK 27
+        // hands every lookup a fresh `Field` (`ReflectionFactory.copyField`).
+        let field = |value: &Value| {
+            reflect_override::canonical_field(expect_ref(value).unwrap()).to_owned()
+        };
+        assert_eq!(public.len(), 1);
+        assert_eq!(field(&public[0]), field(&declared[0]));
+        assert_ne!(public[0], declared[0]);
 
         let mut std_host = StdHost::new();
         let field_name = MethodRef {

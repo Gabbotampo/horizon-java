@@ -49,7 +49,7 @@ public final class Probe {
         return out.toString();
     }
 
-    /** After `setAccessible` on the field, `canAccess` is counted (no oracle line). */
+    /** `setAccessible` on one copy leaves a fresh copy's `override` unset. */
     public static String touched() throws Exception {
         Holder2.class.getDeclaredField("priv").setAccessible(true);
         return String.valueOf(Holder2.class.getDeclaredField("priv").canAccess(new Holder2()));
@@ -172,17 +172,14 @@ fn can_access_matches_the_jdk() {
     }
 }
 
-/// `setAccessible` is not modelled, so `override` may be set, and field markers
-/// do not tell two `Field` objects for one field apart: `canAccess` is counted.
+/// `setAccessible(true)` on one `Field` copy does not touch another: a fresh
+/// `getDeclaredField` copy of the same private field answers `false` (OpenJDK
+/// 27 prints `false` for `touched()`). Before `reflect_override` told copies
+/// apart, both calls were counted.
 #[test]
-fn can_access_after_set_accessible_is_counted() {
+fn can_access_after_set_accessible_on_another_copy() {
     let fixture = fixture("can-access-touched");
-    let (_, unknown) = run(&fixture, "demo/Probe", "touched");
-    let names: Vec<&str> = unknown.iter().map(|(name, _)| name.as_str()).collect();
-    for counted in [
-        "java/lang/reflect/Field#setAccessible(Z)V",
-        "java/lang/reflect/Field#canAccess(Ljava/lang/Object;)Z",
-    ] {
-        assert!(names.contains(&counted), "{counted} not in {names:?}");
-    }
+    let (answer, unknown) = run(&fixture, "demo/Probe", "touched");
+    assert_eq!(answer, "false");
+    assert!(unknown.is_empty(), "touched counted {unknown:?}");
 }
