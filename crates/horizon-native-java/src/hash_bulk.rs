@@ -115,6 +115,27 @@ impl<H: Host> Runtime<'_, H> {
         if !jar_involved(self, needle) {
             return Ok(None);
         }
+        // Only a set that looks elements up by `equals`: a copy the host
+        // handed out, an unmodifiable set, or `Set.of`. A sorted set (or a
+        // view of one) finds by `compareTo`, which a scan cannot stand for.
+        let Some(marker) = expect_ref(receiver).cloned() else {
+            return Ok(None);
+        };
+        let copy_like = self.host.is_view_copy(&marker)
+            || marker.starts_with("set/")
+            || marker.starts_with("set#")
+            || marker.contains("#immutable");
+        let sorted_source = self
+            .host
+            .unmodifiable_view_source(&marker)
+            .map(|source| Value::Ref(Some(source)))
+            .and_then(|source| self.host_collection_class(&source))
+            .is_some_and(|class| {
+                class != "java/util/HashSet" && class != "java/util/LinkedHashSet"
+            });
+        if !copy_like || sorted_source {
+            return Ok(None);
+        }
         let elements = self.collection_elements(receiver)?;
         if !self.pure_equality(needle) || !elements.iter().all(|e| self.pure_equality(e)) {
             return self.count_and_continue(r);

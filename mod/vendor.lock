@@ -186,9 +186,9 @@
       "source_sha256": "6a0c971d4d41707bf33ce66b0ef522ce96249d01fcbada58fe794abae467c062"
     },
     "hash_bulk.rs": {
-      "sha256": "f69e6c3d567198f04388429e2d4bef2e8ae16d3e4a4f62c4014539a9294d57d6",
+      "sha256": "d88654a87bf6d3e65029c10cb6b6290c22773c2709d4888f66d45461d187a28d",
       "source": "crates/horizon-native-java/src/hash_bulk.rs",
-      "source_sha256": "f69e6c3d567198f04388429e2d4bef2e8ae16d3e4a4f62c4014539a9294d57d6"
+      "source_sha256": "d88654a87bf6d3e65029c10cb6b6290c22773c2709d4888f66d45461d187a28d"
     },
     "hash_collections.rs": {
       "sha256": "69aaed7d8889cede88db72446e49aec7c4ed3013833d4aa2b5107dcb9a0f504f",
