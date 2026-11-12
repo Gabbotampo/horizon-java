@@ -12,9 +12,11 @@
 //! * the arguments a jar-body target receives are unboxed per its descriptor
 //!   (`BiFunction<String, Integer, Point>` → `Point(String, int)`). The
 //!   JDK-target path already did this;
-//! * a callback's result is unboxed when the interface method returns a
-//!   primitive (`ToIntFunction<Holder>` over `Integer boxed()`), for JDK and
-//!   mod-defined functional interfaces alike. Boxing a primitive result for a
+//! * a callback's result is unboxed and widened when the interface method
+//!   returns a primitive (`ToIntFunction<Holder>` over `Integer boxed()`,
+//!   `DoubleSupplier` over `int anInt()`), for JDK and mod-defined
+//!   functional interfaces alike; arguments are widened the same way
+//!   (`IntFunction` over `takesLong(long)`). Boxing a primitive result for a
 //!   reference return (`box_callback_result`) now also covers a mod's own
 //!   interfaces.
 //!
@@ -24,15 +26,10 @@
 use super::*;
 
 /// `value` converted to the primitive the interface method `call_descriptor`
-/// returns, when it returns one and `value` is a box of it; otherwise
-/// `value` unchanged.
+/// returns, when it returns one: unboxed when it is a box, then widened
+/// (`DoubleSupplier` over an `int` target answers `7.0`, `ToLongFunction`
+/// over an `Integer` target a `long`); otherwise `value` unchanged.
 pub(crate) fn unbox_result(call_descriptor: &str, value: Value) -> Value {
     let returned = return_desc(call_descriptor);
-    if returned.len() != 1 || returned == "V" || !matches!(value, Value::Ref(Some(_))) {
-        return value;
-    }
-    let mut slot = [value];
-    jdk_model::unbox_for_descriptor(&format!("({returned})V"), &mut slot);
-    let [value] = slot;
-    value
+    jdk_model::adapt_to_primitive(&value, returned).unwrap_or(value)
 }

@@ -7,6 +7,9 @@
 //! `Integer`-returning target through `ToIntFunction` or a mod's own
 //! `int`-returning interface.
 //!
+//! The widening cases (an independent review's programs) answered `7`
+//! where Java prints `7.0`, uncounted, or stopped with a type mismatch.
+//!
 //! Every expected value is OpenJDK 25.0.5's output for the same `Probe`
 //! (`javac --release 21`, then `java -cp` calling each method), pasted
 //! verbatim.
@@ -20,10 +23,14 @@ use javac_fixture::Fixture;
 const PROBE: &str = r#"package demo;
 
 import java.util.function.BiFunction;
+import java.util.function.DoubleSupplier;
 import java.util.function.Function;
 import java.util.function.IntFunction;
+import java.util.function.LongFunction;
 import java.util.function.Supplier;
+import java.util.function.ToDoubleFunction;
 import java.util.function.ToIntFunction;
+import java.util.function.ToLongFunction;
 
 public final class Probe {
     record Point(String name, int x) { }
@@ -35,10 +42,14 @@ public final class Probe {
     /// A mod's own functional interfaces, erased and primitive.
     interface Maker<T> { T make(int value); }
     interface Measure { int measure(String text); }
+    interface DblMaker { double make(); }
 
     static int plusOne(int value) { return value + 1; }
     static long seven() { return 7L; }
     static Integer boxedLength(String text) { return text.length(); }
+    static int anInt() { return 7; }
+    static String takesLong(long value) { return "L" + (value << 33); }
+    static String takesDouble(double value) { return "D" + value; }
     static String describe(Object value) { return value.getClass().getSimpleName() + ":" + value; }
 
     /// `Point::new` through an erased `BiFunction`: the `Integer` argument is
@@ -70,6 +81,28 @@ public final class Probe {
         IntFunction<String> plain = Probe::describe;
         Maker<String> maker = Probe::describe;
         return plain.apply(5) + "|" + maker.make(6);
+    }
+
+    /// An `int` result widened to the interface's `double`.
+    public static String widenedResult() {
+        DoubleSupplier supplier = Probe::anInt;
+        DblMaker maker = Probe::anInt;
+        return supplier.getAsDouble() + "|" + maker.make();
+    }
+
+    /// An `Integer` result unboxed, then widened to `long` and `double`.
+    public static String unboxedThenWidenedResult() {
+        ToLongFunction<Holder> asLong = Holder::boxed;
+        ToDoubleFunction<Holder> asDouble = Holder::boxed;
+        return (asLong.applyAsLong(new Holder()) << 33) + "|" + asDouble.applyAsDouble(new Holder());
+    }
+
+    /// Arguments widened (and unboxed first) into the target's parameters.
+    public static String widenedArguments() {
+        IntFunction<String> fromInt = Probe::takesLong;
+        LongFunction<String> fromLong = Probe::takesDouble;
+        Function<Integer, String> fromBox = Probe::takesLong;
+        return fromInt.apply(3) + "|" + fromLong.apply(5L) + "|" + fromBox.apply(2);
     }
 }
 "#;
@@ -112,4 +145,22 @@ fn a_boxed_result_is_unboxed_for_a_primitive_return() {
 #[test]
 fn a_primitive_argument_reaches_an_object_parameter_as_its_box() {
     assert_eq!(exact("boxedArgument"), "Integer:5|Integer:6");
+}
+
+/// An `int` target behind `DoubleSupplier` and a mod's `double make()`.
+#[test]
+fn a_primitive_result_is_widened_to_the_interface_return() {
+    assert_eq!(exact("widenedResult"), "7.0|7.0");
+}
+
+/// `Integer boxed()` behind `ToLongFunction` and `ToDoubleFunction`.
+#[test]
+fn a_boxed_result_is_unboxed_then_widened() {
+    assert_eq!(exact("unboxedThenWidenedResult"), "352187318272|41.0");
+}
+
+/// `int` → `long`, `long` → `double`, and `Integer` → `int` → `long`.
+#[test]
+fn arguments_are_unboxed_then_widened_to_the_target_parameters() {
+    assert_eq!(exact("widenedArguments"), "L25769803776|D5.0|L17179869184");
 }
