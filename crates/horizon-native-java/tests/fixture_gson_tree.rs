@@ -1,5 +1,6 @@
 //! Gson's JSON tree (`JsonObject`, `JsonArray`, `JsonPrimitive`, `JsonNull`,
-//! their conversions, equality, copies and text, and `Gson.toJson` of a tree), compiled from
+//! their conversions, equality, copies and text, and `Gson.toJson` of a tree, plus
+//! `JsonParser` and `Gson.fromJson` into the tree classes), compiled from
 //! real Java at test time.
 //!
 //! The probe below is compiled against signature-only copies of the
@@ -369,6 +370,22 @@ public class Probe {
             + (JsonNull.INSTANCE.deepCopy() == JsonNull.INSTANCE) + (p.deepCopy() == p);
     }
 
+    /** JsonParser documents, numbers kept as parsed text, comments. */
+    public static String parse() {
+        String doc = "{\n  // a comment\n  \"n\": 5, \"neg\": -12, \"z\": -0, \"big\": 123456789012345678901234567890,\n"
+            + "  \"dec\": 1.50, \"exp\": 1e3, \"dexp\": 2.5E-3, # hash comment\n  \"s\": \"\\u00e9\\/\\\"\\\\\\t\\ud83d\\ude00\", /* block */ \"t\": true, \"f\": false, \"nul\": null,\n"
+            + "  \"arr\": [1, [2, []], {}], \"dup\": 1, \"dup\": 2\n}";
+        JsonObject o = JsonParser.parseString(doc).getAsJsonObject();
+        JsonElement n = o.get("n");
+        return o.toString()
+            + "|" + n.getAsInt() + "," + o.get("dec").getAsInt() + "," + o.get("exp").getAsInt() + "," + o.get("dec").getAsDouble() + "," + o.get("big").getAsDouble()
+            + "," + o.get("exp").getAsLong() + "," + o.get("dexp").getAsFloat() + "," + o.get("z").getAsInt() + "," + o.get("neg").getAsLong() + "," + o.get("big").getAsString()
+            + "|" + n.getAsNumber().getClass().getName() + "," + n.getAsJsonPrimitive().isNumber() + "," + o.get("s").getAsString().length() + "," + o.get("nul").isJsonNull()
+            + "|" + JsonParser.parseString("") + "," + JsonParser.parseString(" \n ").isJsonNull() + "," + JsonParser.parseString("null").isJsonNull()
+            + "," + JsonParser.parseString("[1,\"a\"]") + "," + JsonParser.parseString("\"top\"").getAsString() + "," + JsonParser.parseReader(new StringReader("{\"r\":1}"))
+            + "|" + o.get("dup") + "," + o.keySet();
+    }
+
     /** Gson#toJson over a tree with the builder's options. */
     public static String gsonWrite() {
         JsonObject o = new JsonObject();
@@ -389,6 +406,17 @@ public class Probe {
         Object asObject = o;
         return plain.toJson(o) + "\n" + pretty.toJson(o) + "\n" + nulls.toJson(o) + "\n" + plain.toJson(asObject)
             + "\n" + plain.toJson(JsonNull.INSTANCE) + "\n" + pretty.toJson(new JsonPrimitive("x'y")) + "\n" + o;
+    }
+
+    /** Gson#fromJson into the tree classes. */
+    public static String gsonRead() {
+        Gson gson = new GsonBuilder().setLenient().create();
+        JsonObject o = gson.fromJson("{\"a\": [1, 2.0, \"x\"], \"b\": {\"c\": null}} // tail comment", JsonObject.class);
+        JsonObject fromReader = gson.fromJson(new StringReader("{\"r\": true}"), JsonObject.class);
+        JsonObject empty = gson.fromJson("", JsonObject.class);
+        JsonElement el = new Gson().fromJson("[3]", JsonElement.class);
+        JsonArray arr = new Gson().fromJson("[4, 5]", JsonArray.class);
+        return o + "|" + o.get("a").getAsJsonArray().get(1).getAsNumber().getClass().getSimpleName() + "|" + fromReader + "|" + empty + "|" + el + "|" + arr.size();
     }
 
     /** Iteration: for-each over an array, forEach with a lambda, entrySet. */
@@ -436,7 +464,7 @@ public class Probe {
     }
 
     public static void main(String[] args) {
-        String[] names = {"build", "order", "access", "errors", "equality", "copies", "gsonWrite", "iterate", "kinds", "numbers", "counted"};
+        String[] names = {"build", "order", "access", "errors", "equality", "copies", "parse", "gsonWrite", "gsonRead", "iterate", "kinds", "numbers", "counted"};
         for (String name : names) {
             try {
                 String v = (String) Probe.class.getMethod(name).invoke(null);
@@ -649,10 +677,30 @@ fn kinds_iteration_and_number_text_are_gsons() {
     );
 }
 
+/// JsonParser with comments, escapes, parsed numbers kept as `LazilyParsedNumber` text and their conversions, duplicate names and empty documents.
+#[test]
+fn json_parser_reads_documents_and_keeps_number_text() {
+    let fixture = Fixture::build("parse");
+    assert_eq!(
+        fixture.exact("parse"),
+        "{\"n\":5,\"neg\":-12,\"z\":-0,\"big\":123456789012345678901234567890,\"dec\":1.50,\"exp\":1e3,\"dexp\":2.5E-3,\"s\":\"\u{e9}/\\\"\\\\\\t\u{1f600}\",\"t\":true,\"f\":false,\"nul\":null,\"arr\":[1,[2,[]],{}],\"dup\":2}|5,1,1000,1.5,1.2345678901234568E29,1000,0.0025,0,-12,123456789012345678901234567890|com.google.gson.internal.LazilyParsedNumber,true,7,true|null,true,true,[1,\"a\"],top,{\"r\":1}|2,[n, neg, z, big, dec, exp, dexp, s, t, f, nul, arr, dup]"
+    );
+}
+
+/// Gson#fromJson into JsonObject, JsonElement and JsonArray, from a string and a reader, and an empty document.
+#[test]
+fn gson_reads_text_into_tree_classes() {
+    let fixture = Fixture::build("gsonRead");
+    assert_eq!(
+        fixture.exact("gsonRead"),
+        "{\"a\":[1,2.0,\"x\"],\"b\":{\"c\":null}}|LazilyParsedNumber|{\"r\":true}|null|[3]|2"
+    );
+}
+
 /// What the model does not answer is counted, never approximated. On the
 /// real jar the probe prints `0.1|true|{"a":1}`: a boxed `0.1f` is a `Float`
 /// whose text differs from the `Double` the untyped runtime cannot rule out,
-/// `JsonNull.hashCode()` is an identity hash, and `JsonParser` is not modelled yet.
+/// `JsonNull.hashCode()` is an identity hash, and `{a:1}` uses the lenient unquoted name the parser does not reproduce.
 #[test]
 fn what_the_model_cannot_answer_is_counted() {
     let fixture = Fixture::build("counted");

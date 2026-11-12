@@ -11,9 +11,8 @@
 //!
 //! This module builds, reads, compares and writes trees: `JsonElement.toString`
 //! and `Gson.toJson` of a tree (through `gson_model.rs`'s `gson_to_json`).
-//! Reading JSON text into a tree (`JsonParser`, `Gson.fromJson` into a tree
-//! class) is not modelled yet and is counted: `Gson.fromJson` into a tree
-//! class used to answer a map marker typed as the tree.
+//! `parse.rs` reads JSON text into a tree (`JsonParser`, `Gson.fromJson` into
+//! a tree class).
 //!
 //! ## Representation
 //!
@@ -67,6 +66,8 @@
 //! JVM's module/loader clause, the same departure `checkcast.rs` names.
 
 use super::*;
+
+mod parse;
 
 pub(crate) const JSON_ELEMENT: &str = "com/google/gson/JsonElement";
 pub(crate) const JSON_OBJECT: &str = "com/google/gson/JsonObject";
@@ -710,18 +711,12 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        if r.owner == "com/google/gson/Gson" && r.name == "fromJson" {
-            // Reading text into a tree is not modelled yet. The general
-            // `fromJson` path would answer a map marker typed as a tree, so
-            // the read is counted instead.
-            if args
-                .get(1)
-                .and_then(expect_ref)
-                .is_some_and(|class| tree_class(class))
-            {
-                return self.count_tree_call(r, receiver, args).map(Some);
-            }
-            return Ok(None);
+        // Reading text into a tree (`parse.rs`).
+        if parse::is_parser(r) {
+            return self.invoke_json_parser(r, receiver, args);
+        }
+        if r.owner == "com/google/gson/Gson" {
+            return self.invoke_gson_fromjson_tree(r, receiver, args);
         }
         let Some(receiver) = receiver else {
             return Ok(None);

@@ -305,6 +305,24 @@ still `ran-hollow` on `Gson#fromJson(String, Class)` into `JsonObject` (Cupboard
 marker typed as a `JsonObject`; `modelbrowser` 3 → 0, now `ran-clean`; `takeitout` 53 → 49. No
 verdict got worse.
 
+With the parser on top (`gson_tree/parse.rs`: `JsonParser`, `Gson.fromJson` into a tree class),
+against the same `9eb57c5`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 1,164 → **896** |
+| mega | 59 → **60** | 88 → 87 | 4 → 4 | 101 → 101 | 2,473 → **2,468** |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+
+Every `JsonParser` call left the ranking too, and the counted `fromJson` into `JsonObject` is
+read. `cupboard` is 78 → 4 and `structureessentials` 198 → 9: both now get through Cupboard's
+config write and stop on `String#replaceFirst` in `CupboardConfig#splitLongDesc`, which they now
+reach (0 → 13 calls, the only call whose count rose). `PatPat` 14 → 13 and both `clientcommands`
+builds 2 → 1. Corpus-xl's total is 8 above the tree-only run because those two jars run further.
+No verdict got worse. The Gson calls still counted are `Gson` writes through an adapter or a
+custom strategy (#49's rule), `toJsonTree`, `toJson(JsonElement, JsonWriter)`,
+`TypeToken#getType` and two `GsonBuilder#setPrettyPrinting` calls, all unchanged by this model.
+
 ## Known limits of this census
 
 - The probe executes a jar as shipped. A jar whose entrypoint only works with its own
