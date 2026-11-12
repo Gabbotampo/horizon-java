@@ -1006,39 +1006,69 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
     /// host; a `StringBuilder` element reads its text, `null` reads `null`.
     /// An `Iterable`'s elements come back from the host as stored item
     /// markers, so each is parsed back to its value before it is joined.
-    pub(crate) fn invoke_string_join(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    pub(crate) fn invoke_string_join(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/lang/String" || r.name != "join" {
-            return None;
+            return Ok(None);
         }
-        let text = |runtime: &Self, value: &Value| match value {
-            Value::Ref(Some(marker)) => runtime
-                .string_builders
-                .get(marker)
-                .cloned()
-                .unwrap_or_else(|| crate::value_text(value)),
-            other => crate::value_text(other),
+        let Some(separator) = args.first() else {
+            return Ok(None);
         };
-        let separator = text(self, args.first()?);
-        let parts: Vec<String> = match r.descriptor.as_str() {
+        let elements: Vec<Value> = match r.descriptor.as_str() {
             "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
-                let array = expect_ref(args.get(1)?)?;
-                let values = self.arrays.get(array)?.clone();
-                values.iter().map(|value| text(self, value)).collect()
+                let Some(values) = args
+                    .get(1)
+                    .and_then(expect_ref)
+                    .and_then(|array| self.arrays.get(array))
+                else {
+                    return Ok(None);
+                };
+                values.clone()
             }
             "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;" => {
-                let items = self.host.mutable_collection_values(args.get(1)?)?;
+                let Some(items) = args
+                    .get(1)
+                    .and_then(|items| self.host.mutable_collection_values(items))
+                else {
+                    return Ok(None);
+                };
                 items
                     .iter()
                     .map(|item| {
                         crate::parse_collection_value(item)
-                            .map(|value| text(self, &value))
-                            .unwrap_or_else(|_| item.clone())
+                            .unwrap_or_else(|_| Value::Ref(Some(item.clone())))
                     })
                     .collect()
             }
-            _ => return None,
+            _ => return Ok(None),
         };
-        Some(Value::Ref(Some(parts.join(&separator))))
+        // `String.join` takes `String.valueOf(element)` of each element: a
+        // builder's text, a jar `CharSequence`'s own `toString()`
+        // (`jar_text.rs`, counted when it has none), else the value's text.
+        let mut parts = Vec::with_capacity(elements.len());
+        for value in std::iter::once(separator).chain(&elements) {
+            let text = match value {
+                Value::Ref(Some(marker)) if self.string_builders.contains_key(marker) => {
+                    self.string_builders[marker].clone()
+                }
+                Value::Ref(Some(marker))
+                    if crate::jar_text::object_marker_class(marker).is_some() =>
+                {
+                    match self.runtime_value_of(value, "java/lang/String", "join")? {
+                        Some(Value::Ref(Some(text))) => text,
+                        Some(_) => "null".to_owned(),
+                        None => crate::value_text(value),
+                    }
+                }
+                other => crate::value_text(other),
+            };
+            parts.push(text);
+        }
+        let separator = parts.remove(0);
+        Ok(Some(Value::Ref(Some(parts.join(&separator)))))
     }
 
     /// The JDK calls the interpreter answers itself, in one dispatch slot:

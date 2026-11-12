@@ -206,7 +206,7 @@ pub(crate) fn jdk_superclass_declares(class: &str, name: &str, descriptor: &str)
 /// keep the models' answers: running a copy's bytecode for some calls while
 /// the models answer the rest would mix two implementations in one object.
 /// Interpreting a linked library wholly is a separate decision.
-fn library_modelled(class: &str) -> bool {
+pub(crate) fn library_modelled(class: &str) -> bool {
     [
         "com/google/common/",
         "it/unimi/dsi/fastutil/",
@@ -224,7 +224,7 @@ fn package_of(class: &str) -> &str {
 
 /// The class of a `class#n` object marker (an object `new` built), in any
 /// package, or `None` for every other marker family.
-fn constructed_object_class(marker: &str) -> Option<&str> {
+pub(crate) fn constructed_object_class(marker: &str) -> Option<&str> {
     let (class, serial) = marker.split_once('#')?;
     (!class.is_empty()
         && !class.contains([':', ' ', '.'])

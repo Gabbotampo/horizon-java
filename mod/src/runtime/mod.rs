@@ -51,6 +51,7 @@ mod guava_model;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
+mod jar_operands;
 mod jar_text;
 mod java_format;
 mod java_format_args;
@@ -2109,6 +2110,13 @@ pub trait Host {
         Ok(Value::default_for(return_desc(&r.descriptor)))
     }
 
+    /// Count `r` as an unknown host call and answer its neutral default:
+    /// a model was handed a jar object it holds no state for
+    /// (`jar_operands.rs`).
+    fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        Ok(Value::default_for(return_desc(&r.descriptor)))
+    }
+
     /// Invoke an instance method with its receiver preserved. Existing hosts
     /// keep their old behavior through the default forwarding implementation.
     fn invoke_instance(
@@ -3927,6 +3935,10 @@ impl StdHost {
 }
 
 impl Host for StdHost {
+    fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        self.unknown_host_call(r)
+    }
+
     fn counted_unknown_calls(&self) -> usize {
         self.unknown_host_call_count()
     }
@@ -7197,7 +7209,10 @@ impl Host for StdHost {
                 Ok(collection_value("list", &values))
             }
             (owner, "toString", "()Ljava/lang/String;") if is_collection_owner(owner) => {
-                Ok(Value::Ref(Some(collection_text(self, receiver)?)))
+                // A jar subclass's marker names its own class; the JDK owner
+                // says whether it prints as a map (`AbstractMap.toString`).
+                let map = is_map_owner(owner);
+                Ok(Value::Ref(Some(collection_text(self, receiver, map)?)))
             }
             // Number's primitive accessors are inherited by every boxed numeric
             // type. Keep the conversion rules in one bounded path so a value
@@ -10924,13 +10939,18 @@ fn parse_collection_value(value: &str) -> Result<Value, NativeError> {
     parse_value_marker(value)
 }
 
-fn collection_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError> {
+fn collection_text(
+    host: &mut StdHost,
+    value: &Value,
+    owner_is_map: bool,
+) -> Result<String, NativeError> {
     let values = host_collection_values(host, value)?;
     let marker = expect_string(value).to_owned();
     let kind = marker.split('/').next().unwrap_or(&marker);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     let class = marker.split_once('#').map(|(class, _)| class);
-    let is_map = kind == "map"
+    let is_map = owner_is_map
+        || kind == "map"
         || class.is_some_and(|class| {
             is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
         });
@@ -19272,6 +19292,13 @@ impl<H: Host> Runtime<'_, H> {
             let expected = arg_count(&callback.target.descriptor);
             if values.len() == expected && callback.target.name != "<init>" {
                 jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut values);
+                // A jar object argument no model can read is counted
+                // (`jar_operands.rs`), as for the direct call.
+                if let Some(value) =
+                    self.count_unmodelled_jar_operand(&callback.target, 0xb8, None, &values)?
+                {
+                    return Ok(Some(value));
+                }
                 // A library the interpreter models (Guava, proxies, the JDK
                 // shapes in `library_dispatch`) answers a method reference
                 // to it the way it answers the direct call.
@@ -19306,6 +19333,28 @@ impl<H: Host> Runtime<'_, H> {
             };
             let (receiver, mut rest) = (receiver.clone(), rest.to_vec());
             jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut rest);
+            // `Collection::size` on a jar object runs the object's own body
+            // (`jvm_dispatch.rs`); a JDK body over its data is counted
+            // (`jar_operands.rs`). The handle kind is not recorded, so the
+            // reference is dispatched as an interface call would be.
+            if let Some(owner) =
+                self.jvm_selected_jar_body(&callback.target, 0xb9, Some(&receiver))?
+            {
+                return self
+                    .invoke(
+                        &owner,
+                        &callback.target.name,
+                        &callback.target.descriptor,
+                        Some(receiver),
+                        &rest,
+                    )
+                    .map(Some);
+            }
+            if let Some(value) =
+                self.count_unmodelled_jar_operand(&callback.target, 0xb9, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
                 && is_collection_owner(&callback.target.owner)
@@ -23945,6 +23994,13 @@ impl<H: Host> Runtime<'_, H> {
                         )
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // A model handed a jar object it has no state for
+                        // counts it instead of answering (`jar_operands.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_service_loader(&r, receiver.as_ref(), &args)
                     ) {
                         // Providers built as the JDK builds them (`service_loader.rs`).
@@ -23977,7 +24033,9 @@ impl<H: Host> Runtime<'_, H> {
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
                         format_java_string_call(self, &r, &args)?
-                    } else if let Some(value) = self.invoke_string_join(&r, &args) {
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_string_join(&r, &args))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
