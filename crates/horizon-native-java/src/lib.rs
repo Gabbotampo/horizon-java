@@ -42,6 +42,7 @@ mod field_get_set;
 mod frame_bound;
 mod game_codecs;
 mod game_hooks;
+mod game_rules;
 mod gson_model;
 mod gson_tree;
 mod guava_model;
@@ -72,6 +73,7 @@ mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
 mod jvm_dispatch;
+mod lambda_boxing;
 mod library_dispatch;
 mod list_equality;
 mod map_compute;
@@ -86,6 +88,9 @@ mod native_library;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
+pub mod neoforge_imc;
+mod neoforge_inject;
+pub mod neoforge_lifecycle;
 mod neoforge_loader;
 mod neoforge_subscribe;
 mod nested_jars;
@@ -2100,6 +2105,13 @@ pub trait Host {
     ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
         None
     }
+    /// The `InterModComms` queues this host reads and sends to, and the unknown-call table
+    /// (`neoforge_imc.rs`). A host that keeps none answers `None`, and IMC stays unmodelled.
+    fn neoforge_imc(
+        &mut self,
+    ) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
+        None
+    }
     /// An instance field the interpreter does not hold, read with its
     /// receiver: a field of a host object (`player.connection` on a façade
     /// player). The default answers as hosts always did, without it.
@@ -2602,6 +2614,8 @@ pub struct StdHost {
     /// The command tree the jar's registration callbacks built and the
     /// command running now (`brigadier.rs`).
     brigadier: brigadier::BrigadierState,
+    /// FML's `InterModComms` queues, shared with the other jars of a game (`neoforge_imc.rs`).
+    imc: neoforge_imc::ImcHandle,
 }
 
 impl Default for StdHost {
@@ -2696,6 +2710,7 @@ impl StdHost {
             game_event: None,
             client: client_surface::ClientState::default(),
             brigadier: Default::default(),
+            imc: neoforge_imc::ImcHandle::default(),
         }
     }
 
@@ -3051,6 +3066,7 @@ impl StdHost {
     /// behavior; server integrations should select `SERVER`.
     pub fn with_environment_type(mut self, environment_type: impl Into<String>) -> Self {
         self.environment_type = environment_type.into();
+        self.neoforge_bus.server = self.environment_type == "SERVER";
         self
     }
 
@@ -3307,6 +3323,12 @@ impl StdHost {
 
     pub fn payload_registrations(&self) -> &[PayloadRegistration] {
         &self.payload_registrations
+    }
+
+    /// Counts every payload registration as an unknown host call, for an embedding with no
+    /// channel to route them on: the registration ran, but no packet will reach its handler.
+    pub fn count_unrouted_payloads(&mut self, why: &str) {
+        crate::neoforge_lifecycle::count_unrouted_payloads(self, why);
     }
 
     /// The registered payload channels as `(id, direction, codec)` for the
@@ -3995,6 +4017,11 @@ impl Host for StdHost {
     ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
         Some((&mut self.neoforge_bus, &mut self.unknown_host_calls))
     }
+    fn neoforge_imc(
+        &mut self,
+    ) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
+        Some((&mut self.imc, &mut self.unknown_host_calls))
+    }
     fn write_console(&mut self, text: &str) {
         self.console_out.push_str(text);
     }
@@ -4119,6 +4146,8 @@ impl Host for StdHost {
         self.brigadier_instance_of(marker, wanted)
             || self.mod_container_instance_of(marker, wanted)
             || neoforge_bus::bus_instance_of(marker, wanted)
+            || neoforge_lifecycle::instance_of(marker, wanted)
+            || neoforge_imc::instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -5430,6 +5459,10 @@ impl Host for StdHost {
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
+            return Ok(value);
+        }
+        // The loading stages' event objects (`neoforge_lifecycle.rs`).
+        if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
@@ -7268,7 +7301,10 @@ impl Host for StdHost {
                 Ok(collection_value("list", &values))
             }
             (owner, "toString", "()Ljava/lang/String;") if is_collection_owner(owner) => {
-                Ok(Value::Ref(Some(collection_text(self, receiver)?)))
+                // A jar subclass's marker names its own class; the JDK owner
+                // says whether it prints as a map (`AbstractMap.toString`).
+                let map = is_map_owner(owner);
+                Ok(Value::Ref(Some(collection_text(self, receiver, map)?)))
             }
             // Number's primitive accessors are inherited by every boxed numeric
             // type. Keep the conversion rules in one bounded path so a value
@@ -9940,7 +9976,9 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         "java/lang/ExceptionInInitializerError"
         | "java/lang/NoClassDefFoundError"
         | "java/lang/ClassFormatError"
-        | "java/lang/UnsatisfiedLinkError" => "java/lang/LinkageError",
+        | "java/lang/UnsatisfiedLinkError"
+        | "java/lang/IncompatibleClassChangeError" => "java/lang/LinkageError",
+        "java/lang/AbstractMethodError" => "java/lang/IncompatibleClassChangeError",
         "java/lang/StackOverflowError"
         | "java/lang/OutOfMemoryError"
         | "java/lang/InternalError"
@@ -10763,7 +10801,8 @@ fn box_callback_result<H: Host>(
     call_descriptor: &str,
 ) -> Result<Value, NativeError> {
     if !return_desc(call_descriptor).starts_with('L') {
-        return Ok(value);
+        // A primitive return unboxes a boxed result (`lambda_boxing.rs`).
+        return Ok(lambda_boxing::unbox_result(call_descriptor, value));
     }
     let Some(marker) = expect_ref(receiver) else {
         return Ok(value);
@@ -10957,13 +10996,18 @@ fn parse_collection_value(value: &str) -> Result<Value, NativeError> {
     parse_value_marker(value)
 }
 
-fn collection_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError> {
+fn collection_text(
+    host: &mut StdHost,
+    value: &Value,
+    owner_is_map: bool,
+) -> Result<String, NativeError> {
     let values = host_collection_values(host, value)?;
     let marker = expect_string(value).to_owned();
     let kind = marker.split('/').next().unwrap_or(&marker);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     let class = marker.split_once('#').map(|(class, _)| class);
-    let is_map = kind == "map"
+    let is_map = owner_is_map
+        || kind == "map"
         || class.is_some_and(|class| {
             is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
         });
@@ -15676,13 +15720,23 @@ impl NativeJar {
                     .cloned()
                     .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
                 let constructor_args = self.entry_constructor_args(&class_name, &constructor);
-                runtime.invoke(
+                // FML constructs a mod with its container active (`neoforge_imc.rs`).
+                let active = is_neoforge
+                    .then(|| self.mod_annotation_id(&class_name))
+                    .flatten();
+                let previous =
+                    active.and_then(|id| neoforge_imc::set_active(runtime.host, Some(id)));
+                let constructed = runtime.invoke(
                     &class_name,
                     "<init>",
                     &constructor.descriptor,
                     Some(Value::Ref(Some(class_name.clone()))),
                     &constructor_args,
-                )?;
+                );
+                if active.is_some() {
+                    neoforge_imc::set_active(runtime.host, previous.as_deref());
+                }
+                constructed?;
             }
             if method != "<init>" {
                 // The loader constructs the entrypoint instance and then calls
@@ -19350,7 +19404,8 @@ impl<H: Host> Runtime<'_, H> {
             // (`jvm_dispatch.rs`); a JDK body over its data is counted
             // (`jar_operands.rs`). The handle kind is not recorded, so the
             // reference is dispatched as an interface call would be.
-            if let Some(owner) = self.jvm_selected_jar_body(&callback.target, 0xb9, Some(&receiver))
+            if let Some(owner) =
+                self.jvm_selected_jar_body(&callback.target, 0xb9, Some(&receiver))?
             {
                 return self
                     .invoke(
@@ -19432,6 +19487,9 @@ impl<H: Host> Runtime<'_, H> {
         if !args_consumed {
             target_args.extend_from_slice(args);
         }
+        // An erased `Integer` argument unboxed into an `int` parameter
+        // (`lambda_boxing.rs`).
+        jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut target_args);
         let expected = arg_count(&callback.target.descriptor);
         if target_args.len() != expected {
             return Err(NativeError::Metadata(format!(
@@ -22227,41 +22285,21 @@ impl<H: Host> Runtime<'_, H> {
     /// method `Impl` inherits from an interface default, such as
     /// NightConfig's `ConfigParser.parse(String)`. Without this the walk ended
     /// at `java/lang/Object` and the host answered a neutral `null` for a body
-    /// the jar ships. Interfaces are searched breadth first from the classes'
-    /// own declarations, so a sub-interface's override is found before the
-    /// default it overrides; the search is bounded by
-    /// [`MAX_SUPERCLASS_WALK`] interfaces.
+    /// the jar ships. The default is the maximally specific one (JVMS
+    /// §5.4.3.3, `jvm_dispatch.rs`), so a sub-interface's override beats the
+    /// default it overrides wherever either is declared.
     fn inherited_default_owner(
         &self,
         chain: &[String],
         name: &str,
         descriptor: &str,
     ) -> Option<String> {
-        let mut queue = std::collections::VecDeque::new();
-        for class in chain {
-            if let Some(file) = self.class(class) {
-                queue.extend(file.interface_names());
-            }
+        // JVMS §5.4.3.3's maximally specific default (`jvm_dispatch.rs`); a
+        // conflict or an abstract-only set selects nothing here.
+        match self.maximally_specific_default(chain, name, descriptor) {
+            jvm_dispatch::DefaultSelection::Selected(owner) => Some(owner),
+            _ => None,
         }
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(interface) = queue.pop_front() {
-            if seen.len() >= MAX_SUPERCLASS_WALK {
-                break;
-            }
-            if !seen.insert(interface.clone()) {
-                continue;
-            }
-            let Some(file) = self.class(&interface) else {
-                continue;
-            };
-            if file.method(name, descriptor).is_some_and(|method| {
-                method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0
-            }) {
-                return Some(interface);
-            }
-            queue.extend(file.interface_names());
-        }
-        None
     }
 
     /// The program counter of this frame's handler that catches `thrown` at
@@ -22795,10 +22833,12 @@ impl<H: Host> Runtime<'_, H> {
             // site bound, the body is that method, not the interface's own
             // (absent) code — a config validator or a custom `Supplier` shape
             // would otherwise answer `null`.
+            // Its result is boxed or unboxed to the abstract method's return
+            // type, as the metafactory adapts it (`lambda_boxing.rs`).
             if let Some(receiver) = receiver.as_ref()
                 && let Some(value) = self.invoke_callback(receiver, args)?
             {
-                return Ok(value);
+                return box_callback_result(self, receiver, value, desc);
             }
             // A Fabric event's invoker is a host marker standing for the
             // jar's array-backed invoker, which the host does not run: the
@@ -23921,7 +23961,7 @@ impl<H: Host> Runtime<'_, H> {
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
                     } else if let Some(owner) =
-                        self.jvm_selected_jar_body(&r, op, receiver.as_ref())
+                        invoke_or_catch!(at, self.jvm_selected_jar_body(&r, op, receiver.as_ref()))
                     {
                         // The receiver's own body, before any host model
                         // (`jvm_dispatch.rs`).
@@ -23930,6 +23970,12 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // FML's `InterModComms` (`neoforge_imc.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
@@ -23985,7 +24031,9 @@ impl<H: Host> Runtime<'_, H> {
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
                         format_java_string_call(self, &r, &args)?
-                    } else if let Some(value) = self.invoke_string_join(&r, &args) {
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_string_join(&r, &args))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -24212,7 +24260,17 @@ impl<H: Host> Runtime<'_, H> {
                                         at,
                                         self.invoke_callback(receiver, &args)
                                     ) {
-                                        Some(value) => value,
+                                        // Boxed or unboxed to the interface
+                                        // method's return (`lambda_boxing.rs`).
+                                        Some(value) => invoke_or_catch!(
+                                            at,
+                                            box_callback_result(
+                                                self,
+                                                receiver,
+                                                value,
+                                                &resolved.descriptor
+                                            )
+                                        ),
                                         None => invoke_or_catch!(
                                             at,
                                             self.host.invoke_instance(&resolved, receiver, &args)
@@ -36739,6 +36797,26 @@ mandatory = true
         assert_eq!(
             host.payload_registrations().last().unwrap().direction,
             "configurationToClient"
+        );
+        // An embedding with no payload channel counts each one under its direction.
+        host.count_unrouted_payloads("no channel");
+        let counted: Vec<_> = host
+            .unknown_host_calls()
+            .into_iter()
+            .filter(|(key, _)| key.contains("(no channel)"))
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#configurationToClient (no channel)".to_owned(),
+                    1
+                ),
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#playToServer (no channel)".to_owned(),
+                    1
+                ),
+            ]
         );
     }
 

@@ -906,34 +906,59 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
     class == wanted || known.contains(&wanted)
 }
 
-/// Unbox the arguments a method reference to a JDK method receives, the way
-/// the lambda metafactory adapts `BinaryOperator<Integer>` to `Integer::sum`:
-/// a boxed marker in a primitive parameter position becomes the primitive.
-/// `args` are the target's declared parameters in order (no receiver); a value
-/// that is already primitive, or not a box, is left as it is.
+/// Adapt the arguments a method reference's target receives, the way the
+/// lambda metafactory does (JLS 5.3 invocation contexts: unboxing, then
+/// widening primitive conversion): a box in a primitive parameter position
+/// becomes its primitive (`BinaryOperator<Integer>` → `Integer::sum`), and a
+/// primitive is widened to the parameter's type (`IntFunction` →
+/// `takesLong(long)`, `Function<Integer, ?>` → `takesLong(long)`). `args` are
+/// the target's declared parameters in order (no receiver); a reference
+/// parameter, or a value that is no box, is left as it is.
 pub(crate) fn unbox_for_descriptor(descriptor: &str, args: &mut [Value]) {
     for (parameter, value) in super::descriptor_arguments(descriptor)
         .iter()
         .zip(args.iter_mut())
     {
-        if !matches!(value, Value::Ref(Some(_))) {
-            continue;
-        }
-        let unboxed = match parameter.as_str() {
-            "I" | "S" | "B" => super::boxed_integer(value)
-                .or_else(|| super::boxed_short(value).map(i32::from))
-                .or_else(|| super::boxed_byte(value).map(i32::from))
-                .map(Value::Int),
-            "C" => super::boxed_character(value).map(Value::Int),
-            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
-            "J" => super::boxed_long(value).map(Value::Long),
-            "F" | "D" => super::boxed_number(value).map(Value::Float),
-            _ => None,
-        };
-        if let Some(unboxed) = unboxed {
-            *value = unboxed;
+        if let Some(adapted) = adapt_to_primitive(value, parameter) {
+            *value = adapted;
         }
     }
+}
+
+/// `value` unboxed (when it is a box) and widened to the primitive type
+/// `descriptor` (`I`, `J`, `F`, `D`...), or `None` when `descriptor` is not a
+/// primitive or `value` is neither a primitive nor a box.
+///
+/// Widening follows JLS 5.1.2: `int`/`long` to `float` round to the nearest
+/// `float`; to `double`, `int` is exact and `long` rounds. A narrowing is never
+/// applied (the metafactory has none), so such a value is unboxed only.
+pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Value> {
+    if !matches!(descriptor, "I" | "S" | "B" | "C" | "Z" | "J" | "F" | "D") {
+        return None;
+    }
+    let primitive = match value {
+        Value::Ref(Some(_)) => match descriptor {
+            "C" => super::boxed_character(value).map(Value::Int),
+            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
+            _ => super::boxed_integer(value)
+                .or_else(|| super::boxed_short(value).map(i32::from))
+                .or_else(|| super::boxed_byte(value).map(i32::from))
+                .or_else(|| super::boxed_character(value))
+                .map(Value::Int)
+                .or_else(|| super::boxed_long(value).map(Value::Long))
+                .or_else(|| super::boxed_number(value).map(Value::Float)),
+        }?,
+        Value::Int(_) | Value::Long(_) | Value::Float(_) => value.clone(),
+        _ => return None,
+    };
+    Some(match (primitive, descriptor) {
+        (Value::Int(int), "J") => Value::Long(i64::from(int)),
+        (Value::Int(int), "F") => Value::Float(f64::from(int as f32)),
+        (Value::Int(int), "D") => Value::Float(f64::from(int)),
+        (Value::Long(long), "F") => Value::Float(f64::from(long as f32)),
+        (Value::Long(long), "D") => Value::Float(long as f64),
+        (other, _) => other,
+    })
 }
 
 /// A parsed class's `access_flags`, read back from its bytes (the parser
@@ -1006,39 +1031,69 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     /// host; a `StringBuilder` element reads its text, `null` reads `null`.
     /// An `Iterable`'s elements come back from the host as stored item
     /// markers, so each is parsed back to its value before it is joined.
-    pub(crate) fn invoke_string_join(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    pub(crate) fn invoke_string_join(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/lang/String" || r.name != "join" {
-            return None;
+            return Ok(None);
         }
-        let text = |runtime: &Self, value: &Value| match value {
-            Value::Ref(Some(marker)) => runtime
-                .string_builders
-                .get(marker)
-                .cloned()
-                .unwrap_or_else(|| crate::runtime::value_text(value)),
-            other => crate::runtime::value_text(other),
+        let Some(separator) = args.first() else {
+            return Ok(None);
         };
-        let separator = text(self, args.first()?);
-        let parts: Vec<String> = match r.descriptor.as_str() {
+        let elements: Vec<Value> = match r.descriptor.as_str() {
             "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
-                let array = expect_ref(args.get(1)?)?;
-                let values = self.arrays.get(array)?.clone();
-                values.iter().map(|value| text(self, value)).collect()
+                let Some(values) = args
+                    .get(1)
+                    .and_then(expect_ref)
+                    .and_then(|array| self.arrays.get(array))
+                else {
+                    return Ok(None);
+                };
+                values.clone()
             }
             "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;" => {
-                let items = self.host.mutable_collection_values(args.get(1)?)?;
+                let Some(items) = args
+                    .get(1)
+                    .and_then(|items| self.host.mutable_collection_values(items))
+                else {
+                    return Ok(None);
+                };
                 items
                     .iter()
                     .map(|item| {
                         crate::runtime::parse_collection_value(item)
-                            .map(|value| text(self, &value))
-                            .unwrap_or_else(|_| item.clone())
+                            .unwrap_or_else(|_| Value::Ref(Some(item.clone())))
                     })
                     .collect()
             }
-            _ => return None,
+            _ => return Ok(None),
         };
-        Some(Value::Ref(Some(parts.join(&separator))))
+        // `String.join` takes `String.valueOf(element)` of each element: a
+        // builder's text, a jar `CharSequence`'s own `toString()`
+        // (`jar_text.rs`, counted when it has none), else the value's text.
+        let mut parts = Vec::with_capacity(elements.len());
+        for value in std::iter::once(separator).chain(&elements) {
+            let text = match value {
+                Value::Ref(Some(marker)) if self.string_builders.contains_key(marker) => {
+                    self.string_builders[marker].clone()
+                }
+                Value::Ref(Some(marker))
+                    if crate::runtime::jar_text::object_marker_class(marker).is_some() =>
+                {
+                    match self.runtime_value_of(value, "java/lang/String", "join")? {
+                        Some(Value::Ref(Some(text))) => text,
+                        Some(_) => "null".to_owned(),
+                        None => crate::runtime::value_text(value),
+                    }
+                }
+                other => crate::runtime::value_text(other),
+            };
+            parts.push(text);
+        }
+        let separator = parts.remove(0);
+        Ok(Some(Value::Ref(Some(parts.join(&separator)))))
     }
 
     /// The JDK calls the interpreter answers itself, in one dispatch slot:
