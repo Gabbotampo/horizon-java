@@ -87,6 +87,8 @@ mod native_library;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
+mod neoforge_inject;
+pub mod neoforge_lifecycle;
 mod neoforge_loader;
 mod neoforge_subscribe;
 mod nested_jars;
@@ -3017,6 +3019,7 @@ impl StdHost {
     /// behavior; server integrations should select `SERVER`.
     pub fn with_environment_type(mut self, environment_type: impl Into<String>) -> Self {
         self.environment_type = environment_type.into();
+        self.neoforge_bus.server = self.environment_type == "SERVER";
         self
     }
 
@@ -3273,6 +3276,12 @@ impl StdHost {
 
     pub fn payload_registrations(&self) -> &[PayloadRegistration] {
         &self.payload_registrations
+    }
+
+    /// Counts every payload registration as an unknown host call, for an embedding with no
+    /// channel to route them on: the registration ran, but no packet will reach its handler.
+    pub fn count_unrouted_payloads(&mut self, why: &str) {
+        crate::runtime::neoforge_lifecycle::count_unrouted_payloads(self, why);
     }
 
     /// The registered payload channels as `(id, direction, codec)` for the
@@ -4061,6 +4070,7 @@ impl Host for StdHost {
         self.brigadier_instance_of(marker, wanted)
             || self.mod_container_instance_of(marker, wanted)
             || neoforge_bus::bus_instance_of(marker, wanted)
+            || neoforge_lifecycle::instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -5372,6 +5382,10 @@ impl Host for StdHost {
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
+            return Ok(value);
+        }
+        // The loading stages' event objects (`neoforge_lifecycle.rs`).
+        if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
@@ -36805,6 +36819,26 @@ mandatory = true
         assert_eq!(
             host.payload_registrations().last().unwrap().direction,
             "configurationToClient"
+        );
+        // An embedding with no payload channel counts each one under its direction.
+        host.count_unrouted_payloads("no channel");
+        let counted: Vec<_> = host
+            .unknown_host_calls()
+            .into_iter()
+            .filter(|(key, _)| key.contains("(no channel)"))
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#configurationToClient (no channel)".to_owned(),
+                    1
+                ),
+                (
+                    "net/neoforged/neoforge/network/registration/PayloadRegistrar#playToServer (no channel)".to_owned(),
+                    1
+                ),
+            ]
         );
     }
 

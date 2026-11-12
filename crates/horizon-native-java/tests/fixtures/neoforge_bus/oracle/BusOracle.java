@@ -64,6 +64,53 @@ public class BusOracle {
         return "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
     }
 
+    /// FML's `AutomaticEventSubscriber.lambda$inject$4` (loader-12.0.12) for `container` on a
+    /// dedicated server, written from its bytecode: the real `inject` needs `FMLLoader.getCurrent()`,
+    /// which only a running loader has. The registrations themselves are the real bus's
+    /// `register(Method)`.
+    static void inject(String container, IEventBus modBus, IEventBus gameBus, Class<?>... classes) {
+        for (Class<?> type : classes) {
+            net.neoforged.fml.common.EventBusSubscriber annotation =
+                    type.getAnnotation(net.neoforged.fml.common.EventBusSubscriber.class);
+            net.neoforged.fml.common.Mod mod = type.getAnnotation(net.neoforged.fml.common.Mod.class);
+            String modid = !annotation.modid().isEmpty() ? annotation.modid() : mod != null ? mod.value() : container;
+            if (!modid.equals(container)) continue;
+            if (!java.util.Arrays.asList(annotation.value()).contains(net.neoforged.api.distmarker.Dist.DEDICATED_SERVER)) continue;
+            try {
+                Class.forName(type.getName(), true, type.getClassLoader());
+                for (java.lang.reflect.Method method : type.getDeclaredMethods()) {
+                    if (!method.isAnnotationPresent(net.neoforged.bus.api.SubscribeEvent.class)) continue;
+                    if (!java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
+                        throw new IllegalArgumentException("Method " + method + " annotated with @SubscribeEvent is not static");
+                    }
+                    if (method.getParameterCount() != 1 || !Event.class.isAssignableFrom(method.getParameterTypes()[0])) {
+                        throw new IllegalArgumentException("Method " + method + " annotated with @SubscribeEvent must have only one parameter that is an Event subtype");
+                    }
+                    (IModBusEvent.class.isAssignableFrom(method.getParameterTypes()[0]) ? modBus : gameBus).register(method);
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /// The lines `run` prints.
+    static String printed(Runnable run) {
+        PrintStream real = System.out;
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(buffer, true));
+        try {
+            run.run();
+        } finally {
+            System.setOut(real);
+        }
+        List<String> lines = new ArrayList<>();
+        for (String line : buffer.toString().split("\n")) {
+            if (!line.isEmpty()) lines.add("\"" + line + "\"");
+        }
+        return "\"out\":[" + String.join(",", lines) + "]";
+    }
+
     public static void main(String[] args) {
         IEventBus game = NeoForge.EVENT_BUS;
         game.start();
@@ -101,6 +148,25 @@ public class BusOracle {
             IEventBus bus = buses[which].equals("game") ? game : modBus();
             System.out.println("{\"case\":\"refused_" + which + "\",\"bus\":\"" + buses[which] + "\",\"result\":"
                 + quote(BusDemo.refused(bus, which)) + "}");
+        }
+        IEventBus injectGame = gameBus();
+        IEventBus injectMod = modBus();
+        BusDemo.beforeInject(injectGame);
+        System.out.println("{\"case\":\"inject_init\"," + printed(() -> inject("demo", injectMod, injectGame,
+                demo.AutoSubscribers.class, demo.SkippedSubscribers.ClientOnly.class, demo.SkippedSubscribers.OtherMod.class)) + "}");
+        System.out.println("{\"case\":\"inject_tick\"," + post(injectGame, new ServerTickEvent.Post()) + "}");
+        System.out.println("{\"case\":\"inject_setup\"," + post(injectMod, new FMLCommonSetupEvent()) + "}");
+        Class<?>[] refusedInject = {demo.InjectRefused.NotStatic.class, demo.InjectRefused.TwoArguments.class,
+                demo.InjectRefused.NotAnEvent.class, demo.InjectRefused.AbstractEvent.class};
+        for (int which = 0; which < refusedInject.length; which++) {
+            String result;
+            try {
+                inject("refuse" + which, modBus(), gameBus(), refusedInject[which]);
+                result = "registered";
+            } catch (RuntimeException e) {
+                result = e.getClass().getName() + ": " + e.getMessage();
+            }
+            System.out.println("{\"case\":\"inject_refused_" + which + "\",\"result\":" + quote(result) + "}");
         }
         System.out.println("{\"java\":" + quote(System.getProperty("java.vm.name") + " " + System.getProperty("java.runtime.version")) + "}");
     }

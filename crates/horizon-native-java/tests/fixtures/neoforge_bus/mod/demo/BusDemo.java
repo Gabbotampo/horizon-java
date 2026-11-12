@@ -24,6 +24,12 @@ public class BusDemo {
         System.out.println("static");
     }
 
+    /// What a `@Mod` constructor registers before FML injects the mod's `@EventBusSubscriber`s.
+    public static void beforeInject(IEventBus bus) {
+        bus.addListener(EventPriority.HIGHEST, (ServerTickEvent.Post e) -> System.out.println("ctor-highest"));
+        bus.addListener(EventPriority.HIGH, (ServerTickEvent.Post e) -> System.out.println("ctor-high"));
+    }
+
     /// Every `addListener` overload, each priority, on one event.
     public static void order(IEventBus bus) {
         BusDemo bound = new BusDemo("bound");
