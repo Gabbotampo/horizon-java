@@ -509,12 +509,12 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                         }
                     });
                 }
-                best.map_or(Value::Ref(None), super::optional_wrap)
+                best.map_or_else(super::empty_optional, super::optional_wrap)
             }
             ("findFirst" | "findAny", "()Ljava/util/Optional;") => values
                 .first()
                 .cloned()
-                .map_or(Value::Ref(None), super::optional_wrap),
+                .map_or_else(super::empty_optional, super::optional_wrap),
             ("reduce", "(Ljava/util/function/BinaryOperator;)Ljava/util/Optional;") => {
                 let operator = argument();
                 let mut acc: Option<Value> = None;
@@ -526,7 +526,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                         }
                     });
                 }
-                acc.map_or(Value::Ref(None), super::optional_wrap)
+                acc.map_or_else(super::empty_optional, super::optional_wrap)
             }
             (
                 "reduce",

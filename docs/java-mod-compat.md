@@ -681,7 +681,8 @@ generation moves on at `restoreFrom` and at logout, as a new `ServerPlayer` woul
   with the event listeners' façade): `getWorldPath(LevelResource)` is the world folder in the interpreter's virtual
   game folder with the resource id resolved under it as vanilla does (`/horizon/game/world/.` for `ROOT`; a jar's
   own `new LevelResource(id)` keeps its id), `getGameRules().get(GameRules.X)` the rule's current boxed value,
-  `registryAccess().lookupOrThrow(key)` a registry the game lists (`containsKey`, `keySet`, `size`; blocks,
+  `registryAccess().lookupOrThrow(key)` a registry the game lists (`containsKey`, `size`, and `keySet` in the
+  bucket order of vanilla's `byLocation` `HashMap`, rebuilt from the registration order; blocks,
   items, entity types, biomes and the other command registries, or blocks/items/entity types before the world
   opens), a level's `getGameTime`/`getDayTime`, and `ServerPlayNetworking.canSend(player, type)` whether that
   player's client takes the channel (every declared client-bound channel for a Horizon client, none for any other
@@ -1106,9 +1107,11 @@ annotation member the use site left out answers the interface's `AnnotationDefau
 followed by the call's arguments (a static reference is told apart by arity), `invokevirtual` on a concrete base
 method reaches the override of a constructed jar subclass, and a Mixin `static` accessor's placeholder body is
 replaced by the generated contract. `StackWalker.walk` sees the interpreter's own jar frames (innermost first; host
-frames do not exist natively and are not invented). `String.matches`/`Pattern.matches` answer a bounded, exact regex
-subset (literals, classes, groups, alternation, greedy and lazy quantifiers) and name any other pattern instead of
-guessing. Game values that are never null in the game answer an opaque marker of their declared type when the host
+frames do not exist natively and are not invented). `String.matches`/`replaceAll`/`replaceFirst`/`split` and `Pattern.matches`/`quote`
+answer through a reimplementation of `java.util.regex` (`java_regex/`: Java's node graph and backtracking order,
+classes, anchors, lookaround, back references, the `CASE_INSENSITIVE`/`MULTILINE`/`DOTALL`/`LITERAL` flags and the
+replacement-string rules with their exceptions), diffed against OpenJDK 27 by `tools/java_regex_oracle.py`; any
+pattern, input or group outside that subset is counted instead of guessed. Game values that are never null in the game answer an opaque marker of their declared type when the host
 does not model them: codecs, steps of a `...$Builder` chain and its `build()`, and a game type's own `create*`
 factory; every vanilla `Registries`/`BuiltInRegistries` field answers its registry id, and a mod registry made with
 `ResourceKey.createRegistryKey` and `FabricRegistryBuilder` carries its id.

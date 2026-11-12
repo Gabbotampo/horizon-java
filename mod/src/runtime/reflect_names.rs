@@ -14,7 +14,7 @@ impl ClassFile {
     /// `Some(Some(name))` for a member or local class, `Some(None)` for an
     /// anonymous one, `None` when the class is not nested (or the table is
     /// unreadable).
-    fn nested_simple_name(&self) -> Option<Option<String>> {
+    pub(super) fn nested_simple_name(&self) -> Option<Option<String>> {
         let mut r = Reader::new(&self.raw);
         if r.u4().ok()? != 0xCAFE_BABE {
             return None;

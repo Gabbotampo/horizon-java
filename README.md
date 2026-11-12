@@ -57,6 +57,16 @@ nothing about whether the mod works. The committed ledgers predate the host-call
   overwhelmingly `target-outside-jar`); the opt-in hook tier binds plans to game hook sites instead.
   Game-class mixins remain the main phase-2 gap.
 
+- **Entrypoint census** (`tools/unmodelled_calls.py`, the native probe over the same corpora, every server
+  stage, the game's verdict), re-measured on 11 November 2026 first with the interpreter-honesty fixes
+  (#37, #38, #41): `ran-clean` 174 → 112 (wide 52 → 31, mega 86 → 59, NeoForge 36 → 22), 18 jars
+  `ran-partial`, and 132 more refused, almost all on a `NullPointerException` the interpreter used to
+  carry on through. Lower was correct there: those jars were clean only because failures were answered
+  silently. The unmodelled-answer batch (#49–#53: Gson's builder, `ModOrigin`, `MapMaker`, executors,
+  host method references) then moves them the other way: `ran-partial` 18 → 8, `refused` 202 → 187,
+  and `ran-clean` 112 → 111 (two clean rows leave because #49 now counts a write that used an
+  adapter or custom naming strategy instead of ignoring it). Detail in [docs/unmodelled-calls.md](docs/unmodelled-calls.md).
+
 Phase 1 is not met yet: neither Fabric ledger has 0 `native-gap`, and the NeoForge ledger is
 measured but not gated. See the status page for per-row detail and repro commands.
 
@@ -93,7 +103,7 @@ Minecraft/loader install skip when the corresponding files or environment variab
 `mod/` is a Horizon **native mod** (`docs/mod-plan.md`): the first way this runtime runs inside the
 game instead of in the probe. It implements the game's typed `Hooks` from the mod API on
 [arismoko/horizon](https://github.com/arismoko/horizon) (crate `horizon-mod-api`, library
-`mod_api`), pinned to commit `c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac` in `mod/horizon-mod.toml`.
+`mod_api`), pinned to commit `cf0113879ebee600bff86070466f75b2db90b40a` in `mod/horizon-mod.toml`.
 
 What it does today:
 
@@ -102,8 +112,8 @@ What it does today:
   config service (`Host::config_files`). With no jars to run it is `{"schema":1,"jars":[]}`.
 - **M1, run jars.** Every `.jar` in `config/horizon_java/java-mods/` is read as bytes through the
   same service and run at `server_about_to_start` with its own `StdHost`. One log line per jar and
-  one row in the report: the id, `ran-clean` / `ran-hollow` / `refused`, the host-call and
-  unknown-host-call counts, and the refusal reason.
+  one row in the report: the id, `ran-clean` / `ran-hollow` / `ran-partial` / `refused`, the
+  host-call and unknown-host-call counts, and the reason a jar was refused or ran partially.
 - **M2, game hooks.** Each jar's runtime (heap, statics and recorded listeners) stays alive for the
   server, and this mod's `server_about_to_start` / `server_starting` / `server_started` /
   `server_stopping` / `server_stopped` hooks fire the Fabric `ServerLifecycleEvents` and NeoForge
@@ -125,6 +135,8 @@ python3 tools/vendor.py             # after changing crates/horizon-native-java
 python3 tools/java_mod_fixture.py --out DIR                 # milestone 1's jar
 python3 tools/java_mod_fixture.py --kind lifecycle --out DIR # SERVER_STARTED/STOPPING lines
 python3 tools/java_mod_fixture.py --kind command --out DIR   # /javahello [name]
+python3 tools/java_mod_fixture.py --kind hooks --out DIR     # the M2c event listeners
+python3 tools/java_mod_fixture.py --kind m2d --out DIR       # AFTER_DEATH and a click's hand
 ```
 
 The documented build is Horizon's launcher (`horizon-launcher native-build mod/ --server-output OUT

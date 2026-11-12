@@ -27,8 +27,7 @@ import com.electronwill.nightconfig.core.CommentedConfig;
 import java.util.List;
 
 public final class ConfigProbe {
-    public static String run() {
-        CommentedConfig config = null;
+    public static String run(CommentedConfig config) {
         int size = (Integer) config.getOrElse("general.overworld_region_size", Integer.valueOf(3));
         String name = (String) config.getOrElse(List.of("general", "name"), "fallback");
         return size + "|" + name;
@@ -86,12 +85,19 @@ fn source_built_probe_reads_nightconfig_defaults() {
 
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let mut host = jar.seed_host(StdHost::new());
+    // The config object a loader hands the mod (the probe used to call
+    // `getOrElse` on a local `null`, which the JVM answers with a
+    // `NullPointerException`).
+    let config = Value::Ref(Some(
+        "com/electronwill/nightconfig/core/CommentedConfig#0".into(),
+    ));
     let value = jar
-        .invoke_method(
+        .invoke_method_with_args(
             "demo.ConfigProbe",
             "run",
-            "()Ljava/lang/String;",
+            "(Lcom/electronwill/nightconfig/core/CommentedConfig;)Ljava/lang/String;",
             None,
+            &[config],
             &mut host,
         )
         .unwrap();

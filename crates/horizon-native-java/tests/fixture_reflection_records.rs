@@ -144,6 +144,10 @@ final class Probe {
         Class<?> type = Class.forName("demo.Counter");
         Counter counter = new Counter();
         Field value = type.getDeclaredField("value");
+        // `value` is private to Counter: without this OpenJDK 25 throws
+        // IllegalAccessException (class demo.Probe cannot access a member of
+        // class demo.Counter with modifiers "private"); with it, 7|5|7|5.
+        value.setAccessible(true);
         value.set(counter, Integer.valueOf(7));
         Field total = type.getDeclaredField("TOTAL");
         total.set(type, Integer.valueOf(5));

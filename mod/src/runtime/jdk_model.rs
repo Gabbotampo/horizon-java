@@ -118,6 +118,14 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             }
             _ => None,
         },
+        // `System.Logger.Level`'s constants: the disabled-logger model drops
+        // every message, so the level is only ever handed back to `log` or
+        // compared. The marker carries the enum's own name.
+        "java/lang/System$Logger$Level" => matches!(
+            name,
+            "ALL" | "TRACE" | "DEBUG" | "INFO" | "WARNING" | "ERROR" | "OFF"
+        )
+        .then(|| Value::Ref(Some(format!("enum/java/lang/System$Logger$Level/{name}")))),
         _ => None,
     }
 }
@@ -231,6 +239,15 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         }
         ("java/util/logging/Logger", "getLogger", descriptor)
             if descriptor.ends_with(")Ljava/util/logging/Logger;") =>
+        {
+            Some(Ok(logger_value(&logger_name(args))))
+        }
+        // `System.getLogger(String[, ResourceBundle])`: the JDK's
+        // `System.Logger` is answered by the same disabled-logger model as
+        // `java.util.logging` (the host writes nothing and reports every level
+        // disabled, which is a logger configured to drop the mod's output).
+        ("java/lang/System", "getLogger", descriptor)
+            if descriptor.ends_with(")Ljava/lang/System$Logger;") =>
         {
             Some(Ok(logger_value(&logger_name(args))))
         }
@@ -879,41 +896,69 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
             _ => return false,
         }
     };
-    let known = platform_supertypes(class);
+    let known = match platform_supertypes(class) {
+        [] => crate::runtime::java_immutable::supertypes(class),
+        known => known,
+    };
     if known.is_empty() {
         return crate::runtime::library_dispatch::fastutil_instance_of(class, wanted);
     }
     class == wanted || known.contains(&wanted)
 }
 
-/// Unbox the arguments a method reference to a JDK method receives, the way
-/// the lambda metafactory adapts `BinaryOperator<Integer>` to `Integer::sum`:
-/// a boxed marker in a primitive parameter position becomes the primitive.
-/// `args` are the target's declared parameters in order (no receiver); a value
-/// that is already primitive, or not a box, is left as it is.
+/// Adapt the arguments a method reference's target receives, the way the
+/// lambda metafactory does (JLS 5.3 invocation contexts: unboxing, then
+/// widening primitive conversion): a box in a primitive parameter position
+/// becomes its primitive (`BinaryOperator<Integer>` → `Integer::sum`), and a
+/// primitive is widened to the parameter's type (`IntFunction` →
+/// `takesLong(long)`, `Function<Integer, ?>` → `takesLong(long)`). `args` are
+/// the target's declared parameters in order (no receiver); a reference
+/// parameter, or a value that is no box, is left as it is.
 pub(crate) fn unbox_for_descriptor(descriptor: &str, args: &mut [Value]) {
     for (parameter, value) in super::descriptor_arguments(descriptor)
         .iter()
         .zip(args.iter_mut())
     {
-        if !matches!(value, Value::Ref(Some(_))) {
-            continue;
-        }
-        let unboxed = match parameter.as_str() {
-            "I" | "S" | "B" => super::boxed_integer(value)
-                .or_else(|| super::boxed_short(value).map(i32::from))
-                .or_else(|| super::boxed_byte(value).map(i32::from))
-                .map(Value::Int),
-            "C" => super::boxed_character(value).map(Value::Int),
-            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
-            "J" => super::boxed_long(value).map(Value::Long),
-            "F" | "D" => super::boxed_number(value).map(Value::Float),
-            _ => None,
-        };
-        if let Some(unboxed) = unboxed {
-            *value = unboxed;
+        if let Some(adapted) = adapt_to_primitive(value, parameter) {
+            *value = adapted;
         }
     }
+}
+
+/// `value` unboxed (when it is a box) and widened to the primitive type
+/// `descriptor` (`I`, `J`, `F`, `D`...), or `None` when `descriptor` is not a
+/// primitive or `value` is neither a primitive nor a box.
+///
+/// Widening follows JLS 5.1.2: `int`/`long` to `float` round to the nearest
+/// `float`; to `double`, `int` is exact and `long` rounds. A narrowing is never
+/// applied (the metafactory has none), so such a value is unboxed only.
+pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Value> {
+    if !matches!(descriptor, "I" | "S" | "B" | "C" | "Z" | "J" | "F" | "D") {
+        return None;
+    }
+    let primitive = match value {
+        Value::Ref(Some(_)) => match descriptor {
+            "C" => super::boxed_character(value).map(Value::Int),
+            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
+            _ => super::boxed_integer(value)
+                .or_else(|| super::boxed_short(value).map(i32::from))
+                .or_else(|| super::boxed_byte(value).map(i32::from))
+                .or_else(|| super::boxed_character(value))
+                .map(Value::Int)
+                .or_else(|| super::boxed_long(value).map(Value::Long))
+                .or_else(|| super::boxed_number(value).map(Value::Float)),
+        }?,
+        Value::Int(_) | Value::Long(_) | Value::Float(_) => value.clone(),
+        _ => return None,
+    };
+    Some(match (primitive, descriptor) {
+        (Value::Int(int), "J") => Value::Long(i64::from(int)),
+        (Value::Int(int), "F") => Value::Float(f64::from(int as f32)),
+        (Value::Int(int), "D") => Value::Float(f64::from(int)),
+        (Value::Long(long), "F") => Value::Float(f64::from(long as f32)),
+        (Value::Long(long), "D") => Value::Float(long as f64),
+        (other, _) => other,
+    })
 }
 
 /// A parsed class's `access_flags`, read back from its bytes (the parser
@@ -971,179 +1016,6 @@ pub(crate) fn boxed_text(marker: &str, desc: &str) -> Option<String> {
     }
 }
 
-/// The `[flags][width][.precision]` part of one `String.format` specifier.
-///
-/// Only the `-` (left-justify) and `0` (zero-pad) flags are read; any other
-/// flag, an argument index (`%1$s`) or a combination the JDK rejects
-/// (`%-d` with no width, `%05s`) is refused with a named reason rather than
-/// formatted differently from the JVM.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FormatSpec {
-    left: bool,
-    zero: bool,
-    width: Option<usize>,
-    pub(crate) precision: Option<usize>,
-}
-
-impl FormatSpec {
-    /// Read the specifier starting at `at` (just past `%`), leaving `at` on
-    /// the conversion character.
-    pub(crate) fn parse(bytes: &[u8], at: &mut usize) -> Result<Self, NativeError> {
-        let mut spec = Self::default();
-        while let Some(flag) = bytes.get(*at) {
-            match flag {
-                b'-' => spec.left = true,
-                b'0' => spec.zero = true,
-                b'+' | b' ' | b',' | b'#' | b'(' => {
-                    return Err(NativeError::Metadata(format!(
-                        "unsupported String.format flag {}",
-                        *flag as char
-                    )));
-                }
-                _ => break,
-            }
-            *at += 1;
-        }
-        let digits = |at: &mut usize| {
-            let start = *at;
-            while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
-                *at += 1;
-            }
-            std::str::from_utf8(&bytes[start..*at])
-                .ok()
-                .filter(|text| !text.is_empty())
-                .and_then(|text| text.parse::<usize>().ok())
-        };
-        spec.width = digits(at);
-        if bytes.get(*at) == Some(&b'$') {
-            return Err(NativeError::Metadata(
-                "String.format argument indexes are not modelled".into(),
-            ));
-        }
-        if bytes.get(*at) == Some(&b'.') {
-            *at += 1;
-            spec.precision = Some(digits(at).ok_or_else(|| {
-                NativeError::Metadata("String.format precision has no digits".into())
-            })?);
-        }
-        Ok(spec)
-    }
-
-    /// Apply the width, flags and (for `%s`) precision to one converted
-    /// piece.
-    pub(crate) fn pad(&self, piece: String, conversion: char) -> Result<String, NativeError> {
-        if matches!(conversion, '%' | 'n') {
-            return Ok(piece);
-        }
-        let numeric = matches!(conversion, 'd' | 'x' | 'X' | 'f');
-        if (self.left || self.zero) && self.width.is_none() {
-            return Err(NativeError::Metadata(format!(
-                "String.format %{conversion} flag needs a width"
-            )));
-        }
-        if self.zero && (!numeric || self.left) {
-            return Err(NativeError::Metadata(format!(
-                "String.format %{conversion} does not take the 0 flag here"
-            )));
-        }
-        let piece = match (self.precision, conversion) {
-            (Some(precision), 's') => piece.chars().take(precision).collect(),
-            (Some(_), 'f') | (None, _) => piece,
-            (Some(_), other) => {
-                return Err(NativeError::Metadata(format!(
-                    "String.format %{other} does not take a precision"
-                )));
-            }
-        };
-        let Some(width) = self.width else {
-            return Ok(piece);
-        };
-        let length = piece.chars().count();
-        if length >= width {
-            return Ok(piece);
-        }
-        let fill = width - length;
-        Ok(if self.left {
-            format!("{piece}{}", " ".repeat(fill))
-        } else if self.zero {
-            match piece.strip_prefix('-') {
-                Some(digits) => format!("-{}{digits}", "0".repeat(fill)),
-                None => format!("{}{piece}", "0".repeat(fill)),
-            }
-        } else {
-            format!("{}{piece}", " ".repeat(fill))
-        })
-    }
-}
-
-/// `%.<precision>f` as the JDK's `Formatter` prints it.
-///
-/// The JDK rounds `RoundingMode.HALF_UP` on the double's shortest decimal
-/// digits (what `Double.toString` shows), not on its exact binary value:
-/// `String.format("%.2f", 2.675)` is `2.68` and `9.995` is `10.00`, where a
-/// correctly rounded binary value would give `2.67` and `9.99`.
-pub(crate) fn format_half_up(value: f64, precision: usize) -> String {
-    let scientific = format!("{:e}", value.abs());
-    let Some((mantissa, exponent)) = scientific.split_once('e') else {
-        return format!("{value:.precision$}");
-    };
-    let Ok(exponent) = exponent.parse::<i64>() else {
-        return format!("{value:.precision$}");
-    };
-    let significant = mantissa.replace('.', "").into_bytes();
-    // The digits as `int.frac`: `point` digits sit before the decimal point.
-    let point = exponent + 1;
-    let mut integer = Vec::new();
-    let mut fraction = Vec::new();
-    if point <= 0 {
-        integer.push(b'0');
-        fraction.extend(std::iter::repeat_n(b'0', (-point) as usize));
-        fraction.extend_from_slice(&significant);
-    } else {
-        let point = point as usize;
-        for index in 0..point.max(significant.len()) {
-            let digit = significant.get(index).copied().unwrap_or(b'0');
-            if index < point {
-                integer.push(digit);
-            } else {
-                fraction.push(digit);
-            }
-        }
-    }
-    let round_up = fraction.get(precision).is_some_and(|digit| *digit >= b'5');
-    fraction.resize(precision, b'0');
-    let mut digits = integer;
-    let split = digits.len();
-    digits.extend_from_slice(&fraction);
-    if round_up {
-        let mut index = digits.len();
-        loop {
-            if index == 0 {
-                digits.insert(0, b'1');
-                break;
-            }
-            index -= 1;
-            if digits[index] == b'9' {
-                digits[index] = b'0';
-            } else {
-                digits[index] += 1;
-                break;
-            }
-        }
-    }
-    let split = split + (digits.len() - split - precision);
-    let mut text = String::from_utf8_lossy(&digits[..split]).into_owned();
-    if precision > 0 {
-        text.push('.');
-        text.push_str(&String::from_utf8_lossy(&digits[split..]));
-    }
-    if value.is_sign_negative() {
-        format!("-{text}")
-    } else {
-        text
-    }
-}
-
 /// Whether `marker` names an object this runtime or the host built
 /// (`owner/Class#n`), as opposed to string text.
 fn is_object_marker(marker: &str) -> bool {
@@ -1159,39 +1031,69 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     /// host; a `StringBuilder` element reads its text, `null` reads `null`.
     /// An `Iterable`'s elements come back from the host as stored item
     /// markers, so each is parsed back to its value before it is joined.
-    pub(crate) fn invoke_string_join(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    pub(crate) fn invoke_string_join(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/lang/String" || r.name != "join" {
-            return None;
+            return Ok(None);
         }
-        let text = |runtime: &Self, value: &Value| match value {
-            Value::Ref(Some(marker)) => runtime
-                .string_builders
-                .get(marker)
-                .cloned()
-                .unwrap_or_else(|| crate::runtime::value_text(value)),
-            other => crate::runtime::value_text(other),
+        let Some(separator) = args.first() else {
+            return Ok(None);
         };
-        let separator = text(self, args.first()?);
-        let parts: Vec<String> = match r.descriptor.as_str() {
+        let elements: Vec<Value> = match r.descriptor.as_str() {
             "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
-                let array = expect_ref(args.get(1)?)?;
-                let values = self.arrays.get(array)?.clone();
-                values.iter().map(|value| text(self, value)).collect()
+                let Some(values) = args
+                    .get(1)
+                    .and_then(expect_ref)
+                    .and_then(|array| self.arrays.get(array))
+                else {
+                    return Ok(None);
+                };
+                values.clone()
             }
             "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;" => {
-                let items = self.host.mutable_collection_values(args.get(1)?)?;
+                let Some(items) = args
+                    .get(1)
+                    .and_then(|items| self.host.mutable_collection_values(items))
+                else {
+                    return Ok(None);
+                };
                 items
                     .iter()
                     .map(|item| {
                         crate::runtime::parse_collection_value(item)
-                            .map(|value| text(self, &value))
-                            .unwrap_or_else(|_| item.clone())
+                            .unwrap_or_else(|_| Value::Ref(Some(item.clone())))
                     })
                     .collect()
             }
-            _ => return None,
+            _ => return Ok(None),
         };
-        Some(Value::Ref(Some(parts.join(&separator))))
+        // `String.join` takes `String.valueOf(element)` of each element: a
+        // builder's text, a jar `CharSequence`'s own `toString()`
+        // (`jar_text.rs`, counted when it has none), else the value's text.
+        let mut parts = Vec::with_capacity(elements.len());
+        for value in std::iter::once(separator).chain(&elements) {
+            let text = match value {
+                Value::Ref(Some(marker)) if self.string_builders.contains_key(marker) => {
+                    self.string_builders[marker].clone()
+                }
+                Value::Ref(Some(marker))
+                    if crate::runtime::jar_text::object_marker_class(marker).is_some() =>
+                {
+                    match self.runtime_value_of(value, "java/lang/String", "join")? {
+                        Some(Value::Ref(Some(text))) => text,
+                        Some(_) => "null".to_owned(),
+                        None => crate::runtime::value_text(value),
+                    }
+                }
+                other => crate::runtime::value_text(other),
+            };
+            parts.push(text);
+        }
+        let separator = parts.remove(0);
+        Ok(Some(Value::Ref(Some(parts.join(&separator)))))
     }
 
     /// The JDK calls the interpreter answers itself, in one dispatch slot:
@@ -1207,6 +1109,12 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             return Ok(Some(value));
         }
         if let Some(value) = self.invoke_list_sort(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_identifier_runtime(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_value_of_builder(r, args) {
             return Ok(Some(value));
         }
         self.invoke_char_sequence(r, receiver, args)
@@ -1621,7 +1529,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
 }
 
 /// `String#hashCode` over UTF-16 code units.
-fn java_string_hash(text: &str) -> i32 {
+pub(crate) fn java_string_hash(text: &str) -> i32 {
     text.encode_utf16().fold(0i32, |hash, unit| {
         hash.wrapping_mul(31).wrapping_add(i32::from(unit))
     })
@@ -1780,30 +1688,6 @@ mod tests {
                     .unwrap(),
                 Value::Int(expected),
                 "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn format_half_up_rounds_the_shortest_digits_like_the_jdk() {
-        // `String.format("%.<p>f", x)` on a JVM (java 21).
-        for (value, precision, expected) in [
-            (0.125, 2, "0.13"),
-            (-0.125, 2, "-0.13"),
-            (2.675, 2, "2.68"),
-            (9.995, 2, "10.00"),
-            (0.5, 0, "1"),
-            (1.0 / 3.0, 3, "0.333"),
-            (1.005, 2, "1.01"),
-            (0.045, 2, "0.05"),
-            (123456.785, 2, "123456.79"),
-            (1e-7, 3, "0.000"),
-            (2.5, 0, "3"),
-        ] {
-            assert_eq!(
-                format_half_up(value, precision),
-                expected,
-                "{value} {precision}"
             );
         }
     }

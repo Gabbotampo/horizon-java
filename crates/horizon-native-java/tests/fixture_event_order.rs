@@ -280,7 +280,7 @@ fn fabric_phases_order_listeners_and_a_deciding_result_stops_the_rest() {
             player: Some(ALEX),
             pos: Some([1, 70, 2]),
             face: Some([0, 1, 0]),
-            off_hand: true,
+            off_hand: Some(true),
             ..EventContext::default()
         },
     );
@@ -451,6 +451,15 @@ fn neoforge_priorities_order_listeners_and_cancellation_skips_the_unasked() {
     let mut host = StdHost::new();
     jar.execute("demo.NeoOrder", None, "neoforge", &mut host)
         .unwrap();
+    // FML injects the `@EventBusSubscriber`s after the `@Mod` constructor.
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
     let found = host.game_listeners(&jar, true);
     assert_eq!(found.listeners.len(), 5);
     assert!(

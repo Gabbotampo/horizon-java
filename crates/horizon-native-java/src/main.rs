@@ -1,6 +1,7 @@
 use horizon_native_java::{
     ClassFile, Entrypoint, MethodRef, MixinInjectionPlan, NativeJar, StdHost,
-    mixin_plans_in_weave_order, weave_class_with_extras, weave_classes_with_extras,
+    content::declarations, mixin_plans_in_weave_order, weave_class_with_extras,
+    weave_classes_with_extras,
 };
 use std::{
     collections::BTreeMap,
@@ -579,6 +580,18 @@ fn execution_json(
     host: &StdHost,
     jar: &NativeJar,
 ) -> serde_json::Value {
+    // The typed blocks and items as the fork's content declarations, for the offline bake
+    // (`tools/bake.py`): the file value plus the id the package's path comes from.
+    let typed = declarations(host.registrations());
+    let content = |block: bool| -> Vec<serde_json::Value> {
+        typed
+            .iter()
+            .filter(|declaration| declaration.is_block() == block)
+            .map(|declaration| {
+                serde_json::json!({ "id": declaration.id(), "file": declaration.file_json() })
+            })
+            .collect()
+    };
     serde_json::json!({
         "status": "ok",
         "kind": kind,
@@ -600,6 +613,10 @@ fn execution_json(
                 "typed": entry.declaration.is_some(),
             }))
             .collect::<Vec<_>>(),
+        "content": {
+            "blocks": content(true),
+            "items": content(false),
+        },
         "listeners": host.listener_registrations().count(),
         "events": host.posted_events().len(),
         "mixin_targets": mixin_target_labels(
@@ -656,12 +673,42 @@ fn main() -> ExitCode {
         println!("{}", mixin_plans_json(&jar));
         return ExitCode::SUCCESS;
     }
+    // `main,server` names several stages, run in that order the way the
+    // loader runs them (Fabric's `Hooks.startServer`: `main`, then `server`).
+    let requested_stages: Vec<String> = requested_kind
+        .as_deref()
+        .map(|kinds| kinds.split(',').map(str::to_owned).collect())
+        .unwrap_or_default();
+    if requested_stages.len() > 1 {
+        if explicit_class.is_some() {
+            eprintln!("an explicit class runs one stage; name one kind with it");
+            return ExitCode::FAILURE;
+        }
+        kind = requested_stages.join(",");
+    }
+    // The stage each entrypoint below runs under, when several are named.
+    let mut entry_stages = Vec::new();
     let entrypoints = if let Some(class) = explicit_class {
         vec![horizon_native_java::Entrypoint {
             class,
             method: None,
             adapter: None,
         }]
+    } else if requested_stages.len() > 1 {
+        // Every stage's own side is a server unless it is `client`.
+        let mut entries = Vec::new();
+        for stage in &requested_stages {
+            let side = if stage == "client" {
+                "CLIENT"
+            } else {
+                "SERVER"
+            };
+            for entry in jar.discover_entrypoints_on(stage, side) {
+                entry_stages.push(stage.clone());
+                entries.push(entry);
+            }
+        }
+        entries
     } else {
         // A NeoForge `@Mod` class can be limited to one physical side; the
         // probe runs the client role only when asked for `client`, and every
@@ -726,30 +773,60 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    // Each entrypoint runs under the stage that names it. A failing one is
+    // recorded and the rest still run, as in the game's loader (`load_jar`
+    // after #31): the failure is this interpreter's limit, not a reason to
+    // drop an entrypoint the jar ships. The verdict is the game's own.
     let mut calls = 0;
-    let mut error = None;
-    for entry in &entrypoints {
+    let mut ran = 0;
+    let mut failures = Vec::new();
+    let mut failed_classes = Vec::new();
+    for (index, entry) in entrypoints.iter().enumerate() {
+        let stage = entry_stages.get(index).unwrap_or(&kind);
         if let Some(adapter) = entry.adapter.as_deref() {
-            error = Some(format!(
+            failures.push(format!(
                 "{}: Fabric entrypoint adapter {adapter} is not supported by the native path",
                 entry.class
             ));
-            break;
+            continue;
         }
-        match jar.execute(&entry.class, entry.method.as_deref(), &kind, &mut host) {
-            Ok(report) => calls += report.calls,
+        match jar.execute(&entry.class, entry.method.as_deref(), stage, &mut host) {
+            Ok(report) => {
+                calls += report.calls;
+                ran += 1;
+            }
             Err(entry_error) => {
-                error = Some(format!("{}: {entry_error}", entry.class));
-                break;
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{stage} {}: {entry_error}", entry.class));
             }
         }
     }
+    // FML injects each container's `@EventBusSubscriber` classes once its `@Mod` classes are
+    // built (`neoforge_inject.rs`); a failed injection fails that container.
+    // Then NeoForge's loading stages, each followed by its deferred work
+    // (`neoforge_lifecycle.rs`): what the jar's lifecycle listeners do is part of its load.
+    if ran > 0 {
+        let budget = horizon_native_java::ExecutionBudget::UNBOUNDED;
+        failures.extend(jar.inject_event_subscribers(&mut host, &budget, &failed_classes));
+        for stage in horizon_native_java::neoforge_lifecycle::LoadingStage::ALL {
+            failures.extend(jar.run_loading_stage(stage, &mut host, &budget));
+            failures.extend(jar.run_deferred_work(&mut host, &budget));
+        }
+    }
+    let error = (ran == 0).then(|| failures.join("; "));
     match error {
         None => {
             if json {
                 let commands = command_summary(&jar, &host, kind != "client");
                 println!("{}", {
                     let mut report = execution_json(&kind, &entrypoints, calls, &host, &jar);
+                    report["verdict"] = horizon_native_java::verdict::verdict(
+                        ran,
+                        failures.len(),
+                        host.unknown_host_call_count(),
+                    )
+                    .into();
+                    report["failed"] = failures.clone().into();
                     // The listeners the game can fire, by event name, and
                     // the registrations on events it never fires.
                     report["game_listeners"] = game_listener_counts(&host, &jar, kind != "client");
@@ -768,9 +845,17 @@ fn main() -> ExitCode {
         }
         Some(error) => {
             if json {
+                // What the entrypoints counted before they stopped: the calls
+                // a refused jar leaned on are exactly what explains it.
                 println!(
                     "{}",
-                    serde_json::json!({"status": "error", "stage": "execute", "error": error.to_string()})
+                    serde_json::json!({
+                        "status": "error",
+                        "stage": "execute",
+                        "error": error.to_string(),
+                        "unknown_host_call_count": host.unknown_host_call_count(),
+                        "unknown_host_calls": host.unknown_host_calls(),
+                    })
                 );
             } else {
                 eprintln!("native execution stopped: {error}");

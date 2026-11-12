@@ -18,5 +18,5 @@ capabilities = ["registries"]
 # The launcher rebuilds the game at this commit; `mod/vendor.lock` records the
 # horizon-java commit its runtime was copied from.
 game = "26.3"
-horizon = "c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac"
+horizon = "cf0113879ebee600bff86070466f75b2db90b40a"
 mixins = "5a64af938ec86b00d53d16a408aabc0038fb3e57"

@@ -958,7 +958,11 @@ impl<H: Host> GameHookHost<'_, H> {
     ) -> Option<Result<Value, NativeError>> {
         if facade_server::owns(text) {
             return Some(
-                facade_server::answer(&self.context.server, text, r, args).map_err(|_| {
+                // A Java exception vanilla throws there stays one.
+                facade_server::answer(&self.context.server, text, r, args).map_err(|error| {
+                    if matches!(error, NativeError::UncaughtException { .. }) {
+                        return error;
+                    }
                     NativeError::Metadata(format!(
                         "game hook value {text} does not model {}#{}{}",
                         r.owner, r.name, r.descriptor
@@ -1179,6 +1183,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
+    }
+
+    fn counted_unknown_calls(&self) -> usize {
+        self.inner.counted_unknown_calls()
+    }
+
+    fn jar_module_descriptor(&self) -> Option<bool> {
+        self.inner.jar_module_descriptor()
     }
 
     fn payload_type_id(&self, marker: &str) -> Option<String> {

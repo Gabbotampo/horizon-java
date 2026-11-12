@@ -15,10 +15,14 @@ aggregates the probe's `unknown_host_calls`:
     sole           jars where this call is the only distinct unknown left
                    (so modelling it alone would make them ran-clean)
 
-A jar with `unknown_host_call_count == 0` is `ran-clean`; one whose entrypoint
-returned with at least one unknown is `ran-hollow`; one the probe refused is
-`refused`; a jar with no server-side entrypoint is `skipped` (client-only or a
-library, out of scope for a server run).
+A Fabric jar runs every server stage it declares, in the loader's order
+(`Hooks.startServer`: `main`, then `server`), passed to the probe as
+`main,server`; a NeoForge jar runs its `@Mod` classes. The verdict is the one
+the game's mod gives (`verdict.rs`): `ran-clean` when every stage ran with no
+unknown host call, `ran-hollow` with at least one, `ran-partial` when a stage
+failed and another ran, `refused` when nothing ran. A jar with no server-side
+entrypoint is `skipped` (client-only or a library, out of scope for a server
+run).
 
 Default corpora: the Fabric `~/horizon-corpus/{corpus-xl,mega}` and the NeoForge
 jars pinned by `tools/real_mod_fixtures/neoforge_corpus.lock.json`. Nothing is
@@ -82,10 +86,40 @@ def corpus_jars(name: str, directory: Path) -> list[Path]:
     return jars
 
 
+SERVER_STAGES = ("main", "server")
+
+
 def entrypoint_kind(path: Path, corpus: str) -> str | None:
+    """The stages a dedicated server runs for this jar, comma-joined in loader order.
+
+    Fabric Loader's `Hooks.startServer` invokes every `main` entrypoint, then
+    every `server` one, so a jar with both runs both (the game's mod does the
+    same since #31). A jar without Fabric server stages runs its NeoForge
+    `@Mod` classes.
+    """
     if corpus == "neoforge":
         return "neoforge"
-    return ledger.entrypoint_kind(ledger.read_jar_entrypoints(path))
+    entrypoints = ledger.read_jar_entrypoints(path)
+    if entrypoints is None:
+        return None
+    stages = [kind for kind in SERVER_STAGES if kind in entrypoints.kinds]
+    if stages:
+        return ",".join(stages)
+    if entrypoints.neoforge:
+        return "neoforge"
+    return None
+
+
+def row_verdict(result: dict) -> str:
+    """The label of one probe run that returned `status: ok`.
+
+    The probe reports the game's own verdict (`ran-partial` included); an older
+    probe without one is labelled from its unknown-call count.
+    """
+    verdict = result.get("verdict")
+    if verdict in {"ran-clean", "ran-hollow", "ran-partial", "refused"}:
+        return verdict
+    return "ran-clean" if result.get("unknown_host_call_count") == 0 else "ran-hollow"
 
 
 def probe_one(probe: Path, jar: Path, kind: str, deps: list[Path],
@@ -182,17 +216,20 @@ def main(argv: list[str] | None = None) -> int:
                     calls = result.get("unknown_host_calls")
                     if not isinstance(unknown, int) or not isinstance(calls, list):
                         calls = []
-                    rows.append({
+                    row = {
                         "jar": jar.name,
-                        "verdict": "ran-clean" if unknown == 0 else "ran-hollow",
+                        "verdict": row_verdict(result),
                         "kind": kind,
                         "unknown": unknown,
                         "calls": calls,
                         "deps": [dep.name for dep in deps],
                         "missing": missing,
-                    })
+                    }
+                    if result.get("failed"):
+                        row["failed"] = [str(item)[:400] for item in result["failed"]]
+                    rows.append(row)
                 else:
-                    rows.append({
+                    row = {
                         "jar": jar.name,
                         "verdict": "refused",
                         "kind": kind,
@@ -200,7 +237,14 @@ def main(argv: list[str] | None = None) -> int:
                         "error": str(result.get("error"))[:400],
                         "deps": [dep.name for dep in deps],
                         "missing": missing,
-                    })
+                    }
+                    # The calls the jar counted before it stopped. Kept for
+                    # reading why it was refused; the ranking and totals stay
+                    # over runs that finished, so they are not aggregated.
+                    before = result.get("unknown_host_calls")
+                    if isinstance(before, list) and before:
+                        row["counted_before_error"] = before
+                    rows.append(row)
         report[name] = {"directory": str(directory), "rows": rows}
 
     totals, ranked = aggregate({name: data["rows"] for name, data in report.items()})
