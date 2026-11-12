@@ -67,9 +67,18 @@ impl<H: Host> Runtime<'_, H> {
         if value_class::is_plain_string(marker) {
             return Arg::Str(marker.clone());
         }
+        // A jar object prints its own `toString` (`jar_text.rs`); one that
+        // throws, or that only the JVM can print (an identity hash), is
+        // refused here and counted by the host.
+        if jar_text::object_marker_class(marker).is_some() {
+            return match self.runtime_value_of(value, "java/util/Formatter", "format") {
+                Ok(Some(Value::Ref(Some(text)))) => Arg::Str(text),
+                Ok(Some(Value::Ref(None))) => Arg::Null,
+                _ => Arg::Opaque,
+            };
+        }
         // A model object whose `toString` the host answers; anything else
-        // (a jar object, a marker no model prints) cannot be printed or
-        // hashed exactly.
+        // (a marker no model prints) cannot be printed or hashed exactly.
         match self.host.modelled_to_string(value) {
             Some(text) => Arg::Str(text),
             None => Arg::Opaque,
