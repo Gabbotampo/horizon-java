@@ -21,9 +21,9 @@
       "source_sha256": "ccc81083a79c0241d38f600868399202ee25fd36b19f409710619b8978ef037c"
     },
     "checkcast.rs": {
-      "sha256": "5d58980a02fb2c71b772cbfce27677cbd83df67b500e659aa851812fb08a37f4",
+      "sha256": "3c453d4e33a8fd88bd7e70f60fb9bb81502e2d7dd78327443eb9145f11bbf853",
       "source": "crates/horizon-native-java/src/checkcast.rs",
-      "source_sha256": "5d58980a02fb2c71b772cbfce27677cbd83df67b500e659aa851812fb08a37f4"
+      "source_sha256": "d8eed8852e04da23e58040bab163ea5ee139214e024e158ebe017f574c64d243"
     },
     "class_init.rs": {
       "sha256": "ada441500e228f62d853a59bc6963bc604e9fc10037edd257f6dc72b9f6ab800",
@@ -81,9 +81,9 @@
       "source_sha256": "dc67bbb1769412c40d3fb862cdfc26a88efa24fdd3f1d0fc67ea192d1f8c8fb0"
     },
     "dependencies.rs": {
-      "sha256": "17b9eebf0f89f70de56b14294f3cbcd82b54752ee7e4db7792d6ef08e5d30c17",
+      "sha256": "f17420fc207dcb37b91884a21037a27f3a035c417f321c0b95953da429f276e7",
       "source": "crates/horizon-native-java/src/dependencies.rs",
-      "source_sha256": "40c31bd68e69e172a4d183ddfcdbe97fac40d9fd57f12dfc721e1128e521bb4c"
+      "source_sha256": "4fed8d4f9301d17dd76700a740626a869e156fc27edab5db51780f2872fafb39"
     },
     "dfu_pair.rs": {
       "sha256": "9ac1ffd02a0b043f6034a2386af6a8fbb2c9be4e5f6f586a78e0ad94c694cb66",
@@ -161,9 +161,9 @@
       "source_sha256": "7abff55db9a69f1379c55f44cea140b599174d26a4d8fb3a34da34f440af33aa"
     },
     "gson_tree.rs": {
-      "sha256": "b9fe898a9e823a8deb30fa21369ae9e37aaa32965699732a38e41da3c6a6cdcc",
+      "sha256": "52c6c1211a9bf954fc4babea34669fe8e9ba05f63abbf4d7500d2ca8bb345ebc",
       "source": "crates/horizon-native-java/src/gson_tree.rs",
-      "source_sha256": "8c9a36e6330684dd0476b3f5a539dae4e3df457bc929613ad15b7163e82569c2"
+      "source_sha256": "45c934c76bb7f6e63b5356be5c7089615c8d908e0246da48adb476fdb1b94d77"
     },
     "gson_tree/parse.rs": {
       "sha256": "d0f79b7bff9e7fa9bc673365e1fca9c3e17ceb4411938fc288caca6cadcaa6b1",
@@ -206,9 +206,9 @@
       "source_sha256": "f1a70c8d2886227ed595d51bd127fd23c4b7ae9290918e89071cbf9d4a00b51e"
     },
     "java_immutable.rs": {
-      "sha256": "a801d989119ec01ed2b39b8b0fe21c7ac465b4f0a4be5264a2502ff4d8cdd427",
+      "sha256": "bc1ed935ca6c1f918fcd171ec3745e051d5cb97ded6539f1d66e56006b9573a6",
       "source": "crates/horizon-native-java/src/java_immutable.rs",
-      "source_sha256": "f9d3d770725f5b6acd4cb69a71ff2cc995e1fade113cdb7f841b7e082572c6ce"
+      "source_sha256": "f30783572af0d724335638c70a857565a63ade4bd7bb2f167c5fb797c3907894"
     },
     "java_nbt.rs": {
       "sha256": "dcb3e6ead1da40cc5037882dba87f5bb29e84b7a33744fa90cb4990ce9f89182",
@@ -276,9 +276,9 @@
       "source_sha256": "fbca7f6045dbfc354b968baf0e64ea2c1fd6490866f0b75832e5319aa282d72d"
     },
     "library_dispatch.rs": {
-      "sha256": "5175e8e7a0adcb3518d3ab157a8ce3968426d0b913caab8a1d7e387375e52550",
+      "sha256": "7aa7f16bf5f4df19ebad72d7c58207dfbbc0a74acf94cce94f490a69faa5565e",
       "source": "crates/horizon-native-java/src/library_dispatch.rs",
-      "source_sha256": "2b5ed1676f6ae089bdd896a31e8e4f7e3b375d849703e09611b6dc34932ab889"
+      "source_sha256": "73ce75c380a78862e574ee8304b6a23c086e15b3259dce6143dd8a423363037b"
     },
     "map_compute.rs": {
       "sha256": "4a907b1c175c5ae186a2117b7bf9ff18b0e1dd7f230227878d69b3f390c09902",
@@ -301,9 +301,9 @@
       "source_sha256": "0e0b0a4ba3bcbca80ec0bd892b737d65e7577b0ddeffc1d08c59ae9b1cbc1d2b"
     },
     "mod.rs": {
-      "sha256": "960b25ecfe9abc15c60f631bb21e960349b29f08a6091de9ae31566cf3375019",
+      "sha256": "3f620c4bd7aee3b67cb5019955409fbf9019a739dd47c8a97365ca9ca16f8003",
       "source": "crates/horizon-native-java/src/lib.rs",
-      "source_sha256": "175b70a545ea9f7f7ea8a9fda523796964ca1bca875f400c85d0e10554719220"
+      "source_sha256": "cf5fb1cadb6cd53031e91bb1b8f0ab53c17c62bea25073a6668569b757819dcd"
     },
     "mod_config_register.rs": {
       "sha256": "9791c6644e749c7e35d73f7d39f892ebf11366c3091878ddce2892cf0ea8ba3f",
@@ -320,6 +320,11 @@
       "source": "crates/horizon-native-java/src/mod_origin.rs",
       "source_sha256": "8b5919bf05e5901da14dc320892bfd4279e826e251db1791d18a8ad92541d31b"
     },
+    "native_library.rs": {
+      "sha256": "e689372f7ae6878e42b78e89f6b4338e6be8e116729a3c5747f5269857f662fa",
+      "source": "crates/horizon-native-java/src/native_library.rs",
+      "source_sha256": "64825d68fb242d385b2225c76170faacf2a9f50dc70e8937000fec1b77b2335d"
+    },
     "neoforge_attachments.rs": {
       "sha256": "3979f80c5f99dd5d53bad2f91a3c31f183767a5ae88ec4e861e494c04726c291",
       "source": "crates/horizon-native-java/src/neoforge_attachments.rs",
@@ -331,9 +336,9 @@
       "source_sha256": "1ccdd4fe36b2107c8f9a4bfea476fea80f52578ebb22e7a9a315f3ed58694a79"
     },
     "neoforge_loader.rs": {
-      "sha256": "8617c4559b8b5706e4a211ab86ed010afd5b92363a5b77c910eadbc744a3c87f",
+      "sha256": "45fbdd31d8230c62f5af9e695942bd2e5cccd124ada8ae41f8ecd1441aa31c06",
       "source": "crates/horizon-native-java/src/neoforge_loader.rs",
-      "source_sha256": "a0934251a83d2a7006c79d3e8bca93a496755d9298b4e15903ef8d033edaad4a"
+      "source_sha256": "d6f5a1d38fdd0d51edf92892a84e104cd3090956b265113e47007a032f61b3ba"
     },
     "nested_jars.rs": {
       "sha256": "f76facdba8c0cf6ed8a11c212c34471e35a0ec4afee40634a3312657aff82b97",
@@ -390,6 +395,16 @@
       "source": "crates/horizon-native-java/src/registry_contents.rs",
       "source_sha256": "4087cab4104781ae0a9ffb78941102a452191ab536e83d6b3ddda993e6042b90"
     },
+    "sequenced.rs": {
+      "sha256": "b00535aa403b0ddf8357bf99df7b8f5e9a6218991650277f1f5281f47904d8b1",
+      "source": "crates/horizon-native-java/src/sequenced.rs",
+      "source_sha256": "b00535aa403b0ddf8357bf99df7b8f5e9a6218991650277f1f5281f47904d8b1"
+    },
+    "service_loader.rs": {
+      "sha256": "485cd45e89bf4e4309352771ab44f72e4db8bc7ee969c6797a91dc416b9ea109",
+      "source": "crates/horizon-native-java/src/service_loader.rs",
+      "source_sha256": "485cd45e89bf4e4309352771ab44f72e4db8bc7ee969c6797a91dc416b9ea109"
+    },
     "stack_walk.rs": {
       "sha256": "ed8561ac09a46193ef391702b454c330645c1b3ea4e48cd1963ec85065f0e3c3",
       "source": "crates/horizon-native-java/src/stack_walk.rs",
@@ -424,5 +439,5 @@
   "note": "Generated by tools/vendor.py; do not edit. One commit of horizon-java, copied into the native mod's one crate.",
   "schema": 1,
   "source": "crates/horizon-native-java/src",
-  "source_commit": "1afc3633a4f73367674cb6ffd887004e1cbe90dd"
+  "source_commit": "f54880b644e411cacc1802053d8881ad0d4e9863"
 }

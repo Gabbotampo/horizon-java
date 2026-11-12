@@ -19,11 +19,29 @@ use crate::runtime::NativeJar;
 /// The loaders and Java are always present on a real loader. `fabric-api` is
 /// modelled by the host's Fabric API surface (`platform_class_present`), which
 /// is why the corpus runs Fabric mods without shipping the API jar.
+///
+/// A mod may depend on one Fabric API module instead of the umbrella id. The
+/// modules listed here are the ones whose entry points that surface answers,
+/// to the same degree it answers them under `fabric-api`:
+/// - `fabric-api-base`: `Event` and `EventFactory.createArrayBacked`;
+/// - `fabric-lifecycle-events-v1`: the server lifecycle and tick events, which
+///   the game fires (`events.rs`);
+/// - `fabric-command-api-v2`: `CommandRegistrationCallback`, fired with the
+///   command façade;
+/// - `fabric-resource-loader-v1`: `ResourceLoader.get`; a reload listener is
+///   accepted and never runs (the runtime has no resource reload).
+///
+/// Any other module id still has to be a jar: listing it would claim a
+/// surface the host does not model.
 pub const HOST_PROVIDED_MODS: &[&str] = &[
     "minecraft",
     "java",
     "fabricloader",
     "fabric-api",
+    "fabric-api-base",
+    "fabric-lifecycle-events-v1",
+    "fabric-command-api-v2",
+    "fabric-resource-loader-v1",
     "neoforge",
     "forge",
 ];
@@ -237,6 +255,45 @@ mod tests {
             &["collective".to_owned(), "cupboard".to_owned()]
         );
         assert!(plan.links_for(0).is_empty());
+    }
+
+    /// spark's and libjf's declared requirements (their `fabric.mod.json`):
+    /// the modelled Fabric API modules are the host's, an unmodelled one is not.
+    #[test]
+    fn modelled_fabric_api_modules_are_the_hosts_and_others_are_missing() {
+        let spark = jar(
+            "spark",
+            &[
+                "fabricloader",
+                "minecraft",
+                "fabric-api-base",
+                "fabric-command-api-v2",
+                "fabric-lifecycle-events-v1",
+            ],
+        );
+        let libjf = jar(
+            "libjf",
+            &[
+                "fabricloader",
+                "minecraft",
+                "fabric-resource-loader-v1",
+                "fabric-lifecycle-events-v1",
+                "fabric-command-api-v2",
+            ],
+        );
+        let rendering = jar("hud", &["fabric-rendering-v1"]);
+        let jars = [
+            ("spark.jar", &spark),
+            ("libjf.jar", &libjf),
+            ("hud.jar", &rendering),
+        ];
+        let plan = plan(&jars);
+        assert_eq!(plan.missing.get(&0), None);
+        assert_eq!(plan.missing.get(&1), None);
+        assert_eq!(
+            plan.missing.get(&2).unwrap(),
+            &["fabric-rendering-v1".to_owned()]
+        );
     }
 
     #[test]
