@@ -67,6 +67,7 @@ mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
 mod jdk_stream;
+mod jdk_string_builder;
 mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
@@ -7440,29 +7441,27 @@ impl Host for StdHost {
                         .is_some_and(|other| Some(other) == boxed_boolean(receiver)))
                     as i32,
             )),
-            ("java/lang/StringBuilder", "<init>", _) | ("java/lang/StringBuffer", "<init>", _) => {
-                Ok(Value::Void)
-            }
             ("java/lang/StringBuilder", "append", descriptor)
             | ("java/lang/StringBuffer", "append", descriptor)
-                if descriptor.ends_with(")Ljava/lang/StringBuilder;")
-                    || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
+                if (descriptor.ends_with(")Ljava/lang/StringBuilder;")
+                    || descriptor.ends_with(")Ljava/lang/StringBuffer;"))
+                    && let Some(current) = builder_contents(receiver) =>
             {
-                let current = builder_contents(receiver).unwrap_or("");
                 let added = builder_append_text(self, r, args)?;
                 Ok(Value::Ref(Some(format!("string-builder/{current}{added}"))))
             }
             ("java/lang/StringBuilder", "toString", "()Ljava/lang/String;")
-            | ("java/lang/StringBuffer", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(
-                Some(builder_contents(receiver).unwrap_or("").to_owned()),
-            )),
+            | ("java/lang/StringBuffer", "toString", "()Ljava/lang/String;")
+                if let Some(current) = builder_contents(receiver) =>
+            {
+                Ok(Value::Ref(Some(current.to_owned())))
+            }
             ("java/lang/StringBuilder", "length", "()I")
-            | ("java/lang/StringBuffer", "length", "()I") => Ok(Value::Int(
-                builder_contents(receiver)
-                    .unwrap_or("")
-                    .encode_utf16()
-                    .count() as i32,
-            )),
+            | ("java/lang/StringBuffer", "length", "()I")
+                if let Some(current) = builder_contents(receiver) =>
+            {
+                Ok(Value::Int(current.encode_utf16().count() as i32))
+            }
             ("java/lang/String", "length", "()I") => Ok(Value::Int(
                 expect_string(receiver).encode_utf16().count() as i32,
             )),
@@ -8826,6 +8825,17 @@ impl Host for StdHost {
                 });
                 Ok(receiver.clone())
             }
+            // A builder the runtime constructed reaches the host only when
+            // its model left the call counted (`jdk_string_builder.rs`); its
+            // text is not its marker, so even `toString` is counted here.
+            ("java/lang/StringBuilder" | "java/lang/StringBuffer", name, _)
+                if name != "<init>"
+                    && expect_ref(receiver)
+                        .and_then(|marker| jar_text::object_marker_class(marker))
+                        .is_some_and(|class| class == r.owner) =>
+            {
+                self.unknown_host_call(r)
+            }
             _ => {
                 // The bounded object model has no per-class `toString`; a
                 // marker's text is the fallback a handler can observe (a
@@ -9077,12 +9087,15 @@ fn class_is_assignable(target: &str, source: &str) -> bool {
         && (target == source || target == "java.lang.Object" || target == "java.lang.Cloneable")
 }
 
+/// The text of a builder the standard host itself answers: a bare class
+/// marker or a `string-builder/<text>` chain. A `StringBuilder#n` object is
+/// one the runtime constructed and answers (`jdk_string_builder.rs`); one that
+/// reaches the host is a call that model left counted, so it is not answered
+/// here as an empty builder.
 fn builder_contents(value: &Value) -> Option<&str> {
     let value = expect_ref(value)?;
     if matches!(
-        value
-            .split_once('#')
-            .map_or(value.as_str(), |(class, _)| class),
+        value.as_str(),
         "java/lang/StringBuilder" | "java/lang/StringBuffer"
     ) {
         Some("")
@@ -20675,87 +20688,6 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// Answer `StringBuilder`/`StringBuffer` members for a builder this
-    /// invocation constructed.
-    ///
-    /// `append` returns the receiver and mutates it, so a caller that ignores
-    /// the return value (`sb.append(a); sb.append(b); sb.toString()`) still
-    /// sees both appends. The old host model returned a fresh
-    /// `string-builder/<text>` marker from each call, which lost every append
-    /// whose result was not threaded through.
-    fn invoke_string_builder(
-        &mut self,
-        r: &MethodRef,
-        receiver: Option<&Value>,
-        args: &[Value],
-    ) -> Result<Option<Value>, NativeError> {
-        if !matches!(
-            r.owner.as_str(),
-            "java/lang/StringBuilder" | "java/lang/StringBuffer"
-        ) {
-            return Ok(None);
-        }
-        let Some(marker) = receiver.and_then(expect_ref) else {
-            return Ok(None);
-        };
-        match (r.name.as_str(), r.descriptor.as_str()) {
-            ("<init>", _) => {
-                let initial = match r.descriptor.as_str() {
-                    "(Ljava/lang/String;)V" => args
-                        .first()
-                        .and_then(expect_ref)
-                        .cloned()
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
-                self.string_builders.insert(marker.to_owned(), initial);
-                Ok(Some(Value::Void))
-            }
-            ("append", descriptor)
-                if descriptor.ends_with(")Ljava/lang/StringBuilder;")
-                    || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
-            {
-                let added = builder_append_text(self.host, r, args)?;
-                self.string_builders
-                    .entry(marker.to_owned())
-                    .or_default()
-                    .push_str(&added);
-                Ok(Some(Value::Ref(Some(marker.to_owned()))))
-            }
-            ("toString", "()Ljava/lang/String;") => Ok(Some(Value::Ref(Some(
-                self.string_builders
-                    .get(marker)
-                    .cloned()
-                    .unwrap_or_default(),
-            )))),
-            ("length", "()I") => Ok(Some(Value::Int(
-                self.string_builders
-                    .get(marker)
-                    .map_or(0, |text| text.encode_utf16().count() as i32),
-            ))),
-            ("isEmpty", "()Z") => Ok(Some(Value::Int(i32::from(
-                self.string_builders
-                    .get(marker)
-                    .is_none_or(|text| text.is_empty()),
-            )))),
-            ("setLength", "(I)V") => {
-                let requested = args.first().ok_or_else(|| {
-                    NativeError::Metadata("StringBuilder.setLength needs an argument".into())
-                })?;
-                let length = usize::try_from(expect_int(r, requested)?).map_err(|_| {
-                    NativeError::Metadata("StringBuilder.setLength is negative".into())
-                })?;
-                let text = self.string_builders.entry(marker.to_owned()).or_default();
-                let mut units = text.encode_utf16().collect::<Vec<_>>();
-                units.truncate(length);
-                *text =
-                    String::from_utf16(&units).unwrap_or_else(|_| String::from_utf16_lossy(&units));
-                Ok(Some(Value::Void))
-            }
-            _ => Ok(None),
-        }
-    }
-
     /// The path text a `File`, `Path`, string or stream marker names.
     ///
     /// A `File`/`FileInputStream`/`FileWriter` marker resolves through
@@ -24125,9 +24057,11 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.invoke_array_clone(&r, receiver.as_ref()) {
                         value
-                    } else if let Some(value) =
-                        self.invoke_string_builder(&r, receiver.as_ref(), &args)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_string_builder(&r, receiver.as_ref(), &args)
+                    ) {
+                        // `jdk_string_builder.rs`: its index checks throw.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
