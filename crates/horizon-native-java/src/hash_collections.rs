@@ -335,7 +335,7 @@ impl<H: Host> Runtime<'_, H> {
             if tainted_argument && self.shows_argument_order(r) {
                 return self.count_and_continue(r);
             }
-            return Ok(None);
+            return self.snapshot_set_contains(r, opcode, receiver, args);
         };
         let Some(receiver) = receiver else {
             return Ok(None);
@@ -350,6 +350,15 @@ impl<H: Host> Runtime<'_, H> {
             return self.construct_hash_collection(r, receiver, &marker, kind, args);
         }
         self.resync_hash_table(receiver)?;
+        if kind.map
+            && matches!(
+                r.name.as_str(),
+                "computeIfAbsent" | "computeIfPresent" | "compute" | "merge"
+            )
+        {
+            // `hash_bulk.rs`.
+            return self.hash_compute(r, receiver, &marker, kind, args);
+        }
         let mut table = self.take_table(&marker, kind);
         if tainted_argument && matches!(r.name.as_str(), "putAll" | "addAll") {
             table.tainted = true;
@@ -854,7 +863,8 @@ impl<H: Host> Runtime<'_, H> {
                     None => self.count_and_continue(r),
                 }
             }
-            _ => Ok(None),
+            // `containsAll`/`removeAll`/`retainAll`/`equals` (`hash_bulk.rs`).
+            _ => self.hash_bulk_member(r, receiver, kind, table, args),
         }
     }
 

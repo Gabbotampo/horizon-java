@@ -185,10 +185,15 @@
       "source": "crates/horizon-native-java/src/guava_model.rs",
       "source_sha256": "6a0c971d4d41707bf33ce66b0ef522ce96249d01fcbada58fe794abae467c062"
     },
+    "hash_bulk.rs": {
+      "sha256": "f69e6c3d567198f04388429e2d4bef2e8ae16d3e4a4f62c4014539a9294d57d6",
+      "source": "crates/horizon-native-java/src/hash_bulk.rs",
+      "source_sha256": "f69e6c3d567198f04388429e2d4bef2e8ae16d3e4a4f62c4014539a9294d57d6"
+    },
     "hash_collections.rs": {
-      "sha256": "590b3ad8a79e4afc80830c593de303477985ffc1dedc136e541f2fdc2f698dbf",
+      "sha256": "69aaed7d8889cede88db72446e49aec7c4ed3013833d4aa2b5107dcb9a0f504f",
       "source": "crates/horizon-native-java/src/hash_collections.rs",
-      "source_sha256": "3e7fd22508669d037ee9d4a75dd70c9ff894f882962ae9698a0cc46a77d3f687"
+      "source_sha256": "9c569b2d0467c3039dfe450007d06a97c8bb56d5e0992a80705680efc292bbbc"
     },
     "hash_map_order.rs": {
       "sha256": "526f983baaab6ce53d68a889aeba70bc43b3904e97ee60a7b40ee652d5d543cf",
@@ -196,9 +201,9 @@
       "source_sha256": "526f983baaab6ce53d68a889aeba70bc43b3904e97ee60a7b40ee652d5d543cf"
     },
     "hash_table.rs": {
-      "sha256": "b055f144aa34f8b68f668d8990c26d4434f470c61c7de3846b5c43da2340c0a9",
+      "sha256": "d6342f38bed5d97a85ce90c80642fccb364a9b30c0f8c24adda2dadd5ffe2244",
       "source": "crates/horizon-native-java/src/hash_table.rs",
-      "source_sha256": "eae33d348779b4ddafbb0e6a922e4602179c8470a6f6d8b5c2c325bbd6f5db1c"
+      "source_sha256": "52b489b520a6aa7ced70ee9ffa074ea369d14bee3b02db5ad3f17cbfdae38bab"
     },
     "heap.rs": {
       "sha256": "18263e22283fd7210e9f6bdea34fce0926c82bc8bf7e979d6608014d771559cc",
@@ -306,9 +311,9 @@
       "source_sha256": "95e74bd84a405162015d12cf5191c8e0bf0f0fdd8931ba0ef7fabb9a4ffa7ffa"
     },
     "jdk_model.rs": {
-      "sha256": "3bebdb8acdb01cce935a542a7be7d6a6e493d18953512daf8d81bf984a845184",
+      "sha256": "e0add7e1507c6d7ef530d857b53170a848983ce6d45df945e80cf182d97d98cc",
       "source": "crates/horizon-native-java/src/jdk_model.rs",
-      "source_sha256": "4d70c5745d7688ca099763805529003ff94bd633c8ff23e17d43cfba436b3c58"
+      "source_sha256": "ced6d9ed580078deb8b4f9bf6f1b40855e254c5de62ae6c7a62b4ff48936e74c"
     },
     "jdk_reflect_proxy.rs": {
       "sha256": "7a12a1465387401a47de186a66a1d7a3c21b24aeaa75b62ffa2e813dc53ec6dc",
@@ -351,9 +356,9 @@
       "source_sha256": "73ce75c380a78862e574ee8304b6a23c086e15b3259dce6143dd8a423363037b"
     },
     "list_equality.rs": {
-      "sha256": "eaf1ef228bae1dd7462b573db0060d4a26a0634cbeef13bb1d69e587b0ac803f",
+      "sha256": "4796cdca4f0ccf97c6789fafd810e39add545b8c623f3fb4cb2e09e0c68bae13",
       "source": "crates/horizon-native-java/src/list_equality.rs",
-      "source_sha256": "eaf1ef228bae1dd7462b573db0060d4a26a0634cbeef13bb1d69e587b0ac803f"
+      "source_sha256": "4796cdca4f0ccf97c6789fafd810e39add545b8c623f3fb4cb2e09e0c68bae13"
     },
     "map_compute.rs": {
       "sha256": "4a907b1c175c5ae186a2117b7bf9ff18b0e1dd7f230227878d69b3f390c09902",
@@ -376,9 +381,9 @@
       "source_sha256": "0e0b0a4ba3bcbca80ec0bd892b737d65e7577b0ddeffc1d08c59ae9b1cbc1d2b"
     },
     "mod.rs": {
-      "sha256": "41d74ca8cb8d049ccfad6ee83e1ea67bc07b7e628a3d124f598f9982d77650da",
+      "sha256": "e3dab3956b2f003df495a79a61df6f4d4997ff991dee6b7cb0172b475ce114ee",
       "source": "crates/horizon-native-java/src/lib.rs",
-      "source_sha256": "ea51b9644ec4d634c596ab3e0ab2ec5d35e95c8b64d86ee7d153542e88e09c26"
+      "source_sha256": "58211bbe4a1e3504a22b2d974828b4031b8d992fe4f986043a80c58ce78a124b"
     },
     "mod_config_register.rs": {
       "sha256": "9791c6644e749c7e35d73f7d39f892ebf11366c3091878ddce2892cf0ea8ba3f",
