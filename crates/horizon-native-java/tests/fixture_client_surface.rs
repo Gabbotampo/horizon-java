@@ -498,9 +498,15 @@ fn a_neoforge_client_mod_registers_through_its_mod_bus_events() {
         return;
     };
     let jar = NativeJar::from_path(&jar_path).unwrap();
+    let budget = horizon_native_java::ExecutionBudget::UNBOUNDED;
     let mut host = StdHost::new();
     jar.execute("demo.NeoClient", None, "neoforge", &mut host)
         .unwrap();
+    // FML injects the `@EventBusSubscriber` after the `@Mod` constructor.
+    assert!(
+        jar.inject_event_subscribers(&mut host, &budget, &[])
+            .is_empty()
+    );
     let found = host.game_listeners(&jar, false);
     let mut named: Vec<GameEvent> = found.listeners.iter().map(|l| l.event).collect();
     named.sort();
@@ -512,8 +518,21 @@ fn a_neoforge_client_mod_registers_through_its_mod_bus_events() {
             GameEvent::ClientRegisterGuiLayers,
         ]
     );
-    // A server drops a `Dist.CLIENT` subscriber's methods.
-    assert!(host.game_listeners(&jar, true).listeners.is_empty());
+    // A dedicated server never injects a `Dist.CLIENT` subscriber.
+    let mut server = StdHost::new().with_environment_type("SERVER");
+    jar.execute("demo.NeoClient", None, "neoforge", &mut server)
+        .unwrap();
+    assert!(
+        jar.inject_event_subscribers(&mut server, &budget, &[])
+            .is_empty()
+    );
+    let on_server = server.game_listeners(&jar, true);
+    assert!(on_server.listeners.is_empty());
+    assert!(
+        on_server.unsupported.is_empty(),
+        "{:?}",
+        on_server.unsupported
+    );
 
     // Nothing is registered until the client fires its registration events.
     assert!(host.client_key_mappings().is_empty());
