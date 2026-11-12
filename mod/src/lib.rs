@@ -2061,6 +2061,7 @@ fn load_jar(
     file: String,
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
+    imc: &runtime::neoforge_imc::ImcBus,
 ) -> Result<LoadedJar, JarRow> {
     let id = jar_id(&jar, &file);
     let entrypoints = jar.role_entrypoints(false);
@@ -2073,6 +2074,8 @@ fn load_jar(
         return Err(JarRow::refused(&file, id, reason.to_owned()));
     }
     let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+    // Every jar of the game shares FML's `InterModComms` queues, from the constructors on.
+    imc.join(&file, &jar, &mut host);
     for (link, dependency) in links {
         if let Err(error) = host.link_jar(link.clone(), dependency) {
             return Err(JarRow::refused(
@@ -2580,7 +2583,12 @@ mod tests {
 
     /// The verdict and reason `load_jar` gives a jar, whether it loaded or was refused.
     fn load_verdict(jar: Arc<NativeJar>) -> (&'static str, Option<String>) {
-        match load_jar("demo.jar".to_owned(), jar, &[]) {
+        match load_jar(
+            "demo.jar".to_owned(),
+            jar,
+            &[],
+            &runtime::neoforge_imc::ImcBus::new(),
+        ) {
             Ok(loaded) => (loaded.row.verdict, loaded.row.reason),
             Err(row) => (row.verdict, row.reason),
         }

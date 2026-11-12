@@ -88,7 +88,7 @@ impl NativeJar {
     }
 
     /// The id a class's NeoForge `@Mod("id")` annotation names.
-    fn mod_annotation_id(&self, class: &str) -> Option<&str> {
+    pub(crate) fn mod_annotation_id(&self, class: &str) -> Option<&str> {
         let annotation = self
             .classes
             .get(class)?
