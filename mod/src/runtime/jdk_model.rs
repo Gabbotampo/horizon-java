@@ -906,34 +906,59 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
     class == wanted || known.contains(&wanted)
 }
 
-/// Unbox the arguments a method reference to a JDK method receives, the way
-/// the lambda metafactory adapts `BinaryOperator<Integer>` to `Integer::sum`:
-/// a boxed marker in a primitive parameter position becomes the primitive.
-/// `args` are the target's declared parameters in order (no receiver); a value
-/// that is already primitive, or not a box, is left as it is.
+/// Adapt the arguments a method reference's target receives, the way the
+/// lambda metafactory does (JLS 5.3 invocation contexts: unboxing, then
+/// widening primitive conversion): a box in a primitive parameter position
+/// becomes its primitive (`BinaryOperator<Integer>` → `Integer::sum`), and a
+/// primitive is widened to the parameter's type (`IntFunction` →
+/// `takesLong(long)`, `Function<Integer, ?>` → `takesLong(long)`). `args` are
+/// the target's declared parameters in order (no receiver); a reference
+/// parameter, or a value that is no box, is left as it is.
 pub(crate) fn unbox_for_descriptor(descriptor: &str, args: &mut [Value]) {
     for (parameter, value) in super::descriptor_arguments(descriptor)
         .iter()
         .zip(args.iter_mut())
     {
-        if !matches!(value, Value::Ref(Some(_))) {
-            continue;
-        }
-        let unboxed = match parameter.as_str() {
-            "I" | "S" | "B" => super::boxed_integer(value)
-                .or_else(|| super::boxed_short(value).map(i32::from))
-                .or_else(|| super::boxed_byte(value).map(i32::from))
-                .map(Value::Int),
-            "C" => super::boxed_character(value).map(Value::Int),
-            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
-            "J" => super::boxed_long(value).map(Value::Long),
-            "F" | "D" => super::boxed_number(value).map(Value::Float),
-            _ => None,
-        };
-        if let Some(unboxed) = unboxed {
-            *value = unboxed;
+        if let Some(adapted) = adapt_to_primitive(value, parameter) {
+            *value = adapted;
         }
     }
+}
+
+/// `value` unboxed (when it is a box) and widened to the primitive type
+/// `descriptor` (`I`, `J`, `F`, `D`...), or `None` when `descriptor` is not a
+/// primitive or `value` is neither a primitive nor a box.
+///
+/// Widening follows JLS 5.1.2: `int`/`long` to `float` round to the nearest
+/// `float`; to `double`, `int` is exact and `long` rounds. A narrowing is never
+/// applied (the metafactory has none), so such a value is unboxed only.
+pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Value> {
+    if !matches!(descriptor, "I" | "S" | "B" | "C" | "Z" | "J" | "F" | "D") {
+        return None;
+    }
+    let primitive = match value {
+        Value::Ref(Some(_)) => match descriptor {
+            "C" => super::boxed_character(value).map(Value::Int),
+            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
+            _ => super::boxed_integer(value)
+                .or_else(|| super::boxed_short(value).map(i32::from))
+                .or_else(|| super::boxed_byte(value).map(i32::from))
+                .or_else(|| super::boxed_character(value))
+                .map(Value::Int)
+                .or_else(|| super::boxed_long(value).map(Value::Long))
+                .or_else(|| super::boxed_number(value).map(Value::Float)),
+        }?,
+        Value::Int(_) | Value::Long(_) | Value::Float(_) => value.clone(),
+        _ => return None,
+    };
+    Some(match (primitive, descriptor) {
+        (Value::Int(int), "J") => Value::Long(i64::from(int)),
+        (Value::Int(int), "F") => Value::Float(f64::from(int as f32)),
+        (Value::Int(int), "D") => Value::Float(f64::from(int)),
+        (Value::Long(long), "F") => Value::Float(f64::from(long as f32)),
+        (Value::Long(long), "D") => Value::Float(long as f64),
+        (other, _) => other,
+    })
 }
 
 /// A parsed class's `access_flags`, read back from its bytes (the parser
