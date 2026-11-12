@@ -24,6 +24,7 @@ mod collection_base;
 mod collection_callback;
 mod color_collection;
 mod commons_io;
+mod concurrent_sync;
 pub mod content;
 mod declarations_content;
 pub mod dependencies;
@@ -24114,6 +24115,12 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, mod_origin::invoke(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        concurrent_sync::invoke(self, &r, receiver.as_ref(), &args)
+                    ) {
+                        // `CountDownLatch`, `new ThreadPoolExecutor` (`concurrent_sync.rs`).
                         value
                     } else if let Some(value) =
                         executors::invoke_thread_factory(self, &r, receiver.as_ref(), &args)
