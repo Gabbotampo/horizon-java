@@ -9,6 +9,8 @@ runtime-only change does not tax its own PR:
   that touches `mod/**` or `tools/vendor.py`, and run by CI only for those (`.github/workflows/ci.yml`).
 
 A one-byte hand edit must fail the first; a runtime edit the mod does not carry must fail the second.
+A data file a source embeds (`include_str!`/`include_bytes!`) is vendored and locked like a source,
+so the mod's crate builds without it being copied by hand.
 """
 
 import importlib.util
@@ -116,6 +118,69 @@ class VendorModTests(unittest.TestCase):
         # A `#[path]` submodule of `client_surface.rs` keeps its relative module paths.
         surface = files["client_surface.rs"][1].decode()
         self.assertIn('#[path = "client_items.rs"]', surface)
+
+    def test_an_embedded_data_file_is_vendored_and_locked(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            src = tree / "crates" / "horizon-native-java" / "src"
+            (src / "tables").mkdir()
+            (src / "tables" / "sample.bin").write_bytes(b"\x00\xffbytes, not text\n")
+            (src / "embeds_sample.rs").write_text(
+                'pub(crate) const SAMPLE: &[u8] = include_bytes!("tables/sample.bin");\n'
+            )
+            write = subprocess.run(
+                [sys.executable, str(VENDOR), "--repo", str(tree)],
+                text=True, capture_output=True, timeout=120, check=False,
+            )
+            self.assertEqual(write.returncode, 0, write.stderr)
+            vendored = tree / "mod" / "src" / "runtime" / "tables" / "sample.bin"
+            # Copied byte for byte beside its vendored includer, where the macro looks for it.
+            self.assertEqual(vendored.read_bytes(), b"\x00\xffbytes, not text\n")
+            self.assertEqual(check(tree, "--check")[0], 0)
+
+            # The lock covers it: an edit fails the lock check, and so does a deletion.
+            vendored.write_bytes(b"\x01\xffbytes, not text\n")
+            code, stderr = check(tree, "--check-lock")
+            self.assertEqual(code, 1)
+            self.assertIn("tables/sample.bin", stderr)
+            vendored.unlink()
+            code, stderr = check(tree, "--check-lock")
+            self.assertEqual(code, 1)
+            self.assertIn("missing", stderr)
+
+            # A changed source data file is drift for the full check only.
+            subprocess.run([sys.executable, str(VENDOR), "--repo", str(tree)], check=True,
+                           capture_output=True, timeout=120)
+            (src / "tables" / "sample.bin").write_bytes(b"new\n")
+            self.assertEqual(check(tree, "--check-lock")[0], 0)
+            code, stderr = check(tree, "--check")
+            self.assertEqual(code, 1)
+            self.assertIn("sample.bin", stderr)
+
+            # A file in the copy that nothing vendors is not the tool's output.
+            (tree / "mod" / "src" / "runtime" / "stray.json").write_text("{}")
+            code, stderr = check(tree, "--check-lock")
+            self.assertEqual(code, 1)
+            self.assertIn("stray.json", stderr)
+
+    def test_an_include_the_tool_cannot_follow_is_refused(self):
+        for line, message in (
+            ('const A: &str = include_str!(concat!("a", ".json"));', "non-literal"),
+            ('const A: &str = include_str!("../../../README.md");', "outside"),
+            ('const A: &str = include_str!("missing.json");', "does not exist"),
+        ):
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as scratch:
+                tree = copy_tree(Path(scratch) / "tree")
+                src = tree / "crates" / "horizon-native-java" / "src"
+                (src / "bad_include.rs").write_text(line + "\n")
+                (tree / "README.md").write_text("outside the runtime source\n")
+                result = subprocess.run(
+                    [sys.executable, str(VENDOR), "--repo", str(tree)],
+                    text=True, capture_output=True, timeout=120, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertIn("bad_include.rs", result.stderr)
 
 
 if __name__ == "__main__":

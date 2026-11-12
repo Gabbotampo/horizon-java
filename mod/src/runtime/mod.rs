@@ -60,11 +60,17 @@ mod java_nbt;
 mod java_numbers;
 mod java_regex;
 mod java_tostring;
+mod jdk_character;
+mod jdk_character_table;
+mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
 mod jdk_stream;
+mod jdk_string_builder;
 mod jdk_supertypes;
+#[cfg(test)]
+mod jdk_text_oracle;
 mod library_dispatch;
 mod map_compute;
 mod method_handles;
@@ -73,6 +79,7 @@ mod mixin_plugins;
 mod mod_config_register;
 mod mod_config_spec;
 mod mod_origin;
+mod modified_utf8;
 mod native_library;
 pub mod neoforge_attachments;
 mod neoforge_loader;
@@ -4037,6 +4044,10 @@ impl Host for StdHost {
         if let Some(value) = self.neoforge_loader_static(r) {
             return Ok(value);
         }
+        // `Character.UnicodeBlock` constants (`jdk_character.rs`).
+        if let Some(value) = jdk_character::unicode_block_static(r) {
+            return Ok(value);
+        }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
@@ -4232,6 +4243,9 @@ impl Host for StdHost {
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
+        if let Some(value) = jdk_character::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -4402,12 +4416,6 @@ impl Host for StdHost {
             ("java/lang/Integer", "toHexString", "(I)Ljava/lang/String;") => Ok(Value::Ref(Some(
                 format!("{:x}", expect_int(r, Self::argument(r, args, 0)?)? as u32),
             ))),
-            ("java/lang/Character", "toLowerCase", "(C)C")
-            | ("java/lang/Character", "toLowerCase", "(I)I") => {
-                let value = java_code_point(Self::argument(r, args, 0)?)
-                    .and_then(|c| c.to_lowercase().next());
-                Ok(Value::Int(value.map_or(0xfffd, u32::from) as i32))
-            }
             ("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
                 Ok(Value::Ref(Some(format!("character:{value}"))))
@@ -5334,6 +5342,10 @@ impl Host for StdHost {
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
             return value;
+        }
+        // `Character.UnicodeBlock#toString` (`jdk_character.rs`).
+        if let Some(value) = jdk_character::unicode_block_instance(r, receiver) {
+            return Ok(value);
         }
         // A Fabric mod container's origin (`mod_origin.rs`); also reached
         // through `String.valueOf`/`"" + origin`, which asks this host for the
@@ -7429,29 +7441,27 @@ impl Host for StdHost {
                         .is_some_and(|other| Some(other) == boxed_boolean(receiver)))
                     as i32,
             )),
-            ("java/lang/StringBuilder", "<init>", _) | ("java/lang/StringBuffer", "<init>", _) => {
-                Ok(Value::Void)
-            }
             ("java/lang/StringBuilder", "append", descriptor)
             | ("java/lang/StringBuffer", "append", descriptor)
-                if descriptor.ends_with(")Ljava/lang/StringBuilder;")
-                    || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
+                if (descriptor.ends_with(")Ljava/lang/StringBuilder;")
+                    || descriptor.ends_with(")Ljava/lang/StringBuffer;"))
+                    && let Some(current) = builder_contents(receiver) =>
             {
-                let current = builder_contents(receiver).unwrap_or("");
                 let added = builder_append_text(self, r, args)?;
                 Ok(Value::Ref(Some(format!("string-builder/{current}{added}"))))
             }
             ("java/lang/StringBuilder", "toString", "()Ljava/lang/String;")
-            | ("java/lang/StringBuffer", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(
-                Some(builder_contents(receiver).unwrap_or("").to_owned()),
-            )),
+            | ("java/lang/StringBuffer", "toString", "()Ljava/lang/String;")
+                if let Some(current) = builder_contents(receiver) =>
+            {
+                Ok(Value::Ref(Some(current.to_owned())))
+            }
             ("java/lang/StringBuilder", "length", "()I")
-            | ("java/lang/StringBuffer", "length", "()I") => Ok(Value::Int(
-                builder_contents(receiver)
-                    .unwrap_or("")
-                    .encode_utf16()
-                    .count() as i32,
-            )),
+            | ("java/lang/StringBuffer", "length", "()I")
+                if let Some(current) = builder_contents(receiver) =>
+            {
+                Ok(Value::Int(current.encode_utf16().count() as i32))
+            }
             ("java/lang/String", "length", "()I") => Ok(Value::Int(
                 expect_string(receiver).encode_utf16().count() as i32,
             )),
@@ -8815,6 +8825,17 @@ impl Host for StdHost {
                 });
                 Ok(receiver.clone())
             }
+            // A builder the runtime constructed reaches the host only when
+            // its model left the call counted (`jdk_string_builder.rs`); its
+            // text is not its marker, so even `toString` is counted here.
+            ("java/lang/StringBuilder" | "java/lang/StringBuffer", name, _)
+                if name != "<init>"
+                    && expect_ref(receiver)
+                        .and_then(|marker| jar_text::object_marker_class(marker))
+                        .is_some_and(|class| class == r.owner) =>
+            {
+                self.unknown_host_call(r)
+            }
             _ => {
                 // The bounded object model has no per-class `toString`; a
                 // marker's text is the fallback a handler can observe (a
@@ -9066,12 +9087,15 @@ fn class_is_assignable(target: &str, source: &str) -> bool {
         && (target == source || target == "java.lang.Object" || target == "java.lang.Cloneable")
 }
 
+/// The text of a builder the standard host itself answers: a bare class
+/// marker or a `string-builder/<text>` chain. A `StringBuilder#n` object is
+/// one the runtime constructed and answers (`jdk_string_builder.rs`); one that
+/// reaches the host is a call that model left counted, so it is not answered
+/// here as an empty builder.
 fn builder_contents(value: &Value) -> Option<&str> {
     let value = expect_ref(value)?;
     if matches!(
-        value
-            .split_once('#')
-            .map_or(value.as_str(), |(class, _)| class),
+        value.as_str(),
         "java/lang/StringBuilder" | "java/lang/StringBuffer"
     ) {
         Some("")
@@ -10126,14 +10150,6 @@ fn boxed_integer(value: &Value) -> Option<i32> {
     }
 }
 
-fn java_code_point(value: &Value) -> Option<char> {
-    let code_point = boxed_integer(value)?;
-    (0..=0x10ffff)
-        .contains(&code_point)
-        .then(|| char::from_u32(code_point as u32))
-        .flatten()
-}
-
 fn boxed_character(value: &Value) -> Option<i32> {
     match value {
         // Java `char` is an unsigned UTF-16 code unit, so isolated surrogates
@@ -10355,76 +10371,14 @@ fn format_integer_us(value: i64) -> String {
     }
 }
 
-/// Render a `double` the way `Double.toString` does, from the shortest
-/// round-tripping digits (the same digits Java prints).
+/// `Double.toString(value)`, exactly as Java 25 prints it (`jdk_float_text.rs`).
 fn format_java_float(value: f64) -> String {
-    java_float_text(format!("{value:e}"))
+    jdk_float_text::double_to_string(value)
 }
 
-/// The `float` twin: the digits must round-trip through `f32`, so a `0.1F`
-/// prints `0.1` rather than the `f64` value of the stored `f32`.
+/// `Float.toString` of a `float` the interpreter holds widened to `double`.
 fn format_java_float32(value: f64) -> String {
-    java_float_text(format!("{:e}", value as f32))
-}
-
-/// Format a Rust `{:e}` string (`3.5e0`, `1.25e-4`) as Java's `toString`.
-///
-/// Java keeps the plain decimal form for `1e-3 <= |m| < 1e7` and uses
-/// scientific notation with one leading digit outside it, always keeping at
-/// least one fractional digit (`1.0`, `100.0`, `1.0E20`).
-fn java_float_text(scientific: String) -> String {
-    // Rust spells the non-finite values without an exponent.
-    match scientific.as_str() {
-        "NaN" => return "NaN".to_owned(),
-        "inf" => return "Infinity".to_owned(),
-        "-inf" => return "-Infinity".to_owned(),
-        _ => {}
-    }
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("`{:e}` always writes an exponent");
-    let exponent: i32 = exponent.parse().expect("`{:e}` writes a decimal exponent");
-    let negative = mantissa.starts_with('-');
-    let digits = mantissa
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect::<String>();
-    let mut output = String::new();
-    if negative {
-        output.push('-');
-    }
-    // The digits are `d[0].d[1..]`, so the decimal point sits after
-    // `exponent + 1` digits.
-    let point = exponent + 1;
-    if (-3..=6).contains(&exponent) {
-        if point <= 0 {
-            output.push_str("0.");
-            output.push_str(&"0".repeat((-point) as usize));
-            output.push_str(&digits);
-        } else {
-            let point = point as usize;
-            if point < digits.len() {
-                output.push_str(&digits[..point]);
-                output.push('.');
-                output.push_str(&digits[point..]);
-            } else {
-                output.push_str(&digits);
-                output.push_str(&"0".repeat(point - digits.len()));
-                output.push_str(".0");
-            }
-        }
-    } else {
-        output.push_str(&digits[..1]);
-        output.push('.');
-        if digits.len() > 1 {
-            output.push_str(&digits[1..]);
-        } else {
-            output.push('0');
-        }
-        output.push('E');
-        output.push_str(&exponent.to_string());
-    }
-    output
+    jdk_float_text::float_to_string(value)
 }
 
 /// The collection kind a reference return descriptor declares, when it is one
@@ -20734,87 +20688,6 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// Answer `StringBuilder`/`StringBuffer` members for a builder this
-    /// invocation constructed.
-    ///
-    /// `append` returns the receiver and mutates it, so a caller that ignores
-    /// the return value (`sb.append(a); sb.append(b); sb.toString()`) still
-    /// sees both appends. The old host model returned a fresh
-    /// `string-builder/<text>` marker from each call, which lost every append
-    /// whose result was not threaded through.
-    fn invoke_string_builder(
-        &mut self,
-        r: &MethodRef,
-        receiver: Option<&Value>,
-        args: &[Value],
-    ) -> Result<Option<Value>, NativeError> {
-        if !matches!(
-            r.owner.as_str(),
-            "java/lang/StringBuilder" | "java/lang/StringBuffer"
-        ) {
-            return Ok(None);
-        }
-        let Some(marker) = receiver.and_then(expect_ref) else {
-            return Ok(None);
-        };
-        match (r.name.as_str(), r.descriptor.as_str()) {
-            ("<init>", _) => {
-                let initial = match r.descriptor.as_str() {
-                    "(Ljava/lang/String;)V" => args
-                        .first()
-                        .and_then(expect_ref)
-                        .cloned()
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
-                self.string_builders.insert(marker.to_owned(), initial);
-                Ok(Some(Value::Void))
-            }
-            ("append", descriptor)
-                if descriptor.ends_with(")Ljava/lang/StringBuilder;")
-                    || descriptor.ends_with(")Ljava/lang/StringBuffer;") =>
-            {
-                let added = builder_append_text(self.host, r, args)?;
-                self.string_builders
-                    .entry(marker.to_owned())
-                    .or_default()
-                    .push_str(&added);
-                Ok(Some(Value::Ref(Some(marker.to_owned()))))
-            }
-            ("toString", "()Ljava/lang/String;") => Ok(Some(Value::Ref(Some(
-                self.string_builders
-                    .get(marker)
-                    .cloned()
-                    .unwrap_or_default(),
-            )))),
-            ("length", "()I") => Ok(Some(Value::Int(
-                self.string_builders
-                    .get(marker)
-                    .map_or(0, |text| text.encode_utf16().count() as i32),
-            ))),
-            ("isEmpty", "()Z") => Ok(Some(Value::Int(i32::from(
-                self.string_builders
-                    .get(marker)
-                    .is_none_or(|text| text.is_empty()),
-            )))),
-            ("setLength", "(I)V") => {
-                let requested = args.first().ok_or_else(|| {
-                    NativeError::Metadata("StringBuilder.setLength needs an argument".into())
-                })?;
-                let length = usize::try_from(expect_int(r, requested)?).map_err(|_| {
-                    NativeError::Metadata("StringBuilder.setLength is negative".into())
-                })?;
-                let text = self.string_builders.entry(marker.to_owned()).or_default();
-                let mut units = text.encode_utf16().collect::<Vec<_>>();
-                units.truncate(length);
-                *text =
-                    String::from_utf16(&units).unwrap_or_else(|_| String::from_utf16_lossy(&units));
-                Ok(Some(Value::Void))
-            }
-            _ => Ok(None),
-        }
-    }
-
     /// The path text a `File`, `Path`, string or stream marker names.
     ///
     /// A `File`/`FileInputStream`/`FileWriter` marker resolves through
@@ -24184,9 +24057,11 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.invoke_array_clone(&r, receiver.as_ref()) {
                         value
-                    } else if let Some(value) =
-                        self.invoke_string_builder(&r, receiver.as_ref(), &args)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_string_builder(&r, receiver.as_ref(), &args)
+                    ) {
+                        // `jdk_string_builder.rs`: its index checks throw.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -26156,7 +26031,7 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
         let c = match tag {
             1 => {
                 let length = r.u2()? as usize;
-                Cp::Utf8(String::from_utf8_lossy(r.bytes(length)?).into_owned())
+                Cp::Utf8(modified_utf8::decode(r.bytes(length)?))
             }
             3 => Cp::Integer(r.u4()? as i32),
             7 => Cp::Class(r.u2()?),
