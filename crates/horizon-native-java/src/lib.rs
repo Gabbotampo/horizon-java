@@ -70,6 +70,7 @@ mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
 mod jvm_dispatch;
+mod lambda_boxing;
 mod library_dispatch;
 mod map_compute;
 mod method_handles;
@@ -10756,7 +10757,8 @@ fn box_callback_result<H: Host>(
     call_descriptor: &str,
 ) -> Result<Value, NativeError> {
     if !return_desc(call_descriptor).starts_with('L') {
-        return Ok(value);
+        // A primitive return unboxes a boxed result (`lambda_boxing.rs`).
+        return Ok(lambda_boxing::unbox_result(call_descriptor, value));
     }
     let Some(marker) = expect_ref(receiver) else {
         return Ok(value);
@@ -19431,6 +19433,9 @@ impl<H: Host> Runtime<'_, H> {
         if !args_consumed {
             target_args.extend_from_slice(args);
         }
+        // An erased `Integer` argument unboxed into an `int` parameter
+        // (`lambda_boxing.rs`).
+        jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut target_args);
         let expected = arg_count(&callback.target.descriptor);
         if target_args.len() != expected {
             return Err(NativeError::Metadata(format!(
@@ -22868,10 +22873,12 @@ impl<H: Host> Runtime<'_, H> {
             // site bound, the body is that method, not the interface's own
             // (absent) code — a config validator or a custom `Supplier` shape
             // would otherwise answer `null`.
+            // Its result is boxed or unboxed to the abstract method's return
+            // type, as the metafactory adapts it (`lambda_boxing.rs`).
             if let Some(receiver) = receiver.as_ref()
                 && let Some(value) = self.invoke_callback(receiver, args)?
             {
-                return Ok(value);
+                return box_callback_result(self, receiver, value, desc);
             }
             // A Fabric event's invoker is a host marker standing for the
             // jar's array-backed invoker, which the host does not run: the
@@ -24273,7 +24280,17 @@ impl<H: Host> Runtime<'_, H> {
                                         at,
                                         self.invoke_callback(receiver, &args)
                                     ) {
-                                        Some(value) => value,
+                                        // Boxed or unboxed to the interface
+                                        // method's return (`lambda_boxing.rs`).
+                                        Some(value) => invoke_or_catch!(
+                                            at,
+                                            box_callback_result(
+                                                self,
+                                                receiver,
+                                                value,
+                                                &resolved.descriptor
+                                            )
+                                        ),
                                         None => invoke_or_catch!(
                                             at,
                                             self.host.invoke_instance(&resolved, receiver, &args)
