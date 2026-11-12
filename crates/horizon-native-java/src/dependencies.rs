@@ -72,46 +72,46 @@ impl LoadPlan {
 /// One jar's mod ids, lowercased because loader mod ids are compared without
 /// case.
 ///
-/// The jar's own Fabric and NeoForge ids, then what Fabric Loader 0.19.5
-/// selects for a `fabric.mod.json` ([`fabric_provided`]): a mod answers for its
-/// `provides` aliases as well as its id, and every jar its `jars` list names is
-/// a mod of its own, recursively. `libjf` ships `libjf-base` that way, and
-/// `libjf-base` provides `libjf_base`, the spelling a NeoForge
-/// `[[dependencies]]` table uses (`respackopts` requires both).
+/// The jar's own Fabric and NeoForge ids, then the mods its bundled jars make
+/// resolvable, by each loader's own rule: [`fabric_provided`] (a mod answers
+/// for its `provides` aliases too, and the jars its `jars` list names are mods,
+/// recursively) and [`neoforge_provided`] (the jars its JarJar metadata names
+/// are mod files, recursively). `libjf` ships `libjf-base` the Fabric way, and
+/// `libjf-base` provides `libjf_base`, the spelling `respackopts`' NeoForge
+/// `[[dependencies]]` use; `respackopts` bundles its `muscript` the NeoForge
+/// way.
 fn mod_ids(jar: &NativeJar) -> Vec<String> {
     let mut ids: Vec<String> = [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
         .into_iter()
         .flatten()
         .map(str::to_owned)
         .collect();
-    if let Some(metadata) = jar.resource_bytes.get("fabric.mod.json") {
-        let mut budget = MAX_NESTED_MODS;
-        fabric_provided(
-            metadata,
-            &|file| jar.resource_bytes.get(file).cloned(),
-            0,
-            &mut budget,
-            &mut ids,
-        );
-    }
+    let entry = |name: &str| jar.resource_bytes.get(name).cloned();
+    let mut budget = MAX_NESTED_MODS;
+    fabric_provided(&entry, 0, &mut budget, &mut ids);
+    let mut budget = MAX_NESTED_MODS;
+    neoforge_provided(&entry, 0, &mut budget, &mut ids);
     let mut ids: Vec<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
     ids.sort();
     ids.dedup();
     ids
 }
 
-/// How deep Jar-in-Jar is followed. Fabric Loader recurses without a depth
-/// bound (each nested jar is scanned like a top-level one); a real bundle is
-/// two levels deep (`libjf` → `libjf-base` → a Fabric API module).
+/// How deep Jar-in-Jar is followed. Both loaders recurse without a depth
+/// bound; a real bundle is two levels deep (`libjf` → `libjf-base` → a Fabric
+/// API module).
 const MAX_NESTING: usize = 8;
-/// How many nested jars one top-level jar may contribute ids from.
+/// How many nested jars one top-level jar may contribute ids from, per loader.
 const MAX_NESTED_MODS: usize = 256;
-/// The largest nested jar read below the first level (the first level is the
-/// outer jar's bounded resource bytes).
-const MAX_NESTED_JAR_BYTES: u64 = 16 << 20;
+/// The largest entry read from a nested jar (the top level reads the outer
+/// jar's own bounded resource bytes).
+const MAX_NESTED_ENTRY_BYTES: u64 = 16 << 20;
 
-/// The ids one `fabric.mod.json` makes resolvable, appended to `ids`, as
-/// Fabric Loader 0.19.5 does it:
+/// Answers one entry of a jar by its exact name.
+type Entries<'a> = dyn Fn(&str) -> Option<Vec<u8>> + 'a;
+
+/// The ids one jar's `fabric.mod.json` makes resolvable, appended to `ids`,
+/// as Fabric Loader 0.19.5 does it:
 ///
 /// - `ModResolver.selectMod` puts the candidate in the selected-mods map
 ///   under `getId()` and under every id of `getProvides()` (the metadata's
@@ -124,15 +124,11 @@ const MAX_NESTED_JAR_BYTES: u64 = 16 << 20;
 ///   too. A jar in `META-INF/jars/` that the list does not name is not a mod,
 ///   and an entry without a `fabric.mod.json` contributes nothing.
 ///
-/// `entry` answers a nested entry's bytes by name.
-fn fabric_provided(
-    metadata: &[u8],
-    entry: &dyn Fn(&str) -> Option<Vec<u8>>,
-    depth: usize,
-    budget: &mut usize,
-    ids: &mut Vec<String>,
-) {
-    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(metadata) else {
+/// At `depth` 0 the jar is the top-level one, whose id is already counted.
+fn fabric_provided(entry: &Entries<'_>, depth: usize, budget: &mut usize, ids: &mut Vec<String>) {
+    let Some(metadata) = entry("fabric.mod.json")
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
         return;
     };
     if depth > 0
@@ -151,53 +147,118 @@ fn fabric_provided(
                 .map(str::to_owned),
         );
     }
-    if depth >= MAX_NESTING {
-        return;
-    }
     let files = metadata
         .get("jars")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|jar| jar.get("file").and_then(serde_json::Value::as_str));
+        .filter_map(|jar| jar.get("file").and_then(serde_json::Value::as_str))
+        .filter(|file| file.ends_with(".jar"));
     for file in files {
-        if *budget == 0 {
-            return;
-        }
-        if !file.ends_with(".jar") {
-            continue;
-        }
-        let Some(bytes) = entry(file) else {
-            continue;
-        };
-        *budget -= 1;
-        let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
-            continue;
-        };
-        let Some(nested_metadata) = read_entry(&mut zip, "fabric.mod.json") else {
-            continue;
-        };
-        let zip = std::cell::RefCell::new(zip);
-        fabric_provided(
-            &nested_metadata,
-            &|name| read_entry(&mut zip.borrow_mut(), name),
-            depth + 1,
-            budget,
-            ids,
-        );
+        nested(entry, file, depth, budget, &mut |nested, budget| {
+            fabric_provided(nested, depth + 1, budget, ids)
+        });
     }
 }
 
+/// The ids one jar's NeoForge metadata makes resolvable, appended to `ids`,
+/// as FancyModLoader 12.0.12 with JarJarSelector 0.5.3 does it:
+///
+/// - `JarSelector.detect` reads `META-INF/jarjar/metadata.json`
+///   (`Constants.CONTAINED_JARS_METADATA_PATH`) from each mod file and
+///   `recursivelyDetectContainedJars` follows every `jars[].path` into the
+///   jar it names, reading that jar's own metadata the same way.
+/// - `JarInJarDependencyLocator.scanMods` adds each selected jar to the
+///   discovery pipeline as a mod file, so every `[[mods]]` `modId` of its
+///   `META-INF/neoforge.mods.toml` is a mod.
+///
+/// Not modelled: JarJar's version selection (`JarSelector.select` keeps one
+/// version per `group:artifact` and fails the launch on disjoint ranges);
+/// every named jar answers for its ids here. A named path that is missing
+/// fails a NeoForge launch (`Mod file {} declares Jar-in-Jar {} but does not
+/// contain it`) and is skipped here.
+fn neoforge_provided(entry: &Entries<'_>, depth: usize, budget: &mut usize, ids: &mut Vec<String>) {
+    if depth > 0 {
+        let toml = entry("META-INF/neoforge.mods.toml").or_else(|| entry("META-INF/mods.toml"));
+        if let Some(text) = toml.and_then(|bytes| String::from_utf8(bytes).ok()) {
+            ids.extend(neoforge_mod_ids(&text));
+        }
+    }
+    let Some(metadata) = entry("META-INF/jarjar/metadata.json")
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return;
+    };
+    let paths = metadata
+        .get("jars")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|jar| jar.get("path").and_then(serde_json::Value::as_str));
+    for path in paths {
+        nested(entry, path, depth, budget, &mut |nested, budget| {
+            neoforge_provided(nested, depth + 1, budget, ids)
+        });
+    }
+}
+
+/// Open the nested jar `name` of the jar `entry` reads and hand its entries
+/// to `scan`, within [`MAX_NESTING`] and the caller's jar budget.
+fn nested(
+    entry: &Entries<'_>,
+    name: &str,
+    depth: usize,
+    budget: &mut usize,
+    scan: &mut dyn FnMut(&Entries<'_>, &mut usize),
+) {
+    if depth >= MAX_NESTING || *budget == 0 {
+        return;
+    }
+    let Some(bytes) = entry(name) else {
+        return;
+    };
+    *budget -= 1;
+    let Ok(zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return;
+    };
+    let zip = std::cell::RefCell::new(zip);
+    scan(&|name| read_entry(&mut zip.borrow_mut(), name), budget);
+}
+
 /// One file entry of a nested jar, when it exists, is a file and fits
-/// [`MAX_NESTED_JAR_BYTES`].
+/// [`MAX_NESTED_ENTRY_BYTES`].
 fn read_entry(zip: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>, name: &str) -> Option<Vec<u8>> {
     let mut file = zip.by_name(name).ok()?;
-    if file.is_dir() || file.size() > MAX_NESTED_JAR_BYTES {
+    if file.is_dir() || file.size() > MAX_NESTED_ENTRY_BYTES {
         return None;
     }
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
     Some(bytes)
+}
+
+/// Every `modId` of a `[[mods]]` record in a NeoForge (or Forge) mods TOML. A
+/// block header ends the record before it, so a `[[dependencies.x]]` block's
+/// `modId` (a requirement, not a mod) is never read as one.
+fn neoforge_mod_ids(text: &str) -> Vec<String> {
+    let mut in_mods = false;
+    let mut ids = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_mods = line == "[[mods]]";
+            continue;
+        }
+        if !in_mods {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim() == "modId"
+        {
+            ids.push(value.trim().trim_matches('"').trim_matches('\'').to_owned());
+        }
+    }
+    ids
 }
 
 /// Build the run order, link closure and missing-dependency rows for `jars`.
@@ -500,6 +561,78 @@ mod tests {
         );
         assert_eq!(plan.links_for(0), [1]);
         assert_eq!(plan.order, [1, 0]);
+    }
+
+    /// A NeoForge layout, with the rules FancyModLoader 12.0.12 and
+    /// JarJarSelector 0.5.3 read (`JarSelector.recursivelyDetectContainedJars`,
+    /// `JarInJarDependencyLocator.scanMods`): every jar
+    /// `META-INF/jarjar/metadata.json` names is a mod file whose `[[mods]]`
+    /// are mods, its own JarJar jars too; a jar in `META-INF/jars/` the
+    /// metadata does not name is not, and a dependency's `modId` is not a mod.
+    #[test]
+    fn jarjar_jars_provide_their_mod_ids_as_neoforge_selects_them() {
+        let toml = |mods: &[&str], extra: &str| {
+            let mut text = String::from("modLoader = \"javafml\"\n");
+            for id in mods {
+                text += &format!("[[mods]]\nmodId = \"{id}\"\nversion = \"1\"\n");
+            }
+            text + extra
+        };
+        let jarjar = |paths: &[&str]| {
+            let jars = paths
+                .iter()
+                .map(|path| {
+                    format!(r#"{{"identifier":{{"group":"g","artifact":"a"}},"path":"{path}"}}"#)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"{{"jars":[{jars}]}}"#)
+        };
+        let deep = zip_of(&[(
+            "META-INF/neoforge.mods.toml",
+            toml(&["deep_nf"], "").as_bytes(),
+        )]);
+        let inner_toml = toml(
+            &["inner_a", "inner_b"],
+            "[[dependencies.inner_a]]\nmodId = \"dep_x\"\ntype = \"required\"\n",
+        );
+        let inner_jarjar = jarjar(&["META-INF/jars/deep.jar"]);
+        let inner = zip_of(&[
+            ("META-INF/neoforge.mods.toml", inner_toml.as_bytes()),
+            ("META-INF/jarjar/metadata.json", inner_jarjar.as_bytes()),
+            ("META-INF/jars/deep.jar", &deep),
+        ]);
+        let unlisted = zip_of(&[(
+            "META-INF/neoforge.mods.toml",
+            toml(&["unlisted_nf"], "").as_bytes(),
+        )]);
+        let outer_toml = toml(&["outer"], "");
+        let outer_jarjar = jarjar(&["META-INF/jars/inner.jar", "META-INF/jars/absent.jar"]);
+        let outer = NativeJar::from_bytes(&zip_of(&[
+            ("META-INF/neoforge.mods.toml", outer_toml.as_bytes()),
+            ("META-INF/jarjar/metadata.json", outer_jarjar.as_bytes()),
+            ("META-INF/jars/inner.jar", &inner),
+            ("META-INF/jars/unlisted.jar", &unlisted),
+        ]))
+        .unwrap();
+        let dependent = jar(
+            "dependent",
+            &[
+                "outer",
+                "inner_a",
+                "inner_b",
+                "deep_nf",
+                "unlisted_nf",
+                "dep_x",
+            ],
+        );
+        let jars = [("dependent.jar", &dependent), ("outer.jar", &outer)];
+        let plan = plan(&jars);
+        assert_eq!(
+            plan.missing.get(&0).unwrap(),
+            &["dep_x".to_owned(), "unlisted_nf".to_owned()]
+        );
+        assert_eq!(plan.links_for(0), [1]);
     }
 
     /// A top-level mod's own `provides` answers for it too (`selectMod` puts
