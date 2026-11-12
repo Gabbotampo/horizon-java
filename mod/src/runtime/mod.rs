@@ -86,6 +86,7 @@ mod native_library;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
+mod neoforge_inject;
 mod neoforge_loader;
 mod neoforge_subscribe;
 mod nested_jars;

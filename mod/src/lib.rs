@@ -2080,6 +2080,7 @@ fn load_jar(
     let mut calls = 0;
     let mut ran = 0;
     let mut failures = Vec::new();
+    let mut failed_classes = Vec::new();
     for (kind, entry) in &entrypoints {
         if let Some(adapter) = entry.adapter.as_deref() {
             failures.push(format!(
@@ -2105,10 +2106,31 @@ fn load_jar(
                 calls += report.calls;
                 ran += 1;
             }
-            Ok(Err(error)) => failures.push(format!("{}: {error}", entry.class)),
+            Ok(Err(error)) => {
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{}: {error}", entry.class));
+            }
             // A caught panic is this stage failing: the remaining stages still run, and it counts
             // toward `ran-partial` exactly as an interpreter error does.
-            Err(panic) => failures.push(format!("{}: panicked: {panic}", entry.class)),
+            Err(panic) => {
+                failed_classes.push(entry.class.as_str());
+                failures.push(format!("{}: panicked: {panic}", entry.class));
+            }
+        }
+    }
+    // FML injects each container's `@EventBusSubscriber` classes once its `@Mod` classes are
+    // built; a failed injection fails that container (`runtime::neoforge_inject`).
+    if ran > 0 {
+        let injected = caught(&format!("{id} @EventBusSubscriber injection"), || {
+            jar.inject_event_subscribers(
+                &mut host,
+                &runtime::ExecutionBudget::within(JAR_BUDGET),
+                &failed_classes,
+            )
+        });
+        match injected {
+            Ok(problems) => failures.extend(problems),
+            Err(panic) => failures.push(format!("@EventBusSubscriber injection panicked: {panic}")),
         }
     }
     if ran == 0 {
