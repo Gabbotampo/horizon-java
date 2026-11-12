@@ -283,6 +283,28 @@ field, `EnumConfigProperty`'s `getEnumConstants`, `FabricBalmCapabilities`, and
 `CommentedProperties#save`'s `Pattern` outside the native regex subset. The game-bound
 list below is unchanged.
 
+## Re-measured (12 November 2026, Gson's JSON tree)
+
+Old is `9eb57c5` (main) and new is the same commit with Gson's JSON tree modelled from
+gson-2.14.0 (`gson_tree.rs`): `JsonObject`, `JsonArray`, `JsonPrimitive`, `JsonNull` and
+`LazilyParsedNumber`, `JsonElement.toString` and `Gson.toJson` of a tree. Reading text into a
+tree (`JsonParser`, `Gson.fromJson` into a tree class) is counted, and comes in the stacked
+parser PR. Same corpora, deps and command (release-built probes).
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 1,164 → **888** |
+| mega | 59 → **60** | 88 → 87 | 4 → 4 | 101 → 101 | 2,473 → **2,470** |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+
+Every `JsonObject` and `JsonArray` call left the ranking (the table above predates it;
+`JsonObject#addProperty(String, Boolean)` was 64 calls in 4 jars). Movers: `cupboard`
+(`326652-8890593.jar`) 78 → 2 and `structureessentials` (`832882-8896904.jar`) 198 → 2, both
+still `ran-hollow` on `Gson#fromJson(String, Class)` into `JsonObject` (Cupboard's
+`CupboardConfig#writeConfig`), now counted where the general `fromJson` path used to answer a map
+marker typed as a `JsonObject`; `modelbrowser` 3 → 0, now `ran-clean`; `takeitout` 53 → 49. No
+verdict got worse.
+
 ## Known limits of this census
 
 - The probe executes a jar as shipped. A jar whose entrypoint only works with its own
