@@ -387,6 +387,33 @@ answer on lists, not only on queues (`sequenced.rs`). A `javafml` mod's containe
   `ArrayBackedEvent#rebuildInvoker` and now stops at the `String#replaceAll` null in
   `RegisterMod`.
 
+## Re-measured (12 November 2026, `java.util.regex`)
+
+Old is `e02154f` (main, with sequenced lists and `ServiceLoader` providers) and new is the same
+commit with Java's regex engine reimplemented (`java_regex/`, `regex_calls.rs`): `String#matches`,
+`replaceAll`, `replaceFirst` and `split` answer exactly like OpenJDK 27 for any pattern in the
+modelled subset and are counted otherwise. Same corpora, deps and command (fast-built probes).
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → **33** | 43 → 48 | 4 → 4 | 38 → **31** | 911 → 4,941 |
+| mega | 60 → 60 | 88 → 99 | 4 → 4 | 100 → **89** | 2,504 → 10,761 |
+| NeoForge | 21 → 21 | 26 → 26 | 0 → 0 | 38 → 38 | 278 → 278 |
+
+`cupboard` (4 → 0) and `structureessentials` (9 → 0) are now `ran-clean`: Cupboard's
+`splitLongDesc` `replaceFirst` (lookbehinds, a `$1` replacement) is answered. Seven maxhenkel
+rows (Simple Voice Chat ×3, Sound Physics Remastered ×2, Peek ×2, over both corpora) leave
+`refused`: `CommentedProperties#removeNewLines`' `split("\\r?\\n")` was outside the old
+literal-only split. Collective's `RegisterMod#register` (`replaceAll("\\[", "")`, which answered
+null) no longer stops twelve Serilum rows: `collective` 8.67 itself (`ran-hollow`, 474), both
+`fullbrightnesstoggle` builds and both `stackrefill` builds among them. `collective` 8.42/8.46 stop
+earlier, in `RegisterMod.<clinit>` on the `HttpClient$Builder` null, and the NeoForge build in
+`ForgeModLoaderHelper#getGameDirectory`, as on main. `litematica-printer` and `collectorsalbum`
+stay refused at a later point. The unknown totals rise because those jars now run their config
+writers: `Character$UnicodeBlock.of` and `BASIC_LATIN` (683–954 calls each per maxhenkel jar) and
+`StringBuilder#charAt` are 11,729 of the 12,287 added calls. No regex call is left in the ranking or in a
+refusal, and none of these runs reaches a `Matcher` method. No verdict got worse.
+
 ## Known limits of this census
 
 - The probe executes a jar as shipped. A jar whose entrypoint only works with its own
