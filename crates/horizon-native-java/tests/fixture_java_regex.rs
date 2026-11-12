@@ -9,7 +9,7 @@
 //! modelled subset. Compiled with `javac --release 21` and run with `java`
 //! (OpenJDK 27), it printed the lines in `EXPECTED` verbatim.
 
-use horizon_native_java::{NativeJar, StdHost, Value};
+use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
     io::Write,
@@ -289,40 +289,53 @@ fn an_oversized_class_is_counted_not_a_crash() {
 
 /// The final review's stack repro: `String.matches` with the deepest search
 /// the bound allows (`(?:a|b)*` on 199 chars) from under 0–11 jar frames,
-/// on a 2 MiB thread. Unoptimized interpreter frames take ~100 KB each, and
+/// on a 2 MiB thread. Unoptimized interpreter frames take ~150 KB each, and
 /// at 8 of them the matcher's old fixed allowance overflowed the thread.
-/// Each depth now answers `true` like JDK 27, or counts the call when the
-/// stack left cannot hold the search; none aborts.
+/// Each depth now answers `true` like JDK 27, counts the call when the stack
+/// left cannot hold the search, or (since the frame bound is the thread's
+/// stack, `frame_bound.rs`) is refused before a frame the stack cannot hold
+/// starts; none aborts, and once a depth is refused every deeper one is.
 #[test]
 fn matches_under_deep_jar_frames_never_overflows() {
     let (root, jar) = fixture();
     let jar = std::sync::Arc::new(jar);
+    let mut refused_from = None;
     for depth in 0..=11 {
         let jar = std::sync::Arc::clone(&jar);
         let (answer, unknown) = std::thread::Builder::new()
             .stack_size(2 << 20)
             .spawn(move || {
                 let mut host = jar.seed_host(StdHost::new());
-                let answer = jar
-                    .invoke_method_with_args(
-                        "demo/Probe",
-                        "deep",
-                        "(ILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-                        None,
-                        &[
-                            Value::Int(depth),
-                            Value::Ref(Some("(?:a|b)*".into())),
-                            Value::Ref(Some("a".repeat(199))),
-                        ],
-                        &mut host,
-                    )
-                    .unwrap_or_else(|error| panic!("deep({depth}) failed: {error}"));
+                let answer = jar.invoke_method_with_args(
+                    "demo/Probe",
+                    "deep",
+                    "(ILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    None,
+                    &[
+                        Value::Int(depth),
+                        Value::Ref(Some("(?:a|b)*".into())),
+                        Value::Ref(Some("a".repeat(199))),
+                    ],
+                    &mut host,
+                );
                 (answer, host.unknown_host_calls())
             })
             .unwrap()
             .join()
             .unwrap();
         println!("deep({depth}): {answer:?}, counted {unknown:?}");
+        let answer = match answer {
+            Err(NativeError::CallDepthExceeded { .. }) => {
+                refused_from.get_or_insert(depth);
+                continue;
+            }
+            Err(error) => panic!("deep({depth}) failed: {error}"),
+            Ok(answer) => answer,
+        };
+        assert!(
+            refused_from.is_none(),
+            "deep({depth}) ran after a shallower depth was refused"
+        );
         if unknown.is_empty() {
             assert_eq!(answer, Value::Ref(Some("true".into())), "deep({depth})");
         } else {
@@ -336,5 +349,6 @@ fn matches_under_deep_jar_frames_never_overflows() {
             );
         }
     }
+    assert_ne!(refused_from, Some(0), "a 2 MiB thread runs the search");
     let _ = fs::remove_dir_all(root);
 }
