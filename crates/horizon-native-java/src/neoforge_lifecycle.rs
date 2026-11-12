@@ -334,6 +334,23 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Result<(), String> {
+        // `dispatchParallelTask` posts with the container active; `postEvent` sets none.
+        let active = (stage != LoadingStage::NetworkSetup).then_some(id);
+        let previous = crate::neoforge_imc::set_active(host, active);
+        let posted = self.post_listeners(stage, id, listeners, event, host, budget);
+        crate::neoforge_imc::set_active(host, previous.as_deref());
+        posted
+    }
+
+    fn post_listeners(
+        &self,
+        stage: LoadingStage,
+        id: &str,
+        listeners: &[BusListener],
+        event: &Value,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<(), String> {
         for listener in listeners {
             if let Err(error) =
                 self.invoke_listener_callback(&listener.callback, vec![event.clone()], host, budget)
@@ -376,12 +393,16 @@ impl NativeJar {
                     .or_default() += 1;
                 continue;
             };
-            if let Err(error) = self.invoke_listener_callback(&callback, Vec::new(), host, budget) {
-                let container = task
-                    .container
-                    .strip_prefix("neoforge-mod-container/")
-                    .and_then(|rest| rest.split('/').next())
-                    .unwrap_or(&task.container);
+            let container = task
+                .container
+                .strip_prefix("neoforge-mod-container/")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or(&task.container);
+            // `DeferredWorkQueue.lambda$makeRunnable$0` runs a task with its owner active.
+            let previous = crate::neoforge_imc::set_active(host, Some(container));
+            let ran = self.invoke_listener_callback(&callback, Vec::new(), host, budget);
+            crate::neoforge_imc::set_active(host, previous.as_deref());
+            if let Err(error) = ran {
                 failures.push(format!("deferred work of {container}: {error}"));
             }
         }

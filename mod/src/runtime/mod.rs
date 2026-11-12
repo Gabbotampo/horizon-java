@@ -88,6 +88,7 @@ mod native_library;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
+pub mod neoforge_imc;
 mod neoforge_inject;
 pub mod neoforge_lifecycle;
 mod neoforge_loader;
@@ -2103,6 +2104,13 @@ pub trait Host {
     ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
         None
     }
+    /// The `InterModComms` queues this host reads and sends to, and the unknown-call table
+    /// (`neoforge_imc.rs`). A host that keeps none answers `None`, and IMC stays unmodelled.
+    fn neoforge_imc(
+        &mut self,
+    ) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
+        None
+    }
     /// An instance field the interpreter does not hold, read with its
     /// receiver: a field of a host object (`player.connection` on a façade
     /// player). The default answers as hosts always did, without it.
@@ -2573,6 +2581,8 @@ pub struct StdHost {
     /// The command tree the jar's registration callbacks built and the
     /// command running now (`brigadier.rs`).
     brigadier: brigadier::BrigadierState,
+    /// FML's `InterModComms` queues, shared with the other jars of a game (`neoforge_imc.rs`).
+    imc: neoforge_imc::ImcHandle,
 }
 
 impl Default for StdHost {
@@ -2665,6 +2675,7 @@ impl StdHost {
             game_event: None,
             client: client_surface::ClientState::default(),
             brigadier: Default::default(),
+            imc: neoforge_imc::ImcHandle::default(),
         }
     }
 
@@ -3971,6 +3982,11 @@ impl Host for StdHost {
     ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
         Some((&mut self.neoforge_bus, &mut self.unknown_host_calls))
     }
+    fn neoforge_imc(
+        &mut self,
+    ) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
+        Some((&mut self.imc, &mut self.unknown_host_calls))
+    }
     fn write_console(&mut self, text: &str) {
         self.console_out.push_str(text);
     }
@@ -4072,6 +4088,7 @@ impl Host for StdHost {
             || self.mod_container_instance_of(marker, wanted)
             || neoforge_bus::bus_instance_of(marker, wanted)
             || neoforge_lifecycle::instance_of(marker, wanted)
+            || neoforge_imc::instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -15680,13 +15697,23 @@ impl NativeJar {
                     .cloned()
                     .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
                 let constructor_args = self.entry_constructor_args(&class_name, &constructor);
-                runtime.invoke(
+                // FML constructs a mod with its container active (`neoforge_imc.rs`).
+                let active = is_neoforge
+                    .then(|| self.mod_annotation_id(&class_name))
+                    .flatten();
+                let previous =
+                    active.and_then(|id| neoforge_imc::set_active(runtime.host, Some(id)));
+                let constructed = runtime.invoke(
                     &class_name,
                     "<init>",
                     &constructor.descriptor,
                     Some(Value::Ref(Some(class_name.clone()))),
                     &constructor_args,
-                )?;
+                );
+                if active.is_some() {
+                    neoforge_imc::set_active(runtime.host, previous.as_deref());
+                }
+                constructed?;
             }
             if method != "<init>" {
                 // The loader constructs the entrypoint instance and then calls
@@ -24014,6 +24041,12 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // FML's `InterModComms` (`neoforge_imc.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
