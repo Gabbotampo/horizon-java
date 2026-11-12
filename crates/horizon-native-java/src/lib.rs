@@ -38,6 +38,7 @@ mod facade_server;
 mod facade_text;
 mod field_access;
 mod field_get_set;
+mod frame_bound;
 mod game_codecs;
 mod game_hooks;
 mod gson_model;
@@ -12336,7 +12337,8 @@ pub enum NativeError {
         /// raised it; a host call has no frame and leaves this `None`.
         frame: Option<String>,
     },
-    /// A jar nested more jar frames than [`MAX_JAR_CALL_DEPTH`] allows.
+    /// A jar nested more jar frames than the thread's stack holds
+    /// (`frame_bound.rs`).
     ///
     /// The interpreter's frames are Rust frames, so an unbounded jar recursion
     /// is a process abort, not an error a loader could isolate. This bound
@@ -12346,7 +12348,7 @@ pub enum NativeError {
         /// The frame that would have exceeded the bound.
         class: String,
         method: String,
-        /// The bound, in nested jar frames.
+        /// The jar frames already on the chain when the next was refused.
         limit: usize,
     },
     /// A jar ran past the wall-clock budget its caller allowed.
@@ -12408,7 +12410,7 @@ impl std::fmt::Display for NativeError {
                 limit,
             } => write!(
                 f,
-                "native interpreter recursion exceeded {limit} nested jar frames at {class}#{method}"
+                "native interpreter recursion exceeded the thread's stack after {limit} nested jar frames at {class}#{method}"
             ),
             Self::ExecutionBudgetExceeded {
                 class,
@@ -12897,7 +12899,7 @@ pub struct ExecutionBudget {
 }
 
 impl ExecutionBudget {
-    /// No wall-clock bound; only [`MAX_JAR_CALL_DEPTH`] applies.
+    /// No wall-clock bound; only the stack bound (`frame_bound.rs`) applies.
     pub const UNBOUNDED: Self = Self { deadline: None };
 
     /// A budget that expires `limit` from now.
@@ -12921,20 +12923,8 @@ impl ExecutionBudget {
     }
 }
 
-/// The most jar frames one native execution may nest on a 2 MiB thread.
-///
-/// These frames are Rust frames, so an unbounded jar recursion is a stack
-/// overflow: the process aborts instead of unwinding to the loader that could
-/// skip just that jar. The safe count is a property of the compiled frame size.
-/// An unoptimised build reserves about 100 KiB per interpreter frame (every
-/// temporary of the instruction match gets its own slot); an optimised one
-/// reserves about 3 KiB. Both bounds keep more than a third of the 2 MiB
-/// default stack the game's server, render and worker threads run with, and
-/// both are far above what a normal entrypoint nests.
-#[cfg(debug_assertions)]
-const MAX_JAR_CALL_DEPTH: usize = 12;
-#[cfg(not(debug_assertions))]
-const MAX_JAR_CALL_DEPTH: usize = 128;
+// How deep jar frames may nest (as deep as the thread's stack holds) lives in
+// `frame_bound.rs`.
 
 /// Bytecode instructions between wall-clock budget checks inside one frame, so
 /// a loop that calls nothing cannot hold execution past its budget. A power of
@@ -18385,8 +18375,9 @@ struct Runtime<'a, H> {
     /// call.  LIFO, because a constructor argument may itself construct an
     /// object before the outer `<init>` runs.
     pending_skipped_new: Vec<String>,
-    /// Jar frames currently on this runtime's call chain. Bounded by
-    /// [`MAX_JAR_CALL_DEPTH`] in [`Runtime::invoke`] before a frame starts.
+    /// Jar frames currently on this runtime's call chain. Bounded by the
+    /// thread's stack (`frame_bound.rs`) in [`Runtime::invoke`] before a frame
+    /// starts.
     depth: usize,
     /// The wall-clock budget this execution honours, checked with
     /// [`BUDGET_CHECK_INSTRUCTIONS`] and in [`Runtime::invoke`].
@@ -22816,6 +22807,14 @@ impl<H: Host> Runtime<'_, H> {
     /// nested jar call — direct, `super`, virtual, callback or `<clinit>` —
     /// passes through it, and the depth is released on both the value and the
     /// error path.
+    ///
+    /// The callee's class is initialized before its frame starts, as the JVM
+    /// does it at the `invokestatic` (or `new`, see that instruction) in the
+    /// caller: its `<clinit>` nests one frame below the caller, not below the
+    /// callee, and a `StackWalker` inside it sees the caller. Initializing from
+    /// inside the callee's frame counted one extra frame per lazily initialized
+    /// class on the chain (two of the 12 that refused
+    /// `structure_layout_optimizer`).
     fn invoke(
         &mut self,
         class: &str,
@@ -22824,15 +22823,18 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<Value>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        if self.depth >= MAX_JAR_CALL_DEPTH {
+        if !frame_bound::admits_frame(self.depth) {
             return Err(NativeError::CallDepthExceeded {
                 class: class.to_owned(),
                 method: method.to_owned(),
-                limit: MAX_JAR_CALL_DEPTH,
+                limit: self.depth,
             });
         }
         if self.budget.expired() {
             return Err(self.budget_exceeded(class, method));
+        }
+        if method != "<clinit>" {
+            self.ensure_initialized(class)?;
         }
         self.depth += 1;
         stack_walk::enter(class, method);
@@ -22860,9 +22862,6 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<Value>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        if method != "<clinit>" {
-            self.ensure_initialized(class)?;
-        }
         // Snapshot the table so the frame's class reference outlives the
         // `&mut self` calls the instruction loop makes.
         let linked = Arc::clone(&self.linked);
@@ -23661,7 +23660,14 @@ impl<H: Host> Runtime<'_, H> {
                     let created = class_name(&file.pool, i)?;
                     let outcome = self.dispatch_new_anchor(&created, class, method, desc, at)?;
                     match outcome {
-                        AnchorOutcome::Normal => stack.push(self.new_object(&created)),
+                        AnchorOutcome::Normal => {
+                            // JVMS §6.5 `new`: the class is initialized here,
+                            // before the constructor's arguments are evaluated
+                            // and in this frame, so its failure is catchable
+                            // at this instruction.
+                            invoke_or_catch!(at, self.ensure_initialized(&created));
+                            stack.push(self.new_object(&created));
+                        }
                         // A cancelled NEW leaves the reference descriptor's
                         // default (null) and makes the matching `<init>` skip.
                         AnchorOutcome::Suppress => {
@@ -29961,25 +29967,25 @@ modId="minecraft"
         assert!(matches!(error, NativeError::InvalidBranch { .. }));
     }
 
-    /// Runs `f` on a thread with the 2 MiB stack the game's server, render and
-    /// worker threads run with, so a bound proven here holds where jars run.
-    fn on_a_game_thread_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    /// Runs `f` on a thread with a `stack`-byte stack: 2 MiB is what the
+    /// game's server, render and worker threads run with, so a bound proven
+    /// there holds where jars run.
+    fn on_a_thread_stack<T: Send + 'static>(
+        stack: usize,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         std::thread::Builder::new()
             .name("recursion-bound".into())
-            .stack_size(2 * 1024 * 1024)
+            .stack_size(stack)
             .spawn(f)
             .expect("spawn the bounded thread")
             .join()
             .expect("the depth bound keeps the recursion on its own stack")
     }
 
-    /// A jar that recurses without bound is one failed jar, not a process
-    /// abort: the interpreter's frames are Rust frames, and a stack overflow
-    /// cannot be caught by the batch's `catch_unwind`.
-    #[test]
-    fn unbounded_recursion_fails_with_the_depth_bound() {
-        // `static int f(int n) { return f(n); }`
-        let class = ClassFile {
+    /// `static int f(int n) { return f(n); }`
+    fn recurse_class() -> ClassFile {
+        ClassFile {
             name: "demo/Recurse".into(),
             super_name: "java/lang/Object".into(),
             pool: vec![
@@ -30009,47 +30015,12 @@ modId="minecraft"
 
             annotations: Vec::new(),
             raw: Vec::new(),
-        };
-        on_a_game_thread_stack(move || {
-            let jar = NativeJar::from_classes([class]);
-            let error = jar
-                .invoke_method_with_args(
-                    "demo.Recurse",
-                    "f",
-                    "(I)I",
-                    None,
-                    &[Value::Int(1)],
-                    &mut NullHost,
-                )
-                .expect_err("an unbounded recursion must fail");
-            let text = error.to_string();
-            match error {
-                NativeError::CallDepthExceeded {
-                    class,
-                    method,
-                    limit,
-                } => {
-                    assert_eq!(class, "demo/Recurse");
-                    assert_eq!(method, "f");
-                    assert_eq!(limit, MAX_JAR_CALL_DEPTH);
-                }
-                other => panic!("expected the depth bound, got {other:?}"),
-            }
-            assert!(
-                text.contains(&format!(
-                    "{MAX_JAR_CALL_DEPTH} nested jar frames at demo/Recurse#f"
-                )),
-                "{text}"
-            );
-        });
+        }
     }
 
-    /// The bound leaves a legitimate recursive method alone: a chain just
-    /// under it answers normally.
-    #[test]
-    fn recursion_below_the_bound_still_runs() {
-        // `static int down(int n) { if (n == 0) return 0; return down(n - 1); }`
-        let class = ClassFile {
+    /// `static int down(int n) { if (n == 0) return 0; return down(n - 1); }`
+    fn countdown_class() -> ClassFile {
+        ClassFile {
             name: "demo/Countdown".into(),
             super_name: "java/lang/Object".into(),
             pool: vec![
@@ -30081,16 +30052,85 @@ modId="minecraft"
 
             annotations: Vec::new(),
             raw: Vec::new(),
-        };
-        let depth = (MAX_JAR_CALL_DEPTH - 4) as i32;
-        let result = on_a_game_thread_stack(move || {
-            NativeJar::from_classes([class])
+        }
+    }
+
+    /// Recurse without bound on a `stack`-byte thread; answers the depth the
+    /// bound refused at.
+    fn unbounded_recursion_depth(stack: usize) -> usize {
+        on_a_thread_stack(stack, move || {
+            let jar = NativeJar::from_classes([recurse_class()]);
+            let error = jar
+                .invoke_method_with_args(
+                    "demo.Recurse",
+                    "f",
+                    "(I)I",
+                    None,
+                    &[Value::Int(1)],
+                    &mut NullHost,
+                )
+                .expect_err("an unbounded recursion must fail");
+            let text = error.to_string();
+            match error {
+                NativeError::CallDepthExceeded {
+                    class,
+                    method,
+                    limit,
+                } => {
+                    assert_eq!(class, "demo/Recurse");
+                    assert_eq!(method, "f");
+                    assert!(
+                        text.contains(&format!(
+                            "after {limit} nested jar frames at demo/Recurse#f"
+                        )),
+                        "{text}"
+                    );
+                    limit
+                }
+                other => panic!("expected the depth bound, got {other:?}"),
+            }
+        })
+    }
+
+    /// A jar that recurses without bound is one failed jar, not a process
+    /// abort: the interpreter's frames are Rust frames, and a stack overflow
+    /// cannot be caught by the batch's `catch_unwind`.
+    #[test]
+    fn unbounded_recursion_fails_with_the_depth_bound() {
+        let depth = unbounded_recursion_depth(2 << 20);
+        assert!(depth >= 1, "a 2 MiB thread runs at least one frame");
+    }
+
+    /// The bound is the thread's stack, not a fixed count: four times the
+    /// stack nests more frames, and the count cap stops a recursion that
+    /// would otherwise fill a very large stack.
+    #[test]
+    fn the_depth_bound_follows_the_threads_stack() {
+        let game_thread = unbounded_recursion_depth(2 << 20);
+        let main_thread = unbounded_recursion_depth(8 << 20);
+        assert!(
+            main_thread > game_thread,
+            "8 MiB nests {main_thread}, 2 MiB {game_thread}"
+        );
+        assert_eq!(
+            unbounded_recursion_depth(1 << 30),
+            frame_bound::MAX_JAR_CALL_DEPTH
+        );
+    }
+
+    /// The bound leaves a legitimate recursive method alone: a chain deeper
+    /// than the old fixed bound of 12 (unoptimised) answers normally on a
+    /// thread whose stack holds it, as the JVM's would.
+    #[test]
+    fn recursion_below_the_bound_still_runs() {
+        let result = on_a_thread_stack(64 << 20, move || {
+            NativeJar::from_classes([countdown_class()])
                 .invoke_method_with_args(
                     "demo.Countdown",
                     "down",
                     "(I)I",
                     None,
-                    &[Value::Int(depth)],
+                    &[Value::Int(200)],
                     &mut NullHost,
                 )
                 .unwrap()

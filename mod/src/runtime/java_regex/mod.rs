@@ -35,7 +35,7 @@
 //! an unknown host call, never a guessed answer.
 
 mod engine;
-mod stack;
+pub(crate) mod stack;
 mod syntax;
 #[cfg(test)]
 mod tests;

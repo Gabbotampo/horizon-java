@@ -89,7 +89,7 @@ const MAX_STACK: usize = 1_280 << 10;
 const STACK_RESERVE: usize = 128 << 10;
 /// The allowance where the platform does not report the thread's stack:
 /// what the interpreter promises to leave free on a 2 MiB thread
-/// (`MAX_JAR_CALL_DEPTH`) less [`STACK_RESERVE`].
+/// (`frame_bound::UNKNOWN_STACK_DEPTH`) less [`STACK_RESERVE`].
 const UNKNOWN_STACK: usize = 512 << 10;
 
 type R<T> = Result<T, Unsupported>;
