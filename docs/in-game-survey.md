@@ -721,3 +721,108 @@ The §5.2 follow-ups on the `after` build, each relaunching a copy of the same w
 Results (both batch JSONs, game logs, `java-runtime.json` reports, player files, probe outputs, the
 three discarded runs and the scripts) stay on elysium under
 `~/ava/results/attachments-carryon-2026-11-11/` and are not committed.
+
+## Third survey: after attachments, config and reflection (12 November 2026, elysium)
+
+The same 40 jars in the same 10 batches plus the fixture batch, re-run on current `main`. The `#56`
+column is the re-survey above. Its build was horizon-java `ba4ece913d`, whose runtime is `main` at
+`02c1d4e8ad`. That is **before** #49–#53 too: those five merged into the `docs/unmodelled-census`
+branch and reached `main` with #55, after the re-survey's build. So this delta covers #49–#53, #55,
+#58/#59, #61, #62, #65–#68, #70, #71, #73, #74 and #75.
+
+| | |
+|---|---|
+| Machine | elysium (x86_64, 24 cores, RTX 3090, NVIDIA 615.78.08), headless, the game on a private `Xvfb :83`; nice 10, `CARGO_BUILD_JOBS=12` |
+| Game source | `arismoko/horizon` `cf0113879ebee600bff86070466f75b2db90b40a` (still the pin in `mod/horizon-mod.toml`), unmodified; the re-survey's stage worktree, with `native-api/horizon_java` replaced by each measured commit's `mod/` (the `horizon-mod-api` path edit only) |
+| Game's own version line | `Horizon 0.1.0`: the first line of all 22 batch logs. The pinned game logs no commit field, so the stage's `HEAD` above is the build |
+| Measured | **horizon-java `9eb57c547f`** (`main` with #75), and **`e912e9f117`** (`main` with #74, before #75 merged) as a separate full run. `tools/vendor.py --check`: 77 vendored files match `crates/horizon-native-java/src` at both (`vendor.lock` records an older commit, a stale record, not a different runtime) |
+| Build | dev profile, default features, rust 1.99.1, a fresh target dir; `HORIZON_NO_AUDIO=1` at run time; the generated `main.rs` binds `mod_0::hooks` as the launcher writes it |
+| Driver | `tools/in_game_survey.py --sample`, then `--manifest` with the fixture batch, unchanged since the re-survey: fresh scratch tree per batch under `~/ava/env`, 10 GiB systemd cap, 600 play ticks, `--world B<n> --creative` with no `--seed` |
+
+**#75 changed nothing in this sample.** The `e912e9f` and `9eb57c5` runs agree on every jar's
+verdict, unknown count, host-call count, usages, commands and failures; only tick-driven callback
+totals differ, because run lengths differ. The table below is the `9eb57c5` run.
+
+**Fixtures:** all four `ran-clean` again. `/javahello Viola` answered `Hello, Viola!`, and
+`give m3_fixture:ruby_block 1` gave one.
+
+**Playability:** 11/11 runs reached `wait-ready` (732–773 play ticks), placed and broke a block in all
+11 (the re-survey's `b6` leaf miss did not recur), moved 3.4–14.1 blocks, and quit cleanly.
+
+### Per jar, #56 → now
+
+Only jars where something moved are listed. The other 33 are unchanged in verdict, unknown count,
+callbacks ran/failed, usages and command answer, apart from tick-driven callback counts
+(`connectivity`, `limitedchunks`, `cupboard` 631–632 → 669–670).
+
+| jar | #56 in game | now in game | cb ran/failed | usages tr/ref | survey command | cause |
+|---|---|---|---|---|---|---|
+| `carryon` | ran-hollow, 13 unknown | **ran-hollow, 2 unknown** | 7/616 → **671/0** | 3/2 → **5/0** | `/carryon debug`: "An unexpected error occurred" (`Player#getData`) → **ran**, no reply (returns 0, as the jar does for a player carrying nothing) | listeners and the command: **#58/#59** (attachments). Usages: **#61** (`EntityArgument.players()` carried as the player kind). Entry unknowns, from a probe at each merge: **#67** removed `ModConfigSpec$Builder#build` ×2 (and so reached a second `ModContainer#registerConfig`, 1 → 2); **#68** removed `Field#canAccess` ×8, which uncovered 27 `Field#getBoolean`/`getDouble`/`getInt`; **#71** removed those 27; **#73** removed `registerConfig` ×2. The 2 left are `IEventBus#addListener(Consumer)` |
+| `Jade` | ran-hollow, 4 | ran-hollow, 4 | 1/0 → 1/0 | 0/2 → **2/0** | `/jade`: unknown command → same | usages: **#61**. `/jade` is still not a registered root; the 4 unknowns are unchanged (`IEventBus#addListener`) |
+| `Iceberg` | ran-clean, **2 listener failures** | ran-clean | 0/2 → **2/0** | 0/0 | — | **#51** (Guava `MapMaker`): `EventFactory#<clinit>` no longer dies on `makeMap()`, so `level_load` and `player_join` run. One counted unknown remains inside the `level_load` callback (the report does not name it) |
+| `structure_pool_api` | ran-clean, **1 listener failure** | ran-clean | 0/1 → **1/0** | 0/0 | — | **#51**: `StructurePoolAPI#<clinit> +44` no longer dies on the `MapMaker` null |
+| `collective` | refused, 112 unknown | refused, **80** unknown | 0/0 | 0/0 | — | **#51** moved the failure. The `EventFactoryImpl#<clinit>` `MapMaker` NPE is gone, and the entrypoint now throws `NullPointerException: Cannot read field "listeners"`, reported at `ArrayBackedEvent#register +53`. That offset is the `synchronized` block's rethrow, so the first throw is inside the locked region (`getOrCreatePhase` → `EventPhaseData#addListener` → `rebuildInvoker`) and is not pinned down yet. The count is what was counted before the throw, so it follows where the throw lands |
+| `stackrefill` (with `collective`) | refused, 1 unknown | refused, **5** unknown | 0/0 | 0/0 | — | **#50** (Fabric `ModOrigin`): `FabricBundleJarJarCheck#isModJarJard +41` no longer NPEs. The next stop is collective's `RegisterMod#register +30`, `String.replace` on null. Its receiver is `arg.replaceAll("\\[", "")` (+18–23), so `String#replaceAll` answered null |
+| `NoChatReports` | ran-clean | **ran-hollow, 1 unknown** | 0/0 | 0/0 | — | **#49** (honest Gson): `Gson#toJson(Object, Appendable)` is now counted instead of answered as if written. At `02c1d4e` the probe reports 0 unknowns; at #49's merge (`535c990`) it reports this 1. Its config file write never happened before either; the label now says so |
+
+Totals, using the unknown-call names from the jars' own `--json` probe on `9eb57c5`'s runtime (`neoforge`/`main` stage, matching the game's counts):
+
+| Measure | Re-survey #56 (`ba4ece913d`) | Now (`9eb57c547f`) |
+|---|---|---|
+| In-game verdicts | 19 `ran-clean` (4 with listener failures), 13 `ran-hollow`, 1 `ran-partial`, 7 `refused` | **18 `ran-clean`** (2 with listener failures), **14 `ran-hollow`**, 1 `ran-partial`, 7 `refused` |
+| Unknown host calls (entrypoints) | 431 | **393**: `carryon` −11, `collective` −32, `stackrefill` +4, `NoChatReports` +1 |
+| Unknown host calls inside callbacks | 36 | 36 (22 `calcmod`, 8 `chunky`, 2 `baguettelib`, 1 each `Iceberg`, `carryon` (`sync_not_sent`), `mcwifipnp`, `entity-view-distance`) |
+| Callbacks ran / failed | 1,919 / 621 | **2,700 / 2** |
+| Listener failures by jar | `carryon` 616, `Iceberg` 2, `chunky` 1, `mcwifipnp` 1, `structure_pool_api` 1 | `chunky` 1 (`ServerLevel#getWorldBorder()`), `mcwifipnp` 1 (its own `IUPnPProvider#getUPnPInstance()`) |
+| Command usages translated / refused | 116 / 29 | **120 / 25** (`carryon` and `Jade` +2/−2 each, #61) |
+| Survey commands run / refused at runtime | 1 / 4 | **2 / 3**: `modelbrowser` and `carryon` run; `limitedchunks` (`CommandSourceStack#getLevel()`), `chunky` (`ChunkyFabric#chunky()`) and `mcwifipnp` (`JsonObject#entrySet()`) are refused |
+| Content declarations | 0 blocks, 0 items from the 40 | the same; the `m3` fixture's block was given through its baked package |
+
+**Regressions: one label, no behaviour.** `NoChatReports` went `ran-clean` → `ran-hollow`. That is
+#49 counting a Gson write it used to pretend happened; the jar does exactly what it did before.
+Nothing else got worse. No jar went from running to refused, no listener or command that worked in
+#56 fails now, and the fixtures did not move. #75 had no effect here, for better or worse.
+
+**Still not working, even where the label is good.** `carryon` runs all its listeners and
+its debug command, but it is `ran-hollow`: its two mod-bus listeners are never registered, and
+carrying itself was not exercised. 22 of the 40 jars remain `ran-hollow` (14), `ran-partial` (1)
+or `refused` (7).
+
+### Top in-game causes now
+
+1. **Gson instance calls**: 280 of the 393 entrypoint unknowns. `JsonObject#add`/`addProperty`/`get`/
+   `asMap` and `JsonArray#add` account for `structureessentials` 198 and `cupboard` 78, `JsonObject#addProperty`
+   for `modelbrowser` 3, and `Gson#toJson(Object, Appendable)` for `NoChatReports` 1. `JsonObject#entrySet()`
+   also refuses `/uuidfixer list` (`mcwifipnp`). Four jars hollow, one command refused.
+2. **NeoForge mod-bus `IEventBus#addListener`** (`(Consumer)` and `(Class, Consumer)`): 20 calls in 7
+   NeoForge jars: the only remaining unknowns in 6 of them (`fzzy_config` 8, `Jade` 4,
+   `supermartijn642configlib` 3, `carryon` 2, `ForgeConfigAPIPort` 1, `yacl` 1), and one of
+   `geckolib`'s 2 (the other is `DeferredRegister$DataComponents#registerComponentType`). This is
+   now the whole gap between `carryon` and `ran-clean`.
+3. **Refusals: missing dependencies (4) and host `null`s that a call then hits (3 + 1 partial).**
+   `fancymenu` (`melody`), `respackopts` (`libjf`), `spark` (Fabric API modules) and
+   `structure_layout_optimizer` (`resourcefulconfig`) declare dependencies the sample leaves out.
+   `collective` (the `listeners` NPE above), `stackrefill` (`String#replaceAll` answering null),
+   `Bookshelf` (`Class#getCanonicalName()` on a null `getClass()` at `Services#lambda$loadMany$0 +4`)
+   and `krypton`'s `main` (a Netty `ByteBuf` in `NativeConstraints#<clinit> +37`) are the runtime's
+   own gaps.
+
+Then the single-call hollows: `Properties#setProperty` ×2 (`PacketFixer`) and `String#formatted` ×1
+(`MossyLib`), both in open #63; `Optionull#mapOrElse` ×2 (`ResourcefulLib`). Then the game reads the
+mod API does not carry: `CommandSourceStack#getLevel()`, `ServerLevel#getWorldBorder()`. Then the
+command bridge's remaining 25 refused usages (`Dimension` 6, `BlockPos` 5, `Bool` 5, `Resource` 3,
+`Identifier` 2, permission predicates 3, `GameProfile` 1). `modelbrowser`'s reply still arrives as
+its raw translation key.
+
+### How the causes were found
+
+A native probe was built at every first-parent merge from `02c1d4e` to `9eb57c5`, including the
+merges inside #55's branch (`8742db2`, `5ff89dd` #50, `882a216` #51, `06be281` #52, `f64dfa5` #53,
+`535c990` #49). It was run on `NoChatReports`, `carryon`, `Jade`, `collective`, `stackrefill --link
+collective`, `cupboard` and `structureessentials --link cupboard`, and the first merge where each
+result changed is the cause named above. Listener and command changes are not visible to the
+probe. They are attributed from the failure the re-survey logged (`Player#getData` → #58/#59, the
+`MapMaker` null → #51, the `Entity` argument kind → #61), and that failure is gone in this run.
+
+Results (all 22 batch JSONs, game logs, `java-runtime.json` reports, probe and sweep outputs, the
+build logs) stay on elysium under `~/ava/results/survey3-2026-11-12/` and are not committed.
