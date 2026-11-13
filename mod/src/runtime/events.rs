@@ -1062,6 +1062,16 @@ pub struct EventContext {
     /// What `player` holds and their game mode, read by the hook for this
     /// firing (`facade_world.rs`). `None` makes those reads refuse.
     pub held: Option<HeldItems>,
+    /// Whether a block entity stood at `pos`, for Fabric `PlayerBlockBreakEvents.AFTER`'s
+    /// `BlockEntity` (the `level.getBlockEntity(pos)` `destroyBlock` read before the removal).
+    /// `Some(false)` passes `null`, as vanilla does for a block without one; `Some(true)` passes
+    /// a marker whose reads are counted, because the host hands over the entity's saved data, not
+    /// a live object. `None` (a hook that does not say) passes `null`, as before.
+    pub block_entity: Option<bool>,
+    /// NeoForge `ServerTickEvent`/`LevelTickEvent#hasTime`: the host's
+    /// `MinecraftServer.haveTime()`, read once when the tick hook fires (NeoForge
+    /// evaluates its `BooleanSupplier` at each call). `None` refuses the read.
+    pub has_time: Option<bool>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1584,13 +1594,18 @@ impl StdHost {
                     .as_ref()
                     .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}"))),
                 ("getHand", _) => Some(hand_marker(context.off_hand)),
+                // `PlayerInteractEvent.EntityInteract#getTarget`: the clicked entity.
+                ("getTarget", _) if event == GameEvent::UseEntity => context
+                    .entity
+                    .as_ref()
+                    .map(|entity| marker(format!("game/entity/{}", entity.id))),
                 ("getState", _) => context.block.as_deref().map(block_state_marker),
                 ("getEntity" | "getPlayer" | "player" | "entity", _) => context_subject(&context),
                 ("getSource" | "source", _) => context
                     .damage
                     .as_ref()
                     .map(|damage| marker(format!("game/damage/{damage}"))),
-                ("hasTime", "Z") => flag(true),
+                ("hasTime", "Z") => context.has_time.and_then(flag),
                 // NeoForge `PlayerEvent.Clone#isWasDeath`: `ServerPlayer.restoreFrom(old,
                 // keepEverything)` posts `new Clone(this, old, !keepEverything)` (@371-382 of the
                 // 26.3 patched server). The firing's flag is Fabric `COPY_FROM`'s `alive`, which
@@ -2216,7 +2231,13 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             vec![subject(), damage(), Value::Float(f64::from(context.amount))]
         }
         Shape::EntityDamage => vec![subject(), damage()],
-        Shape::BlockBreak => vec![level(), player(), pos(), block_state(), Value::Ref(None)],
+        Shape::BlockBreak => {
+            let block_entity = match context.block_entity {
+                Some(true) => missing("block-entity"),
+                Some(false) | None => Value::Ref(None),
+            };
+            vec![level(), player(), pos(), block_state(), block_entity]
+        }
         Shape::UseBlock => {
             // The hit result names its block and face: `game/block-hit/x,y,z/UP`.
             let hit = context.pos.map_or_else(
@@ -2760,6 +2781,52 @@ mod tests {
         assert!(matches!(name, Some(Err(NativeError::UnknownHostCall(_)))));
     }
 
+    /// Fabric `PlayerBlockBreakEvents.AFTER` gets `destroyBlock`'s `this.level`, the player, the
+    /// position, the state and the `BlockEntity` it read before the removal: `null` when no block
+    /// entity stood there, otherwise an object this host cannot rebuild from saved data, so a
+    /// counted marker rather than a `null` that would say "none".
+    #[test]
+    fn an_after_break_passes_the_level_and_a_null_or_counted_block_entity() {
+        let firing = |block_entity| {
+            EventFiring::new(
+                GameEvent::BlockBreakAfter,
+                Arc::new(EventFacade::default()),
+                EventContext {
+                    level: Some("minecraft:the_nether".into()),
+                    player: Some(7),
+                    pos: Some([1, 2, 3]),
+                    block: Some("minecraft:chest".into()),
+                    block_entity,
+                    ..EventContext::default()
+                },
+            )
+        };
+        let without = fabric_arguments(Shape::BlockBreak, &firing(Some(false))).unwrap();
+        assert_eq!(without[0], level_marker("minecraft:the_nether"));
+        assert_eq!(without[1], player_marker(7));
+        assert_eq!(without[3], block_state_marker("minecraft:chest"));
+        assert_eq!(without[4], Value::Ref(None));
+
+        let with = fabric_arguments(Shape::BlockBreak, &firing(Some(true))).unwrap();
+        assert_eq!(with[4], marker("game/unknown/block-entity".into()));
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(firing(Some(true))));
+        let before = host.unknown_host_call_count();
+        let read = host
+            .game_event_call(
+                &MethodRef {
+                    owner: "net/minecraft/world/level/block/entity/BlockEntity".into(),
+                    name: "getBlockPos".into(),
+                    descriptor: "()Lnet/minecraft/core/BlockPos;".into(),
+                },
+                &with[4],
+                &[],
+            )
+            .unwrap();
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(host.unknown_host_call_count(), before + 1);
+    }
+
     /// A firing that names the block and the position lets a block-break
     /// callback read both: `Blocks.STONE` is the state's block, and the
     /// position's coordinates come back. An argument the firing does not give
@@ -2871,6 +2938,55 @@ mod tests {
             marker("enum/net/minecraft/world/InteractionHand/OFF_HAND".into())
         );
         assert_eq!(args[3], marker("game/entity/42".into()));
+    }
+
+    /// NeoForge's `EntityInteract#getTarget()` is the clicked entity and `getLevel()` the
+    /// player's level: the same entity and level a Fabric `UseEntityCallback` is handed.
+    #[test]
+    fn an_entity_interaction_answers_its_target_and_level() {
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::UseEntity,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(7),
+                level: Some("minecraft:the_nether".into()),
+                entity: Some(FacadeEntity {
+                    id: 42,
+                    kind: "minecraft:cow".into(),
+                    level: Some("minecraft:the_nether".into()),
+                }),
+                off_hand: Some(false),
+                ..EventContext::default()
+            },
+        )));
+        let event = event_marker(GameEvent::UseEntity);
+        let call = |host: &mut StdHost, name: &str, returns: &str| {
+            host.game_event_call(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$EntityInteract"
+                        .into(),
+                    name: name.into(),
+                    descriptor: format!("(){returns}"),
+                },
+                &event,
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(
+            call(
+                &mut host,
+                "getTarget",
+                "Lnet/minecraft/world/entity/Entity;"
+            ),
+            marker("game/entity/42".into())
+        );
+        assert_eq!(
+            call(&mut host, "getLevel", "Lnet/minecraft/world/level/Level;"),
+            level_marker("minecraft:the_nether")
+        );
     }
 
     /// A firing that does not know which hand acted passes a hand marker no read answers:

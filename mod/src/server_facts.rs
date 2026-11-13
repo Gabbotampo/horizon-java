@@ -181,15 +181,16 @@ fn facade_stack(host: &dyn Host, stack: &ItemStack) -> FacadeStack {
     }
 }
 
-/// What `player` holds and their game mode, for a use-item firing: the
-/// clicked hand is the hook's own stack (what `getItemInHand(hand)` answers
-/// at `UseItemCallback` time), the other hand is read from the host. `None`
-/// when the host cannot name the player's living entity, so the reads refuse.
+/// What `player` holds and their game mode, for a use-item or use-entity
+/// firing: the clicked hand is the hook's own stack (what `getItemInHand(hand)`
+/// answers at `UseItemCallback`/`UseEntityCallback` time; `None` is an empty
+/// hand), the other hand is read from the host. `None` when the host cannot
+/// name the player's living entity, so the reads refuse.
 pub(crate) fn held_items(
     host: &dyn ServerHost,
     player: PlayerRef,
     clicked: Hand,
-    stack: &ItemStack,
+    stack: Option<&ItemStack>,
 ) -> Option<HeldItems> {
     let living = host.living(player.entity())?;
     let other = match clicked {
@@ -200,7 +201,7 @@ pub(crate) fn held_items(
     let other_stack = living
         .hand_item(host, other)
         .map(|stack| facade_stack(host, &stack));
-    let clicked_stack = Some(facade_stack(host, stack));
+    let clicked_stack = stack.map(|stack| facade_stack(host, stack));
     let (main_hand, off_hand) = match clicked {
         Hand::Main => (clicked_stack, other_stack),
         _ => (other_stack, clicked_stack),
