@@ -190,7 +190,8 @@ impl<H: Host> Runtime<'_, H> {
                 let source_marker = expect_ref(&source).cloned().unwrap_or_default();
                 let root = self.mod_count_root(&source_marker);
                 let structure = self.structure_of(&source, how)?;
-                let expected = self.mod_stamp(&root);
+                let expected = self.capture_mod_count(&source);
+                let deque = !self.has_mod_count(&source);
                 let iterator = self.host.invoke_instance(r, receiver, args)?;
                 if let Some(iterator) = expect_ref(&iterator) {
                     self.host.store_iterator_guard(
@@ -205,7 +206,7 @@ impl<H: Host> Runtime<'_, H> {
                             },
                             expected,
                             structure,
-                            deque: how == FailFast::Deque,
+                            deque,
                         },
                     );
                 }
@@ -404,13 +405,17 @@ impl<H: Host> Runtime<'_, H> {
                 doomed[index] = true;
             }
         }
-        match self.mod_verdict(&root, expected, source, FailFast::ArrayList, &structure)? {
-            ModVerdict::Same => {}
-            ModVerdict::Changed => return Err(concurrent_modification()),
-            ModVerdict::Unknown => {
-                self.count_list_member(source, "removeIf", "(Ljava/util/function/Predicate;)Z")?;
-                return Ok(Value::Int(0));
-            }
+        // A resize no tracked member made is a change too.
+        if self.resized(source, FailFast::ArrayList, &structure)? {
+            return Err(concurrent_modification());
+        }
+        let counted = MethodRef {
+            owner: self.host_collection_class(source).unwrap_or_default(),
+            name: "removeIf".into(),
+            descriptor: "(Ljava/util/function/Predicate;)Z".into(),
+        };
+        if !self.check_mod_count(&counted, source, expected)? {
+            return Ok(Value::Int(0));
         }
         if first >= end {
             return Ok(Value::Int(0));
@@ -479,8 +484,7 @@ impl<H: Host> Runtime<'_, H> {
             next_index -= 1;
             live.remove(next_index);
             self.host.replace_mutable_collection(source, live);
-            self.bump_mod_count(&root, false);
-            expected = self.mod_stamp(&root);
+            expected = self.own_structural_change(source);
             structure = self.structure_of(source, FailFast::Cursor)?;
             removed = true;
         }
