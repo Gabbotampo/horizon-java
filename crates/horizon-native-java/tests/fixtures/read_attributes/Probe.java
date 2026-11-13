@@ -65,6 +65,26 @@ public final class Probe {
         return out.toString();
     }
 
+    /// Where `realPaths` works: an absolute directory. The oracle's driver
+    /// sets it to the JVM's working directory.
+    public static String base = "/w";
+
+    public static String realPaths() throws Exception {
+        Path root = Path.of(base);
+        Path dir = Files.createDirectories(root.resolve("d"));
+        Path file = Files.writeString(dir.resolve("x.toml"), "x");
+        StringBuilder out = new StringBuilder();
+        out.append(file.toRealPath().equals(file)).append(',')
+            .append(dir.toRealPath().equals(dir)).append('|');
+        out.append(attempt(() -> dir.resolve("missing").toRealPath())).append('|');
+        out.append(attempt(() -> file.resolve("y").toRealPath())).append('|');
+        out.append(Path.of("a//b/").equals(Path.of("a/b"))).append(',')
+            .append(Path.of("a/b").equals(Path.of("a/c"))).append(',')
+            .append(Path.of("a").equals("a")).append(',')
+            .append(Path.of("a//b/").hashCode()).append(',').append(Path.of("/a").hashCode());
+        return out.toString().replace(base, "<base>");
+    }
+
     /// The attributes the model cannot know: counted.
     public static String counted() throws Exception {
         Path a = Path.of("a.toml");
