@@ -60,6 +60,15 @@ public final class HostValues {
         + ((Object) Optional.empty() != Optional.of(1)) + (OptionalInt.of(5) != OptionalInt.of(6));
   }
 
+  /** The same handle flowing to both sides is one object (provable). */
+  public static String sameHandle() {
+    OptionalInt a = OptionalInt.of(5);
+    OptionalInt b = a;
+    Optional<String> c = Optional.of("x");
+    Object d = c;
+    return "" + (a == b) + (c == d) + (a != b);
+  }
+
   /** Two OptionalInt.of(5) are equal values but different objects. */
   public static String byValue() {
     return "" + (OptionalInt.of(5) == OptionalInt.of(5));
@@ -139,6 +148,8 @@ fn no_string_spells_an_optional_and_the_optionals_answer_as_java_25() {
         ),
         // The empties are the kinds' singletons (canonical: one object).
         ("canonical", "truetruetruetruetruetrue"),
+        // The same handle on both sides: provably one object, not counted.
+        ("sameHandle", "truetruefalse"),
     ] {
         let (value, unknown) = run(&jar, name);
         assert_eq!(

@@ -22,7 +22,8 @@
 //!   but may be different objects (`Optional.of(5)` twice, `OptionalInt.of(5)`
 //!   twice). An identity operation on two of them (`==`, `!=`) is counted,
 //!   unless the same handle provably flows to both sides, which the identity
-//!   analysis decides (#126). Equal keys never answer identity.
+//!   analysis decides (`reference_identity.rs`). Equal keys never answer
+//!   identity.
 
 use std::sync::Arc;
 
@@ -157,34 +158,6 @@ impl HostRef {
     pub(crate) fn parse_marker(body: &str) -> Option<Self> {
         let (tag, key) = body.split_once(':')?;
         Some(Self::new(HostKind::from_tag(tag)?, key))
-    }
-}
-
-impl<H: crate::Host> crate::Runtime<'_, H> {
-    /// `if_acmp` on two handles: different handles are different objects; a
-    /// canonical kind's equal handles are one object; equal by-value handles
-    /// are counted (Java's answer is an identity the handle does not keep)
-    /// and keep the old `true`. `None` when either side is no handle.
-    pub(crate) fn host_same_object(
-        &mut self,
-        lhs: &crate::Value,
-        rhs: &crate::Value,
-    ) -> Result<Option<bool>, crate::NativeError> {
-        let (crate::Value::Host(left), crate::Value::Host(right)) = (lhs, rhs) else {
-            return Ok(None);
-        };
-        if left != right {
-            return Ok(Some(false));
-        }
-        if left.canonical() {
-            return Ok(Some(true));
-        }
-        self.host.unknown_operand_call(&crate::MethodRef {
-            owner: "java/lang/Object".into(),
-            name: "if_acmp".into(),
-            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
-        })?;
-        Ok(Some(true))
     }
 }
 
