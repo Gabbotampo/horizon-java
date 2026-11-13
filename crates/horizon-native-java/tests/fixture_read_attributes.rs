@@ -37,6 +37,27 @@ fn file_kinds_and_read_attributes_answer_like_jdk_25() {
     );
 }
 
+/// `Path.toRealPath()` of absolute paths, and `Path.equals`/`hashCode`:
+/// `realPaths` printed this on JDK 25
+/// with `base` set to the JVM's working directory. In the runtime `base` stays
+/// `/w`, an absolute directory the probe makes.
+#[test]
+fn real_paths_answer_like_jdk_25() {
+    let fixture = Fixture::build("read-attributes-real", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(
+        fixture.text_on(&mut host, "realPaths"),
+        "true,true|NoSuchFileException:<base>/d/missing|\
+         FileSystemException:<base>/d/x.toml/y: Not a directory|true,false,false,94772,1554"
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
 /// A file's size (the model keeps text, not bytes or a charset), its times and
 /// its inode are not the model's to know: each is counted, never answered.
 #[test]
