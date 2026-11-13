@@ -155,7 +155,7 @@ fn fabric_catalog_mod_initializes_items_blocks_and_loader_queries() {
     let stubs = sources! {
         "net/fabricmc/api/ModInitializer.java" => "package net.fabricmc.api; public interface ModInitializer { void onInitialize(); }",
         "net/fabricmc/loader/api/ModContainer.java" => "package net.fabricmc.loader.api; public interface ModContainer { String getModId(); String getVersion(); }",
-        "net/fabricmc/loader/api/FabricLoader.java" => r#"package net.fabricmc.loader.api; import java.util.List; import java.util.Optional; public final class FabricLoader { public static FabricLoader getInstance() { return new FabricLoader(); } public Optional<ModContainer> getModContainer(String id) { return Optional.empty(); } public List<ModContainer> getAllMods() { return List.of(); } public boolean isModLoaded(String id) { return false; } }"#,
+        "net/fabricmc/loader/api/FabricLoader.java" => r#"package net.fabricmc.loader.api; import java.util.List; import java.util.Optional; public final class FabricLoader { public static FabricLoader getInstance() { return new FabricLoader(); } public Optional<ModContainer> getModContainer(String id) { return Optional.empty(); } public java.util.Collection<ModContainer> getAllMods() { return List.of(); } public boolean isModLoaded(String id) { return false; } }"#,
         "net/minecraft/resources/Identifier.java" => r#"package net.minecraft.resources; public final class Identifier { private final String namespace; private final String path; private Identifier(String n, String p) { namespace = n; path = p; } public static Identifier fromNamespaceAndPath(String n, String p) { return new Identifier(n, p); } public static Identifier parse(String v) { return new Identifier("minecraft", v); } public static Identifier tryParse(String v) { return parse(v); } public String getNamespace() { return namespace; } public String getPath() { return path; } public String toString() { return namespace + ":" + path; } }"#,
         "net/minecraft/core/Registry.java" => "package net.minecraft.core; import net.minecraft.resources.Identifier; public interface Registry<T> { static <T> T register(Registry<T> registry, Identifier id, T value) { return value; } }",
         "net/minecraft/core/registries/Registries.java" => "package net.minecraft.core.registries; import net.minecraft.core.Registry; public final class Registries { public static final Registry<Object> ITEM = null; public static final Registry<Object> BLOCK = null; }",
@@ -199,7 +199,7 @@ public final class FabricCatalogMod implements ModInitializer {
 
     FabricLoader loader = FabricLoader.getInstance();
     Optional<ModContainer> self = loader.getModContainer("catalog-fabric");
-    List<ModContainer> all = loader.getAllMods();
+    java.util.Collection<ModContainer> all = loader.getAllMods();
     if (self.isPresent() && !all.isEmpty()) {
       loader.isModLoaded("minecraft");
     }
