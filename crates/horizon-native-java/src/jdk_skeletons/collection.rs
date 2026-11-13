@@ -122,7 +122,7 @@ impl<H: Host> Runtime<'_, H> {
                     if e == *this {
                         text.push_str("(this Collection)");
                     } else {
-                        text.push_str(&self.java_text(&e)?);
+                        text.push_str(&self.virtual_text(&e)?);
                     }
                     if !self.has_next(&it)? {
                         text.push(']');
@@ -145,7 +145,7 @@ impl<H: Host> Runtime<'_, H> {
             let equal = if *o == Value::Ref(None) {
                 e == Value::Ref(None)
             } else {
-                self.java_equals(o, &e)?
+                self.virtual_equals(o, &e)?
             };
             if equal {
                 return Ok(true);
