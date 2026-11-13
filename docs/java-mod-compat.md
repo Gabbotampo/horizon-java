@@ -1375,6 +1375,21 @@ that Rust calls right after it draws the world, so a mod's `@Inject(at = TAIL)` 
 They are named in the catalog and are the cheapest possible coverage for a `@Redirect` on vanilla code
 Horizon does not have an object for.
 
+### The Fabric Loader Horizon reports
+
+`FabricLoader.getAllMods` (`fabric_mods.rs`) lists the run's containers as Fabric Loader 0.19.5
+builds them. **Intended departure: Horizon has no real Fabric Loader; it reports the version whose
+behaviour the runtime reproduces.** The `fabricloader` container answers Fabric Loader 0.19.5's
+own `fabric.mod.json` (version `0.19.5`, name `Fabric Loader`, ...), and `mixinextras` the
+MixinExtras 0.5.5 that loader bundles, because 0.19.5 is the loader this runtime is ported from
+and checked against. `java` is Loader's built-in for Java 25 (version `25`; its `java.vm.name`
+depends on the JDK vendor and is counted). `minecraft` is the game version the host was seeded
+with, and is counted without one (the game's mod has no API for it at the pinned fork). The
+Fabric API modules the host provides (`fabric-api`, `fabric-api-base`, `fabric-command-api-v2`,
+`fabric-lifecycle-events-v1`, `fabric-resource-loader-v1`) report their own metadata from
+`fabric-api-0.165.0+26.3`, the release the host's Fabric API model reproduces (`events.rs`): the
+same departure, for the same reason.
+
 ## The mapping
 
 The part the request calls "then what that maps to here". Columns: the Java thing, what mods actually do
