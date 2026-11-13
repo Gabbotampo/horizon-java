@@ -27,7 +27,7 @@
 //! rest on something the runtime cannot see; otherwise the call goes on to the
 //! host and is counted, as before:
 //!
-//! * the field marker must carry its access flags and the declaring class must
+//! * the `Field` handle must carry its access flags and the declaring class must
 //!   be one the runtime holds with its class-file bytes;
 //! * the declaring class must be one of the running jar's own classes, and
 //!   its module open to the caller under both loaders (`reflect_override`: a
@@ -37,8 +37,8 @@
 //!   `field_get_set`'s docs);
 //! * the object's class must be decidable (`checkcast`'s rules);
 //! * the `Field` object's `override` must be known (`reflect_override`): a
-//!   field read back out of a collection is no particular copy, and its flag
-//!   is known only when every copy of the field agrees;
+//!   copy-free field is no particular copy, and its flag is known only when
+//!   every copy of the field agrees;
 //! * a private member's nest host must be readable (`NestHost` naming a class
 //!   the runtime holds).
 
@@ -177,11 +177,11 @@ impl<H: Host> Runtime<'_, H> {
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("canAccess", "(Ljava/lang/Object;)Z") => {
-                let Some(marker) = receiver.and_then(expect_ref).cloned() else {
+                let Some(field) = receiver else {
                     return Ok(None);
                 };
                 let object = args.first().cloned().unwrap_or(Value::Ref(None));
-                self.field_can_access(&marker, &object, caller)
+                self.field_can_access(field, &object, caller)
             }
             _ => self.invoke_field_get_set(r, receiver, args, caller),
         }
@@ -189,29 +189,23 @@ impl<H: Host> Runtime<'_, H> {
 
     fn field_can_access(
         &self,
-        marker: &str,
+        field: &Value,
         object: &Value,
         caller: &str,
     ) -> Result<Option<Value>, NativeError> {
-        let Some((declaring, member)) = reflect_override::canonical_field(marker)
-            .strip_prefix("reflect-field/")
-            .and_then(|rest| rest.split_once('#'))
+        // A `Field` without its flags (a `getDeclaredField` miss) carries
+        // none to check.
+        let Some(host_reflect::Member {
+            class: declaring,
+            name,
+            descriptor: Some(descriptor),
+            access: Some(access),
+            ..
+        }) = host_reflect::field_of(field)
         else {
             return Ok(None);
         };
-        let (name, Some((descriptor, access))) = parse_field_marker(member) else {
-            return Ok(None);
-        };
-        // A marker without its flags (a `getDeclaredField` miss) carries
-        // none to check.
-        if !member
-            .split(':')
-            .nth(2)
-            .is_some_and(|flags| !flags.is_empty())
-        {
-            return Ok(None);
-        }
-        let Some(overridden) = self.field_override(marker) else {
+        let Some(overridden) = self.field_override(field) else {
             return Ok(None);
         };
         let Some(class_flags) = self.class(declaring).and_then(checkcast::class_access) else {

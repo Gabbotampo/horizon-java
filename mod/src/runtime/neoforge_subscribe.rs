@@ -469,7 +469,11 @@ fn simple_name(class: &str) -> &str {
 }
 
 /// The classes one method's `Exceptions` attribute names, read back from the class bytes.
-fn method_exceptions(file: &ClassFile, name: &str, descriptor: &str) -> Option<Vec<String>> {
+pub(crate) fn method_exceptions(
+    file: &ClassFile,
+    name: &str,
+    descriptor: &str,
+) -> Option<Vec<String>> {
     let mut r = Reader::new(&file.raw);
     if r.u4().ok()? != 0xCAFE_BABE {
         return None;

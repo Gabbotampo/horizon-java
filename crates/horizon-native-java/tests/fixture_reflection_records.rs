@@ -378,13 +378,17 @@ fn class_for_name_fields_and_methods_use_local_markers() {
         fixture.text("fieldFacts"),
         "3|LIMIT,label|LIMIT=int:25,label=java.lang.String:17,count=int:2"
     );
+    // Each `Method.toString` is OpenJDK 25's (two runs alike). Named
+    // departure, older than #156 P10: the array is in the class file's
+    // order, where HotSpot answered `label`, `versionName`, `bump` (an order
+    // the JDK does not specify).
     assert_eq!(
         fixture.text("methodFacts"),
         concat!(
             "3",
-            "|reflect-method/demo/Model#versionName()Ljava/lang/String;",
-            "|reflect-method/demo/Model#label()Ljava/lang/String;",
-            "|reflect-method/demo/Model#bump(I)I"
+            "|public static java.lang.String demo.Model.versionName()",
+            "|public java.lang.String demo.Model.label()",
+            "|public int demo.Model.bump(int)"
         )
     );
     assert_eq!(fixture.text("methodLookup"), "label:0");

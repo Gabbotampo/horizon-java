@@ -151,6 +151,15 @@ pub enum HostKind {
     /// `java.util.OptionalDouble`: key `""` when empty, else the `double`'s
     /// `Double.doubleToLongBits` (every `NaN` one key, `-0.0` not `0.0`).
     OptionalDouble,
+    /// `java.lang.reflect.Field`: key `<class>#<name>[:<descriptor>:<access>]
+    /// [#<copy>]` (`host_reflect.rs`).
+    ReflectField,
+    /// `java.lang.reflect.Method`: key `<class>#<name>[<descriptor>[:<access>
+    /// [i][:<throws>]]]` (`host_reflect.rs`).
+    ReflectMethod,
+    /// `java.lang.reflect.Constructor`: key `<class>#[<descriptor>[:<access>
+    /// [:<throws>]]]` (`host_reflect.rs`).
+    ReflectConstructor,
 }
 
 /// How a kind's Java class follows from its key.
@@ -243,7 +252,6 @@ pub(crate) fn always_canonical(_key: &str) -> bool {
 }
 
 /// The canonical predicate of a kind whose every object is a fresh value.
-#[allow(dead_code)]
 pub(crate) fn never_canonical(_key: &str) -> bool {
     false
 }
@@ -287,6 +295,27 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("java/util/OptionalDouble"),
         canonical: canonical_when_empty,
         methods: &crate::host_optional::OPTIONAL_DOUBLE,
+    },
+    KindInfo {
+        kind: HostKind::ReflectField,
+        tag: "rfld",
+        class: ClassRule::Fixed(crate::host_reflect::FIELD),
+        canonical: crate::host_reflect::field_canonical,
+        methods: &crate::host_reflect::MEMBER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ReflectMethod,
+        tag: "rmth",
+        class: ClassRule::Fixed(crate::host_reflect::METHOD),
+        canonical: never_canonical,
+        methods: &crate::host_reflect::MEMBER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ReflectConstructor,
+        tag: "rctr",
+        class: ClassRule::Fixed(crate::host_reflect::CONSTRUCTOR),
+        canonical: never_canonical,
+        methods: &crate::host_reflect::MEMBER_METHODS,
     },
 ];
 

@@ -71,6 +71,7 @@ mod host_entry;
 mod host_list_iterator;
 mod host_optional;
 mod host_ref;
+mod host_reflect;
 mod immutable_collections;
 mod iteration_guard;
 mod jar_compare;
@@ -6375,39 +6376,25 @@ impl Host for StdHost {
         {
             return Ok(value);
         }
+        // A `Field`/`Method` handle's own facts (`host_reflect.rs`); its
+        // `toString` is the kind's row.
         if r.owner == "java/lang/reflect/Field"
             && matches!(
                 r.name.as_str(),
-                "getName" | "getType" | "getModifiers" | "getDeclaringClass" | "toString"
+                "getName" | "getType" | "getModifiers" | "getDeclaringClass"
             )
+            && let Some(field) = host_reflect::field_of(receiver)
         {
-            let marker = receiver_marker.as_deref().ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
-            })?;
-            let marker = reflect_override::canonical_field(marker);
-            let method = marker.strip_prefix("reflect-field/").ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
-            })?;
-            let (declaring, member) = method.split_once('#').ok_or_else(|| {
-                NativeError::Metadata("reflective field marker has no name separator".into())
-            })?;
-            let (name, descriptor_and_access) = member.split_once(':').unwrap_or((member, ""));
-            let (descriptor, access) = descriptor_and_access
-                .rsplit_once(':')
-                .map_or((descriptor_and_access, 0), |(descriptor, access)| {
-                    (descriptor, access.parse::<u16>().unwrap_or(0))
-                });
             return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(name.to_owned()))),
-                ("getType", "()Ljava/lang/Class;") => {
-                    Ok(Value::Ref(Some(erased_field_type(descriptor))))
-                }
-                ("getModifiers", "()I") => Ok(Value::Int(i32::from(access))),
-                // The class the marker was read from declares the field.
+                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(field.name.to_owned()))),
+                ("getType", "()Ljava/lang/Class;") => Ok(Value::Ref(Some(erased_field_type(
+                    field.descriptor.unwrap_or_default(),
+                )))),
+                ("getModifiers", "()I") => Ok(Value::Int(i32::from(field.access.unwrap_or(0)))),
+                // The class the lookup read the field from declares it.
                 ("getDeclaringClass", "()Ljava/lang/Class;") => {
-                    Ok(Value::Ref(Some(declaring.to_owned())))
+                    Ok(Value::Ref(Some(field.class.to_owned())))
                 }
-                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(marker.to_owned()))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "java/lang/reflect/Field#{}{}",
                     r.name, r.descriptor
@@ -6415,29 +6402,14 @@ impl Host for StdHost {
             };
         }
         if r.owner == "java/lang/reflect/Method"
-            && matches!(
-                r.name.as_str(),
-                "getName" | "getParameterCount" | "toString"
-            )
+            && matches!(r.name.as_str(), "getName" | "getParameterCount")
+            && let Some(method) = host_reflect::method_of(receiver)
         {
-            let marker = receiver_marker.as_deref().ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Method marker".into())
-            })?;
-            let method = marker.strip_prefix("reflect-method/").ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Method marker".into())
-            })?;
-            let (_, member) = method.split_once('#').ok_or_else(|| {
-                NativeError::Metadata("reflective method marker has no name separator".into())
-            })?;
-            let (name, descriptor) = member
-                .find('(')
-                .map_or((member, None), |at| (&member[..at], Some(&member[at..])));
             return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(name.to_owned()))),
+                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(method.name.to_owned()))),
                 ("getParameterCount", "()I") => {
-                    Ok(Value::Int(descriptor.map_or(0, arg_count) as i32))
+                    Ok(Value::Int(method.descriptor.map_or(0, arg_count) as i32))
                 }
-                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(marker.to_owned()))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "java/lang/reflect/Method#{}{}",
                     r.name, r.descriptor
@@ -10132,8 +10104,7 @@ fn bounded_captured_markers(values: &[Value]) -> String {
 /// and a lookup compares like with like.
 fn collection_item_marker(value: &Value) -> String {
     match value {
-        // A `Field` copy is kept and compared as its field (`Field.equals`).
-        Value::Ref(Some(value)) => format!("r{}", reflect_override::canonical_field(value)),
+        Value::Ref(Some(value)) => format!("r{value}"),
         // A handle's own text form, unescaped like a reference's
         // (`HostRef::encode`).
         Value::Host(host) => host.encode(),
@@ -10146,13 +10117,7 @@ fn value_marker(value: &Value) -> String {
         Value::Int(value) => format!("i{value}"),
         Value::Long(value) => format!("l{value}"),
         Value::Float(value) => format!("f{}", format_java_float(*value)),
-        // A `Field` copy is stored and compared as its field (`Field.equals`).
-        Value::Ref(Some(value)) => format!(
-            "r{}",
-            reflect_override::canonical_field(value)
-                .replace('\\', "\\\\")
-                .replace(',', "\\,")
-        ),
+        Value::Ref(Some(value)) => format!("r{}", value.replace('\\', "\\\\").replace(',', "\\,")),
         // An `Integer` is one key however it was boxed (`boxed::canonical`).
         Value::Boxed(Boxed::Integer(value)) => format!("i{value}"),
         Value::Boxed(boxed) => boxed.marker(),
@@ -12305,18 +12270,6 @@ fn generic_type_bounds(bounds: &[GenericType]) -> Vec<GenericType> {
         vec![GenericType::Class("java/lang/Object".into())]
     } else {
         bounds.to_vec()
-    }
-}
-
-fn parse_field_marker(member: &str) -> (&str, Option<(&str, u16)>) {
-    let mut parts = reflect_override::strip_field_copy(member).split(':');
-    let name = parts.next().unwrap_or(member);
-    let descriptor = parts.next();
-    let access = parts.next().and_then(|access| access.parse().ok());
-    match (descriptor, access) {
-        (Some(descriptor), Some(access)) => (name, Some((descriptor, access))),
-        (Some(descriptor), None) => (name, Some((descriptor, 0))),
-        _ => (name, None),
     }
 }
 
@@ -20830,26 +20783,18 @@ impl<H: Host> Runtime<'_, H> {
             && r.name == "getGenericType"
             && r.descriptor == "()Ljava/lang/reflect/Type;"
         {
-            let marker = receiver.and_then(expect_ref).ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+            let field = receiver.and_then(host_reflect::field_of).ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Field handle".into())
             })?;
-            let (class, member) = marker
-                .strip_prefix("reflect-field/")
-                .and_then(|marker| marker.split_once('#'))
-                .ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
-                })?;
-            let (name, declared) = parse_field_marker(member);
-            let descriptor = declared
-                .map(|(descriptor, _)| descriptor.to_owned())
-                .or_else(|| {
-                    self.class(class).and_then(|file| {
-                        file.fields
-                            .iter()
-                            .find(|field| field.name == name)
-                            .map(|field| field.descriptor.clone())
-                    })
-                });
+            let (class, name) = (field.class, field.name);
+            let descriptor = field.descriptor.map(str::to_owned).or_else(|| {
+                self.class(class).and_then(|file| {
+                    file.fields
+                        .iter()
+                        .find(|field| field.name == name)
+                        .map(|field| field.descriptor.clone())
+                })
+            });
             let signature = descriptor.as_deref().and_then(|descriptor| {
                 self.class(class)
                     .and_then(|file| file.field_signature(name, descriptor))
@@ -21019,19 +20964,16 @@ impl<H: Host> Runtime<'_, H> {
                     file.fields
                         .iter()
                         .filter(|field| declared || field.access & 1 != 0)
-                        .map(|field| {
-                            format!(
-                                "reflect-field/{class}#{}:{}:{}",
-                                field.name, field.descriptor, field.access
-                            )
-                        })
+                        .map(|field| (field.name.clone(), field.descriptor.clone(), field.access))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             // One fresh `Field` per element, as `copyField` makes them.
             let fields = fields
                 .into_iter()
-                .map(|field| self.field_copy(field))
+                .map(|(name, descriptor, access)| {
+                    self.field_copy(&class, &name, Some((&descriptor, access)))
+                })
                 .collect::<Vec<_>>();
             let marker = self.new_array("java/lang/reflect/Field", "getDeclaredFields");
             self.arrays.insert(marker.clone(), fields);
@@ -21043,7 +20985,7 @@ impl<H: Host> Runtime<'_, H> {
         {
             let class = reflection_class_name(receiver, r)?.to_owned();
             let name = expect_string(StdHost::argument(r, args, 0)?);
-            let marker = self
+            let declared = self
                 .class(&class)
                 .and_then(|file| {
                     file.fields.iter().find(|field| {
@@ -21051,14 +20993,12 @@ impl<H: Host> Runtime<'_, H> {
                             && (r.name == "getDeclaredField" || field.access & 1 != 0)
                     })
                 })
-                .map(|field| {
-                    format!(
-                        "reflect-field/{class}#{}:{}:{}",
-                        field.name, field.descriptor, field.access
-                    )
-                })
-                .unwrap_or_else(|| format!("reflect-field/{class}#{name}"));
-            return Ok(Some(self.field_copy(marker)));
+                .map(|field| (field.descriptor.clone(), field.access));
+            let name = name.to_owned();
+            let declared = declared
+                .as_ref()
+                .map(|(descriptor, access)| (descriptor.as_str(), *access));
+            return Ok(Some(self.field_copy(&class, &name, declared)));
         }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getMethods" | "getDeclaredMethods")
@@ -21077,13 +21017,12 @@ impl<H: Host> Runtime<'_, H> {
             let class = reflection_class_name(receiver, r)?;
             let name = expect_string(StdHost::argument(r, args, 0)?);
             let parameter_types = self.parameter_types(args);
-            let marker = self
-                .reflected_descriptor(class, name, &parameter_types)
-                .map_or_else(
-                    || format!("reflect-method/{class}#{name}"),
-                    |descriptor| format!("reflect-method/{class}#{name}{descriptor}"),
-                );
-            return Ok(Some(Value::Ref(Some(marker))));
+            let descriptor = self.reflected_descriptor(class, name, &parameter_types);
+            return Ok(Some(self.reflected_method(
+                class,
+                name,
+                descriptor.as_deref(),
+            )));
         }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getConstructor" | "getDeclaredConstructor")
@@ -21107,9 +21046,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut wanted = String::from("(");
                 for parameter in &parameter_types {
                     let Some(descriptor) = class_descriptor(parameter) else {
-                        return Ok(Some(Value::Ref(Some(format!(
-                            "reflect-constructor/{class}#"
-                        )))));
+                        return Ok(Some(host_reflect::constructor(class, None, None)));
                     };
                     wanted.push_str(&descriptor);
                 }
@@ -21128,16 +21065,12 @@ impl<H: Host> Runtime<'_, H> {
                         frame: None,
                     });
                 }
-                let marker = format!("reflect-constructor/{class}#{wanted}");
-                return Ok(Some(Value::Ref(Some(marker))));
+                return Ok(Some(self.reflected_constructor(class, Some(&wanted))));
             }
-            let marker = self
-                .reflected_descriptor(class, "<init>", &parameter_types)
-                .map_or_else(
-                    || format!("reflect-constructor/{class}#"),
-                    |descriptor| format!("reflect-constructor/{class}#{descriptor}"),
-                );
-            return Ok(Some(Value::Ref(Some(marker))));
+            let descriptor = self.reflected_descriptor(class, "<init>", &parameter_types);
+            return Ok(Some(
+                self.reflected_constructor(class, descriptor.as_deref()),
+            ));
         }
         // `AnnotatedElement` queries the class-file model answers for classes,
         // fields and methods alike: whether an annotation is present, and a
@@ -21192,15 +21125,11 @@ impl<H: Host> Runtime<'_, H> {
             && r.name == "getAnnotation"
             && r.descriptor == "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
         {
-            let marker = expect_string(receiver.unwrap_or(&Value::Ref(None)));
             let wanted = expect_string(StdHost::argument(r, args, 0)?);
-            let found = marker
-                .strip_prefix("reflect-method/")
-                .and_then(|marker| marker.split_once('#'))
-                .and_then(|(class, member)| {
-                    let (name, descriptor) = member
-                        .find('(')
-                        .map_or((member, None), |at| (&member[..at], Some(&member[at..])));
+            let found = receiver
+                .and_then(host_reflect::method_of)
+                .and_then(|method| {
+                    let (class, name, descriptor) = (method.class, method.name, method.descriptor);
                     let file = self.class(class)?;
                     let method = file.methods.iter().find(|candidate| {
                         candidate.name == name
@@ -21216,18 +21145,13 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(self.annotation_proxy(found)));
         }
         if r.owner == "java/lang/reflect/Field" && matches!(r.name.as_str(), "get" | "set") {
-            let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
+            let field = receiver.and_then(host_reflect::field_of).ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Field handle".into())
             })?;
-            let (class, member) = marker
-                .strip_prefix("reflect-field/")
-                .and_then(|marker| marker.split_once('#'))
-                .ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/reflect/Field marker".into())
-                })?;
-            let (name, declared) = parse_field_marker(member);
-            let declared = declared
-                .map(|(descriptor, access)| (descriptor.to_owned(), access))
+            let (class, name) = (field.class, field.name);
+            let declared = field
+                .descriptor
+                .map(|descriptor| (descriptor.to_owned(), field.access.unwrap_or(0)))
                 .or_else(|| {
                     self.class(class).and_then(|file| {
                         file.fields
@@ -21278,15 +21202,15 @@ impl<H: Host> Runtime<'_, H> {
             }));
         }
         if r.owner == "java/lang/reflect/Constructor" {
-            let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Constructor marker".into())
-            })?;
-            let (class, descriptor) = marker
-                .strip_prefix("reflect-constructor/")
-                .and_then(|marker| marker.split_once('#'))
+            let constructor = receiver
+                .and_then(host_reflect::constructor_of)
                 .ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/reflect/Constructor marker".into())
+                    NativeError::Metadata("malformed java/lang/reflect/Constructor handle".into())
                 })?;
+            let (class, descriptor) = (
+                constructor.class,
+                constructor.descriptor.unwrap_or_default(),
+            );
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getName", "()Ljava/lang/String;") => {
                     return Ok(Some(Value::Ref(Some(class.replace('/', ".")))));
@@ -21323,16 +21247,10 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         if r.owner == "java/lang/reflect/Method" && r.name == "invoke" {
-            let marker = expect_string(receiver.unwrap_or(&Value::Ref(None)));
-            let marker = marker.strip_prefix("reflect-method/").ok_or_else(|| {
-                NativeError::Metadata("malformed java/lang/reflect/Method marker".into())
+            let method = receiver.and_then(host_reflect::method_of).ok_or_else(|| {
+                NativeError::Metadata("malformed java/lang/reflect/Method handle".into())
             })?;
-            let (owner, member) = marker.split_once('#').ok_or_else(|| {
-                NativeError::Metadata("reflective method marker has no name separator".into())
-            })?;
-            let (name, descriptor) = member
-                .find('(')
-                .map_or((member, None), |at| (&member[..at], Some(&member[at..])));
+            let (owner, name, descriptor) = (method.class, method.name, method.descriptor);
             let invocation_args = StdHost::argument(r, args, 1)?;
             let invocation_args = if matches!(invocation_args, Value::Ref(None)) {
                 Vec::new()
@@ -21438,18 +21356,16 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Hand out one runtime annotation a class or method already declares.
     /// Absence is Java's `null`, never an invented empty annotation.
-    /// The visible annotations of one reflected element: a class marker, a
-    /// `reflect-field/` marker or a `reflect-method/` (or constructor) marker
-    /// naming a class the runtime holds. `None` when the element is not one
-    /// the class-file model knows, so the call keeps its host answer.
+    /// The visible annotations of one reflected element: a class marker, or a
+    /// `Field`, `Method` or `Constructor` handle naming a class the runtime
+    /// holds. `None` when the element is not one the class-file model knows,
+    /// so the call keeps its host answer.
     fn element_annotations(&self, receiver: &Value) -> Option<Vec<Annotation>> {
-        let marker = expect_ref(receiver)?;
-        if let Some(rest) = marker.strip_prefix("reflect-field/") {
-            let (class, member) = rest.split_once('#')?;
-            let (name, declared) = parse_field_marker(member);
+        if let Some(field) = host_reflect::field_of(receiver) {
+            let (class, name) = (field.class, field.name);
             let file = self.class(class)?;
-            let descriptor = match declared {
-                Some((descriptor, _)) => descriptor.to_owned(),
+            let descriptor = match field.descriptor {
+                Some(descriptor) => descriptor.to_owned(),
                 None => file
                     .fields
                     .iter()
@@ -21459,18 +21375,11 @@ impl<H: Host> Runtime<'_, H> {
             };
             return Some(file.field_annotations(name, &descriptor));
         }
-        if let Some(rest) = marker
-            .strip_prefix("reflect-method/")
-            .or_else(|| marker.strip_prefix("reflect-constructor/"))
+        if let Some(executable) =
+            host_reflect::method_of(receiver).or_else(|| host_reflect::constructor_of(receiver))
         {
-            let (class, member) = rest.split_once('#')?;
-            let (name, descriptor) = if marker.starts_with("reflect-constructor/") {
-                ("<init>", (!member.is_empty()).then_some(member))
-            } else {
-                member
-                    .find('(')
-                    .map_or((member, None), |at| (&member[..at], Some(&member[at..])))
-            };
+            let (class, name, descriptor) =
+                (executable.class, executable.name, executable.descriptor);
             let file = self.class(class)?;
             let method = file.methods.iter().find(|candidate| {
                 candidate.name == name
@@ -21478,7 +21387,7 @@ impl<H: Host> Runtime<'_, H> {
             })?;
             return Some(method.annotations.clone());
         }
-        let class = marker.replace('.', "/");
+        let class = expect_ref(receiver)?.replace('.', "/");
         self.class(&class).map(|file| file.annotations.clone())
     }
 
@@ -37468,9 +37377,10 @@ mandatory = true
             )
             .unwrap()
             .unwrap();
+        let member = host_reflect::method_of(&method).unwrap();
         assert_eq!(
-            method,
-            Value::Ref(Some("reflect-method/demo/Reflective#answer()I".into()))
+            (member.class, member.name, member.descriptor, member.access),
+            ("demo/Reflective", "answer", Some("()I"), Some(9))
         );
         let methods_lookup = MethodRef {
             owner: "java/lang/Class".into(),
@@ -37526,11 +37436,12 @@ mandatory = true
             name: "toString".into(),
             descriptor: "()Ljava/lang/String;".into(),
         };
+        // `Method.toString` (Java 25's form, `host_reflect.rs`).
         assert_eq!(
             std_host
                 .invoke_instance(&method_string, &method, &[])
                 .unwrap(),
-            Value::Ref(Some("reflect-method/demo/Reflective#answer()I".into()))
+            Value::Ref(Some("public static int demo.Reflective.answer()".into()))
         );
         let invoke = MethodRef {
             owner: "java/lang/reflect/Method".into(),
@@ -37569,8 +37480,8 @@ mandatory = true
             .unwrap()
             .unwrap();
         assert_eq!(
-            overloaded,
-            Value::Ref(Some("reflect-method/demo/Reflective#answer(I)I".into()))
+            host_reflect::method_of(&overloaded).unwrap().descriptor,
+            Some("(I)I")
         );
         assert_eq!(
             std_host
@@ -37770,9 +37681,7 @@ mandatory = true
         let public = runtime.arrays.get(public_marker).unwrap().clone();
         // The same field, as `Field.equals` sees it, but its own copy: JDK 27
         // hands every lookup a fresh `Field` (`ReflectionFactory.copyField`).
-        let field = |value: &Value| {
-            reflect_override::canonical_field(expect_ref(value).unwrap()).to_owned()
-        };
+        let field = |value: &Value| host_reflect::field_copy_free(value).unwrap().to_owned();
         assert_eq!(public.len(), 1);
         assert_eq!(field(&public[0]), field(&declared[0]));
         assert_ne!(public[0], declared[0]);

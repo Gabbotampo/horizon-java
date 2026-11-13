@@ -177,10 +177,12 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether the host's marker comparison can differ from Java for
-    /// `value`: it runs a jar `equals` body, or it is `null`, which `List.of`
-    /// refuses to look up.
+    /// `value`: it runs a jar `equals` body, it is `null`, which `List.of`
+    /// refuses to look up, or it is a host handle, whose `equals` is its
+    /// kind's row: equal handles may have different keys (two copies of one
+    /// `Field`, `host_ref.rs`), so their text never answers "not equal".
     fn jar_equals(&self, value: &Value) -> bool {
-        *value == Value::Ref(None) || self.runs_jar_equals(value)
+        matches!(value, Value::Ref(None) | Value::Host(_)) || self.runs_jar_equals(value)
     }
 
     /// Whether `value.equals` runs a jar body: a jar object with its own
