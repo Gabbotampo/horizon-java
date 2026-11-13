@@ -111,6 +111,7 @@ mod sequenced;
 mod service_loader;
 mod stack_walk;
 mod string_constructors;
+mod synchronized_views;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
@@ -2530,6 +2531,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// `Collections.synchronized*` views and the collection each wraps
+    /// (`synchronized_views.rs`).
+    synchronized_views: BTreeMap<String, String>,
     /// `List.reversed()` views: view marker → (its list, whether it writes
     /// through) (`sequenced.rs`).
     reversed_views: BTreeMap<String, (String, bool)>,
@@ -2656,6 +2660,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
@@ -3055,7 +3060,7 @@ impl StdHost {
     }
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<String>> {
-        let marker = expect_ref(receiver)?;
+        let marker = self.synchronized_target(expect_ref(receiver)?);
         if let Some(values) = self.view_values(marker) {
             return Some(values);
         }
@@ -4037,7 +4042,8 @@ impl Host for StdHost {
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
         if let Some(marker) = expect_ref(value) {
-            self.mutable_collections.insert(marker.to_owned(), values);
+            let marker = self.synchronized_target(marker).to_owned();
+            self.mutable_collections.insert(marker, values);
         }
     }
 
@@ -4810,6 +4816,9 @@ impl Host for StdHost {
                 "singletonMap",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
             ) => Ok(collection_value("map", args)),
+            ("java/util/Collections", name, _) if name.starts_with("synchronized") => self
+                .synchronized_view(r, args)
+                .unwrap_or_else(|| self.unknown_host_call(r)),
             ("java/util/Collections", "unmodifiableList", "(Ljava/util/List;)Ljava/util/List;")
             | ("java/util/Collections", "unmodifiableSet", "(Ljava/util/Set;)Ljava/util/Set;")
             | ("java/util/Collections", "unmodifiableMap", "(Ljava/util/Map;)Ljava/util/Map;") => {
@@ -5426,6 +5435,11 @@ impl Host for StdHost {
         // The loading stages' event objects (`neoforge_lifecycle.rs`).
         if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
+        }
+        // A synchronized view runs every call on what it wraps
+        // (`synchronized_views.rs`).
+        if let Some(wrapped) = self.synchronized_receiver(receiver) {
+            return self.invoke_instance(r, &wrapped, args);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
