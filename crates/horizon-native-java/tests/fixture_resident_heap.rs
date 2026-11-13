@@ -8,6 +8,9 @@
 //! The Fabric and game classes are compiled as stubs so `javac` accepts the
 //! mod; only the mod's own classes go into the jar, as for a real one.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ExecutionBudget, Host, NativeJar, StdHost, Value,
     events::{EventContext, EventFacade, EventFiring, GameEvent, GameListener},
@@ -21,12 +24,8 @@ use std::{
 };
 use zip::write::SimpleFileOptions;
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-resident-heap-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn scratch(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("resident-heap-{name}"));
     fs::create_dir_all(&root).unwrap();
     root
 }

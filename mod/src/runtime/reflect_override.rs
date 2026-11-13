@@ -57,21 +57,21 @@
 //! hash). The runtime never decides a denial, so it never builds an
 //! `InaccessibleObjectException`.
 //!
-//! **Telling copies apart.** A `Field` the reflection lookups hand out is the
-//! field's marker (`reflect-field/<class>#<name>:<descriptor>:<flags>`) with
-//! a copy number appended (`#<n>`, from the object counter). Copies of one
-//! field are therefore distinct values, and `if_acmpeq` tells them apart as
-//! the JVM does. Collections compare and store their elements as text
-//! (`value_marker`), so a copy enters a collection as the field's canonical
-//! marker: lookups compare by `Field.equals`, as in Java, and a field read
-//! back out of a collection is no particular copy. Its `override` is known
-//! only when every copy of the field agrees (none set, or all set); otherwise
-//! a call whose answer depends on it is counted. Each field also remembers
-//! how many copies were handed out and how many have `override` set.
+//! **Telling copies apart.** A `Field` the reflection lookups hand out is a
+//! handle (`host_reflect.rs`) whose key is the field's
+//! (`<class>#<name>:<descriptor>:<flags>`) with a copy number appended
+//! (`#<n>`, from the object counter). Copies of one field are therefore
+//! distinct handles, and `if_acmpeq` tells them apart as the JVM does; a copy
+//! keeps its number in a collection, and collections compare by
+//! `Field.equals` (the kind's row), as in Java. A field without a copy number
+//! (the copy-free key) is known only when every copy of the field agrees
+//! (none set, or all set); otherwise a call whose answer depends on it is
+//! counted. Each field also remembers how many copies were handed out and how
+//! many have `override` set. The table's entries hang off the handle's key
+//! (`<key>|reflect#…`), so the heap keeps them while the copy is reachable.
 
 use super::*;
 
-pub(super) const FIELD_PREFIX: &str = "reflect-field/";
 const FIELD: &str = "java/lang/reflect/Field";
 const METHOD: &str = "java/lang/reflect/Method";
 const CONSTRUCTOR: &str = "java/lang/reflect/Constructor";
@@ -79,14 +79,14 @@ const EXECUTABLE: &str = "java/lang/reflect/Executable";
 const ACCESSIBLE: &str = "java/lang/reflect/AccessibleObject";
 
 /// `<copy>|OWN`: one `Field` copy's own `override` (`Int(0|1)`), or, for a
-/// `Method`/`Constructor` marker, that some `setAccessible` reached it.
+/// `Method`/`Constructor` handle, that some `setAccessible` reached it.
 const OWN: &str = "reflect#override";
 /// `<canonical>|COPIES`: how many copies of the field were handed out.
 const COPIES: &str = "reflect#copies";
 /// `<canonical>|OVERRIDDEN`: how many of those copies have `override` set.
 const OVERRIDDEN: &str = "reflect#overridden";
 /// `<canonical>|UNKNOWN`: an `override` change could not be attributed to a
-/// copy (a counted `setAccessible`, or one on the canonical marker), so no
+/// copy (a counted `setAccessible`, or one on a copy-free field), so no
 /// copy's flag is known any more.
 const UNKNOWN: &str = "reflect#override-unknown";
 
@@ -113,69 +113,44 @@ pub(super) fn module_descriptor_in(resources: &BTreeMap<String, String>) -> Opti
     seeded.then(|| resources.keys().any(|name| is_module_descriptor(name)))
 }
 
-/// The copy number a reflection lookup appended to a field marker's member
-/// part (`name:descriptor:flags#n`), stripped. A member without flags (a
-/// lookup miss) never carries one.
-pub(super) fn strip_field_copy(member: &str) -> &str {
-    match member.rsplit_once('#') {
-        Some((field, number))
-            if !number.is_empty()
-                && number.bytes().all(|byte| byte.is_ascii_digit())
-                && field.matches(':').count() == 2 =>
-        {
-            field
-        }
-        _ => member,
+/// The class a `Field`, `Method` or `Constructor` handle is declared by,
+/// when it names a member the declaring class has (a lookup miss carries no
+/// descriptor, and a field miss no flags either).
+fn declaring_class(value: &Value) -> Option<String> {
+    if let Some(field) = host_reflect::field_of(value) {
+        return field.access.is_some().then_some(field.class);
     }
+    let member = host_reflect::member_of(value)?;
+    member.descriptor.is_some().then_some(member.class)
 }
 
-/// A field marker without its copy number: the text every copy of the field
-/// shares, and what `Field.equals` compares. Any other text is returned as is.
-pub(super) fn canonical_field(marker: &str) -> &str {
-    let Some(rest) = marker.strip_prefix(FIELD_PREFIX) else {
-        return marker;
-    };
-    let Some((_, member)) = rest.split_once('#') else {
-        return marker;
-    };
-    let stripped = strip_field_copy(member);
-    &marker[..marker.len() - (member.len() - stripped.len())]
-}
-
-/// The class a `Field`, `Method` or `Constructor` marker is declared by, when
-/// the marker names a member the declaring class has (a lookup miss carries
-/// no descriptor or flags).
-fn declaring_class(marker: &str) -> Option<&str> {
-    let canonical = canonical_field(marker);
-    if let Some(rest) = canonical.strip_prefix(FIELD_PREFIX) {
-        let (class, member) = rest.split_once('#')?;
-        return (member.matches(':').count() == 2).then_some(class);
-    }
-    if let Some(rest) = marker.strip_prefix("reflect-method/") {
-        let (class, member) = rest.split_once('#')?;
-        return member.contains('(').then_some(class);
-    }
-    let (class, descriptor) = marker
-        .strip_prefix("reflect-constructor/")?
-        .split_once('#')?;
-    descriptor.starts_with('(').then_some(class)
+/// The key every copy of a field shares, and the key of any other handle.
+fn shared_key(value: &Value) -> Option<&str> {
+    host_reflect::field_copy_free(value).or_else(|| host_reflect::member_key(value))
 }
 
 impl<H: Host> Runtime<'_, H> {
-    /// A new `Field` object for the field `canonical` names: the marker with a
-    /// fresh copy number. Every lookup that returns a `Field` makes one.
-    pub(super) fn field_copy(&mut self, canonical: String) -> Value {
-        if !canonical.starts_with(FIELD_PREFIX) || declaring_class(&canonical).is_none() {
+    /// A new `Field` object for the field `class.name` (`declared` is its
+    /// descriptor and flags when the class's field table names it): a handle
+    /// with a fresh copy number. Every lookup that returns a `Field` makes
+    /// one.
+    pub(super) fn field_copy(
+        &mut self,
+        class: &str,
+        name: &str,
+        declared: Option<(&str, u16)>,
+    ) -> Value {
+        let Some((descriptor, access)) = declared else {
             // A lookup miss: nothing to tell apart.
-            return Value::Ref(Some(canonical));
-        }
-        let copies = format!("{canonical}|{COPIES}");
+            return host_reflect::field(class, name, None, None);
+        };
+        let copies = format!("{class}#{name}:{descriptor}:{access}|{COPIES}");
         let count = self.counter(&copies);
         self.fields
             .insert(copies, Value::Int(count.saturating_add(1)));
-        let marker = format!("{canonical}#{}", self.next_object);
+        let copy = self.next_object;
         self.next_object = self.next_object.saturating_add(1);
-        Value::Ref(Some(marker))
+        host_reflect::field(class, name, declared, Some(copy as u64))
     }
 
     fn counter(&self, key: &str) -> i32 {
@@ -185,47 +160,53 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// The `override` flag of the `Field` object `marker` is. `None` when it
-    /// cannot be known: a canonical marker (read back from a collection)
-    /// whose copies disagree, or a field whose flags lost track.
-    pub(super) fn field_override(&self, marker: &str) -> Option<bool> {
-        let canonical = canonical_field(marker);
-        if self.fields.contains_key(&format!("{canonical}|{UNKNOWN}")) {
+    /// The `override` flag of the `Field` object `field` is. `None` when it
+    /// cannot be known: a copy-free field whose copies disagree, or a field
+    /// whose flags lost track.
+    pub(super) fn field_override(&self, field: &Value) -> Option<bool> {
+        let (Some(key), Some(shared)) = (host_reflect::member_key(field), shared_key(field)) else {
+            return Some(false);
+        };
+        if self.fields.contains_key(&format!("{shared}|{UNKNOWN}")) {
             return None;
         }
-        if canonical != marker {
-            return Some(self.counter(&format!("{marker}|{OWN}")) != 0);
+        if shared != key {
+            return Some(self.counter(&format!("{key}|{OWN}")) != 0);
         }
-        let overridden = self.counter(&format!("{canonical}|{OVERRIDDEN}"));
+        let overridden = self.counter(&format!("{shared}|{OVERRIDDEN}"));
         if overridden == 0 {
             return Some(false);
         }
-        (overridden == self.counter(&format!("{canonical}|{COPIES}"))).then_some(true)
+        (overridden == self.counter(&format!("{shared}|{COPIES}"))).then_some(true)
     }
 
-    /// Set the `override` flag of `marker`. `false` when the object is not
+    /// Set the `override` flag of `member`. `false` when the object is not
     /// one copy and the copies do not already all hold `flag`: the change is
     /// then not attributable, and every copy's flag becomes unknown.
-    fn set_override(&mut self, marker: &str, flag: bool) -> bool {
-        let canonical = canonical_field(marker);
-        if !canonical.starts_with(FIELD_PREFIX) {
-            // `Method`/`Constructor` markers do not tell copies apart; the
+    fn set_override(&mut self, member: &Value, flag: bool) -> bool {
+        let (Some(key), Some(shared)) = (host_reflect::member_key(member), shared_key(member))
+        else {
+            return false;
+        };
+        let (key, shared) = (key.to_owned(), shared.to_owned());
+        if host_reflect::field_of(member).is_none() {
+            // `Method`/`Constructor` handles do not tell copies apart; the
             // mark makes `isAccessible` on them counted from now on.
-            self.fields.insert(format!("{marker}|{OWN}"), Value::Int(1));
+            self.fields.insert(format!("{key}|{OWN}"), Value::Int(1));
             return true;
         }
-        if canonical == marker {
-            if self.field_override(marker) == Some(flag) {
+        if shared == key {
+            if self.field_override(member) == Some(flag) {
                 return true;
             }
-            self.forget_override(marker);
+            self.forget_override(member);
             return false;
         }
-        let own = format!("{marker}|{OWN}");
+        let own = format!("{key}|{OWN}");
         let was = self.counter(&own) != 0;
         self.fields.insert(own, Value::Int(i32::from(flag)));
         if was != flag {
-            let overridden = format!("{canonical}|{OVERRIDDEN}");
+            let overridden = format!("{shared}|{OVERRIDDEN}");
             let count = self.counter(&overridden);
             let count = if flag {
                 count.saturating_add(1)
@@ -239,14 +220,16 @@ impl<H: Host> Runtime<'_, H> {
 
     /// An `override` change this model could not decide (the call is
     /// counted): no copy of the field has a known flag any more.
-    fn forget_override(&mut self, marker: &str) {
-        let canonical = canonical_field(marker);
-        if canonical.starts_with(FIELD_PREFIX) {
-            self.fields
-                .insert(format!("{canonical}|{UNKNOWN}"), Value::Int(1));
+    fn forget_override(&mut self, member: &Value) {
+        let Some(shared) = shared_key(member) else {
+            return;
+        };
+        let key = if host_reflect::field_of(member).is_some() {
+            format!("{shared}|{UNKNOWN}")
         } else {
-            self.fields.insert(format!("{marker}|{OWN}"), Value::Int(1));
-        }
+            format!("{shared}|{OWN}")
+        };
+        self.fields.insert(key, Value::Int(1));
     }
 
     /// Whether `declaring`'s module is open to `caller` under both loaders
@@ -262,12 +245,12 @@ impl<H: Host> Runtime<'_, H> {
     /// `checkCanSetAccessible(caller, declaring, …)`, decided only where it
     /// passes for a reason the runtime can see (module docs): `false` means
     /// "not decided", never "denied".
-    fn can_set_accessible(&self, marker: &str, caller: &str) -> bool {
-        declaring_class(marker).is_some_and(|declaring| self.module_open_to(declaring, caller))
+    fn can_set_accessible(&self, member: &Value, caller: &str) -> bool {
+        declaring_class(member).is_some_and(|declaring| self.module_open_to(&declaring, caller))
     }
 
-    /// Answer `setAccessible`, `trySetAccessible`, `isAccessible` and
-    /// `Field.equals`/`hashCode`. `None` leaves the call to the rest of the
+    /// Answer `setAccessible`, `trySetAccessible` and `isAccessible` (a
+    /// handle's `equals`/`hashCode` are its kind's row). `None` leaves the call to the rest of the
     /// dispatch (the host counts it).
     pub(super) fn invoke_reflect_override(
         &mut self,
@@ -287,58 +270,39 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Ok(self.set_accessible_all(args, caller));
         }
-        let Some(marker) = receiver.and_then(expect_ref).cloned() else {
+        let Some(member) = receiver.filter(|member| declaring_class(member).is_some()) else {
             return Ok(None);
         };
-        if declaring_class(&marker).is_none() {
-            return Ok(None);
-        }
+        let field = host_reflect::field_of(member).is_some();
         Ok(match (r.name.as_str(), r.descriptor.as_str()) {
             ("setAccessible", "(Z)V") => {
                 let flag = matches!(args.first(), Some(Value::Int(flag)) if *flag != 0);
-                if flag && !self.can_set_accessible(&marker, caller) {
+                if flag && !self.can_set_accessible(member, caller) {
                     // Counted: the real call may have set `override`.
-                    self.forget_override(&marker);
+                    self.forget_override(member);
                     return Ok(None);
                 }
-                self.set_override(&marker, flag).then_some(Value::Void)
+                self.set_override(member, flag).then_some(Value::Void)
             }
             ("trySetAccessible", "()Z") => {
-                if self.field_override(&marker) == Some(true) && marker.starts_with(FIELD_PREFIX) {
+                if field && self.field_override(member) == Some(true) {
                     return Ok(Some(Value::Int(1)));
                 }
-                if !self.can_set_accessible(&marker, caller) {
-                    self.forget_override(&marker);
+                if !self.can_set_accessible(member, caller) {
+                    self.forget_override(member);
                     return Ok(None);
                 }
-                self.set_override(&marker, true).then_some(Value::Int(1))
+                self.set_override(member, true).then_some(Value::Int(1))
             }
             ("isAccessible", "()Z") => {
-                if marker.starts_with(FIELD_PREFIX) {
-                    self.field_override(&marker)
+                if field {
+                    self.field_override(member)
                         .map(|flag| Value::Int(i32::from(flag)))
                 } else {
                     // A `Method`/`Constructor` nothing made accessible.
-                    (!self.fields.contains_key(&format!("{marker}|{OWN}"))).then_some(Value::Int(0))
+                    let key = host_reflect::member_key(member).unwrap_or_default();
+                    (!self.fields.contains_key(&format!("{key}|{OWN}"))).then_some(Value::Int(0))
                 }
-            }
-            ("equals", "(Ljava/lang/Object;)Z") if r.owner == FIELD => {
-                let other = args.first().and_then(expect_ref);
-                let same = other.is_some_and(|other| {
-                    other.starts_with(FIELD_PREFIX)
-                        && canonical_field(other) == canonical_field(&marker)
-                });
-                Some(Value::Int(i32::from(same)))
-            }
-            ("hashCode", "()I") if r.owner == FIELD => {
-                // `getDeclaringClass().getName().hashCode() ^ getName().hashCode()`.
-                let rest = &canonical_field(&marker)[FIELD_PREFIX.len()..];
-                let (class, member) = rest.split_once('#').unwrap_or((rest, ""));
-                let name = member.split(':').next().unwrap_or(member);
-                Some(Value::Int(
-                    jdk_model::java_string_hash(&class.replace('/', "."))
-                        ^ jdk_model::java_string_hash(name),
-                ))
             }
             _ => None,
         })
@@ -351,21 +315,25 @@ impl<H: Host> Runtime<'_, H> {
         let items = args.first().and_then(|array| self.array(array).ok())?;
         let count = items.len();
         // A `null` element is a `NullPointerException` in the check loop.
-        let markers: Vec<String> = items.iter().filter_map(expect_ref).cloned().collect();
-        let decided = markers.len() == count
-            && markers.iter().all(|marker| {
-                declaring_class(marker).is_some()
-                    && (!flag || self.can_set_accessible(marker, caller))
+        let members: Vec<Value> = items
+            .iter()
+            .filter(|item| host_reflect::member_key(item).is_some())
+            .cloned()
+            .collect();
+        let decided = members.len() == count
+            && members.iter().all(|member| {
+                declaring_class(member).is_some()
+                    && (!flag || self.can_set_accessible(member, caller))
             });
         if !decided {
-            for marker in &markers {
-                self.forget_override(marker);
+            for member in &members {
+                self.forget_override(member);
             }
             return None;
         }
         let mut all = true;
-        for marker in &markers {
-            all &= self.set_override(marker, flag);
+        for member in &members {
+            all &= self.set_override(member, flag);
         }
         all.then_some(Value::Void)
     }

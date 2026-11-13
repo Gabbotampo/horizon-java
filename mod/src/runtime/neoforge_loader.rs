@@ -8,6 +8,7 @@
 //! seeded. A question outside that set is left to the rest of the dispatch
 //! chain, which still reports and refuses it.
 
+use crate::runtime::host_path::FML_PATHS_CLASS;
 use crate::runtime::{
     AnnotationValue, Method, MethodRef, NativeJar, StdHost, Value, expect_ref, expect_string,
     is_always_loaded_mod, neutral_args,
@@ -21,9 +22,9 @@ const DEDICATED_SERVER: &str = "dist/DEDICATED_SERVER";
 /// answers, because both runtimes put a mod's files under the same game root.
 fn fml_path_root(name: &str) -> Option<&'static str> {
     match name {
-        "GAMEDIR" => Some("path:/horizon/game"),
-        "CONFIGDIR" => Some("path:/horizon/config"),
-        "MODSDIR" => Some("path:/horizon/mods"),
+        "GAMEDIR" => Some("/horizon/game"),
+        "CONFIGDIR" => Some("/horizon/config"),
+        "MODSDIR" => Some("/horizon/mods"),
         _ => None,
     }
 }
@@ -126,16 +127,14 @@ impl StdHost {
                 "net/neoforged/fml/loading/FMLPaths",
                 name,
                 "Lnet/neoforged/fml/loading/FMLPaths;",
-            ) => {
-                fml_path_root(name).map(|path| Value::Ref(Some(format!("fml-path/{name}/{path}"))))
-            }
+            ) => fml_path_root(name).map(|_| crate::runtime::host_path::fml_path_value(name)),
             // The loader's one game bus, told apart from each mod's bus:
             // the two accept different events (`neoforge_bus.rs`).
             (
                 "net/neoforged/neoforge/common/NeoForge",
                 "EVENT_BUS",
                 "Lnet/neoforged/bus/api/IEventBus;",
-            ) => Some(Value::Ref(Some(crate::runtime::neoforge_bus::GAME_BUS.into()))),
+            ) => Some(crate::runtime::neoforge_bus::game_bus()),
             (
                 "net/minecraftforge/common/MinecraftForge",
                 "EVENT_BUS",
@@ -251,15 +250,17 @@ impl StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Value> {
+        if (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str())
+            == (FML_PATHS_CLASS, "get", "()Ljava/nio/file/Path;")
+        {
+            let name = crate::runtime::host_path::fml_path_name(receiver)?;
+            return fml_path_root(name).map(crate::runtime::path_value);
+        }
         let marker = match receiver {
             Value::Ref(Some(marker)) => marker.as_str(),
             _ => return None,
         };
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
-            ("net/neoforged/fml/loading/FMLPaths", "get", "()Ljava/nio/file/Path;") => {
-                let (_, path) = marker.strip_prefix("fml-path/")?.split_once('/')?;
-                Some(Value::Ref(Some(path.to_owned())))
-            }
             ("net/neoforged/api/distmarker/Dist", "isClient", "()Z") => {
                 Some(Value::Int(i32::from(marker == CLIENT)))
             }

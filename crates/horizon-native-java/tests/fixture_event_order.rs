@@ -7,6 +7,9 @@
 //! the mods' own classes go into the jars, and the native host answers the
 //! API classes exactly as it does for a real jar.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ExecutionBudget, Host, NativeJar, StdHost, Value,
     events::{
@@ -25,12 +28,8 @@ use zip::write::SimpleFileOptions;
 
 const ALEX: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-event-order-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn scratch(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("event-order-{name}"));
     fs::create_dir_all(&root).unwrap();
     root
 }

@@ -480,10 +480,12 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return false;
         };
-        self.class(&r.owner).is_some_and(|file| {
+        let declared = self.class(&r.owner).is_some_and(|file| {
             file.fields.iter().any(|field| {
                 field.name == r.name && field.descriptor == r.descriptor && !field.is_static()
             })
-        }) && self.class_is_instance(class, &r.owner)
+        }) || jdk_skeletons::skeleton_field_owner(&r.owner, &r.name, &r.descriptor)
+            == Some(r.owner.as_str());
+        declared && self.class_is_instance(class, &r.owner)
     }
 }

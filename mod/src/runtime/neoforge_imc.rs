@@ -56,14 +56,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::runtime::events::ListenerCallback;
+use crate::runtime::host_events::key_of;
 use crate::runtime::{
-    ExecutionBudget, Host, MethodRef, NativeError, NativeJar, Runtime, StdHost, Value, expect_ref,
+    ExecutionBudget, Host, HostKind, MethodRef, NativeError, NativeJar, Runtime, StdHost, Value,
+    expect_ref,
 };
 
 const COMMS: &str = "net/neoforged/fml/InterModComms";
-const MESSAGE: &str = "net/neoforged/fml/InterModComms$IMCMessage";
-const MESSAGE_MARKER: &str = "neoforge-imc-message/";
-const SUPPLIER_MARKER: &str = "neoforge-imc-supplier/";
 const SEND: &str = "(Ljava/lang/String;Ljava/lang/String;Ljava/util/function/Supplier;)Z";
 const SEND_AS: &str =
     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/util/function/Supplier;)Z";
@@ -165,15 +164,6 @@ pub(crate) fn set_active<H: Host + ?Sized>(host: &mut H, id: Option<&str>) -> Op
     std::mem::replace(&mut imc.active, id.map(str::to_owned))
 }
 
-/// `instanceof` for a message record and a cross-jar supplier.
-pub(crate) fn instance_of(marker: &str, wanted: &str) -> bool {
-    if marker.starts_with(MESSAGE_MARKER) {
-        return matches!(wanted, MESSAGE | "java/lang/Record" | "java/lang/Object");
-    }
-    marker.starts_with(SUPPLIER_MARKER)
-        && matches!(wanted, "java/util/function/Supplier" | "java/lang/Object")
-}
-
 fn count(unknown: &mut BTreeMap<String, usize>, call: &str, why: &str) {
     *unknown.entry(format!("{call} ({why})")).or_default() += 1;
 }
@@ -190,26 +180,16 @@ fn null_pointer() -> NativeError {
     }
 }
 
-/// A value that means the same in another jar's runtime: `null`, a primitive box (its marker is
-/// its value, `integer:10`) or a plain string.
+/// A value that means the same in another jar's runtime: `null`, a primitive box (it carries its
+/// value) or a plain string.
 fn crosses_jars(value: &Value) -> bool {
-    const BOXES: [&str; 8] = [
-        "java/lang/Integer",
-        "java/lang/Long",
-        "java/lang/Short",
-        "java/lang/Byte",
-        "java/lang/Character",
-        "java/lang/Float",
-        "java/lang/Double",
-        "java/lang/Boolean",
-    ];
     match value {
-        Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Ref(None) => true,
-        Value::Ref(Some(text)) => {
-            crate::runtime::value_class::is_plain_string(text)
-                || (!text.contains('#')
-                    && crate::runtime::class_of_value(value).is_some_and(|class| BOXES.contains(&&*class)))
+        Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) | Value::Ref(None) => {
+            true
         }
+        Value::Ref(Some(text)) => crate::runtime::value_class::is_plain_string(text),
+        // A host handle answers by its kind's row (`host_ref.rs`).
+        Value::Host(host) => host.crosses_jars(&crosses_jars),
         Value::Void => false,
     }
 }
@@ -257,13 +237,13 @@ impl<H: Host> Runtime<'_, H> {
                 _ => Ok(None),
             };
         }
-        let Some(marker) = receiver.and_then(expect_ref) else {
+        let Some(receiver) = receiver else {
             return Ok(None);
         };
-        if let Some(id) = marker.strip_prefix(MESSAGE_MARKER) {
+        if let Some(id) = key_of(receiver, HostKind::ImcMessage) {
             return Ok(self.imc_message_member(r, id));
         }
-        if let Some(id) = marker.strip_prefix(SUPPLIER_MARKER)
+        if let Some(id) = key_of(receiver, HostKind::ImcSupplier)
             && r.name == "get"
             && r.descriptor == "()Ljava/lang/Object;"
         {
@@ -394,7 +374,7 @@ impl<H: Host> Runtime<'_, H> {
         drop(state);
         let values = taken
             .into_iter()
-            .map(|id| Value::Ref(Some(format!("{MESSAGE_MARKER}{id}"))))
+            .map(crate::runtime::host_events::imc_message)
             .collect();
         Ok(self.new_stream(class, method, values))
     }
@@ -415,7 +395,7 @@ impl<H: Host> Runtime<'_, H> {
                 if message.origin == own || message.supplier == Value::Ref(None) {
                     message.supplier.clone()
                 } else {
-                    Value::Ref(Some(format!("{SUPPLIER_MARKER}{id}")))
+                    crate::runtime::host_events::imc_supplier(id)
                 }
             }
             _ => return None,

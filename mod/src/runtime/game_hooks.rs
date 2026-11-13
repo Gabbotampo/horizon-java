@@ -1025,10 +1025,10 @@ impl<H: Host> GameHookHost<'_, H> {
     }
 }
 
-/// Whether `marker` is what `Event.invoker()` answers for a Fabric event the
-/// host made (`fabric-event/<n>/invoker`, `lib.rs`).
-fn is_fabric_event_invoker(marker: &str) -> bool {
-    marker.starts_with("fabric-event/") && marker.ends_with("/invoker")
+/// Whether `value` is what `Event.invoker()` answers for a Fabric event
+/// (`host_events.rs`).
+fn is_fabric_event_invoker(value: &Value) -> bool {
+    crate::runtime::host_events::key_of(value, crate::runtime::HostKind::FabricInvoker).is_some()
 }
 
 impl<H: Host> Host for GameHookHost<'_, H> {
@@ -1103,7 +1103,7 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         // array-backed invoker over its listeners, so any answer here would be
         // made up (an `Allow` invoker answering `false` cancels what vanilla
         // keeps). The firing fails instead.
-        if expect_ref(receiver).is_some_and(|marker| is_fabric_event_invoker(marker)) {
+        if is_fabric_event_invoker(receiver) {
             return Err(NativeError::Metadata(format!(
                 "game hook callback calls {}#{}{} on a Fabric event's invoker, which the hook tier does not run",
                 r.owner, r.name, r.descriptor
@@ -1135,6 +1135,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<String>> {
         self.inner.mutable_collection_values(value)
+    }
+
+    fn is_jdk_list_of(&self, marker: &str) -> bool {
+        self.inner.is_jdk_list_of(marker)
     }
 
     fn service_providers(&self, service: &str) -> Vec<String> {
@@ -1426,6 +1430,8 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
+            watch: Default::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut callback_infos,
