@@ -449,7 +449,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `value.hashCode()` (`invokevirtual Object.hashCode`).
-    fn java_hash(&mut self, value: &Value) -> Result<i32, NativeError> {
+    fn virtual_hash(&mut self, value: &Value) -> Result<i32, NativeError> {
         Ok(int_of(&self.call_virtual(
             Site::Virtual,
             "java/lang/Object",

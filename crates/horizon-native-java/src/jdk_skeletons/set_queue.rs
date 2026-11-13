@@ -66,7 +66,7 @@ impl<H: Host> Runtime<'_, H> {
                 while self.has_next(&it)? {
                     let e = self.next(&it)?;
                     if e != Value::Ref(None) {
-                        h = h.wrapping_add(self.java_hash(&e)?);
+                        h = h.wrapping_add(self.virtual_hash(&e)?);
                     }
                 }
                 Ok(Value::Int(h))
