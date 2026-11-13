@@ -56,6 +56,7 @@ mod guava_text;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
+mod host_entry;
 mod jar_operands;
 mod jar_text;
 mod java_format;
