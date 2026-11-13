@@ -5494,43 +5494,28 @@ impl Host for StdHost {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 java_floor_div_long(left, right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(divide_by_zero)
             }
             ("java/lang/Math", "floorMod", "(JJ)J") => {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 java_floor_mod_long(left, right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(divide_by_zero)
             }
             ("java/lang/Math", "addExact", "(JJ)J") => {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 left.checked_add(right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(|| arithmetic_exception("long overflow"))
             }
             ("java/lang/Math", "max", "(II)I") => Ok(Value::Int(
                 expect_int(r, Self::argument(r, args, 0)?)?
@@ -5544,10 +5529,7 @@ impl Host for StdHost {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 let quotient = i64::from(left) / i64::from(right);
                 let remainder = i64::from(left) % i64::from(right);
@@ -5562,10 +5544,7 @@ impl Host for StdHost {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 // Java computes `a - floorDiv(a, b) * b` in i32 arithmetic, so
                 // a negative divisor produces a negative remainder and the
@@ -5586,10 +5565,7 @@ impl Host for StdHost {
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 left.checked_add(right)
                     .map(Value::Int)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(|| arithmetic_exception("integer overflow"))
             }
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
@@ -12380,6 +12356,24 @@ fn method_ref_null_check(
 
 fn array_index(value: i32) -> Result<usize, NativeError> {
     usize::try_from(value).map_err(|_| NativeError::Metadata("array index is negative".into()))
+}
+
+/// A catchable `java.lang.ArithmeticException` with the JDK's message.
+///
+/// Integer division by zero and `Math`'s exact operations throw it as a
+/// `RuntimeException` a jar can catch, so it travels as a Java throwable the
+/// frame's handler table can take, not as an interpreter error.
+fn arithmetic_exception(message: &str) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/ArithmeticException".into(),
+        message: Some(message.into()),
+        frame: None,
+    }
+}
+
+/// `idiv`/`irem`/`ldiv`/`lrem` and `Math.floorDiv`/`floorMod` by zero.
+fn divide_by_zero() -> NativeError {
+    arithmetic_exception("/ by zero")
 }
 
 /// The throwable a Java array access raises for an index outside the array.
@@ -23899,11 +23893,10 @@ impl<H: Host> Runtime<'_, H> {
                         0x6c => java_int_div(lhs, rhs),
                         _ => java_int_rem(lhs, rhs),
                     }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
-                    stack.push(Value::Int(value));
+                    .ok_or_else(divide_by_zero);
+                    // A zero divisor is a catchable `ArithmeticException`, so
+                    // the frame's own table decides where it lands.
+                    stack.push(Value::Int(invoke_or_catch!(at, value)));
                 }
                 0x61 | 0x65 | 0x69 | 0x6d | 0x71 => {
                     let rhs = pop_long(&mut stack, class, method, at)?;
@@ -23915,11 +23908,8 @@ impl<H: Host> Runtime<'_, H> {
                         0x6d => java_long_div(lhs, rhs),
                         _ => java_long_rem(lhs, rhs),
                     }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
-                    stack.push(Value::Long(value));
+                    .ok_or_else(divide_by_zero);
+                    stack.push(Value::Long(invoke_or_catch!(at, value)));
                 }
                 // fadd/dadd, fsub/dsub, fmul/dmul, fdiv/ddiv, frem/drem. The
                 // `f*` half rounds to `f32` after the operation, exactly as a
@@ -33072,11 +33062,15 @@ mandatory = true
         );
         assert!(matches!(
             host.invoke(&add_exact, &[Value::Int(i32::MAX), Value::Int(1)]),
-            Err(NativeError::Arithmetic { .. })
+            Err(NativeError::UncaughtException { class, message, .. })
+                if class == "java/lang/ArithmeticException"
+                    && message.as_deref() == Some("integer overflow")
         ));
         assert!(matches!(
             host.invoke(&add_exact, &[Value::Int(i32::MIN), Value::Int(-1)]),
-            Err(NativeError::Arithmetic { .. })
+            Err(NativeError::UncaughtException { class, message, .. })
+                if class == "java/lang/ArithmeticException"
+                    && message.as_deref() == Some("integer overflow")
         ));
     }
 
