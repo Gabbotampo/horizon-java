@@ -140,6 +140,15 @@ impl HashTable {
             .collect()
     }
 
+    /// The stored (spread) hash of `key`, when it is in a bin.
+    pub(crate) fn stored_hash(&self, key: &str) -> Option<i32> {
+        self.bins
+            .iter()
+            .flatten()
+            .find(|(k, _)| k == key)
+            .map(|(_, hash)| *hash)
+    }
+
     /// The keys in iteration order (bin by bin), unplaced keys last.
     pub(crate) fn order(&self) -> Vec<String> {
         self.bins
