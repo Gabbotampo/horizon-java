@@ -119,7 +119,7 @@ public final class Probe {
         return sb + "" + m.values();
     }
 
-    /// The reviewer's `equals` on this branch alone: counted here.
+    /// The reviewer's `equals` with jar keys.
     public static String mapEqualsJarKeys() {
         Map<K, String> a = new HashMap<>(), b = new HashMap<>();
         for (int i = 0; i < 4; i++) a.put(new K(i, i), "v" + i);
@@ -200,7 +200,8 @@ fn hash_iteration_is_fail_fast() {
 /// `forEach` walks the live table after a change (JDK 25 printed
 /// `01234101CME`, `abcCME3`, `abCME`), which is not modelled: counted, with
 /// the exception at the end. `equals` of hash maps or their key sets with
-/// jar keys is counted on this branch (#109 answers it).
+/// jar keys: the maps' `equals` is answered (#109), their key-set copies' is
+/// counted.
 #[test]
 fn changes_inside_for_each_and_jar_key_equals_are_counted() {
     let fixture = fixture("changes-inside-for-each-and-jar-key-equa");
@@ -219,10 +220,7 @@ fn changes_inside_for_each_and_jar_key_equals_are_counted() {
         ),
         (
             "mapEqualsJarKeys",
-            &[
-                ("java/util/Map#equals(Ljava/lang/Object;)Z", 1),
-                ("java/util/Set#equals(Ljava/lang/Object;)Z", 1),
-            ],
+            &[("java/util/Set#equals(Ljava/lang/Object;)Z", 1)],
         ),
     ];
     for (method, expected) in cases {

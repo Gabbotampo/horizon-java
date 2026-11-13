@@ -22,6 +22,9 @@
 //!   the bin's tail, turns a bin that already held 8 nodes into a tree (or
 //!   resizes a table smaller than 64 instead), then resizes when the size
 //!   passes the threshold.
+//! - **`computeIfAbsent`/`compute`/`merge`** resize *before* inserting when
+//!   the size already passed the threshold, insert at the bin's **head**, and
+//!   treeify a bin that already held 7 nodes.
 //! - **Removal** unlinks a node; the table never shrinks, `clear` keeps it.
 //!
 //! A tree bin orders and searches its nodes by `compareTo` and identity
@@ -236,6 +239,15 @@ impl HashTable {
         }
     }
 
+    /// The start of `computeIfAbsent`/`compute`/`merge`: they resize before
+    /// they search, whether or not the key is there, when the size already
+    /// passed the threshold or no table is allocated.
+    pub(crate) fn begin_compute(&mut self) {
+        if self.len() as i64 > self.threshold || self.bins.is_empty() {
+            self.resize();
+        }
+    }
+
     /// `putVal`'s insertion of `key`, whose `hashCode()` is `hash` (`None`:
     /// an identity hash): allocate, append to the bin's tail, treeify a bin
     /// that already held 8 nodes, resize past the threshold.
@@ -257,6 +269,26 @@ impl HashTable {
         }
         if size + 1 > self.threshold {
             self.resize();
+        }
+    }
+
+    /// `computeIfAbsent`/`compute`/`merge`'s insertion (after
+    /// [`Self::begin_compute`]): the bin's head, treeifying a bin that
+    /// already held 7 nodes, and no resize afterwards.
+    pub(crate) fn insert_at_head(&mut self, key: String, hash: Option<i32>) {
+        if self.bins.is_empty() {
+            self.resize();
+        }
+        if let Some(hash) = hash {
+            let spread = spread(hash);
+            let bin = spread as u32 as usize & (self.bins.len() - 1);
+            let held = self.bins[bin].len();
+            self.bins[bin].insert(0, (key, spread));
+            if held >= TREEIFY_THRESHOLD - 1 {
+                self.treeify_bin();
+            }
+        } else {
+            self.unplaced.insert(key);
         }
     }
 
