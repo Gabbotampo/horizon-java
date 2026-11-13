@@ -69,6 +69,7 @@ mod heap;
 mod hook_shapes;
 mod host_entry;
 mod iteration_guard;
+mod jar_compare;
 mod jar_operands;
 mod jar_text;
 mod jar_throwables;
@@ -122,6 +123,7 @@ mod open_options;
 mod optionull;
 mod parked_threads;
 pub use parked_threads::ParkedThread;
+mod priority_queue;
 mod reference_identity;
 mod references;
 mod reflect_constructors;
@@ -137,6 +139,7 @@ mod stack_walk;
 mod string_code_points;
 mod string_constructors;
 mod synchronized_views;
+mod tim_sort;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
@@ -2265,6 +2268,14 @@ pub trait Host {
 
     fn store_hash_table(&mut self, _marker: &str, _table: hash_table::HashTable) {}
 
+    /// The comparator a sorted collection or priority queue was built with
+    /// (`priority_queue.rs`), by marker; `None` is natural order.
+    fn collection_comparator(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
+    fn set_collection_comparator(&mut self, _marker: &str, _comparator: Value) {}
+
     /// Remember that `marker` is the copy a map's `keySet()`/`values()`/
     /// `entrySet()` answered (from the map `source`), whose mutators cannot
     /// reach the map.
@@ -2736,6 +2747,8 @@ pub struct StdHost {
     /// The bucket table a JDK hash collection would have, by marker
     /// (`hash_table.rs`, `hash_collections.rs`).
     hash_tables: BTreeMap<String, hash_table::HashTable>,
+    /// The comparators priority queues were built with, by marker.
+    collection_comparators: BTreeMap<String, Value>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
     view_copies: BTreeMap<String, String>,
     /// Which view each copy is (`keySet`, `values`, `entrySet`).
@@ -2885,6 +2898,7 @@ impl StdHost {
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
             hash_tables: BTreeMap::new(),
+            collection_comparators: BTreeMap::new(),
             view_copies: BTreeMap::new(),
             view_kinds: BTreeMap::new(),
             locales: BTreeMap::new(),
@@ -4283,6 +4297,15 @@ impl Host for StdHost {
 
     fn store_hash_table(&mut self, marker: &str, table: hash_table::HashTable) {
         self.hash_tables.insert(marker.to_owned(), table);
+    }
+
+    fn collection_comparator(&self, marker: &str) -> Option<Value> {
+        self.collection_comparators.get(marker).cloned()
+    }
+
+    fn set_collection_comparator(&mut self, marker: &str, comparator: Value) {
+        self.collection_comparators
+            .insert(marker.to_owned(), comparator);
     }
 
     fn note_view_copy(&mut self, marker: &str, source: &str) {
@@ -20025,6 +20048,12 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return Ok(Some(value));
             }
+            // `Mode::name`/`Mode::ordinal`: the enum model the direct call uses.
+            if let Some(value) =
+                self.invoke_enum_member(&callback.target, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
             // `Object::toString` on a host entry: its text, as the direct call
             // prints it (`host_entry.rs`).
             if callback.target.name == "toString"
@@ -24838,6 +24867,12 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_priority_queue(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // `PriorityQueue`'s heap (`priority_queue.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_object_methods(&r, op, receiver.as_ref(), &args)
                     ) {
                         // `equals`/`hashCode` as the JVM runs them
@@ -25046,6 +25081,7 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_jdk_runtime(&r, receiver.as_ref(), &args))
                     {
+                        // A sort's comparator may throw for the jar to catch.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
