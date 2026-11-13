@@ -61,6 +61,7 @@ mod hash_map_order;
 mod hash_table;
 mod heap;
 mod hook_shapes;
+mod host_entry;
 mod immutable_collections;
 mod iteration_guard;
 mod jar_compare;
@@ -7415,10 +7416,13 @@ impl Host for StdHost {
                     value_marker(&key),
                     value_marker(&value)
                 )))),
+                // JDK 25: `key + "=" + value`, each `String.valueOf`'d (a box
+                // as Java prints it; a jar object, which the host cannot run,
+                // counted as in any collection's text).
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
                     "{}={}",
-                    value_marker(&key),
-                    value_marker(&value)
+                    object_text(self, &key),
+                    object_text(self, &value)
                 )))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "{}#{}{}",
@@ -10948,7 +10952,7 @@ fn map_entry_value(key: &Value, value: &Value) -> Value {
     )))
 }
 
-fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
+pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
     let marker = expect_ref(value)
         .and_then(|marker| marker.strip_prefix("map-entry/"))
         .ok_or_else(|| NativeError::Metadata("expected a native map entry marker".into()))?;
@@ -19780,6 +19784,14 @@ impl<H: Host> Runtime<'_, H> {
                 self.invoke_enum_member(&callback.target, Some(&receiver), &rest)?
             {
                 return Ok(Some(value));
+            }
+            // `Object::toString` on a host entry: its text, as the direct call
+            // prints it (`host_entry.rs`).
+            if callback.target.name == "toString"
+                && callback.target.descriptor == "()Ljava/lang/String;"
+                && let Some(text) = self.host_entry_text(&receiver, "callback", "callback")?
+            {
+                return Ok(Some(text));
             }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
