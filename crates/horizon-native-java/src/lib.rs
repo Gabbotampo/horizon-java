@@ -75,6 +75,7 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod lambda_boxing;
 mod library_dispatch;
+mod linked_resources;
 mod map_compute;
 mod method_handles;
 mod mixin_extras;
@@ -2855,9 +2856,12 @@ impl StdHost {
     /// Query an explicitly seeded resource marker without crossing into the
     /// host filesystem or process classpath.
     pub fn resource(&self, name: &str) -> Option<&str> {
+        let name = name.strip_prefix('/').unwrap_or(name);
         self.resources
-            .get(name.strip_prefix('/').unwrap_or(name))
+            .get(name)
             .map(String::as_str)
+            // A linked jar's, after the running jar's (`linked_resources.rs`).
+            .or_else(|| self.linked_classes.resource(name).map(|(marker, _)| marker))
     }
 
     /// Alias named for callers that want to make the query boundary explicit.
@@ -2881,7 +2885,16 @@ impl StdHost {
         let Some(marker) = self.resource(name).map(str::to_owned) else {
             return Value::Ref(None);
         };
-        if let Some(bytes) = self.resource_bytes.get(name).cloned() {
+        let bytes = self.resource_bytes.get(name).cloned().or_else(|| {
+            (!self.resources.contains_key(name))
+                .then(|| {
+                    self.linked_classes
+                        .resource(name)
+                        .map(|(_, bytes)| bytes.to_vec())
+                })
+                .flatten()
+        });
+        if let Some(bytes) = bytes {
             self.resource_streams.insert(marker.clone(), (bytes, 0));
         } else {
             self.resource_streams
@@ -12595,6 +12608,9 @@ pub struct LinkedClassTable {
     /// path, it only answers what a supplied jar declared.
     services: BTreeMap<String, Vec<String>>,
     providers: usize,
+    /// Each linked jar's resources by name, with the marker the host answers
+    /// for them (`linked_resources.rs`).
+    resources: BTreeMap<String, (String, Vec<u8>)>,
 }
 
 impl LinkedClassTable {
@@ -12622,6 +12638,7 @@ impl LinkedClassTable {
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
         let added = self.link_classes(id, jar.classes.values().cloned())?;
+        self.link_resources(jar);
         self.link_services(jar);
         Ok(added)
     }
