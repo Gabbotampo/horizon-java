@@ -294,7 +294,7 @@ fn value_bytes(value: &Value) -> usize {
 fn value_text(value: &Value) -> Option<&str> {
     match value {
         Value::Ref(Some(text)) => Some(text),
-        Value::Host(host) => Some(&host.key),
+        Value::Host(host) => Some(host.key()),
         _ => None,
     }
 }

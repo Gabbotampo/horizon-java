@@ -1428,9 +1428,8 @@ pub(super) fn unboxed_instance_of(value: &Value, wanted: &str) -> bool {
         Value::Long(_) => shared || wanted == "java/lang/Long",
         Value::Int(_) => shared || wanted == "java/lang/Integer",
         Value::Boxed(boxed) => crate::runtime::jdk_model::class_instance_of(boxed.class(), wanted),
-        // A host model's object (an `Optional`) is an instance of its class.
-        Value::Host(_) => crate::runtime::class_of_value(value)
-            .is_some_and(|class| crate::runtime::jdk_model::class_instance_of(&class, wanted)),
+        // A host handle answers by its kind's row (`host_ref.rs`).
+        Value::Host(handle) => handle.instance_of(wanted),
         _ => false,
     }
 }

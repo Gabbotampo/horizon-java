@@ -199,7 +199,7 @@ fn crosses_jars(value: &Value) -> bool {
         }
         Value::Ref(Some(text)) => crate::value_class::is_plain_string(text),
         // An optional crosses when what it holds does (a number always).
-        Value::Host(host) => match host.kind {
+        Value::Host(host) => match host.kind() {
             crate::HostKind::Optional => {
                 crate::optional_present(value).is_none_or(|held| crosses_jars(&held))
             }

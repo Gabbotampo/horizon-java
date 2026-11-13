@@ -241,18 +241,10 @@ impl<H: Host> Runtime<'_, H> {
     /// The hash of a host-modelled value: a list, set or map by the JDK's
     /// formula over its elements, an identifier by `Identifier.hashCode`.
     fn host_value_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
-        // `Optional.hashCode`: `Objects.hashCode(value)`; the primitive
-        // optionals hash their value's box (`0` when empty).
-        if let Value::Host(host) = value {
-            return match host.kind {
-                HostKind::Optional => match optional_present(value) {
-                    Some(held) => self.java_hash(&held),
-                    None => Ok(Some(0)),
-                },
-                HostKind::OptionalInt | HostKind::OptionalLong | HostKind::OptionalDouble => {
-                    Ok(host_hash(value))
-                }
-            };
+        // A handle's `hashCode` is its kind's row, a held value's own
+        // `hashCode` run here (`host_ref.rs`).
+        if let Value::Host(handle) = value {
+            return handle.hash_code(&mut RuntimeNested::new(self));
         }
         let Some(marker) = expect_ref(value) else {
             return Ok(None);
@@ -344,17 +336,14 @@ impl<H: Host> Runtime<'_, H> {
                     ))),
                 }
             }
-            // `Optional.equals`: the other is an optional holding an equal value.
-            Equality::Host if is_optional(a) => Ok(is_optional(b)
-                && match (optional_present(a), optional_present(b)) {
-                    (Some(left), Some(right)) => match self.equality_of(&left) {
-                        Equality::Null => false,
-                        _ => self.java_equals(&left, &right)?,
-                    },
-                    (None, None) => true,
-                    _ => false,
-                }),
-            Equality::Host => Ok(a == b),
+            // A handle's `equals` is its kind's row, a held value's own
+            // `equals` run here (`host_ref.rs`).
+            Equality::Host => match a {
+                Value::Host(handle) => Ok(handle
+                    .equals(b, &mut RuntimeNested::new(self))?
+                    .unwrap_or(a == b)),
+                _ => Ok(a == b),
+            },
         }
     }
 
@@ -535,6 +524,61 @@ impl<H: Host> Runtime<'_, H> {
             descriptor: HASH_CODE.into(),
         })
     }
+    /// `toString()`, `hashCode()` and `equals(Object)` on a host handle,
+    /// whatever class the call names: the kind's row (`host_ref.rs`), with a
+    /// held jar object's own methods run through the interpreter
+    /// (`Optional.of(node).hashCode()` is `node.hashCode()`). An answer only
+    /// the JVM has (a held object's identity hash) is counted.
+    pub(crate) fn invoke_host_object_method(
+        &mut self,
+        r: &MethodRef,
+        opcode: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(Value::Host(handle)) = receiver else {
+            return Ok(None);
+        };
+        if !matches!(opcode, 0xb6 | 0xb9) {
+            return Ok(None);
+        }
+        let mut nested = RuntimeNested {
+            runtime: self,
+            class,
+            method,
+        };
+        let answer = match (r.name.as_str(), r.descriptor.as_str(), args) {
+            ("toString", "()Ljava/lang/String;", []) => handle
+                .to_string(&mut nested)?
+                .map(|text| Value::Ref(Some(text))),
+            ("hashCode", HASH_CODE, []) => handle.hash_code(&mut nested)?.map(Value::Int),
+            ("equals", EQUALS, [other]) => handle
+                .equals(other, &mut nested)?
+                .map(|equal| Value::Int(i32::from(equal))),
+            _ => return Ok(None),
+        };
+        match answer {
+            Some(answer) => Ok(Some(answer)),
+            None => self.host.unknown_operand_call(r).map(Some),
+        }
+    }
+
+    /// `String.valueOf(handle)`: its kind's `toString`, a held value's text
+    /// the runtime's own (`None` when that text is unknown).
+    pub(crate) fn host_ref_text(
+        &mut self,
+        handle: &HostRef,
+        class: &str,
+        method: &str,
+    ) -> Result<Option<String>, NativeError> {
+        handle.to_string(&mut RuntimeNested {
+            runtime: self,
+            class,
+            method,
+        })
+    }
 
     /// `Objects.equals`/`hashCode`/`hash`, `Arrays.hashCode(Object[])`, and a
     /// direct read of an identity hash (`Object.hashCode`/`Enum.hashCode` on a
@@ -703,5 +747,44 @@ impl<H: Host> Runtime<'_, H> {
             .iter()
             .map(|item| parse_collection_value(item))
             .collect()
+    }
+}
+
+/// [`host_ref::Nested`] for the runtime: a held value's `hashCode`, `equals`
+/// and text as the JVM runs them, a jar object's own bodies included.
+/// `class` and `method` name the calling frame, for a library model's
+/// `toString` that runs a callback.
+struct RuntimeNested<'a, 'r, 'f, H: Host> {
+    runtime: &'a mut Runtime<'r, H>,
+    class: &'f str,
+    method: &'f str,
+}
+
+impl<'a, 'r, H: Host> RuntimeNested<'a, 'r, 'static, H> {
+    fn new(runtime: &'a mut Runtime<'r, H>) -> Self {
+        Self {
+            runtime,
+            class: "",
+            method: "",
+        }
+    }
+}
+
+impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
+    fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        self.runtime.java_hash(value)
+    }
+
+    fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
+        self.runtime.objects_equals(a, b).map(Some)
+    }
+
+    fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        if let Value::Host(handle) = value {
+            return handle.to_string(self);
+        }
+        self.runtime
+            .value_of_text(value, "Ljava/lang/Object;", self.class, self.method)
+            .map(Some)
     }
 }
