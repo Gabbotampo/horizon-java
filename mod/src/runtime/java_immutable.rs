@@ -144,10 +144,14 @@ impl StdHost {
                     .next()
                     .unwrap_or_default()
                     .to_lowercase();
-                return Some(
-                    self.elements(&copy)
-                        .map(|values| self.unmodifiable(&kind, values)),
-                );
+                let list_copy = r.owner == "java/util/List";
+                return Some(self.elements(&copy).map(|values| {
+                    let made = self.unmodifiable(&kind, values);
+                    if list_copy {
+                        self.mark_jdk_list_of(&made);
+                    }
+                    made
+                }));
             }
             (
                 "com/google/common/collect/ImmutableList"
@@ -210,7 +214,19 @@ impl StdHost {
         {
             self.empty_collections.insert(marker.clone());
         }
+        if r.owner == "java/util/List" {
+            self.mark_jdk_list_of(&made);
+        }
         Some(Ok(made))
+    }
+
+    /// Remember a JDK `List12`/`ListN` (`List.of`, `List.copyOf`): its
+    /// `indexOf`/`lastIndexOf`/`contains` start with
+    /// `Objects.requireNonNull(o)` (`list_equality.rs`).
+    fn mark_jdk_list_of(&mut self, list: &Value) {
+        if let Some(marker) = expect_ref(list) {
+            self.jdk_list_of.insert(marker.clone());
+        }
     }
 
     /// The elements a view reads: its source's current ones.

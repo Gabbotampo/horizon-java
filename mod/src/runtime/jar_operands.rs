@@ -324,7 +324,7 @@ const ARGUMENT_HOOKS: &[&str] = &[
 /// The data interface that declares `name descriptor` as a default among
 /// `implemented` (closed over superinterfaces), the most specific one when
 /// several do (`List.getFirst` over `SequencedCollection.getFirst`).
-fn data_default_owner(
+pub(crate) fn data_default_owner(
     implemented: &[&'static str],
     name: &str,
     descriptor: &str,
@@ -394,7 +394,7 @@ fn close_data_interface(interface: &str, out: &mut Vec<&'static str>) {
 const IDENTITY_MEMBERS: &[&str] = &["getClass", "notify", "notifyAll", "wait"];
 
 /// Whether `class` is one of the JDK skeleton classes `jvm_dispatch` knows.
-fn is_skeleton(class: &str) -> bool {
+pub(crate) fn is_skeleton(class: &str) -> bool {
     jvm_dispatch::JDK_SKELETONS
         .iter()
         .any(|(skeleton, _, _)| *skeleton == class)
@@ -593,7 +593,11 @@ impl<H: Host> Runtime<'_, H> {
     /// Every data interface `receiver`'s class implements: through its jar
     /// classes and interfaces, and through its JDK skeleton superclass
     /// `base`, closed over their superinterfaces.
-    fn implemented_data_interfaces(&self, receiver: &Value, base: &str) -> Vec<&'static str> {
+    pub(crate) fn implemented_data_interfaces(
+        &self,
+        receiver: &Value,
+        base: &str,
+    ) -> Vec<&'static str> {
         let mut out = Vec::new();
         let Some(class) =
             expect_ref(receiver).and_then(|marker| jvm_dispatch::constructed_object_class(marker))

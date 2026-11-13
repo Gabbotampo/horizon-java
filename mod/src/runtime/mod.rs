@@ -82,12 +82,14 @@ mod java_nbt;
 mod java_numbers;
 mod java_regex;
 mod java_tostring;
+mod jdk_call;
 mod jdk_character;
 mod jdk_character_table;
 mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
 mod jdk_reflect_proxy;
+mod jdk_skeletons;
 mod jdk_stream;
 mod jdk_string_builder;
 mod jdk_supertypes;
@@ -2257,6 +2259,12 @@ pub trait Host {
         None
     }
 
+    /// Whether `marker` is a JDK `List.of`/`List.copyOf` list (`List12`/
+    /// `ListN`), whose search members reject `null` (`list_equality.rs`).
+    fn is_jdk_list_of(&self, _marker: &str) -> bool {
+        false
+    }
+
     /// Whether the host keeps a collection row for `marker`.
     fn has_mutable_collection(&self, _marker: &str) -> bool {
         false
@@ -2754,6 +2762,10 @@ pub struct StdHost {
     /// `Collections.emptyList()`/`emptySet()`/`emptyMap()` markers, whose
     /// mutators JDK 25 does not all refuse (`java_immutable.rs`).
     empty_collections: std::collections::BTreeSet<String>,
+    /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
+    /// ones (`java_immutable.rs`); `list_equality.rs` runs their
+    /// null-hostile `List12`/`ListN` rules.
+    jdk_list_of: std::collections::BTreeSet<String>,
     /// UTF-8 decoders `Charset.newDecoder` made (`charset_decoder.rs`).
     charset_decoders: BTreeMap<String, charset_decoder::DecoderState>,
     /// `Collections.synchronized*` views and the collection each wraps
@@ -2916,6 +2928,7 @@ impl StdHost {
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
             empty_collections: std::collections::BTreeSet::new(),
+            jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
@@ -4309,6 +4322,10 @@ impl Host for StdHost {
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn is_jdk_list_of(&self, marker: &str) -> bool {
+        self.jdk_list_of.contains(marker)
     }
 
     fn has_mutable_collection(&self, marker: &str) -> bool {
@@ -20084,6 +20101,11 @@ impl<H: Host> Runtime<'_, H> {
                     .map(Some);
             }
             if let Some(value) =
+                self.invoke_jdk_skeleton(&callback.target, 0xb9, Some(&receiver), &rest)?
+            {
+                return Ok(Some(value));
+            }
+            if let Some(value) =
                 self.count_unmodelled_jar_operand(&callback.target, 0xb9, Some(&receiver), &rest)?
             {
                 return Ok(Some(value));
@@ -20101,6 +20123,24 @@ impl<H: Host> Runtime<'_, H> {
                 && let Some(text) = self.host_entry_text(&receiver, "callback", "callback")?
             {
                 return Ok(Some(text));
+            }
+            // `StringBuilder::append` bound to a builder (`list.forEach(out::append)`):
+            // the builder's text lives in the interpreter, so the call runs
+            // through the same chain as a direct call (`jdk_call.rs`).
+            if matches!(
+                callback.target.owner.as_str(),
+                "java/lang/StringBuilder" | "java/lang/StringBuffer"
+            ) {
+                return self
+                    .call_virtual(
+                        jdk_call::Site::Virtual,
+                        &callback.target.owner,
+                        &callback.target.name,
+                        &callback.target.descriptor,
+                        &receiver,
+                        &rest,
+                    )
+                    .map(Some);
             }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
@@ -20459,8 +20499,10 @@ impl<H: Host> Runtime<'_, H> {
                 return true;
             }
             let Some(file) = self.class(&current) else {
-                // A JDK throwable superclass and its JDK ancestors.
-                return jar_throwables::throwable_is_instance(&current, wanted);
+                // A JDK skeleton superclass's own supertypes (`jdk_skeletons/`),
+                // else a JDK throwable superclass and its JDK ancestors.
+                return jdk_skeletons::skeleton_is_instance(&current, wanted)
+                    .unwrap_or_else(|| jar_throwables::throwable_is_instance(&current, wanted));
             };
             if file
                 .interface_names()
@@ -23617,12 +23659,14 @@ impl<H: Host> Runtime<'_, H> {
         // `&mut self` calls the instruction loop makes.
         let linked = Arc::clone(&self.linked);
         let host_models = self.host.models_class(class);
-        let file = match self.classes.get(class) {
-            Some(file) => file,
-            None if !host_models => linked
+        // A JDK body's call-site frame (`jdk_call.rs`).
+        let site = jdk_call::site(class);
+        let file = match (self.classes.get(class), site.as_deref()) {
+            (Some(file), _) | (None, Some(file)) => file,
+            (None, None) if !host_models => linked
                 .get(class)
                 .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?,
-            None => {
+            (None, None) => {
                 return Err(NativeError::MissingMethod(format!(
                     "{class}#{method}{desc}"
                 )));
@@ -24871,6 +24915,18 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A jar's copy of a loader class its run's loader
                         // lacks (`class_precedence.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // A JDK skeleton's body or a JDK interface default the
+                        // receiver inherits (`jdk_skeletons/`). It never
+                        // claims a call the jar copy above runs: that one
+                        // takes only static/`invokespecial` calls whose member
+                        // a jar class declares, while a skeleton
+                        // `invokespecial` needs the member to resolve to the
+                        // JDK class, as the JVM's resolution does.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

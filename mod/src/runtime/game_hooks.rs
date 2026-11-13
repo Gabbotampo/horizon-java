@@ -1137,6 +1137,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.mutable_collection_values(value)
     }
 
+    fn is_jdk_list_of(&self, marker: &str) -> bool {
+        self.inner.is_jdk_list_of(marker)
+    }
+
     fn service_providers(&self, service: &str) -> Vec<String> {
         self.inner.service_providers(service)
     }
