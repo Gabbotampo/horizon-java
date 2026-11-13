@@ -61,6 +61,22 @@ impl<H: Host> Runtime<'_, H> {
         if *value == Value::Ref(None) || target == "java/lang/Object" {
             return Ok(());
         }
+        // A JDK throwable target and a throwable value: the JDK hierarchy
+        // decides (`jar_throwables.rs`).
+        if let Some((fits, runtime_class)) = self.throwable_cast(value, target) {
+            if fits {
+                return Ok(());
+            }
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/ClassCastException".into(),
+                message: Some(format!(
+                    "class {} cannot be cast to class {}",
+                    runtime_class.replace('/', "."),
+                    target.replace('/', ".")
+                )),
+                frame: None,
+            });
+        }
         let Some(target_file) = self.class(target) else {
             // A JDK or game target: the runtime models those values by marker
             // and keeps its previous behaviour.

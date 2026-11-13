@@ -122,8 +122,17 @@ impl<H: Host> Runtime<'_, H> {
         if source == target {
             return Ok(Some(answer));
         }
+        // A directory stays one (`file_attributes.rs`): a copy makes an empty
+        // directory, a move renames it.
+        let directory = self.io_dirs.contains(&source);
         if moving {
+            self.io_dirs.remove(&source);
             self.io_files.remove(&source);
+        }
+        if directory {
+            self.io_dirs.insert(target.clone());
+        } else {
+            self.io_dirs.remove(&target);
         }
         self.io_files.insert(target, text);
         Ok(Some(answer))

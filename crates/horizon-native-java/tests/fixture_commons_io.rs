@@ -6,6 +6,9 @@
 //! the text; the expectations below are that contract, and a read of a file
 //! nobody wrote is the `IOException` the library raises.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
@@ -44,11 +47,7 @@ public final class IoProbe {
 
 #[test]
 fn source_built_probe_round_trips_commons_io_text() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-commons-io-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("commons-io");
     let src = root.join("src/demo");
     let stub_src = root.join("src/stubs/org/apache/commons/io");
     let classes = root.join("classes");

@@ -18,6 +18,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // `Files.readAttributes`/`isDirectory` (`file_attributes.rs`), also
+        // as a method reference (`filter(Files::isDirectory)`).
+        if let Some(value) = self.invoke_file_attributes(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // `ServiceLoader` through a method reference (`Provider::get`).
         if let Some(value) = self.invoke_service_loader(r, receiver, args)? {
             return Ok(Some(value));
