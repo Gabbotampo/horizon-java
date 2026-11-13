@@ -144,13 +144,13 @@ impl StdHost {
                     .next()
                     .unwrap_or_default()
                     .to_lowercase();
-                let null_hostile = kind == "list";
+                let list_copy = r.owner == "java/util/List";
                 return Some(self.elements(&copy).map(|values| {
-                    let list = self.unmodifiable(&kind, values);
-                    if null_hostile {
-                        self.mark_null_hostile(&list);
+                    let made = self.unmodifiable(&kind, values);
+                    if list_copy {
+                        self.mark_jdk_list_of(&made);
                     }
-                    list
+                    made
                 }));
             }
             (
@@ -208,18 +208,24 @@ impl StdHost {
                 )));
             }
         }
-        let collection = self.unmodifiable(kind, args.to_vec());
-        if r.owner == "java/util/List" {
-            self.mark_null_hostile(&collection);
+        let made = self.unmodifiable(kind, args.to_vec());
+        if r.name.starts_with("empty")
+            && let Some(marker) = expect_ref(&made)
+        {
+            self.empty_collections.insert(marker.clone());
         }
-        Some(Ok(collection))
+        if r.owner == "java/util/List" {
+            self.mark_jdk_list_of(&made);
+        }
+        Some(Ok(made))
     }
 
-    /// Remember a JDK `ListN`/`List12`: its `indexOf`, `lastIndexOf` and
-    /// `contains` call `Objects.requireNonNull(o)`.
-    fn mark_null_hostile(&mut self, list: &Value) {
+    /// Remember a JDK `List12`/`ListN` (`List.of`, `List.copyOf`): its
+    /// `indexOf`/`lastIndexOf`/`contains` start with
+    /// `Objects.requireNonNull(o)` (`list_equality.rs`).
+    fn mark_jdk_list_of(&mut self, list: &Value) {
         if let Some(marker) = expect_ref(list) {
-            self.null_hostile_lists.insert(marker.clone());
+            self.jdk_list_of.insert(marker.clone());
         }
     }
 
@@ -239,25 +245,15 @@ impl StdHost {
         marker: &str,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
+        if MUTATORS.contains(&r.name.as_str())
+            && self.empty_collections.contains(marker)
+            && let Some(answer) = empty_collection_member(r, args)
+        {
+            return Some(answer);
+        }
         if MUTATORS.contains(&r.name.as_str()) && self.unmodifiable_collections.contains_key(marker)
         {
             return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
-        }
-        // `ListN`/`List12`'s `indexOf`/`lastIndexOf`/`contains` (and
-        // `containsAll`, through `contains`) start with
-        // `Objects.requireNonNull(o)`: a message-less NPE for `null`.
-        if self.null_hostile_lists.contains(marker) {
-            let null_argument = match (r.name.as_str(), r.descriptor.as_str()) {
-                ("indexOf" | "lastIndexOf", "(Ljava/lang/Object;)I")
-                | ("contains", "(Ljava/lang/Object;)Z") => args.first() == Some(&Value::Ref(None)),
-                ("containsAll", "(Ljava/util/Collection;)Z") => self
-                    .elements(args.first()?)
-                    .is_ok_and(|values| values.contains(&Value::Ref(None))),
-                _ => false,
-            };
-            if null_argument {
-                return Some(Err(throw("java/lang/NullPointerException", None)));
-            }
         }
         if (r.name.as_str(), r.descriptor.as_str()) != ("equals", "(Ljava/lang/Object;)Z") {
             return None;
@@ -285,5 +281,36 @@ impl StdHost {
             members(&mine) == members(&theirs)
         };
         Some(Ok(Value::Int(i32::from(equal))))
+    }
+}
+
+/// `Collections.emptyList()`/`emptySet()`/`emptyMap()` mutators that JDK 25
+/// does not refuse: `replaceAll`/`removeIf` only check their argument
+/// (`removeIf` answers `false`), `sort` does nothing, and the members
+/// inherited from `AbstractCollection`/`AbstractList`/`AbstractMap` that
+/// walk the (empty) collection (`remove`, `removeAll`, `retainAll`,
+/// `clear`, adding nothing) find nothing to do. `None`: the member refuses.
+fn empty_collection_member(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
+    let nothing = || -> Value {
+        if r.descriptor.ends_with(")Z") {
+            Value::Int(0)
+        } else if r.descriptor.ends_with(")V") {
+            Value::Void
+        } else {
+            Value::Ref(None)
+        }
+    };
+    let null_argument = matches!(args.first(), Some(Value::Ref(None)));
+    match r.name.as_str() {
+        "replaceAll" | "removeIf" | "removeAll" | "retainAll" if null_argument => {
+            Some(Err(throw("java/lang/NullPointerException", None)))
+        }
+        "replaceAll" | "removeIf" | "sort" | "clear" | "removeAll" | "retainAll" => {
+            Some(Ok(nothing()))
+        }
+        // `remove(Object)`: a walk that finds nothing. `List.remove(int)`
+        // is `AbstractList`'s refusal.
+        "remove" if r.descriptor.starts_with("(Ljava/lang/Object;") => Some(Ok(nothing())),
+        _ => None,
     }
 }

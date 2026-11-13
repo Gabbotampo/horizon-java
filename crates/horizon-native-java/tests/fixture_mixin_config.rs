@@ -3,16 +3,15 @@
 //! The jar holds only metadata and JSON, so no `javac` is involved: the test
 //! covers the loader-facing config rows, not class preparation.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{MixinConfig, NativeJar};
 use std::{fs, io::Write, path::PathBuf};
 use zip::write::SimpleFileOptions;
 
-fn build_jar(name: &str, files: &[(&str, &[u8])]) -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-mixin-config-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_jar(name: &str, files: &[(&str, &[u8])]) -> (scratch::Scratch, PathBuf) {
+    let root = scratch::Scratch::new(&format!("mixin-config-{name}"));
     fs::create_dir_all(&root).unwrap();
     let jar_path = root.join(format!("{name}.jar"));
     let mut zip = zip::ZipWriter::new(fs::File::create(&jar_path).unwrap());

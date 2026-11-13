@@ -8,18 +8,12 @@
 //! `NaN`), every numeric conversion, a `double` local and array, `freturn`/
 //! `dreturn`, and the `Double`/`Float`/`String.valueOf`/`StringBuilder` surface.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
-
-/// The javac build root this fixture compiles in. Each test gets its own tag
-/// so the parallel test threads never share a build root.
-fn build_root(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "horizon-native-java-float-{tag}-{}",
-        std::process::id()
-    ))
-}
 
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
@@ -28,9 +22,8 @@ fn javac() -> PathBuf {
 }
 
 /// Compile the fixture class and package it as a Fabric jar.
-fn build_fixture(tag: &str, id: &str, entrypoint: &str, source: &str) -> PathBuf {
-    let root = build_root(tag);
-    let _ = fs::remove_dir_all(&root);
+fn build_fixture(tag: &str, id: &str, entrypoint: &str, source: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("float-{tag}"));
     let class = entrypoint.replace('.', "/");
     let source_path = root.join("src").join(format!("{class}.java"));
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -61,7 +54,7 @@ fn build_fixture(tag: &str, id: &str, entrypoint: &str, source: &str) -> PathBuf
     zip.write_all(&fs::read(root.join("classes").join(format!("{class}.class"))).unwrap())
         .unwrap();
     zip.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 const SOURCE: &str = r#"

@@ -1253,3 +1253,93 @@ appleskin alone with `/gamerule natural_health_regeneration false` after the pla
   after: no entrypoint reaches a game rule.
 
 Results stay on elysium under `~/ava/results/gr-2026-11-13/`.
+
+## Sixth survey: the pin bump to `1cc882b8e0` (13 November 2026, elysium)
+
+The same 43-jar sample in the same 10 batches, the fixture batch, and one new batch (`lm`:
+litematica, malilib, servux). Each ran **twice on the same runtime**, so the pin's own effect is
+separated from what the runtime merges since survey #5 did:
+
+| | baseline | after the bump |
+|---|---|---|
+| Game source | `arismoko/horizon` `cf0113879ebee600bff86070466f75b2db90b40a` (the old pin), unmodified | `arismoko/horizon` `1cc882b8e089a240354d142e3fd115938ce140d7` (the new pin), unmodified |
+| Mod | `main`'s `mod/` at `aaa8220` | this branch's `mod/` (`aaa8220` plus the bump and the game-version seed) |
+| Game's own version line | `Horizon 0.1.0` (first line of every log) | `Horizon 0.1.0` (first line of every log); the game logs no commit field, so each worktree's `HEAD` above is its build |
+| Runtime | `aaa8220`'s `crates/horizon-native-java` in both (`tools/vendor.py --check`: 124 files match) | same |
+
+The build is the dev profile with rust 1.99.1, one target dir shared by both builds, deleted after
+the run. Only the launcher's generated files were added to each worktree (`crates/native-game`,
+`native-api/horizon_java`, the workspace members). The driver is `tools/in_game_survey.py` with
+`--sample` and `--manifest`, on a private `Xvfb :86`, with a 10 GiB systemd cap and 600 play ticks.
+Survey #5 (`bf46291`) is the comparison column.
+
+**Playability:** 24/24 runs reached `wait-ready` (733–822 play ticks), placed and broke a block,
+moved and quit cleanly. **Fixtures:** all four `ran-clean` in both runs. `/javahello Viola` answered
+`Hello, Viola!`, `give m3_fixture:ruby_block 1` gave one, and `m2c` kept stone (the read after the
+break was `minecraft:stone`).
+
+### What the pin changed: baseline → after
+
+The pin's only effect on the sample is that **the three jars that read `minecraft`'s version now run**:
+
+| jar | baseline (old pin) | after (new pin, version seeded) |
+|---|---|---|
+| `servux` 0.12.2 | refused: `StringUtils#getModVersionString +62`, NPE on `Version.getFriendlyString()` (`minecraft`'s counted `getVersion`) | **ran-clean**, 188 host calls |
+| `malilib` 0.30.2 | refused: `MaLiLibFabricData#lambda$collectAllModIds$0 +20`, the same NPE | **ran-hollow**, 2 unknown (`Maps#newHashMap`, client-only `SDLInit#SDL_InitSubSystem`) |
+| `litematica` 0.29.1 (with malilib) | refused: the same `collectAllModIds` NPE | **ran-hollow**, 1 unknown (`Maps#newHashMap`) |
+
+Every one of the 43 sample rows and the four fixtures is otherwise **identical** between the two
+runs: verdicts, entry unknowns, listener failures and their messages, command usages, the survey
+commands' replies and the fixture actions. The only differences are callback counts on tick- and
+entity-driven listeners, which follow the world and the run length (`carryon` 624 → 577, `collective`
+4,778 → 4,372). The probe gives the same answer offline. Without `--game-version` all three refuse
+on that NPE. With `--game-version 26.3` they give `ok` with the unknowns above.
+
+### Every change against survey #5
+
+Rows not listed match survey #5 in every column: konkrete, melody, midnightlib, Iceberg,
+Searchables, cupboard, limitedchunks, connectivity, structureessentials, baguettelib, modelbrowser,
+respackopts, libjf, mcwifipnp, otterlib, calcmod, entity-view-distance, structure_pool_api,
+supermartijn642configlib, cloth-config, Clumps, ForgeConfigAPIPort, fast-ip-ping, MossyLib,
+NoChatReports, ResourcefulConfig, asynclogger, c2me and krypton. Their callback counts still vary
+with the run. Every listed row moved **in both runs**, so the runtime merges since #5 (#94–#140)
+caused it, not the pin. To name the cause, a probe was built at `bf46291` and at `aaa8220` and run
+over every mover, with dependencies linked as the game links them.
+
+| jar | #5 (`bf46291`) | now (both runs) | cause |
+|---|---|---|---|
+| **`jade`** | ran-hollow, 4 unk | **ran-partial, 19 unk** | **Regression in the label, not the bump.** #94/#101 register its `addListener` listeners, and #102/#103 run the loading stages that were never reached before. The deferred work dies in `JsonConfig#<clinit> +19` (NPE), and its `RegisterPayloadHandlersEvent` listener dies in `RequestEntityPacket#<clinit> +37` on an unmodelled `StreamCodec$CodecOperation`. The new unknowns are payload codecs (`ByteBufCodecs#*`, `StreamCodec#composite/map`), Guava `Lists`/`Sets` helpers, `Strictness#LENIENT` and `ModList#getSortedMods`. Running further exposed real gaps, but the label got worse |
+| **`fancymenu`** | ran-hollow, 2 unk; `/fmvariable get test` ran, no reply | ran-hollow, 4 unk; **`/fmvariable get test` refused** at `System#identityHashCode` | **Regression in a command, not the bump.** #104 counts an identity hash (`System.identityHashCode`, `Object.hashCode`) because no run can reproduce it, and a command runs in strict mode, so the command now refuses visibly where it used to run on a made-up hash. Entry unknowns: `CustomPacketPayload#codec` ×2 replace the old `addListener`/`register` ×2 (#94/#103) |
+| `carryon` | ran-hollow, 2 unk | ran-hollow, 22 unk | #94/#102/#103: its listeners and payload registration now run and reach `ByteBufCodecs`/`StreamCodec#composite` (×11 on the probe) and `AutomaticEventSubscriber#inject` (×6). `/carryon debug` still runs |
+| `fzzy_config` | ran-hollow, 8 unk | ran-hollow, 18 unk | #94: its 8 `addListener` calls register now. The probe counts 4 of them for events no game event fires, plus payload codecs ×7 (`CustomPacketPayload#codec` ×5) |
+| `geckolib` | ran-hollow, 2 unk | ran-hollow, **77 unk** | #94/#103: its payload registration now runs into `StreamCodec`/`ByteBufCodecs` (`STRING_UTF8` ×21, `StreamCodec#apply` ×10, `composite` ×14, ...). That is 65 on the neoforge entrypoint alone, against 2 before |
+| `collective` | ran-hollow, 106 unk, 3 listener failures | ran-hollow, 109 unk, the same 3 failures | #113 answers its `CountDownLatch`/`ThreadPoolExecutor` calls (−4). Now counted: `URLEncoder#encode` ×4, `URI#toURL`, `AutomaticEventSubscriber#inject` ×2 |
+| `Bookshelf` | ran-hollow, 18 unk, 1 listener failure | ran-hollow, 16 unk, the same failure (`Rarity is not an enum`) | #94: 4 `addListener` registered, 2 counted for events no game event fires |
+| `PacketFixer` | ran-hollow, 2 unk | ran-hollow, 3 unk | #117 counts `Properties#load(InputStream)` on a stream it cannot read, where it used to answer a silent void |
+| `stackrefill` | ran-hollow, 3 unk | ran-hollow, **1 unk** | #113: `CountDownLatch#getCount`, `ThreadPoolExecutor#allowCoreThreadTimeOut` |
+| `yacl` | ran-hollow, 1 unk | **ran-clean** | #94: `addListener(Class, Consumer)` |
+| `ResourcefulLib` | ran-hollow, 2 unk | **ran-clean** | #121: `Optionull#mapOrElse` |
+| `structure_layout_optimizer` | ran-hollow, 3 unk | ran-hollow, 2 unk | #121 answers `Optionull#mapOrDefault` ×2 and `Class#getEnclosingClass`. The jar then reaches `ResourcefulConfig`'s `@Comment#translation`/`value` (×1 each, counted) |
+| `chunky`, `spark` | callback unknowns 7, 8 | 6, 7 | run-dependent; the same `/chunky` refusal (`ServerPlayer#<instanceof>`) and spark listener failure |
+| *`servux`, `malilib`, `litematica`* | not in #5 | ran-clean, ran-hollow 2, ran-hollow 1 | **the bump** (above) |
+
+### Totals, #5 → now
+
+| Measure | #5, 40 jars | now, same 40 |
+|---|---|---|
+| In-game verdicts | 22 `ran-clean`, 17 `ran-hollow`, 1 `ran-partial`, 0 `refused` | **24 `ran-clean`, 14 `ran-hollow`, 2 `ran-partial`**, 0 `refused` |
+| Unknown host calls (entrypoints) | 162 | **280** (geckolib +75, carryon +20, jade +15, fzzy_config +10, the rest ±3) |
+| Listener failures | 6 (`mcwifipnp` 1, `collective` 3, `spark` 1, `bookshelf` 1) | the same 6 |
+| Command usages translated / refused | 186 / 31 | 186 / 31 |
+| Survey commands run / refused | 4 / 2 | **3 / 3** (`fancymenu` now refused) |
+
+The rise in unknowns is the payload and listener code the NeoForge bus and loading-stage merges now
+reach. It is honest counting of code that runs further than it did, not new breakage in a call that
+used to work. The two label regressions are `jade` (hollow → partial) and `fancymenu`'s command
+(ran → refused). **Neither is caused by the pin**: both show identically on the old pin with the
+same runtime, and each is attributed above.
+
+Results stay on elysium under `~/ava/results/pin-bump-2026-11-13/` and are not committed. That is
+both runs' batch JSONs, game logs and `java-runtime.json` reports, the M0–M3b proof runs on both
+pins (with the ruby screenshot), the probe sweep at `bf46291` and `aaa8220`, the comparisons, and
+the scripts.
