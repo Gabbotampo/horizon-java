@@ -51,6 +51,7 @@ mod guava_text;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
+mod iteration_guard;
 mod host_list_iterator;
 mod jar_operands;
 mod jar_text;
@@ -76,6 +77,7 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod lambda_boxing;
 mod library_dispatch;
+mod list_equality;
 mod map_compute;
 mod method_handles;
 mod mixin_extras;
@@ -96,6 +98,7 @@ mod neoforge_subscribe;
 mod nested_jars;
 mod night_config;
 mod null_checks;
+mod object_methods;
 mod open_options;
 mod optionull;
 mod references;
@@ -2166,6 +2169,29 @@ pub trait Host {
     /// that keeps no collection state has nothing to replace.
     fn replace_mutable_collection(&mut self, _value: &Value, _values: Vec<Value>) {}
 
+    /// The collection an unmodifiable view (`Collections.unmodifiableList`)
+    /// reads, by the view's marker.
+    fn unmodifiable_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// The guard a fail-fast iterator carries (`iteration_guard.rs`).
+    fn iterator_guard(&self, _marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        None
+    }
+
+    fn store_iterator_guard(&mut self, _marker: &str, _guard: iteration_guard::IteratorGuard) {}
+
+    /// How far a host iterator has gone (its next index).
+    fn iterator_cursor(&self, _marker: &str) -> Option<usize> {
+        None
+    }
+
+    /// The map a `keySet()`/`values()`/`entrySet()` copy was taken from.
+    fn view_copy_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -2543,6 +2569,9 @@ pub struct StdHost {
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    /// The fail-fast iterators' guards, by iterator marker
+    /// (`iteration_guard.rs`).
+    iterator_guards: BTreeMap<String, iteration_guard::IteratorGuard>,
     /// `listIterator()`s over host lists (`host_list_iterator.rs`).
     list_iterators: BTreeMap<String, host_list_iterator::ListIter>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
@@ -2662,6 +2691,7 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            iterator_guards: BTreeMap::new(),
             list_iterators: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
@@ -4041,6 +4071,22 @@ impl Host for StdHost {
         if let Some(marker) = expect_ref(value) {
             self.mutable_collections.insert(marker.to_owned(), values);
         }
+    }
+
+    fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
+        self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        self.iterator_guards.get(marker).cloned()
+    }
+
+    fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
+        self.iterator_guards.insert(marker.to_owned(), guard);
+    }
+
+    fn iterator_cursor(&self, marker: &str) -> Option<usize> {
+        self.iterators.get(marker).map(|(_, index)| *index)
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -9399,42 +9445,6 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         }
         Value::Ref(None) => "null".to_owned(),
         Value::Void => String::new(),
-    }
-}
-
-/// Java's component hash for a record's generated `hashCode`.
-///
-/// `Boolean.hashCode` is 1231/1237, a `char` is its code unit, a `long` folds
-/// its halves, a `float`/`double` uses the bit pattern `Float`/`Double` hash
-/// with, and a reference is the value's own `hashCode` — a string marker keeps
-/// `String.hashCode`, an object marker its identity text.
-fn java_value_hash(value: &Value, desc: &str) -> i32 {
-    match (value, desc) {
-        (Value::Int(value), "Z") => {
-            if *value != 0 {
-                1231
-            } else {
-                1237
-            }
-        }
-        (Value::Int(value), _) => *value,
-        (Value::Long(value), _) => (*value ^ ((*value as u64) >> 32) as i64) as i32,
-        (Value::Float(value), "F") => java_float_bits(*value) as i32,
-        (Value::Float(value), _) => java_double_bits(*value) as i32,
-        (Value::Ref(Some(value)), _) => stable_hash(value),
-        _ => 0,
-    }
-}
-
-/// Value equality for a record's generated `equals`: references compare by
-/// their marker (identity for objects, text for strings) and `NaN` compares
-/// equal to `NaN` as `Double.equals` does.
-fn java_values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Float(left), Value::Float(right)) => {
-            java_double_bits(*left) == java_double_bits(*right)
-        }
-        _ => left == right,
     }
 }
 
@@ -22162,100 +22172,6 @@ impl<H: Host> Runtime<'_, H> {
             .map(|ordinal| Value::Int(ordinal as i32)))
     }
 
-    /// Answer a record's generated `toString`/`equals`/`hashCode` call site.
-    ///
-    /// `java.lang.runtime.ObjectMethods.bootstrap` is the invokedynamic
-    /// bootstrap javac emits for a record's three object methods. The
-    /// interpreter cannot run a bootstrap, so it answers the pattern the
-    /// components were declared with: `Record[x=.., y=..]`, component-wise
-    /// equality and the JVM's 31-based hash.
-    fn invoke_record_object_method(
-        &mut self,
-        file: &ClassFile,
-        index: u16,
-        class: &str,
-        name: &str,
-        captured: &[Value],
-    ) -> Result<Option<Value>, NativeError> {
-        let Some(components) = file.record_component_names(index) else {
-            return Ok(None);
-        };
-        let Some(receiver) = captured.first() else {
-            return Ok(None);
-        };
-        match (name, captured.len()) {
-            ("toString", 1) => {
-                let mut text = String::new();
-                // `getSimpleName()`: `Point`, not `Probe$Point`.
-                match file.nested_simple_name() {
-                    Some(Some(simple)) => text.push_str(&simple),
-                    _ => text.push_str(class.rsplit('/').next().unwrap_or(class)),
-                }
-                text.push('[');
-                for (position, component) in components.iter().enumerate() {
-                    if position > 0 {
-                        text.push_str(", ");
-                    }
-                    let (descriptor, value) =
-                        self.record_component(file, class, component, receiver)?;
-                    text.push_str(component);
-                    text.push('=');
-                    text.push_str(&self.value_of_text(&value, &descriptor, class, "toString")?);
-                }
-                text.push(']');
-                Ok(Some(Value::Ref(Some(text))))
-            }
-            ("hashCode", 1) => {
-                let mut hash = 1_i32;
-                for component in &components {
-                    let (descriptor, value) =
-                        self.record_component(file, class, component, receiver)?;
-                    hash = hash
-                        .wrapping_mul(31)
-                        .wrapping_add(java_value_hash(&value, &descriptor));
-                }
-                Ok(Some(Value::Int(hash)))
-            }
-            ("equals", 2) => {
-                let other = captured.get(1).cloned().unwrap_or(Value::Ref(None));
-                let same_record = expect_ref(&other)
-                    .and_then(|marker| marker.split_once('#'))
-                    .is_some_and(|(owner, _)| owner == class);
-                if !same_record {
-                    return Ok(Some(Value::Int(0)));
-                }
-                for component in &components {
-                    let (_, left) = self.record_component(file, class, component, receiver)?;
-                    let (_, right) = self.record_component(file, class, component, &other)?;
-                    if !java_values_equal(&left, &right) {
-                        return Ok(Some(Value::Int(0)));
-                    }
-                }
-                Ok(Some(Value::Int(1)))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// One record component's value and declared descriptor, read through the
-    /// accessor javac generated for it.
-    fn record_component(
-        &mut self,
-        file: &ClassFile,
-        class: &str,
-        component: &str,
-        receiver: &Value,
-    ) -> Result<(String, Value), NativeError> {
-        let descriptor = file
-            .methods
-            .iter()
-            .find(|method| method.name == component && arg_count(&method.descriptor) == 0)
-            .map(|method| method.descriptor.clone())
-            .unwrap_or_else(|| "Ljava/lang/Object;".into());
-        let value = self.invoke(class, component, &descriptor, Some(receiver.clone()), &[])?;
-        Ok((descriptor, value))
-    }
-
     /// `Object.clone` on a runtime-owned array.
     ///
     /// `Enum.values()` is the visible caller: it clones the `$VALUES` array
@@ -24096,6 +24012,19 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_object_methods(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // `equals`/`hashCode` as the JVM runs them
+                        // (`object_methods.rs`, `list_equality.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_iteration_guard(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // Fail-fast iteration (`iteration_guard.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_service_loader(&r, receiver.as_ref(), &args)
                     ) {
                         // Providers built as the JDK builds them (`service_loader.rs`).
@@ -24556,9 +24485,10 @@ impl<H: Host> Runtime<'_, H> {
                         continue;
                     }
                     let site_name = file.invoke_dynamic_name(index)?;
-                    if let Some(value) =
-                        self.invoke_record_object_method(file, index, class, &site_name, &captured)?
-                    {
+                    if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_record_object_method(file, index, class, &site_name, &captured)
+                    ) {
                         if return_desc(&descriptor) != "V" {
                             stack.push(value);
                         }
