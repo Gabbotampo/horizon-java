@@ -33,6 +33,14 @@ public final class Spelled {
     return String.format("%s|%b|%s|%b", "false", "false", "integer:7", "boolean:false");
   }
 
+  /** A String spelled like a box hashes as a String; a box as its class does. */
+  public static String hashes() {
+    Object t = "true", b = "boolean:true", i = "integer:7";
+    return t.hashCode() + "|" + b.hashCode() + "|" + i.hashCode() + "|" + Boolean.TRUE.hashCode() + "|"
+        + Character.valueOf('a').hashCode() + "|" + Short.valueOf((short) -3).hashCode() + "|"
+        + java.util.Objects.hash("true", Boolean.FALSE, 7) + "|" + java.util.Objects.equals("integer:7", Integer.valueOf(7));
+  }
+
   /** Real boxes still print, class and compare as boxes. */
   public static String boxes() {
     Object i = Integer.valueOf(5), s = Short.valueOf((short) -2), c = Character.valueOf('a'), b = Boolean.TRUE;
@@ -91,6 +99,10 @@ fn strings_spelled_like_boxes_are_strings_and_boxes_are_boxes() {
             "false|true|false|false|java.lang.String|java.lang.String",
         ),
         ("format", "false|true|integer:7|true"),
+        (
+            "hashes",
+            "3569038|-1072581216|492450043|1231|97|-3|-865053633|false",
+        ),
         (
             "boxes",
             "5-2atrue|java.lang.Integer|java.lang.Character|truetruefalse|8|true|5|true|a",
