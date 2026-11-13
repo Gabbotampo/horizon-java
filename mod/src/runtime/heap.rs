@@ -181,7 +181,7 @@ impl StdHost {
     /// is listed, including bootstrap-only ones.
     fn root_texts<'a>(&'a self, out: &mut Vec<&'a str>) {
         fn value<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
-            if let Value::Ref(Some(text)) = value {
+            if let Some(text) = value_text(value) {
                 out.push(text);
             }
         }
@@ -239,6 +239,8 @@ impl StdHost {
         self.brigadier_root_texts(out);
         // A server's saved data (`facade_saved_data.rs`).
         self.saved_data.root_texts(out);
+        // NeoForge attachment types and live values (`neoforge_attachments.rs`).
+        self.neoforge_attachments.root_texts(out);
     }
 }
 
@@ -283,9 +285,17 @@ fn over_count_bound(heap: &JavaHeap) -> bool {
 }
 
 fn value_bytes(value: &Value) -> usize {
+    value_text(value).map_or(8, str::len)
+}
+
+/// The text a value names other objects through: a reference's, or a host
+/// handle's key (an `Optional`'s key is its held value's marker, so a jar
+/// object held only by an optional stays reachable).
+fn value_text(value: &Value) -> Option<&str> {
     match value {
-        Value::Ref(Some(text)) => text.len(),
-        _ => 8,
+        Value::Ref(Some(text)) => Some(text),
+        Value::Host(host) => Some(host.key()),
+        _ => None,
     }
 }
 
@@ -401,7 +411,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                     .flat_map(|(_, (elements, _))| elements),
             );
         for value in kept_values {
-            if let Value::Ref(Some(text)) = value {
+            if let Some(text) = value_text(value) {
                 roots.push(text);
             }
         }
@@ -429,7 +439,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .into_iter()
             .flat_map(|(elements, _)| elements);
         for value in fields.chain(arrays).chain(collections).chain(iterators) {
-            if let Value::Ref(Some(text)) = value {
+            if let Some(text) = value_text(value) {
                 collectable.scan(text, &mut found);
             }
         }
@@ -581,6 +591,28 @@ mod tests {
         assert_eq!(
             host.mutable_collections.keys().collect::<Vec<_>>(),
             ["java/util/ArrayList#7"]
+        );
+    }
+
+    #[test]
+    fn an_object_held_by_an_optional_is_kept() {
+        // A static `Optional` holding node 3: the optional is a host handle,
+        // whose key names the node (#156); scanning only references dropped it.
+        let (mut host, mut heap) = graph("demo/Node#1");
+        host.persistent_static_fields.insert(
+            "demo/Mod#HELDLjava/util/Optional;".into(),
+            crate::runtime::optional_wrap(text("demo/Node#3")),
+        );
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(
+            objects(&heap),
+            [
+                "demo/Node#1",
+                "demo/Node#2",
+                "demo/Node#3",
+                "demo/Node#4",
+                "array/Ldemo/Node;/run/0"
+            ]
         );
     }
 

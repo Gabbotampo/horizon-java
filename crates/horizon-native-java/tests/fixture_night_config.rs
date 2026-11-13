@@ -6,6 +6,9 @@
 //! both read through it; the stub interfaces are compiled for `javac` only,
 //! so the probe reaches the host model as it reaches the real library.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
@@ -27,8 +30,7 @@ import com.electronwill.nightconfig.core.CommentedConfig;
 import java.util.List;
 
 public final class ConfigProbe {
-    public static String run() {
-        CommentedConfig config = null;
+    public static String run(CommentedConfig config) {
         int size = (Integer) config.getOrElse("general.overworld_region_size", Integer.valueOf(3));
         String name = (String) config.getOrElse(List.of("general", "name"), "fallback");
         return size + "|" + name;
@@ -38,11 +40,7 @@ public final class ConfigProbe {
 
 #[test]
 fn source_built_probe_reads_nightconfig_defaults() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-night-config-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("night-config");
     let src = root.join("src");
     let classes = root.join("classes");
     let mut sources = Vec::new();
@@ -86,12 +84,19 @@ fn source_built_probe_reads_nightconfig_defaults() {
 
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let mut host = jar.seed_host(StdHost::new());
+    // The config object a loader hands the mod (the probe used to call
+    // `getOrElse` on a local `null`, which the JVM answers with a
+    // `NullPointerException`).
+    let config = Value::Ref(Some(
+        "com/electronwill/nightconfig/core/CommentedConfig#0".into(),
+    ));
     let value = jar
-        .invoke_method(
+        .invoke_method_with_args(
             "demo.ConfigProbe",
             "run",
-            "()Ljava/lang/String;",
+            "(Lcom/electronwill/nightconfig/core/CommentedConfig;)Ljava/lang/String;",
             None,
+            &[config],
             &mut host,
         )
         .unwrap();

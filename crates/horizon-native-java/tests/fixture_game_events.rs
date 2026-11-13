@@ -5,11 +5,14 @@
 //! mods, but only the mods' own classes go into the jars: the native host
 //! answers the API classes, exactly as it does for a real jar.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ExecutionBudget, Host, NativeError, NativeJar, StdHost, Value,
     events::{
-        EventContext, EventFacade, EventFiring, EventLoader, FacadeEntity, FacadePlayer, GameEvent,
-        GameListener,
+        EventContext, EventFacade, EventFiring, EventLoader, FacadeEntity, FacadeOriginal,
+        FacadePlayer, GameEvent, GameListener,
     },
 };
 use std::{
@@ -21,12 +24,8 @@ use std::{
 };
 use zip::write::SimpleFileOptions;
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-game-events-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn scratch(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("game-events-{name}"));
     fs::create_dir_all(&root).unwrap();
     root
 }
@@ -94,7 +93,7 @@ fn facade(tick_count: i32) -> Arc<EventFacade> {
     Arc::new(EventFacade {
         tick_count,
         dedicated: true,
-        max_players: 20,
+        max_players: Some(20),
         players: vec![FacadePlayer {
             uuid: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
             name: "Alex".into(),
@@ -440,13 +439,15 @@ const NEOFORGE_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/entity/player/Player.java",
-        "package net.minecraft.world.entity.player;\npublic class Player { public String getScoreboardName() { return null; } }",
+        "package net.minecraft.world.entity.player;\npublic class Player { public String getScoreboardName() { return null; }\n\
+         public float getHealth() { return 1; } }",
     ),
     (
         "net/neoforged/neoforge/event/tick/ServerTickEvent.java",
         "package net.neoforged.neoforge.event.tick;\n\
          public abstract class ServerTickEvent extends net.neoforged.bus.api.Event {\n\
            public net.minecraft.server.MinecraftServer getServer() { return null; }\n\
+           public boolean hasTime() { return false; }\n\
            public static class Post extends ServerTickEvent {} }",
     ),
     (
@@ -460,7 +461,10 @@ const NEOFORGE_STUBS: &[(&str, &str)] = &[
         "package net.neoforged.neoforge.event.entity.player;\n\
          public class PlayerEvent extends net.neoforged.bus.api.Event {\n\
            public net.minecraft.world.entity.player.Player getEntity() { return null; }\n\
-           public static class PlayerLoggedInEvent extends PlayerEvent {} }",
+           public static class PlayerLoggedInEvent extends PlayerEvent {}\n\
+           public static class Clone extends PlayerEvent {\n\
+             public net.minecraft.world.entity.player.Player getOriginal() { return null; }\n\
+             public boolean isWasDeath() { return false; } } }",
     ),
 ];
 
@@ -518,6 +522,15 @@ fn neoforge_listeners_run_by_event_class_and_honour_set_canceled() {
     let mut host = StdHost::new();
     jar.execute("demo.NeoMod", None, "neoforge", &mut host)
         .unwrap();
+    // FML injects the `@EventBusSubscriber`s after the `@Mod` constructor.
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
     let found = host.game_listeners(&jar, true);
     let named: Vec<(GameEvent, EventLoader)> = found
         .listeners
@@ -587,6 +600,224 @@ fn neoforge_listeners_run_by_event_class_and_honour_set_canceled() {
     assert_eq!(
         static_value(&host, "demo/Logins", "lastLjava/lang/String;"),
         Some(Value::Ref(Some("Alex".into())))
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+const NEOFORGE_TIME_SUBSCRIBER: &str = r#"
+package demo;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
+@EventBusSubscriber(modid = "neo_events") public final class Times {
+  public static String seen = "";
+  @SubscribeEvent public static void onTick(ServerTickEvent.Post event) {
+    seen = seen + (event.hasTime() ? "T" : "F");
+  }
+}
+"#;
+
+/// NeoForge's `ServerTickEvent#hasTime()` returns its `BooleanSupplier`'s answer
+/// (`getAsBoolean`), which `MinecraftServer.tickServer` passes as `this::haveTime`: the listener
+/// hears exactly what the firing carries (the host's `server_has_time`), false included, and a
+/// firing that does not carry it refuses the read instead of answering `true`.
+#[test]
+fn neoforge_server_tick_has_time_is_the_firings_answer() {
+    let root = scratch("neoforge-has-time");
+    let mut sources = NEOFORGE_STUBS.to_vec();
+    sources.push(("demo/NeoMod.java", NEOFORGE_MOD));
+    sources.push(("demo/Times.java", NEOFORGE_TIME_SUBSCRIBER));
+    let jar_path = build_jar(
+        &root,
+        &sources,
+        "demo",
+        (
+            "META-INF/neoforge.mods.toml",
+            "modLoader=\"javafml\"\nloaderVersion=\"[1,)\"\nlicense=\"MIT\"\n[[mods]]\nmodId=\"neo_events\"\nversion=\"1.0\"\n",
+        ),
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = StdHost::new();
+    jar.execute("demo.NeoMod", None, "neoforge", &mut host)
+        .unwrap();
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
+    let found = host.game_listeners(&jar, true);
+    let times = found
+        .listeners
+        .iter()
+        .find(|l| {
+            l.event == GameEvent::ServerTickEnd
+                && format!("{:?}", l.callback).contains("demo/Times")
+        })
+        .expect("the Times subscriber listens to ServerTickEvent.Post")
+        .clone();
+    let run = |host: &mut StdHost, has_time: Option<bool>| {
+        let mut firing = EventFiring::new(
+            GameEvent::ServerTickEnd,
+            facade(0),
+            EventContext {
+                has_time,
+                ..EventContext::default()
+            },
+        );
+        jar.run_game_listener(&times, &mut firing, host, &ExecutionBudget::UNBOUNDED)
+    };
+    run(&mut host, Some(true)).unwrap();
+    run(&mut host, Some(false)).unwrap();
+    assert_eq!(
+        static_value(&host, "demo/Times", "seenLjava/lang/String;"),
+        Some(Value::Ref(Some("TF".into())))
+    );
+    let outcome = run(&mut host, None);
+    assert!(
+        matches!(&outcome, Err(NativeError::UnknownHostCall(r)) if r.name == "hasTime"),
+        "an unknown hasTime must be refused, got {outcome:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+const NEOFORGE_CLONE_SUBSCRIBER: &str = r#"
+package demo;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+@EventBusSubscriber(modid = "neo_events") public final class Clones {
+  public static int deaths;
+  public static int returns;
+  public static String copied;
+  @SubscribeEvent public static void onClone(PlayerEvent.Clone event) {
+    if (event.isWasDeath()) deaths++; else returns++;
+    copied = event.getEntity().getScoreboardName();
+  }
+}
+"#;
+
+const NEOFORGE_ORIGINAL_SUBSCRIBER: &str = r#"
+package demo;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+@EventBusSubscriber(modid = "neo_events") public final class Originals {
+  public static String original;
+  @SubscribeEvent public static void onClone(PlayerEvent.Clone event) {
+    original = event.getOriginal().getScoreboardName() + ":" + event.getOriginal().getHealth();
+  }
+}
+"#;
+
+/// NeoForge's `PlayerEvent.Clone`: `ServerPlayer.restoreFrom(old, keepEverything)` posts
+/// `new Clone(this, old, !keepEverything)` (@371-382 of the 26.3 patched server), and
+/// `isWasDeath()` returns that field: true after a death respawn (`keepEverything` false), false
+/// after an End return. The firing carries Fabric `COPY_FROM`'s `alive` (= `keepEverything`) as
+/// its flag, so a death fires with `flag: false`. `getEntity()` is the new player.
+/// `getOriginal()` is the old player the game lends for the clone hook (arismoko/horizon#3040), its
+/// own marker answering the old player's facts (name, health at death); a firing without one
+/// refuses it rather than handing over the new player.
+#[test]
+fn neoforge_clone_answers_was_death_and_the_original_the_game_lends() {
+    let root = scratch("neoforge-clone");
+    let mut sources = NEOFORGE_STUBS.to_vec();
+    sources.push(("demo/NeoMod.java", NEOFORGE_MOD));
+    sources.push(("demo/Clones.java", NEOFORGE_CLONE_SUBSCRIBER));
+    sources.push(("demo/Originals.java", NEOFORGE_ORIGINAL_SUBSCRIBER));
+    let jar_path = build_jar(
+        &root,
+        &sources,
+        "demo",
+        (
+            "META-INF/neoforge.mods.toml",
+            "modLoader=\"javafml\"\nloaderVersion=\"[1,)\"\nlicense=\"MIT\"\n[[mods]]\nmodId=\"neo_events\"\nversion=\"1.0\"\n",
+        ),
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = StdHost::new();
+    jar.execute("demo.NeoMod", None, "neoforge", &mut host)
+        .unwrap();
+    // FML injects the `@EventBusSubscriber`s after the `@Mod` constructor.
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
+    let found = host.game_listeners(&jar, true);
+    let of = |class: &str| {
+        found
+            .listeners
+            .iter()
+            .find(|l| {
+                l.event == GameEvent::PlayerCopy && format!("{:?}", l.callback).contains(class)
+            })
+            .unwrap_or_else(|| panic!("no PlayerEvent.Clone listener in {class}"))
+            .clone()
+    };
+    let (was_death, original) = (of("demo/Clones"), of("demo/Originals"));
+    let alex = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+    let run_with = |host: &mut StdHost,
+                    listener: &GameListener,
+                    alive: bool,
+                    original: Option<FacadeOriginal>| {
+        let mut firing = EventFiring::new(
+            GameEvent::PlayerCopy,
+            facade(0),
+            EventContext {
+                player: Some(alex),
+                flag: alive,
+                original,
+                ..EventContext::default()
+            },
+        );
+        jar.run_game_listener(listener, &mut firing, host, &ExecutionBudget::UNBOUNDED)
+    };
+    let run = |host: &mut StdHost, listener: &GameListener, alive: bool| {
+        run_with(host, listener, alive, None)
+    };
+
+    // A death respawn, then an End return.
+    run(&mut host, &was_death, false).unwrap();
+    run(&mut host, &was_death, true).unwrap();
+    assert_eq!(
+        static_value(&host, "demo/Clones", "deathsI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Clones", "returnsI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Clones", "copiedLjava/lang/String;"),
+        Some(Value::Ref(Some("Alex".into())))
+    );
+
+    let outcome = run(&mut host, &original, false);
+    assert!(
+        matches!(&outcome, Err(NativeError::UnknownHostCall(r)) if r.name == "getOriginal"),
+        "getOriginal must be refused, got {outcome:?}"
+    );
+    assert_eq!(
+        static_value(&host, "demo/Originals", "originalLjava/lang/String;"),
+        None
+    );
+    let died = FacadeOriginal {
+        uuid: alex,
+        name: Some("Alex".into()),
+        level: Some("minecraft:the_nether".into()),
+        position: Some([1.5, 64.0, -3.5]),
+        health: Some(0.0),
+    };
+    run_with(&mut host, &original, false, Some(died)).unwrap();
+    assert_eq!(
+        static_value(&host, "demo/Originals", "originalLjava/lang/String;"),
+        Some(Value::Ref(Some("Alex:0.0".into())))
     );
     let _ = fs::remove_dir_all(root);
 }
