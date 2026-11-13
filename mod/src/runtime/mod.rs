@@ -50,6 +50,7 @@ mod game_rules;
 mod gson_model;
 mod gson_tree;
 mod guava_model;
+mod guava_text;
 mod hash_bulk;
 mod hash_collections;
 mod hash_map_order;
@@ -4445,6 +4446,10 @@ impl Host for StdHost {
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
+        // Guava's `Splitter`/`Joiner` and `Lists.newArrayList` (`guava_text.rs`).
+        if let Some(value) = self.guava_text(r, None, args) {
+            return value;
+        }
         if let Some(value) = self.neoforge_loader_call(r, args) {
             return Ok(value);
         }
@@ -5560,6 +5565,9 @@ impl Host for StdHost {
         self.record(r, Some(receiver), args);
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
+        }
+        if let Some(value) = self.guava_text(r, Some(receiver), args) {
+            return value;
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
