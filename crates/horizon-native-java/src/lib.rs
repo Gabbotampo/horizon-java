@@ -2529,6 +2529,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// The JDK's own `List.of`/`List.copyOf` lists, whose search members
+    /// reject `null` (`java_immutable.rs`).
+    null_hostile_lists: BTreeSet<String>,
     /// `List.reversed()` views: view marker → (its list, whether it writes
     /// through) (`sequenced.rs`).
     reversed_views: BTreeMap<String, (String, bool)>,
@@ -2655,6 +2658,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            null_hostile_lists: BTreeSet::new(),
             reversed_views: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
