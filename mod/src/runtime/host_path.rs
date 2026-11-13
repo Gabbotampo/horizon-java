@@ -58,6 +58,15 @@ pub(crate) fn unix_normal(path: &str) -> String {
     normal
 }
 
+/// Whether text a `Path` is made of encodes the same on every machine.
+/// `UnixPath` encodes it in `sun.jnu.encoding`, the machine's locale: Java 25
+/// threw `InvalidPathException` for `Path.of("/é")` under the POSIX locale and
+/// made the path under `C.UTF-8`. Only ASCII is the same everywhere, so the
+/// callers count a path made of anything else (and still answer it).
+pub(crate) fn encodable(text: &str) -> bool {
+    text.is_ascii()
+}
+
 /// `Path.of(text)`: a new path object.
 pub(crate) fn path_value(text: &str) -> Value {
     Value::Host(HostRef::new(HostKind::Path, unix_normal(text)))

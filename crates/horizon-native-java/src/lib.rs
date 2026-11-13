@@ -5655,7 +5655,11 @@ impl Host for StdHost {
                 "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
             )
             | ("java/nio/file/Path", "of", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
-                Ok(path_value(expect_string(Self::argument(r, args, 0)?)))
+                let text = expect_string(Self::argument(r, args, 0)?);
+                if !host_path::encodable(text) {
+                    self.unknown_host_call(r)?;
+                }
+                Ok(path_value(text))
             }
             // The virtual filesystem keeps no files of its own: a path is
             // readable only when the caller seeded the same resource name.
@@ -7647,6 +7651,9 @@ impl Host for StdHost {
             }
             ("java/nio/file/Path", "resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 let child = expect_string(Self::argument(r, args, 0)?);
+                if !host_path::encodable(child) {
+                    self.unknown_host_call(r)?;
+                }
                 Ok(path_value(&path_join(path_text(receiver), child)))
             }
             ("java/nio/file/Path", "resolve", "(Ljava/nio/file/Path;)Ljava/nio/file/Path;") => {
@@ -21862,7 +21869,12 @@ impl<H: Host> Runtime<'_, H> {
                             _ => Value::Ref(None),
                         }
                     }
-                    ("toPath", "()Ljava/nio/file/Path;") => path_value(&path),
+                    ("toPath", "()Ljava/nio/file/Path;") => {
+                        if !host_path::encodable(&path) {
+                            self.host.unknown_operand_call(r)?;
+                        }
+                        path_value(&path)
+                    }
                     ("mkdir", "()Z") | ("mkdirs", "()Z") | ("createNewFile", "()Z") => {
                         if r.name == "mkdirs" {
                             self.watch_directories_created(&path);

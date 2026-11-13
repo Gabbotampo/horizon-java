@@ -453,6 +453,11 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
     }
     let path = crate::runtime::host_path::path_key(receiver)?;
     let other = args.first().map(crate::runtime::path_text).unwrap_or_default();
+    // Text a path is made of must encode (`host_path::encodable`); left to
+    // the caller, which counts it.
+    if !crate::runtime::host_path::encodable(other) {
+        return None;
+    }
     let parent = path
         .trim_end_matches('/')
         .rsplit_once('/')

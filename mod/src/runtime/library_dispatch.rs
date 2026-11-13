@@ -1164,6 +1164,9 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
         }
+        if !parts.iter().all(|part| host_path::encodable(part)) {
+            self.host.unknown_operand_call(r)?;
+        }
         // `UnixFileSystem.getPath`: `first`, then each non-empty part after
         // a `/` (none before the first text); `path_value` normalizes.
         let mut joined = String::new();
