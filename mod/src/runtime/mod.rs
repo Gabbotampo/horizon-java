@@ -20,6 +20,7 @@ mod annotation_values;
 mod attachment_codec;
 mod block_item_id;
 pub mod brigadier;
+mod charset_decoder;
 mod checkcast;
 mod class_init;
 pub mod client_surface;
@@ -44,6 +45,7 @@ mod facade_text;
 mod facade_world;
 mod field_access;
 mod field_get_set;
+mod files_copy;
 mod frame_bound;
 mod game_codecs;
 mod game_hooks;
@@ -2531,6 +2533,8 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// UTF-8 decoders `Charset.newDecoder` made (`charset_decoder.rs`).
+    charset_decoders: BTreeMap<String, charset_decoder::DecoderState>,
     /// `Collections.synchronized*` views and the collection each wraps
     /// (`synchronized_views.rs`).
     synchronized_views: BTreeMap<String, String>,
@@ -2660,6 +2664,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
             locales: BTreeMap::new(),
@@ -4144,6 +4149,10 @@ impl Host for StdHost {
         if let Some(value) = self.neoforge_loader_static(r) {
             return Ok(value);
         }
+        // `CodingErrorAction`'s constants (`charset_decoder.rs`).
+        if let Some(value) = Self::coding_error_action_static(r) {
+            return Ok(value);
+        }
         // `Character.UnicodeBlock` constants (`jdk_character.rs`).
         if let Some(value) = jdk_character::unicode_block_static(r) {
             return Ok(value);
@@ -5452,6 +5461,10 @@ impl Host for StdHost {
         // The loading stages' event objects (`neoforge_lifecycle.rs`).
         if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
+        }
+        // UTF-8 decoders and their error actions (`charset_decoder.rs`).
+        if let Some(value) = self.charset_decoder_call(r, receiver, args) {
+            return value;
         }
         // A synchronized view runs every call on what it wraps
         // (`synchronized_views.rs`).
@@ -9903,6 +9916,8 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
         "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
+        // `Files.copy`'s options (`files_copy.rs`).
+        "java/nio/file/StandardCopyOption" => files_copy::STANDARD_COPY_OPTIONS,
         _ => return None,
     })
 }
@@ -9956,6 +9971,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/IllegalAccessException"
         | "java/lang/InstantiationException"
         | "java/lang/reflect/InvocationTargetException" => "java/lang/ReflectiveOperationException",
+        "java/nio/file/FileAlreadyExistsException" => "java/nio/file/FileSystemException",
         "java/io/FileNotFoundException"
         | "java/nio/file/NoSuchFileException"
         | "java/nio/file/FileSystemException" => "java/io/IOException",
@@ -24079,6 +24095,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_files_copy(&r, &args))
+                    {
+                        // `Files.copy(InputStream, ..)` (`files_copy.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
