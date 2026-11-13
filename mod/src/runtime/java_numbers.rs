@@ -118,8 +118,8 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     Some(parsed.map(|value| match (owner, name) {
         (_, "parseInt" | "parseShort" | "parseByte") => Value::Int(value as i32),
         ("java/lang/Long", _) => Value::Long(value),
-        ("java/lang/Integer", _) => Value::Ref(Some(format!("integer:{value}"))),
-        ("java/lang/Short", _) => Value::Ref(Some(format!("short:{value}"))),
-        _ => Value::Ref(Some(format!("byte:{value}"))),
+        ("java/lang/Integer", _) => Value::Boxed(crate::runtime::Boxed::Integer(value as i32)),
+        ("java/lang/Short", _) => Value::Boxed(crate::runtime::Boxed::Short(value as i16)),
+        _ => Value::Boxed(crate::runtime::Boxed::Byte(value as i8)),
     }))
 }

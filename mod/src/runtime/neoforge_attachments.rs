@@ -64,8 +64,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::runtime::attachment_codec::{Codecs, Coded, READ_FAILED};
 use crate::runtime::java_nbt::NbtCompound;
 use crate::runtime::{
-    EMPTY_OPTIONAL, ExecutionBudget, Host, MethodRef, NativeError, NativeJar, Runtime, StdHost,
-    Value, expect_ref,
+    ExecutionBudget, Host, MethodRef, NativeError, NativeJar, Runtime, StdHost, Value, expect_ref,
 };
 
 /// The registry key NeoForge registers attachment types in (`NeoForgeRegistries.Keys`; the oracle
@@ -956,10 +955,8 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 };
                 match (op, value) {
-                    (HolderOp::Existing, Value::Ref(Some(marker))) => {
-                        Value::Ref(Some(format!("optional/{marker}")))
-                    }
-                    (HolderOp::Existing, _) => Value::Ref(Some(EMPTY_OPTIONAL.into())),
+                    // `Optional.ofNullable(data)`.
+                    (HolderOp::Existing, value) => crate::runtime::optional_wrap(value),
                     (_, value) => value,
                 }
             }
@@ -1270,6 +1267,8 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
+            watch: Default::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut callback_infos,
