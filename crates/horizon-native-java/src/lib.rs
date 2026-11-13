@@ -105,6 +105,8 @@ mod null_checks;
 mod object_methods;
 mod open_options;
 mod optionull;
+mod parked_threads;
+pub use parked_threads::ParkedThread;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -2599,6 +2601,8 @@ pub struct StdHost {
     heap: heap::JavaHeap,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
+    /// The threads the jar made and started (`parked_threads.rs`).
+    threads: parked_threads::ThreadTable,
     strict_unknown_host_calls: bool,
     next_lazy_optional: usize,
     next_fabric_event: usize,
@@ -2707,6 +2711,7 @@ impl StdHost {
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             unknown_host_calls: BTreeMap::new(),
+            threads: parked_threads::ThreadTable::default(),
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
             next_fabric_event: 0,
@@ -5681,7 +5686,11 @@ impl Host for StdHost {
                 ));
             }
             return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("<init>", _) => Ok(Value::Void),
+                ("<init>", descriptor) => {
+                    let marker = marker.clone();
+                    self.note_thread_made(&marker, descriptor, args);
+                    Ok(Value::Void)
+                }
                 ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some("main".into()))),
                 ("isDaemon", "()Z") => Ok(Value::Int(0)),
                 ("setDaemon", "(Z)V") => Ok(Value::Void),
@@ -5691,7 +5700,12 @@ impl Host for StdHost {
                 // when strict). Running the body inline instead would run a
                 // worker loop (a file watcher, an update check, a metrics
                 // server) to the budget on the entrypoint's thread.
-                ("start", "()V") => self.unknown_host_call(r),
+                // `parked_threads.rs` names what never ran in the report.
+                ("start", "()V") => {
+                    let marker = marker.clone();
+                    self.note_thread_parked(&marker);
+                    self.unknown_host_call(r)
+                }
                 // Loader diagnostics and IDE detection scan the current
                 // thread's frames. The bounded runtime has no Java stack to
                 // hand out, so the truthful answer is an empty owned array.
