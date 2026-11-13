@@ -10,6 +10,9 @@
 //! the inserted instruction sequence, the adjusted `max_stack`, and the
 //! untouched bytes.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, ReturnMode, weave_class, weave_classes, weave_return,
 };
@@ -50,12 +53,8 @@ fn javac() -> PathBuf {
 }
 
 /// Compile `Target`, `Other` and `Callback` into a fresh directory.
-fn compile(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-returns-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn compile(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("weaver-returns-{name}"));
     let src = root.join("src/demo");
     let classes = root.join("classes");
     fs::create_dir_all(&src).unwrap();
@@ -78,7 +77,7 @@ fn compile(name: &str) -> PathBuf {
         .status()
         .unwrap();
     assert!(status.success(), "javac failed for {name}");
-    classes
+    root.into_path(classes)
 }
 
 fn read_class(classes: &Path, name: &str) -> Vec<u8> {
@@ -439,11 +438,7 @@ fn javap_sees_the_call_before_each_return() {
     )
     .unwrap();
 
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-returns-javap-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("weaver-returns-javap");
     fs::create_dir_all(root.join("demo")).unwrap();
     let target_path = root.join("demo/Target.class");
     let synthetic_path = root.join("demo/T.class");

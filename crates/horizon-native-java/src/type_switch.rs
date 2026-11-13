@@ -59,26 +59,33 @@ impl<H: Host> Runtime<'_, H> {
     /// The index a `typeSwitch` site answers for `value`, starting at
     /// `restart`.
     pub(crate) fn type_switch_index(
-        &self,
+        &mut self,
         labels: &[SwitchLabel],
         value: &Value,
         restart: i32,
-    ) -> i32 {
+    ) -> Result<i32, NativeError> {
         if *value == Value::Ref(None) {
-            return -1;
+            return Ok(-1);
         }
         let start = usize::try_from(restart).unwrap_or(0);
         for (index, label) in labels.iter().enumerate().skip(start) {
-            let matched = match label {
-                SwitchLabel::Class(class) => self.switch_instance_of(value, class),
-                SwitchLabel::String(text) => expect_ref(value).is_some_and(|marker| marker == text),
-                SwitchLabel::Int(expected) => boxed_int(value) == Some(*expected),
+            let matched = match (label, value) {
+                // A host handle by its kind's row (`host_ref.rs`), as the
+                // `instanceof` opcode decides it.
+                (SwitchLabel::Class(class), Value::Host(handle)) => {
+                    class == "java/lang/Object" || self.handle_instance_of(handle, class)?
+                }
+                (SwitchLabel::Class(class), _) => self.switch_instance_of(value, class),
+                (SwitchLabel::String(text), _) => {
+                    expect_ref(value).is_some_and(|marker| marker == text)
+                }
+                (SwitchLabel::Int(expected), _) => boxed_int(value) == Some(*expected),
             };
             if matched {
-                return index as i32;
+                return Ok(index as i32);
             }
         }
-        labels.len() as i32
+        Ok(labels.len() as i32)
     }
 
     /// `value instanceof class` for a switch label: jar objects through their
@@ -116,10 +123,7 @@ impl<H: Host> Runtime<'_, H> {
 /// An `int` a switch value carries, boxed or not.
 fn boxed_int(value: &Value) -> Option<i32> {
     match value {
-        Value::Int(value) => Some(*value),
-        Value::Ref(Some(marker)) => marker
-            .strip_prefix("integer:")
-            .and_then(|text| text.parse().ok()),
+        Value::Int(value) | Value::Boxed(crate::Boxed::Integer(value)) => Some(*value),
         _ => None,
     }
 }

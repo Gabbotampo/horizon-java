@@ -6,6 +6,9 @@
 //! both read through it; the stub interfaces are compiled for `javac` only,
 //! so the probe reaches the host model as it reaches the real library.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
@@ -37,11 +40,7 @@ public final class ConfigProbe {
 
 #[test]
 fn source_built_probe_reads_nightconfig_defaults() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-night-config-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("night-config");
     let src = root.join("src");
     let classes = root.join("classes");
     let mut sources = Vec::new();

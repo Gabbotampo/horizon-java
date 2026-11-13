@@ -97,7 +97,7 @@ fn text(value: &str) -> Value {
 }
 
 fn game_bus() -> Value {
-    text(super::GAME_BUS)
+    super::game_bus()
 }
 
 fn mod_bus() -> Value {
@@ -213,8 +213,9 @@ fn unregister_removes_that_consumer_only() {
 #[test]
 fn listeners_for_events_nothing_fires_are_counted() {
     // NeoForge accepts both (oracle.jsonl, case "not_fired": a real mod bus runs `setup` when FML
-    // posts `FMLCommonSetupEvent`). Nothing in the runtime posts either, so neither is a listener
-    // the game holds, and each registration is an unknown host call named after its event.
+    // posts `FMLCommonSetupEvent`). The common-setup stage posts it here too
+    // (`neoforge_lifecycle.rs`), so that listener is held; nothing posts the jar's own event, so
+    // that registration is an unknown host call named after its event.
     let mut fixture = Fixture::new();
     fixture
         .call(
@@ -225,20 +226,23 @@ fn listeners_for_events_nothing_fires_are_counted() {
         .unwrap();
     let listeners = fixture.host.game_listeners(&fixture.jar, true);
     assert!(listeners.listeners.is_empty(), "{:?}", listeners.listeners);
-    let mut keys: Vec<_> = fixture.host.unknown_host_calls().into_iter().collect();
-    keys.sort();
     assert_eq!(
-        keys,
-        [
-            (
-                "net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V (no game event fires demo/DemoEvent)".to_owned(),
-                1
-            ),
-            (
-                "net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V (no game event fires net/neoforged/fml/event/lifecycle/FMLCommonSetupEvent)".to_owned(),
-                1
-            ),
-        ]
+        fixture.host.unknown_host_calls(),
+        [(
+            "net/neoforged/bus/api/IEventBus#addListener(Ljava/util/function/Consumer;)V (no game event fires demo/DemoEvent)".to_owned(),
+            1
+        )]
+    );
+    let _ = fixture.host.take_stdout();
+    let failures = fixture.jar.run_loading_stage(
+        crate::runtime::neoforge_lifecycle::LoadingStage::CommonSetup,
+        &mut fixture.host,
+        &fixture.budget,
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(
+        fixture.host.take_stdout().lines().collect::<Vec<_>>(),
+        ["setup"]
     );
 }
 
@@ -380,4 +384,98 @@ fn a_mod_constructor_registers_its_own_instance() {
         fixture.fire(GameEvent::RegisterCommands).0,
         ["entry-commands"]
     );
+}
+
+#[test]
+fn injected_subscribers_join_the_constructors_listeners_in_priority_order() {
+    // The `@Mod` constructor registers first, then FML injects the container's
+    // `@EventBusSubscriber`s: `AutoSubscribers` (initialised, its static methods registered),
+    // never the client-only class or another mod's.
+    let mut fixture = Fixture::new();
+    fixture
+        .call("beforeInject", &format!("({BUS})V"), &[game_bus()])
+        .unwrap();
+    let _ = fixture.host.take_stdout();
+    let failures = fixture
+        .jar
+        .inject_event_subscribers(&mut fixture.host, &fixture.budget, &[]);
+    assert!(failures.is_empty(), "{failures:?}");
+    // oracle.jsonl, case "inject_init": only `AutoSubscribers` is initialised.
+    assert_eq!(
+        fixture.host.take_stdout().lines().collect::<Vec<_>>(),
+        ["auto-clinit"]
+    );
+    // oracle.jsonl, case "inject_tick".
+    assert_eq!(
+        fixture.fire(GameEvent::ServerTickEnd).0,
+        ["ctor-highest", "ctor-high", "auto-high"]
+    );
+    // oracle.jsonl, case "inject_setup": the mod bus runs `auto-setup` when the common-setup stage
+    // posts `FMLCommonSetupEvent`.
+    assert_eq!(fixture.host.unknown_host_call_count(), 0);
+    let failures = fixture.jar.run_loading_stage(
+        crate::runtime::neoforge_lifecycle::LoadingStage::CommonSetup,
+        &mut fixture.host,
+        &fixture.budget,
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(
+        fixture.host.take_stdout().lines().collect::<Vec<_>>(),
+        ["auto-setup"]
+    );
+}
+
+#[test]
+fn a_container_whose_constructor_failed_injects_nothing() {
+    // `FMLModContainer#constructMod` @313–364: a throwing `@Mod` constructor ends the task before
+    // `AutomaticEventSubscriber.inject` @388–395.
+    let mut fixture = Fixture::new();
+    let failures = fixture.jar.inject_event_subscribers(
+        &mut fixture.host,
+        &fixture.budget,
+        &["demo.ModEntry"],
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fixture.host.take_stdout(), "");
+    assert!(fixture.fire(GameEvent::ServerTickEnd).0.is_empty());
+    assert_eq!(fixture.host.unknown_host_call_count(), 0);
+}
+
+#[test]
+fn refused_subscribers_fail_their_container_with_fmls_exception() {
+    // oracle.jsonl, cases "inject_refused_0" to "inject_refused_3": each class is its own mod.
+    let expected = [
+        "java.lang.IllegalArgumentException: Method public void demo.InjectRefused$NotStatic.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post) annotated with @SubscribeEvent is not static",
+        "java.lang.IllegalArgumentException: Method public static void demo.InjectRefused$TwoArguments.on(net.neoforged.neoforge.event.tick.ServerTickEvent$Post,int) annotated with @SubscribeEvent must have only one parameter that is an Event subtype",
+        "java.lang.IllegalArgumentException: Method public static void demo.InjectRefused$NotAnEvent.on(java.lang.String) annotated with @SubscribeEvent must have only one parameter that is an Event subtype",
+        "java.lang.IllegalArgumentException: Cannot register listeners for abstract class net.neoforged.neoforge.event.tick.ServerTickEvent. Register a listener to one of its subclasses instead!",
+    ];
+    for (which, expected) in expected.into_iter().enumerate() {
+        let mut fixture = Fixture::new();
+        let container = format!("refuse{which}");
+        let jar = &fixture.jar;
+        let result = jar
+            .with_resident_runtime(&mut fixture.host, &fixture.budget, |runtime| {
+                runtime.inject_container(jar, &container)
+            })
+            .unwrap();
+        match result {
+            Err(NativeError::UncaughtException { class, message, .. }) => {
+                assert_eq!(
+                    (class.as_str(), message.as_deref()),
+                    ("java/lang/RuntimeException", Some(expected)),
+                    "case {which}"
+                );
+            }
+            other => panic!("case {which}: {other:?}"),
+        }
+        assert!(
+            fixture
+                .host
+                .game_listeners(&fixture.jar, true)
+                .listeners
+                .is_empty(),
+            "case {which} registered nothing"
+        );
+    }
 }

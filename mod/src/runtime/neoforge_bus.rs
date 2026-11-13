@@ -15,7 +15,7 @@
 //!   whose checker (`NeoForge.lambda$static$0`) refuses them: "IModBusEvent events are not allowed on
 //!   the common NeoForge bus! Use a mod bus instead."
 //!
-//! They are the markers [`GAME_BUS`] and `neoforge-bus/mod/<mod id>`; any other `IEventBus` value
+//! They are the bus handles [`game_bus`] and [`mod_bus`] (`host_events.rs`); any other `IEventBus` value
 //! (one the runtime cannot trace to either) skips the class checker, which is departure **B1**.
 //!
 //! # `addListener`, as `EventBus` runs it
@@ -79,33 +79,19 @@ use crate::runtime::events::ListenerCallback;
 use crate::runtime::neoforge_event_classes::{ABSTRACT, CANCELLABLE, EVENT_CLASSES, MOD_BUS};
 use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value, expect_ref, parse_callback_marker};
 
+pub(crate) use crate::runtime::host_events::{game_bus, mod_bus};
+
 /// The bus interface every call names.
 pub(crate) const BUS: &str = "net/neoforged/bus/api/IEventBus";
-/// `NeoForge.EVENT_BUS`.
-pub(crate) const GAME_BUS: &str = "neoforge-bus/game";
-/// A mod's bus: `neoforge-bus/mod/<id>`, or without an id when the runtime does not know the mod.
-const MOD_BUS_PREFIX: &str = "neoforge-bus/mod";
 const EVENT: &str = "net/neoforged/bus/api/Event";
 const MOD_BUS_EVENT: &str = "net/neoforged/fml/event/IModBusEvent";
 const CANCELLABLE_EVENT: &str = "net/neoforged/bus/api/ICancellableEvent";
 const CONSUMER: &str = "java/util/function/Consumer";
 
-/// The mod bus of mod `id` (`FMLModContainer#getEventBus`).
-pub(crate) fn mod_bus(id: Option<&str>) -> Value {
-    Value::Ref(Some(match id {
-        Some(id) => format!("{MOD_BUS_PREFIX}/{id}"),
-        None => MOD_BUS_PREFIX.to_owned(),
-    }))
-}
-
-/// The marker a bus call's receiver is, `""` for none.
-pub(crate) fn bus_name(receiver: Option<&Value>) -> String {
-    receiver.and_then(expect_ref).cloned().unwrap_or_default()
-}
-
-/// A bus marker is an `IEventBus`.
-pub(crate) fn bus_instance_of(marker: &str, wanted: &str) -> bool {
-    wanted == BUS && (marker == GAME_BUS || marker.starts_with(MOD_BUS_PREFIX))
+/// The bus a bus call's receiver is (a bus handle, or a value the runtime cannot trace), `null`
+/// for none.
+pub(crate) fn bus_value(receiver: Option<&Value>) -> Value {
+    receiver.cloned().unwrap_or(Value::Ref(None))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,12 +103,10 @@ pub(crate) enum BusKind {
 }
 
 pub(crate) fn bus_kind(receiver: Option<&Value>) -> BusKind {
-    match receiver.and_then(expect_ref) {
-        Some(text) if text == GAME_BUS => BusKind::Game,
-        Some(text) if text == MOD_BUS_PREFIX || text.starts_with("neoforge-bus/mod/") => {
-            BusKind::Mod
-        }
-        _ => BusKind::Unknown,
+    match receiver.and_then(crate::runtime::host_events::is_game_bus) {
+        Some(true) => BusKind::Game,
+        Some(false) => BusKind::Mod,
+        None => BusKind::Unknown,
     }
 }
 
@@ -137,8 +121,8 @@ pub(crate) struct BusListener {
     /// The `Consumer` object (`addListener`) or the registered object or class (`register`),
     /// which `unregister` names.
     pub consumer: Value,
-    /// The bus it is on (its marker), since `unregister` acts on one bus.
-    pub bus: String,
+    /// The bus it is on, since `unregister` acts on one bus.
+    pub bus: Value,
     pub callback: ListenerCallback,
 }
 
@@ -148,7 +132,12 @@ pub struct BusState {
     pub(crate) listeners: Vec<BusListener>,
     /// The `(bus, target)` pairs `register` added a listener for: `EventBus#register` @0–11
     /// returns at once for a target its `listeners` map already holds.
-    pub(crate) registered: Vec<(String, Value)>,
+    pub(crate) registered: Vec<(Value, Value)>,
+    /// The work `ParallelDispatchEvent#enqueueWork` queued for the running loading stage's
+    /// `DeferredWorkQueue` (`neoforge_lifecycle.rs`).
+    pub(crate) deferred: Vec<crate::runtime::neoforge_lifecycle::DeferredTask>,
+    /// The host is a dedicated server (`StdHost::with_environment_type`).
+    pub(crate) server: bool,
 }
 
 /// What the runtime knows about one event class: the generated table's facts for NeoForge's own,
@@ -171,6 +160,11 @@ fn table_facts(class: &str) -> Option<EventFacts> {
         mod_bus: flags & MOD_BUS != 0,
         superclass: superclass.to_owned(),
     })
+}
+
+/// The superclass NeoForge's table names for one of its event classes.
+pub(crate) fn table_superclass(class: &str) -> Option<String> {
+    table_facts(class).map(|facts| facts.superclass)
 }
 
 /// `Class#toString`: `class a.b.C$D` (every event class here is a class, not an interface).
@@ -240,7 +234,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 match self.add_listener(&shape, bus_kind(receiver), args)? {
                     Ok(mut listener) => {
-                        listener.bus = bus_name(receiver);
+                        listener.bus = bus_value(receiver);
                         if let Some((state, _)) = self.host.neoforge_bus() {
                             state.listeners.push(listener);
                         }
@@ -257,7 +251,7 @@ impl<H: Host> Runtime<'_, H> {
             // `EventBus#unregister` @0–16: the listeners this bus holds under that object go; the
             // host's own record of older registrations is cleared by the rest of the chain.
             "unregister" if r.descriptor == "(Ljava/lang/Object;)V" => {
-                let bus = bus_name(receiver);
+                let bus = bus_value(receiver);
                 if let (Some(target), Some((state, _))) = (args.first(), self.host.neoforge_bus()) {
                     state
                         .listeners
@@ -340,14 +334,14 @@ impl<H: Host> Runtime<'_, H> {
         }
         // 3. `getListenerList` @18–35 → `validateAbstractChain`.
         self.validate_abstract_chain(&facts.superclass)?;
-        if crate::runtime::events::bus_event(&class).is_none() {
+        if !crate::runtime::neoforge_lifecycle::delivered(&class, self.bus_on_server()) {
             return counted(&format!("no game event fires {class}"));
         }
         let Some(callback) = self.consumer_callback(&consumer, &class) else {
             return counted("listener callback cannot run");
         };
         Ok(Ok(BusListener {
-            bus: String::new(),
+            bus: Value::Ref(None),
             class,
             priority,
             // `ListenerList.unwrapListeners`: on a class that is not `ICancellableEvent` the
@@ -356,6 +350,13 @@ impl<H: Host> Runtime<'_, H> {
             consumer,
             callback,
         }))
+    }
+
+    /// Whether this host is a dedicated server: what a loading stage posts depends on the side.
+    pub(crate) fn bus_on_server(&mut self) -> bool {
+        self.host
+            .neoforge_bus()
+            .is_some_and(|(state, _)| state.server)
     }
 
     /// `validateAbstractChain(superclass)`, run when the superclass is abstract.

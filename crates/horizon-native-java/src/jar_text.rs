@@ -96,6 +96,10 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // A private JDK collection the skeletons built (a sublist).
+        if let Some(text) = self.invoke_jdk_skeleton(&object_to_string(), 0xb6, Some(value), &[])? {
+            return Ok(Some(text));
+        }
         let Some(receiver_class) = self.jar_object_class(value) else {
             return Ok(None);
         };
@@ -128,11 +132,40 @@ impl<H: Host> Runtime<'_, H> {
                 .invoke(&owner, "toString", TO_STRING, Some(value.clone()), &[])
                 .map(Some);
         }
+        // `Throwable.toString()` on a jar exception (`jar_throwables.rs`).
+        if let Some(text) = self.invoke_jar_throwable(&object_to_string(), 0xb6, Some(value))? {
+            return Ok(Some(text));
+        }
         // `Enum.toString()` is `name()`: the name its constructor received.
         if owner == "java/lang/Enum"
             && let Some((name, _)) = expect_ref(value).and_then(|m| self.enum_constants.get(m))
         {
             return Ok(Some(Value::Ref(Some(name.clone()))));
+        }
+        // A JDK skeleton's `toString` (`AbstractCollection`, `AbstractMap`,
+        // `SimpleEntry`) prints the jar object's own elements, which the host
+        // does not hold: counted (`jar_operands.rs`).
+        if let Some(declaring) = jar_operands::skeleton_declaring(&owner, "toString", TO_STRING) {
+            let to_string = MethodRef {
+                owner: declaring.to_owned(),
+                name: "toString".into(),
+                descriptor: TO_STRING.into(),
+            };
+            // Run where `jdk_skeletons/` implements it, counted otherwise.
+            if let Some(text) = self.invoke_jdk_skeleton(&to_string, 0xb6, Some(value), &[])? {
+                return Ok(Some(text));
+            }
+            return self.host.unknown_operand_call(&to_string).map(Some);
+        }
+        // A concrete JDK collection's `toString` over the jar's own
+        // `iterator()`/`entrySet()` override: counted, the host prints its row.
+        let typed = MethodRef {
+            owner: owner.clone(),
+            name: "toString".into(),
+            descriptor: TO_STRING.into(),
+        };
+        if let Some(counted) = self.concrete_subclass_callback(&typed, value) {
+            self.host.unknown_operand_call(&counted)?;
         }
         // `Object.toString()` (an identity hash), an enum constant this run
         // has no name for, or a platform superclass's method: the host answers
@@ -159,11 +192,30 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // A host handle prints its kind's `toString` (`host_ref.rs`); one
+        // whose held value has no text here is counted.
+        if let Value::Host(handle) = value {
+            return match self.host_ref_text(handle, class, method)? {
+                Some(text) => Ok(Some(Value::Ref(Some(text)))),
+                None => self
+                    .host
+                    .unknown_operand_call(&object_to_string())
+                    .map(Some),
+            };
+        }
         let Some(marker) = expect_ref(value) else {
             return Ok(None);
         };
         if let Some(text) = self.string_builders.get(marker) {
             return Ok(Some(Value::Ref(Some(text.clone()))));
+        }
+        // A host map entry prints `key=value` (`host_entry.rs`).
+        if let Some(text) = self.host_entry_text(value, class, method)? {
+            return Ok(Some(text));
+        }
+        // `File.toString()` is its path.
+        if let Some(path) = self.file_path(value) {
+            return Ok(Some(Value::Ref(Some(path.to_owned()))));
         }
         if object_marker_class(marker).is_none() {
             return Ok(None);
@@ -191,6 +243,12 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<String, NativeError> {
+        if let Value::Host(handle) = value {
+            if let Some(text) = self.host_ref_text(handle, class, method)? {
+                return Ok(text);
+            }
+            self.host.unknown_operand_call(&object_to_string())?;
+        }
         if matches!(value, Value::Ref(Some(_))) {
             match self.runtime_value_of(value, class, method)? {
                 Some(Value::Ref(Some(text))) => return Ok(text),
@@ -219,13 +277,16 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
-        // A virtual `toString()` on a jar object. `invokespecial` (a
-        // `super.toString()`) keeps its symbolic owner.
+        // A virtual `toString()` on a jar object or a host map entry.
+        // `invokespecial` (a `super.toString()`) keeps its symbolic owner.
         if r.name == "toString"
             && r.descriptor == TO_STRING
             && matches!(opcode, 0xb6 | 0xb9)
             && let Some(receiver) = receiver
         {
+            if let Some(text) = self.host_entry_text(receiver, class, method)? {
+                return Ok(Some(text));
+            }
             return self.jar_to_string(receiver, class, method);
         }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {

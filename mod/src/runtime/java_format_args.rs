@@ -53,14 +53,18 @@ impl<H: Host> Runtime<'_, H> {
             Value::Ref(None) => return Arg::Null,
             Value::Int(value) => return Arg::Int(*value),
             Value::Long(value) => return Arg::Long(*value),
-            // A boxed `Float` and a boxed `Double` are the same value here.
-            Value::Float(value) => return Arg::FloatOrDouble(*value),
+            // A bare floating-point value is a `Double`; a `Float` is boxed.
+            Value::Float(value) => return Arg::Double(*value),
+            Value::Boxed(boxed) => return boxed_arg(*boxed),
+            Value::Host(handle) => {
+                return match self.host_ref_text(handle, "", "") {
+                    Ok(Some(text)) => Arg::Str(text),
+                    _ => Arg::Opaque,
+                };
+            }
             Value::Void => return Arg::Opaque,
             Value::Ref(Some(marker)) => marker,
         };
-        if let Some(arg) = boxed_arg(marker) {
-            return arg;
-        }
         if let Some(text) = self.string_builders.get(marker) {
             return Arg::Str(text.clone());
         }
@@ -87,29 +91,15 @@ impl<H: Host> Runtime<'_, H> {
 }
 
 /// A boxed primitive's marker as its argument.
-fn boxed_arg(marker: &str) -> Option<Arg> {
-    // The bare `true`/`false` are boxed booleans to the runtime
-    // (`class_of_value`), but are also what a `String` of that text looks
-    // like. Both print alike under `%s`; under `%b` and `%h` they differ.
-    if let Some(value) = match marker {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    } {
-        return Some(Arg::BoolOrString(value));
+fn boxed_arg(boxed: Boxed) -> Arg {
+    match boxed {
+        Boxed::Boolean(value) => Arg::Bool(value),
+        Boxed::Integer(value) => Arg::Int(value),
+        Boxed::Short(value) => Arg::Short(value),
+        Boxed::Byte(value) => Arg::Byte(value),
+        Boxed::Character(unit) => Arg::Char(unit),
+        Boxed::Float(bits) => Arg::Float(f32::from_bits(bits)),
     }
-    let (kind, text) = marker.split_once(':')?;
-    Some(match kind {
-        "boolean" => Arg::Bool(text.parse().ok()?),
-        "integer" => Arg::Int(text.parse().ok()?),
-        "long" => Arg::Long(text.parse().ok()?),
-        "short" => Arg::Short(text.parse().ok()?),
-        "byte" => Arg::Byte(text.parse().ok()?),
-        "character" => Arg::Char(text.parse().ok()?),
-        "double" => Arg::Double(text.parse().ok()?),
-        "float" => Arg::Float(text.parse().ok()?),
-        _ => return None,
-    })
 }
 
 /// Whether a `Locale` argument formats with the symbols the formatter
