@@ -207,7 +207,7 @@ fn p8_host_objects_answer_as_java_25_or_count() {
             Exact("truetruetruefalse"),
         ),
         // A posted event is a fresh value: the same handle is one object; two made alike may be
-        // two (Java's two events: `false`), so that `==` is counted.
+        // two objects, which the key does not say, so that `==` is counted.
         ("postedIdentity", vec![event.clone(), event], Exact("true")),
         (
             "postedIdentity",
