@@ -3,6 +3,9 @@
 //! bits of the result (JVMS §6.5), and signed division has one defined
 //! overflow result, `MIN_VALUE / -1` is `MIN_VALUE` with remainder 0.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command, sync::OnceLock};
 use zip::write::SimpleFileOptions;
@@ -39,19 +42,15 @@ public final class IntegerOverflowEntrypoint {
 }
 "#;
 
-/// The fixture jar, built once: the tests run in parallel and would
-/// otherwise rewrite the same path under each other.
-fn fixture() -> &'static PathBuf {
-    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
-    FIXTURE.get_or_init(build_fixture)
+/// The fixture jar's bytes, built once for every test; its scratch
+/// directory is gone again as soon as they are read.
+fn fixture() -> &'static [u8] {
+    static FIXTURE: OnceLock<Vec<u8>> = OnceLock::new();
+    FIXTURE.get_or_init(|| fs::read(&*build_fixture()).unwrap())
 }
 
-fn build_fixture() -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-integer-overflow-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_fixture() -> scratch::Scratch {
+    let root = scratch::Scratch::new("integer-overflow");
     let source_path = root.join("src/demo/IntegerOverflowEntrypoint.java");
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();
@@ -81,7 +80,7 @@ fn build_fixture() -> PathBuf {
     jar.write_all(&fs::read(root.join("classes/demo/IntegerOverflowEntrypoint.class")).unwrap())
         .unwrap();
     jar.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 fn call(jar: &NativeJar, name: &str, descriptor: &str, args: &[Value]) -> Value {
@@ -98,7 +97,7 @@ fn call(jar: &NativeJar, name: &str, descriptor: &str, args: &[Value]) -> Value 
 
 #[test]
 fn signed_division_overflow_matches_java() {
-    let jar = NativeJar::from_path(fixture()).unwrap();
+    let jar = NativeJar::from_bytes(fixture()).unwrap();
     assert_eq!(
         call(&jar, "intDivide", "(I)I", &[Value::Int(i32::MIN)]),
         Value::Int(i32::MIN)
@@ -130,7 +129,7 @@ fn signed_division_overflow_matches_java() {
 /// accumulator overflows on any text longer than a few characters.
 #[test]
 fn signed_add_subtract_multiply_and_increment_wrap_like_java() {
-    let jar = NativeJar::from_path(fixture()).unwrap();
+    let jar = NativeJar::from_bytes(fixture()).unwrap();
     let ints = |name: &str, left: i32, right: i32| {
         call(&jar, name, "(II)I", &[Value::Int(left), Value::Int(right)])
     };

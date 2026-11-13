@@ -1,0 +1,36 @@
+watchable:true
+A:w/a.txt ENTRY_CREATE/a.txtx1 ENTRY_MODIFY/a.txt reset=true
+B:w/a.txt ENTRY_MODIFY/a.txt reset=true
+E:w/a.txt ENTRY_MODIFY/a.txt reset=true
+D:w/b.txt ENTRY_CREATE/b.txtx1 reset=true
+F:w/c.txt ENTRY_CREATE/c.txtx1 reset=true
+G:w/sub ENTRY_CREATE/subx1 reset=true
+H:w/n1/n2/n3 ENTRY_CREATE/n1x1 reset=true
+H2:w/n1
+I:null ENTRY_DELETE/c.txtx1 reset=true
+J:false
+K:w/b2.txt ENTRY_DELETE/b.txtx1 ENTRY_CREATE/b2.txtx1 reset=true
+L:w/a.txt ENTRY_CREATE/t.newx1 ENTRY_MODIFY/t.new ENTRY_DELETE/t.newx1 ENTRY_CREATE/a.txtx1 reset=true
+L2:w/a.txt ENTRY_CREATE/t.newx1 ENTRY_MODIFY/t.new ENTRY_DELETE/a.txtx1 ENTRY_DELETE/t.newx1 ENTRY_CREATE/a.txtx1 reset=true
+M:other/b2.txt ENTRY_DELETE/b2.txtx1 reset=true
+N:w/b3.txt ENTRY_CREATE/b3.txtx1 reset=true
+O:w/cp.txt ENTRY_CREATE/cp.txtx1 ENTRY_MODIFY/cp.txt reset=true
+P:w/cp.txt ENTRY_DELETE/cp.txtx1 ENTRY_CREATE/cp.txtx1 ENTRY_MODIFY/cp.txt reset=true
+Q:w/cpe.txt ENTRY_CREATE/cpe.txtx1 reset=true
+R:null ENTRY_CREATE/bw.txtx1 ENTRY_MODIFY/bw.txt reset=true
+R2:null ENTRY_CREATE/bw0.txtx1 reset=true
+S:null ENTRY_MODIFY/bw.txt reset=true
+U:null ENTRY_CREATE/fw.txtx1 ENTRY_MODIFY/fw.txt reset=true
+V:true ENTRY_CREATE/fdx1 reset=true
+V2:true ENTRY_CREATE/cnfx1 reset=true
+W:null ENTRY_MODIFY/a.txt ENTRY_CREATE/wb.txtx1 reset=true
+X:w/sub/x.txt
+Y:null ENTRY_DELETE/subx1 reset=true
+Z:true ENTRY_MODIFY/m.txt unreset=null reset=true requeued=true again=1,true,null
+reregister:true flood=1,OVERFLOW,null,true
+gone:true,false,0,false
+cancel:null,false,false
+closed:ClosedWatchServiceException:null,ClosedWatchServiceException:null,ClosedWatchServiceException:null,true
+register:NoSuchFileException:nope,NotDirectoryException:w/a.txt,IllegalArgumentException:No events to register,IllegalArgumentException:No events to register,NullPointerException:An element in event set is 'null'
+delete:NoSuchFileException:w/zz,DirectoryNotEmptyException:w/n1,DirectoryNotEmptyException:w/n1,false,false,true ENTRY_CREATE/gonex1 ENTRY_DELETE/gonex1 reset=true
+event:ENTRY_CREATE,false,true,null,false

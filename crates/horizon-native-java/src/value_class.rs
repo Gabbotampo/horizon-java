@@ -40,8 +40,7 @@ const SEPARATOR_FREE_MARKERS: &[&str] = &[
     "guava-cache-builder",
     "mixin-environment",
     "stack-walker",
-    // The empty optionals (`EMPTY_OPTIONAL*` in lib.rs).
-    "optional",
+    // The empty primitive optionals (`EMPTY_OPTIONAL_*` in lib.rs).
     "optional-int",
     "optional-long",
     "optional-double",
@@ -153,6 +152,14 @@ impl<H: Host> Runtime<'_, H> {
         );
     }
 
+    /// The component class recorded for `array`, if any.
+    pub(super) fn array_component(&self, array: &str) -> Option<String> {
+        match self.fields.get(&format!("{array}{ARRAY_COMPONENT_FIELD}")) {
+            Some(Value::Ref(Some(component))) => Some(component.clone()),
+            _ => None,
+        }
+    }
+
     /// `array.getClass()` for an array whose component is known, and
     /// `Class.getComponentType()` of an array class (null for any other
     /// class, as on the JVM).
@@ -192,6 +199,9 @@ mod tests {
             "#ff0000",
             "minecraft:block/stone",
             "config.json",
+            // Spelled like the boxes once were; boxes are no longer text.
+            "integer:5",
+            "true",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
@@ -199,8 +209,6 @@ mod tests {
             "demo/Main#3",
             "list/4",
             "registry/minecraft:item",
-            "integer:5",
-            "true",
             "path:/horizon/game",
             "string-builder/2",
             "@indy:demo/Main:0:demo/Main#lambda$0()V:",

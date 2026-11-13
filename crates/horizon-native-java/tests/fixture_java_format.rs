@@ -5,6 +5,9 @@
 //! host as an unknown, counted call. Expected strings are what the same class
 //! printed on OpenJDK 27 and OpenJDK 17.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -44,11 +47,7 @@ fn javac() -> PathBuf {
 /// Compile the fixture class into a jar of its own; each test passes its own
 /// tag so parallel tests never share a build root.
 fn jar(tag: &str) -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-format-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("format-{tag}"));
     let source = root.join("src/demo/FormatEntrypoint.java");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();

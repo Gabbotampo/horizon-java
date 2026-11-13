@@ -11,13 +11,15 @@
 //! probe's reads stay `getstatic`. The same classes, built the same way and
 //! run with `java` (OpenJDK 27), printed the lines in `EXPECTED` verbatim.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
 
@@ -140,15 +142,8 @@ fn javac(classes: &Path, sources: &[(&str, &str)], root: &Path, phase: &str) {
 }
 
 /// Compile V1, recompile V2 over it, and pack `demo/` as a Fabric jar.
-fn fixture() -> (PathBuf, NativeJar) {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-constant-value-{}-{unique}",
-        std::process::id()
-    ));
+fn fixture() -> (scratch::Scratch, NativeJar) {
+    let root = scratch::Scratch::new("constant-value");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();
     javac(

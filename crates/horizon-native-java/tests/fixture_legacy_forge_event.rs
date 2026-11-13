@@ -1,17 +1,16 @@
 //! A source-built legacy Forge fixture that crosses the event-bus boundary
 //! with a real invokedynamic listener marker.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{MethodRef, NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
 
 #[test]
 fn source_built_legacy_forge_fixture_registers_and_dispatches_listener() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-forge-event-fixture-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("forge-event-fixture");
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(src.join("demo")).unwrap();
