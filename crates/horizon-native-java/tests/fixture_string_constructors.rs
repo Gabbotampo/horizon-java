@@ -1,4 +1,6 @@
-//! `new String(...)` is counted, never answered with the allocation marker.
+//! `new String(...)` is counted, never answered with the allocation marker,
+//! until a model builds its text (the `char[]` and code-point constructors
+//! now do: `string_constructors.rs`).
 //!
 //! On `main` before this test, every `String` constructor left the
 //! `java/lang/String#n` marker where Java has the text, silently:
@@ -100,14 +102,49 @@ fn jar() -> NativeJar {
     jar
 }
 
+/// The `char[]` and code-point constructors are modelled
+/// (`string_constructors.rs`): they answer the Java 25 values the comments
+/// above record, with nothing counted.
+#[test]
+fn char_and_code_point_constructors_answer_java_25() {
+    let jar = jar();
+    let cases = [
+        ("chars", "ab|2|true"),
+        ("charsRange", "bc"),
+        ("codePoints", "a\u{1F600}b"),
+        ("reference", "q"),
+    ];
+    for (name, expected) in cases {
+        let mut host = StdHost::new();
+        let answer = jar
+            .invoke_method_with_args(
+                "demo.Ctors",
+                name,
+                "()Ljava/lang/String;",
+                None,
+                &[],
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(
+            answer,
+            horizon_native_java::Value::Ref(Some(expected.to_owned())),
+            "{name}"
+        );
+        assert_eq!(
+            host.unknown_host_call_count(),
+            0,
+            "{name}: {:?}",
+            host.unknown_host_calls()
+        );
+    }
+}
+
 #[test]
 fn every_string_constructor_is_counted_until_it_is_modelled() {
     let jar = jar();
     // (method, the constructor descriptor it must be counted under)
     let cases = [
-        ("chars", "([C)V"),
-        ("charsRange", "([CII)V"),
-        ("codePoints", "([III)V"),
         ("bytes", "([B)V"),
         ("bytesRange", "([BII)V"),
         ("bytesCharset", "([BLjava/nio/charset/Charset;)V"),
@@ -120,7 +157,6 @@ fn every_string_constructor_is_counted_until_it_is_modelled() {
         ("copy", "(Ljava/lang/String;)V"),
         ("builder", "(Ljava/lang/StringBuilder;)V"),
         ("buffer", "(Ljava/lang/StringBuffer;)V"),
-        ("reference", "([C)V"),
         ("supplier", "()V"),
         ("handle", "(Ljava/lang/String;)V"),
     ];
