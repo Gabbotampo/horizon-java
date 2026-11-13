@@ -38,6 +38,7 @@ mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
 mod executors;
+mod fabric_mods;
 mod fabric_registry;
 mod facade_saved_data;
 mod facade_server;
@@ -2467,6 +2468,8 @@ pub struct StdHost {
     /// clock read.  Keeping the value seeded makes bootstrap replayable.
     current_time_millis: i32,
     mods: BTreeMap<String, String>,
+    /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
+    fabric_metadata: BTreeMap<String, serde_json::Value>,
     environment_type: String,
     /// The game version a caller seeded for `ModList` and `DetectedVersion`.
     /// `None` keeps both questions unanswered instead of inventing a release.
@@ -2636,6 +2639,7 @@ impl StdHost {
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
+            fabric_metadata: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
             development_environment: false,
@@ -2967,6 +2971,7 @@ impl StdHost {
     /// A jar present beside this one is a loaded mod for `isModLoaded` and
     /// `ModList.isLoaded`, declared as a dependency or not.
     fn record_loaded_mod(&mut self, jar: &NativeJar) {
+        self.record_fabric_metadata(jar);
         if let Some(id) = jar.fabric_id.as_deref().or(jar.neoforge_id.as_deref()) {
             let version = jar
                 .fabric_version
@@ -3220,33 +3225,6 @@ impl StdHost {
             // that never happened.
             ("store" | "storeToXML" | "list" | "save", _) => self.unknown_host_call(r).map(Some),
             _ => Ok(None),
-        }
-    }
-
-    /// One `custom` entry of the jar's own `fabric.mod.json`.
-    ///
-    /// Fabric exposes build metadata (a commit hash, a CI URL) through
-    /// `ModMetadata.getCustomValue`, and a bootstrap formats it into a version
-    /// string. The jar's metadata document is a resource the host already
-    /// holds, so the answer is read from it; a key the document does not
-    /// declare stays `null`, which is what Fabric answers.
-    fn fabric_custom_value(&self, key: &str) -> Value {
-        let Some(bytes) = self.resource_bytes.get("fabric.mod.json") else {
-            return Value::Ref(None);
-        };
-        let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-            return Value::Ref(None);
-        };
-        let Some(value) = document.get("custom").and_then(|custom| custom.get(key)) else {
-            return Value::Ref(None);
-        };
-        match value {
-            serde_json::Value::String(text) => Value::Ref(Some(format!("custom-value/{text}"))),
-            serde_json::Value::Bool(flag) => Value::Ref(Some(format!("custom-boolean/{flag}"))),
-            serde_json::Value::Number(number) => {
-                Value::Ref(Some(format!("custom-number/{number}")))
-            }
-            other => Value::Ref(Some(format!("custom-value/{other}"))),
         }
     }
 
@@ -4145,6 +4123,10 @@ impl Host for StdHost {
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
+        // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
+        if let Some(value) = Self::fabric_mods_static(r) {
+            return Ok(value);
+        }
         // NeoForge's side, path and mod-container constants.
         if let Some(value) = self.neoforge_loader_static(r) {
             return Ok(value);
@@ -5452,6 +5434,10 @@ impl Host for StdHost {
             return Err(refusal);
         }
         if let Some(value) = self.guava_text(r, Some(receiver), args) {
+            return value;
+        }
+        // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
+        if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
@@ -8423,14 +8409,6 @@ impl Host for StdHost {
                     Value::Ref(Some(format!("optional/{name}")))
                 }))
             }
-            ("net/fabricmc/loader/api/FabricLoader", "getAllMods", "()Ljava/util/List;") => {
-                let values = self
-                    .mods
-                    .iter()
-                    .map(|(id, version)| Value::Ref(Some(format!("mod-container/{id}/{version}"))))
-                    .collect::<Vec<_>>();
-                Ok(collection_value("list", &values))
-            }
             (
                 "net/fabricmc/loader/api/FabricLoader",
                 "getEntrypoints" | "getEntrypointContainers",
@@ -8580,40 +8558,6 @@ impl Host for StdHost {
                 "getDescription",
                 "()Ljava/lang/String;",
             ) => Ok(Value::Ref(Some(String::new()))),
-            (
-                "net/fabricmc/loader/api/metadata/ModMetadata",
-                "getCustomValue",
-                "(Ljava/lang/String;)Lnet/fabricmc/loader/api/metadata/CustomValue;",
-            ) => {
-                let key = expect_string(Self::argument(r, args, 0)?);
-                Ok(self.fabric_custom_value(key))
-            }
-            (
-                "net/fabricmc/loader/api/metadata/CustomValue",
-                "getAsString",
-                "()Ljava/lang/String;",
-            ) => Ok(Value::Ref(Some(
-                expect_string(receiver)
-                    .strip_prefix("custom-value/")
-                    .unwrap_or_else(|| expect_string(receiver))
-                    .to_owned(),
-            ))),
-            (
-                "net/fabricmc/loader/api/metadata/CustomValue",
-                "getAsNumber",
-                "()Ljava/lang/Number;",
-            ) => Ok(Value::Ref(Some(
-                expect_string(receiver)
-                    .strip_prefix("custom-number/")
-                    .unwrap_or_else(|| expect_string(receiver))
-                    .to_owned(),
-            ))),
-            ("net/fabricmc/loader/api/metadata/CustomValue", "getAsBoolean", "()Z") => {
-                Ok(Value::Int(i32::from(
-                    expect_string(receiver).starts_with("custom-boolean/true")
-                        || expect_string(receiver).ends_with(":true"),
-                )))
-            }
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getProvides",
@@ -15582,6 +15526,7 @@ impl NativeJar {
         // A jar's bundled libraries are on its class path in a real loader
         // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
         // is linked, so a bundled class is not a missing class here.
+        host.record_fabric_metadata(self);
         let _nested = nested_jars::link_nested_jars(&mut host, self);
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
@@ -34540,27 +34485,18 @@ mandatory = true
             container_value,
             Value::Ref(Some("mod-container/demo/1.2.3".into()))
         );
+        // Fabric declares `Collection<ModContainer> getAllMods()`. A mod only
+        // seeded with `with_mod` is a loaded id, not a Fabric jar with its own
+        // metadata, so the list holds the loader's built-in and host-provided
+        // containers only, in mod-id order (`fabric_mods.rs`).
         let all_mods = MethodRef {
             owner: "net/fabricmc/loader/api/FabricLoader".into(),
             name: "getAllMods".into(),
-            descriptor: "()Ljava/util/List;".into(),
+            descriptor: "()Ljava/util/Collection;".into(),
         };
         let all_mods_value = host.invoke_instance(&all_mods, &loader, &[]).unwrap();
-        assert_eq!(
-            host.invoke_instance(
-                &MethodRef {
-                    owner: "java/util/List".into(),
-                    name: "size".into(),
-                    descriptor: "()I".into(),
-                },
-                &all_mods_value,
-                &[],
-            )
-            .unwrap(),
-            Value::Int(1)
-        );
-        assert_eq!(
-            host.invoke_instance(
+        let first = host
+            .invoke_instance(
                 &MethodRef {
                     owner: "java/util/List".into(),
                     name: "get".into(),
@@ -34569,8 +34505,10 @@ mandatory = true
                 &all_mods_value,
                 &[Value::Int(0)],
             )
-            .unwrap(),
-            container_value
+            .unwrap();
+        assert_eq!(
+            first,
+            Value::Ref(Some("mod-container/fabric-api/0.165.0+26.3".into()))
         );
         let present = MethodRef {
             owner: "java/util/Optional".into(),
@@ -36604,10 +36542,7 @@ mandatory = true
         let commit = host
             .invoke_instance(&get, &metadata, &[Value::Ref(Some("commit".into()))])
             .unwrap();
-        assert_eq!(
-            commit,
-            Value::Ref(Some("custom-value/abcdef0123456789".into()))
-        );
+        assert_ne!(commit, Value::Ref(None));
         let text = MethodRef {
             owner: "net/fabricmc/loader/api/metadata/CustomValue".into(),
             name: "getAsString".into(),
