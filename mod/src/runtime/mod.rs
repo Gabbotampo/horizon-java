@@ -18,6 +18,7 @@ use std::{
 
 mod annotation_values;
 mod array_copy;
+mod array_deque;
 mod attachment_codec;
 mod block_item_id;
 mod boxed;
@@ -64,6 +65,7 @@ mod hash_map_order;
 mod heap;
 mod hook_shapes;
 mod host_entry;
+mod iteration_guard;
 mod jar_operands;
 mod jar_text;
 mod jar_throwables;
@@ -90,12 +92,14 @@ mod jvm_dispatch;
 mod lambda_boxing;
 mod library_dispatch;
 mod linked_resources;
+mod list_equality;
 mod map_compute;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
 mod mod_config_register;
 mod mod_config_spec;
+mod mod_count;
 mod mod_origin;
 mod modified_utf8;
 mod native_library;
@@ -2239,6 +2243,65 @@ pub trait Host {
     /// that keeps no collection state has nothing to replace.
     fn replace_mutable_collection(&mut self, _value: &Value, _values: Vec<Value>) {}
 
+    /// The collection an unmodifiable view (`Collections.unmodifiableList`)
+    /// reads, by the view's marker.
+    fn unmodifiable_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// The guard a fail-fast iterator carries (`iteration_guard.rs`).
+    fn iterator_guard(&self, _marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        None
+    }
+
+    fn store_iterator_guard(&mut self, _marker: &str, _guard: iteration_guard::IteratorGuard) {}
+
+    /// How far a host iterator has gone (its next index).
+    fn iterator_cursor(&self, _marker: &str) -> Option<usize> {
+        None
+    }
+
+    /// The map a `keySet()`/`values()`/`entrySet()` copy was taken from.
+    fn view_copy_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// The collection a `Collections.synchronized*` view wraps, when
+    /// `value` is one (`synchronized_views.rs`).
+    fn synchronized_wrapped(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
+    /// A collection's `modCount` (`mod_count.rs`).
+    fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
+        mod_count::ModStamp::default()
+    }
+
+    fn store_mod_stamp(&mut self, _marker: &str, _stamp: mod_count::ModStamp) {}
+
+    /// Where a `subList` copy sits in its parent (`mod_count.rs`).
+    fn sub_list_link(&self, _marker: &str) -> Option<mod_count::SubListLink> {
+        None
+    }
+
+    fn store_sub_list_link(&mut self, _marker: &str, _link: Option<mod_count::SubListLink>) {}
+
+    /// The `subList` copies taken from `parent`.
+    fn sub_lists_of(&self, _parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        Vec::new()
+    }
+
+    /// How many `subList` copies are linked at all.
+    fn sub_lists_of_any(&self) -> usize {
+        0
+    }
+
+    /// An `ArrayDeque`'s physical layout (`array_deque.rs`).
+    fn deque_layout(&self, _marker: &str) -> Option<array_deque::DequeLayout> {
+        None
+    }
+
+    fn store_deque_layout(&mut self, _marker: &str, _layout: Option<array_deque::DequeLayout>) {}
     /// A host iterator's cursor, its element count and the class (or encoded
     /// kind) of the collection it iterates, when the host keeps one
     /// (`collection_callback.rs`).
@@ -2641,6 +2704,15 @@ pub struct StdHost {
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    /// The fail-fast iterators' guards, by iterator marker
+    /// (`iteration_guard.rs`).
+    iterator_guards: BTreeMap<String, iteration_guard::IteratorGuard>,
+    /// Each tracked collection's `modCount` (`mod_count.rs`).
+    mod_stamps: BTreeMap<String, mod_count::ModStamp>,
+    /// `subList` copies and where they sit in their parents.
+    sub_lists: BTreeMap<String, mod_count::SubListLink>,
+    /// `ArrayDeque`s' physical layouts (`array_deque.rs`).
+    deque_layouts: BTreeMap<String, array_deque::DequeLayout>,
     /// The class (or encoded kind) of the collection each host iterator
     /// iterates (`collection_callback.rs`).
     iterator_sources: BTreeMap<String, String>,
@@ -2768,6 +2840,10 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            iterator_guards: BTreeMap::new(),
+            mod_stamps: BTreeMap::new(),
+            sub_lists: BTreeMap::new(),
+            deque_layouts: BTreeMap::new(),
             iterator_sources: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
@@ -4140,6 +4216,76 @@ impl Host for StdHost {
             let marker = self.synchronized_target(marker).to_owned();
             self.mutable_collections.insert(marker, values);
         }
+    }
+
+    fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
+        self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        self.iterator_guards.get(marker).cloned()
+    }
+
+    fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
+        self.iterator_guards.insert(marker.to_owned(), guard);
+    }
+
+    fn synchronized_wrapped(&self, value: &Value) -> Option<Value> {
+        self.synchronized_receiver(value)
+    }
+
+    fn mod_stamp(&self, marker: &str) -> mod_count::ModStamp {
+        let marker = self.synchronized_target(marker);
+        self.mod_stamps.get(marker).copied().unwrap_or_default()
+    }
+
+    fn store_mod_stamp(&mut self, marker: &str, stamp: mod_count::ModStamp) {
+        let marker = self.synchronized_target(marker).to_owned();
+        self.mod_stamps.insert(marker, stamp);
+    }
+
+    fn sub_list_link(&self, marker: &str) -> Option<mod_count::SubListLink> {
+        if self.sub_lists.is_empty() {
+            return None;
+        }
+        self.sub_lists.get(marker).cloned()
+    }
+
+    fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
+        match link {
+            Some(link) => self.sub_lists.insert(marker.to_owned(), link),
+            None => self.sub_lists.remove(marker),
+        };
+    }
+
+    fn sub_lists_of_any(&self) -> usize {
+        self.sub_lists.len()
+    }
+
+    fn deque_layout(&self, marker: &str) -> Option<array_deque::DequeLayout> {
+        self.deque_layouts.get(marker).copied()
+    }
+
+    fn store_deque_layout(&mut self, marker: &str, layout: Option<array_deque::DequeLayout>) {
+        match layout {
+            Some(layout) => self.deque_layouts.insert(marker.to_owned(), layout),
+            None => self.deque_layouts.remove(marker),
+        };
+    }
+
+    fn sub_lists_of(&self, parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        if self.sub_lists.is_empty() {
+            return Vec::new();
+        }
+        self.sub_lists
+            .iter()
+            .filter(|(_, link)| link.parent() == parent)
+            .map(|(view, link)| (view.clone(), link.clone()))
+            .collect()
+    }
+
+    fn iterator_cursor(&self, marker: &str) -> Option<usize> {
+        self.iterators.get(marker).map(|(_, index)| *index)
     }
 
     fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
@@ -19723,7 +19869,12 @@ impl<H: Host> Runtime<'_, H> {
                 )? {
                     return Ok(Some(value));
                 }
-                return self.host.invoke(&callback.target, &values).map(Some);
+                let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
+                let value = self.host.invoke(&callback.target, &values)?;
+                if let Some(token) = token {
+                    self.mod_count_after(token, &value)?;
+                }
+                return Ok(Some(value));
             }
             // A constructor reference (`GameClass::new`, `HashMap::new`) is a
             // factory whose effective result is the constructed object, even
@@ -19812,10 +19963,15 @@ impl<H: Host> Runtime<'_, H> {
             )? {
                 return Ok(Some(value));
             }
-            return self
+            // `list::add` moves the list's `modCount` as the call would.
+            let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
+            let value = self
                 .host
-                .invoke_instance(&callback.target, &receiver, &rest)
-                .map(Some);
+                .invoke_instance(&callback.target, &receiver, &rest)?;
+            if let Some(token) = token {
+                self.mod_count_after(token, &value)?;
+            }
+            return Ok(Some(value));
         };
         let Some(method) = class.method(&callback.target.name, &callback.target.descriptor) else {
             return Ok(None);
@@ -24490,6 +24646,25 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    // A synchronized view runs every call on the collection it
+                    // wraps (`synchronized_views.rs`): the collection models
+                    // below answer for that collection, in its own order.
+                    let receiver = match receiver {
+                        Some(view) if op != 0xb7 => {
+                            Some(self.host.synchronized_wrapped(&view).unwrap_or(view))
+                        }
+                        receiver => receiver,
+                    };
+                    // A call that may move a host collection's `modCount`
+                    // (`mod_count.rs`), checked and noted around the dispatch.
+                    let mod_token = if anchor_replacement.is_none() {
+                        invoke_or_catch!(
+                            at,
+                            self.mod_count_before(&r, op, receiver.as_ref(), &args)
+                        )
+                    } else {
+                        None
+                    };
                     // Whether the answer is a jar method body's own `areturn`
                     // (which may legitimately be `null`) rather than a host or
                     // model answer.
@@ -24563,7 +24738,13 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_object_methods(&r, op, receiver.as_ref(), &args)
                     ) {
                         // `equals`/`hashCode` as the JVM runs them
-                        // (`object_methods.rs`).
+                        // (`object_methods.rs`, `list_equality.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_iteration_guard(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // Fail-fast iteration (`iteration_guard.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -24923,6 +25104,9 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         _ => value,
                     };
+                    if let Some(token) = mod_token.filter(|_| !jar_body) {
+                        invoke_or_catch!(at, self.mod_count_after(token, &value));
+                    }
                     if value != Value::Void {
                         stack.push(value);
                     }
@@ -24962,6 +25146,9 @@ impl<H: Host> Runtime<'_, H> {
                         // An object operand concatenates as its own
                         // `toString` (`jar_text.rs`), then reads as a `String`.
                         let mut captured = captured;
+                        // A `subList` operand's `toString` checks its list
+                        // (`mod_count.rs`).
+                        invoke_or_catch!(at, self.sync_sub_list_operands(&captured));
                         invoke_or_catch!(
                             at,
                             self.concat_object_texts(&mut captured, &mut arguments, class, method)
