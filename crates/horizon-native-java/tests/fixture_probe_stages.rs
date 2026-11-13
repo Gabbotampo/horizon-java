@@ -3,17 +3,21 @@
 //! run with the game's own verdict (`verdict.rs`): a stage that fails while
 //! another ran is `ran-partial`, never `ran-clean`.
 
-use std::{fs, io::Write, path::PathBuf, process::Command};
+#[path = "support/scratch.rs"]
+mod scratch;
+
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use zip::write::SimpleFileOptions;
 
 /// A Fabric jar whose `main` entrypoint records that it ran and whose
 /// `server` entrypoint either returns or throws.
-fn two_stage_jar(tag: &str, server_throws: bool) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-stages-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn two_stage_jar(tag: &str, server_throws: bool) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("stages-{tag}"));
     let src = root.join("src/demo");
     let classes = root.join("classes");
     fs::create_dir_all(&src).unwrap();
@@ -60,10 +64,10 @@ fn two_stage_jar(tag: &str, server_throws: bool) -> PathBuf {
             .unwrap();
     }
     zip.finish().unwrap();
-    jar
+    root.into_path(jar)
 }
 
-fn probe(jar: &PathBuf, kinds: &str) -> serde_json::Value {
+fn probe(jar: &Path, kinds: &str) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_horizon-native-java"))
         .arg("--json")
         .arg(jar)

@@ -18,5 +18,5 @@ capabilities = ["registries"]
 # The launcher rebuilds the game at this commit. The runtime in `src/runtime/` is
 # horizon-java's own, vendored by `tools/vendor.py` on the same commit.
 game = "26.3"
-horizon = "cf0113879ebee600bff86070466f75b2db90b40a"
-mixins = "5a64af938ec86b00d53d16a408aabc0038fb3e57"
+horizon = "1cc882b8e089a240354d142e3fd115938ce140d7"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

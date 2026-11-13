@@ -4,6 +4,9 @@
 //! so a channel is known with its codec even before (or without) a receiver.
 //! Signatures follow fabric-networking-api-v1 6.4.1 (Apache-2.0) for 26.3.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value, dispatch_payload_frame};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
@@ -33,12 +36,8 @@ fn build_jar(
     sources: BTreeMap<&str, &str>,
     resources: &[(&str, &str)],
     excluded: &[&str],
-) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-fabric-payload-types-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("fabric-payload-types-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();
@@ -80,7 +79,7 @@ fn build_jar(
         zip.write_all(&fs::read(class).unwrap()).unwrap();
     }
     zip.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 const STUBS: [&str; 7] = [

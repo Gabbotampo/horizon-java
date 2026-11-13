@@ -7,17 +7,16 @@
 //! expectations below are FML's rules, not the scanner's implementation: an
 //! annotation member is what makes a mod class, and `dist` limits the side.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::NativeJar;
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
 
 #[test]
 fn source_built_jar_discovers_annotated_mod_classes_and_their_side() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-neoforge-entrypoints-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("neoforge-entrypoints");
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(src.join("demo")).unwrap();

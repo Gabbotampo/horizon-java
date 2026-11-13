@@ -12,6 +12,9 @@
 //! receiver-keyed and a target outside the jar reaches the host, which is what
 //! the second test pins.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     MixinAccessorKind, MixinSide, MixinSkipReason, NativeJar, StdHost, Value,
 };
@@ -43,12 +46,8 @@ fn build_jar(
     sources: BTreeMap<&str, &str>,
     resources: &[(&str, &str)],
     excluded: &[&str],
-) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-mixin-accessor-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("mixin-accessor-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();
@@ -90,7 +89,7 @@ fn build_jar(
         zip.write_all(&fs::read(class).unwrap()).unwrap();
     }
     zip.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 fn annotation_sources() -> BTreeMap<&'static str, &'static str> {

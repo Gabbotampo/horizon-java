@@ -278,7 +278,9 @@ impl StdHost {
                             .as_ref()
                             .and_then(|contact| contact.get(key))
                             .and_then(serde_json::Value::as_str)
-                            .map_or_else(empty_optional, |value| text(format!("optional/{value}"))))
+                            .map_or_else(empty_optional, |value| {
+                                crate::runtime::optional_wrap(text(value.to_owned()))
+                            }))
                     }
                     _ => self.unknown_host_call(r),
                 })

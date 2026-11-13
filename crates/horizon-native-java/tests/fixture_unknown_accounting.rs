@@ -11,6 +11,9 @@
 //! Before this, each of these answered `0`/`null` and added nothing to
 //! `unknown_host_call_count()`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{Host, MethodRef, NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -22,12 +25,8 @@ use zip::write::SimpleFileOptions;
 
 /// Compile one source (nested classes included) and package its package's
 /// classes as a Fabric jar.
-fn build_fixture(tag: &str, entrypoint: &str, source: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-unknown-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_fixture(tag: &str, entrypoint: &str, source: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("unknown-{tag}"));
     let class = entrypoint.replace('.', "/");
     let source_path = root.join("src").join(format!("{class}.java"));
     let classes = root.join("classes");
@@ -64,7 +63,7 @@ fn build_fixture(tag: &str, entrypoint: &str, source: &str) -> PathBuf {
         zip.write_all(&fs::read(&path).unwrap()).unwrap();
     }
     zip.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 fn count(host: &StdHost, key: &str) -> usize {

@@ -680,7 +680,7 @@ mod tests {
         );
         assert_eq!(
             answer(&facts, &rules, &get, &[rule("RANDOM_TICK_SPEED")]).unwrap(),
-            marker("integer:3")
+            Value::Boxed(crate::runtime::Boxed::Integer(3))
         );
         // A rule the game does not hold, and a member the model does not
         // list, refuse rather than answer a default.
