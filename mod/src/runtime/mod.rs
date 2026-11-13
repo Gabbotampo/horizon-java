@@ -55,6 +55,7 @@ mod heap;
 mod hook_shapes;
 mod jar_operands;
 mod jar_text;
+mod jar_throwables;
 mod java_format;
 mod java_format_args;
 mod java_identifier;
@@ -100,6 +101,7 @@ mod nested_jars;
 mod night_config;
 mod null_checks;
 mod open_options;
+mod optionull;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -2530,6 +2532,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// The JDK's own `List.of`/`List.copyOf` lists, whose search members
+    /// reject `null` (`java_immutable.rs`).
+    null_hostile_lists: BTreeSet<String>,
     /// `List.reversed()` views: view marker → (its list, whether it writes
     /// through) (`sequenced.rs`).
     reversed_views: BTreeMap<String, (String, bool)>,
@@ -2656,6 +2661,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            null_hostile_lists: BTreeSet::new(),
             reversed_views: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
@@ -3086,11 +3092,14 @@ impl StdHost {
     ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("load", "(Ljava/io/InputStream;)V") | ("load", "(Ljava/io/Reader;)V") => {
-                let Some(stream) = expect_ref(Self::argument(r, args, 0)?) else {
-                    return Ok(Some(Value::Void));
-                };
-                let Some((bytes, index)) = self.resource_streams.get_mut(stream) else {
-                    return Ok(Some(Value::Void));
+                // Only a host resource stream has bytes the host can parse.
+                // Any other stream (a file the jar opened, a null) would load
+                // entries the host never sees, so the call is counted rather
+                // than answered as an empty load.
+                let Some((bytes, index)) = expect_ref(Self::argument(r, args, 0)?)
+                    .and_then(|stream| self.resource_streams.get_mut(stream))
+                else {
+                    return self.unknown_host_call(r).map(Some);
                 };
                 let text = String::from_utf8_lossy(&bytes[*index..]).into_owned();
                 *index = bytes.len();
@@ -3181,7 +3190,14 @@ impl StdHost {
                 }
                 Ok(Some(marker))
             }
-            ("store", _) | ("storeToXML", _) | ("list", _) | ("save", _) => Ok(Some(Value::Void)),
+            // JDK 25's `store` writes a `#` line with `new Date().toString()`
+            // (the clock and the time zone) before the key-sorted entries,
+            // `list` walks the table in hash order, and `save` is `store` with
+            // the `IOException` swallowed. None of the text `store`,
+            // `storeToXML`, `list` or `save` writes reaches anything the host
+            // keeps, so each is counted: answering `void` would report a save
+            // that never happened.
+            ("store" | "storeToXML" | "list" | "save", _) => self.unknown_host_call(r).map(Some),
             _ => Ok(None),
         }
     }
@@ -5516,17 +5532,40 @@ impl Host for StdHost {
             let marker = expect_ref(receiver)
                 .ok_or_else(|| NativeError::Metadata("malformed Throwable marker".into()))?;
             if r.name == "<init>" {
-                let message = args.first().and_then(|value| match value {
-                    Value::Ref(Some(text)) => Some(text.clone()),
-                    Value::Ref(None) => None,
-                    _ => None,
-                });
-                let cause = args.iter().find_map(|value| match value {
-                    Value::Ref(Some(value)) if is_throwable_marker(value) => {
-                        Some(Value::Ref(Some(value.clone())))
-                    }
-                    _ => None,
-                });
+                // The cause is the `Throwable` parameter, whatever class the
+                // argument is (a jar exception's name need not end in
+                // `Exception`); `Throwable(Throwable cause)`'s message is
+                // `cause.toString()`, `null` for a null cause.
+                let parameters = descriptor_arguments(&r.descriptor);
+                let cause = parameters
+                    .iter()
+                    .position(|parameter| parameter == "Ljava/lang/Throwable;")
+                    .and_then(|index| args.get(index))
+                    .filter(|value| **value != Value::Ref(None))
+                    .cloned();
+                let message = if r.descriptor == "(Ljava/lang/Throwable;)V" {
+                    cause.as_ref().and_then(expect_ref).map(|cause| {
+                        let class = cause
+                            .split_once('#')
+                            .map_or(cause.as_str(), |(class, _)| class);
+                        let name = class.replace('/', ".");
+                        match self.throwable_messages.get(cause).cloned().flatten() {
+                            Some(message) => format!("{name}: {message}"),
+                            None => name,
+                        }
+                    })
+                } else {
+                    args.first().and_then(|value| match value {
+                        Value::Ref(Some(text))
+                            if parameters
+                                .first()
+                                .is_none_or(|p| p != "Ljava/lang/Throwable;") =>
+                        {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+                };
                 self.throwable_messages.insert(marker.clone(), message);
                 self.throwable_causes.insert(marker.clone(), cause);
                 return Ok(Value::Void);
@@ -5556,9 +5595,10 @@ impl Host for StdHost {
                     let class = marker
                         .split_once('#')
                         .map_or(marker.as_str(), |(class, _)| class);
-                    let class = class.rsplit('/').next().unwrap_or(class);
+                    // `getClass().getName()`: the binary name, package included.
+                    let class = class.replace('/', ".");
                     let Some(Some(message)) = self.throwable_messages.get(marker) else {
-                        return Ok(Value::Ref(Some(class.to_owned())));
+                        return Ok(Value::Ref(Some(class)));
                     };
                     return Ok(Value::Ref(Some(format!("{class}: {message}"))));
                 }
@@ -19734,6 +19774,9 @@ impl<H: Host> Runtime<'_, H> {
                 "java/lang/Iterable",
             ],
             "map" => &["java/util/Map"],
+            // A host map entry (`HashMap`/`TreeMap` node, `Map.entry`): every
+            // one implements only `Map.Entry`.
+            "map-entry" => &["java/util/Map$Entry"],
             _ => &[],
         };
         if collection_kinds.contains(&wanted) {
@@ -20220,6 +20263,9 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(value));
         }
         if let Some(value) = self.invoke_reflect_simple_name(r, receiver)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_reflect_enclosing_class(r, receiver)? {
             return Ok(Some(value));
         }
         // `getSuperclass` walks the jar's own hierarchy: a config scanner that
@@ -22446,6 +22492,10 @@ impl<H: Host> Runtime<'_, H> {
     /// The throwable value a Java handler receives for a throw the host or a
     /// nested frame raised, tagged with the message the throw carries.
     fn caught_throwable(&mut self, class: &str, message: Option<String>) -> Value {
+        // The object a jar frame threw, when this is its throw.
+        if let Some(value) = jar_throwables::take_in_flight(class, &message) {
+            return value;
+        }
         let value = self.new_object(class);
         if let Some(marker) = expect_ref(&value) {
             self.host.record_throwable(marker, message);
@@ -24225,6 +24275,11 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_collection_callback(&r, receiver.as_ref(), &args)
                     ) {
                         value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_optionull(&r, &args))
+                    {
+                        // The game's pure `Optionull` helper (`optionull.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_server_facade(&r, receiver.as_ref(), &args)
@@ -24582,7 +24637,9 @@ impl<H: Host> Runtime<'_, H> {
                     if thrown == Value::Ref(None) {
                         invoke_or_catch!(at, Err(null_checks::throw_null()))
                     }
-                    let thrown_class = thrown_class(&thrown);
+                    // A jar class extending a JDK exception is its own class
+                    // (`jar_throwables.rs`).
+                    let thrown_class = self.throwable_class(&thrown);
                     if let Some(handler) =
                         self.exception_handler(file, method, desc, at, &thrown_class)?
                     {
@@ -24591,9 +24648,12 @@ impl<H: Host> Runtime<'_, H> {
                         pc = handler;
                         continue;
                     }
+                    let message = self.thrown_text(&thrown);
+                    // The handler that catches this throw gets this object.
+                    jar_throwables::note_in_flight(&thrown_class, &message, &thrown);
                     return Err(NativeError::UncaughtException {
                         class: thrown_class,
-                        message: thrown_message(&thrown, self.host),
+                        message,
                         frame: Some(format!("{class}#{method} +{at}")),
                     });
                 }
@@ -34140,6 +34200,122 @@ mandatory = true
     }
 
     #[test]
+    fn properties_writes_and_unreadable_loads_are_counted() {
+        // A jar that saves its config with `props.store(out, ..)` and reads it
+        // back must see the call counted, not a silent `void` (#4 of the
+        // 2026-11-13 census: the four writers were no-ops).
+        let mut host = StdHost::new();
+        let properties = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/lang/System".into(),
+                    name: "getProperties".into(),
+                    descriptor: "()Ljava/util/Properties;".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        let out = Value::Ref(Some("jar-object/java/io/FileOutputStream/0".into()));
+        let comment = Value::Ref(Some("settings".into()));
+        let writes = [
+            ("store", "(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            ("store", "(Ljava/io/Writer;Ljava/lang/String;)V"),
+            ("storeToXML", "(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            ("save", "(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+        ];
+        for (name, descriptor) in writes {
+            let call = MethodRef {
+                owner: "java/util/Properties".into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            host.invoke_instance(&call, &properties, &[out.clone(), comment.clone()])
+                .unwrap();
+        }
+        let list = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "list".into(),
+            descriptor: "(Ljava/io/PrintStream;)V".into(),
+        };
+        host.invoke_instance(&list, &properties, std::slice::from_ref(&out))
+            .unwrap();
+        // A stream the host holds no bytes for: the entries it would load are
+        // unknown, so the load is counted too.
+        let load = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "load".into(),
+            descriptor: "(Ljava/io/InputStream;)V".into(),
+        };
+        host.invoke_instance(&load, &properties, &[out]).unwrap();
+        let counted = host.unknown_host_calls();
+        let count = |key: &str| {
+            counted
+                .iter()
+                .find(|(method, _)| method == key)
+                .map_or(0, |(_, count)| *count)
+        };
+        assert_eq!(
+            count("java/util/Properties#store(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#store(Ljava/io/Writer;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#storeToXML(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#save(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#list(Ljava/io/PrintStream;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#load(Ljava/io/InputStream;)V"),
+            1
+        );
+        assert_eq!(host.unknown_host_call_count(), 6);
+    }
+
+    #[test]
+    fn properties_load_from_a_resource_stream_still_answers() {
+        let mut host =
+            StdHost::new().with_resource_bytes("mod.properties", b"mod.version=1.2.0\n".to_vec());
+        let stream = host.resource_stream("mod.properties");
+        let properties = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/lang/System".into(),
+                    name: "getProperties".into(),
+                    descriptor: "()Ljava/util/Properties;".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        let load = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "load".into(),
+            descriptor: "(Ljava/io/InputStream;)V".into(),
+        };
+        host.invoke_instance(&load, &properties, &[stream]).unwrap();
+        let get = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "getProperty".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&get, &properties, &[Value::Ref(Some("mod.version".into()))])
+                .unwrap(),
+            Value::Ref(Some("1.2.0".into()))
+        );
+        assert_eq!(host.unknown_host_call_count(), 0);
+    }
+
+    #[test]
     fn standard_host_uses_seeded_current_time_millis() {
         let mut host = StdHost::new().with_current_time_millis(1_700_000_000);
         let current_time_millis = MethodRef {
@@ -37769,7 +37945,8 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&to_string, &error, &[]).unwrap(),
-            Value::Ref(Some("IllegalStateException: bad state".into()))
+            // JDK 25: `getClass().getName() + ": " + message`, the binary name.
+            Value::Ref(Some("java.lang.IllegalStateException: bad state".into()))
         );
     }
 
