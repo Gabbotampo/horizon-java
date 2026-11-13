@@ -17,6 +17,7 @@ use std::{
 };
 
 mod annotation_values;
+mod array_copy;
 mod attachment_codec;
 mod block_item_id;
 mod boxed;
@@ -2197,6 +2198,24 @@ pub trait Host {
     /// that keeps no collection state has nothing to replace.
     fn replace_mutable_collection(&mut self, _value: &Value, _values: Vec<Value>) {}
 
+    /// A host iterator's cursor, its element count and the class (or encoded
+    /// kind) of the collection it iterates, when the host keeps one
+    /// (`collection_callback.rs`).
+    fn host_iterator(&self, _marker: &str) -> Option<(usize, usize, Option<String>)> {
+        None
+    }
+
+    /// `next()` on a host iterator.
+    fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
+        Err(NativeError::Metadata(format!(
+            "unknown java/util/Iterator {marker}"
+        )))
+    }
+
+    /// Move a host iterator's cursor (where a JDK iterator's
+    /// `forEachRemaining` leaves it after its action threw).
+    fn set_host_iterator_cursor(&mut self, _marker: &str, _cursor: usize) {}
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -2577,6 +2596,9 @@ pub struct StdHost {
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    /// The class (or encoded kind) of the collection each host iterator
+    /// iterates (`collection_callback.rs`).
+    iterator_sources: BTreeMap<String, String>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -2697,6 +2719,7 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            iterator_sources: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
@@ -4066,6 +4089,38 @@ impl Host for StdHost {
         if let Some(marker) = expect_ref(value) {
             let marker = self.synchronized_target(marker).to_owned();
             self.mutable_collections.insert(marker, values);
+        }
+    }
+
+    fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
+        let (values, index) = self.iterators.get(marker)?;
+        Some((
+            *index,
+            values.len(),
+            self.iterator_sources.get(marker).cloned(),
+        ))
+    }
+
+    fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
+        let (values, index) = self
+            .iterators
+            .get_mut(marker)
+            .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+        let value = values
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| NativeError::UncaughtException {
+                class: "java/util/NoSuchElementException".into(),
+                message: None,
+                frame: None,
+            })?;
+        *index += 1;
+        Ok(value)
+    }
+
+    fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
+        if let Some((values, index)) = self.iterators.get_mut(marker) {
+            *index = cursor.min(values.len());
         }
     }
 
@@ -7010,6 +7065,9 @@ impl Host for StdHost {
             let marker = format!("iterator/{}", self.next_iterator);
             self.next_iterator = self.next_iterator.saturating_add(1);
             self.iterators.insert(marker.clone(), (values, 0));
+            if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
+                self.iterator_sources.insert(marker.clone(), source);
+            }
             return Ok(Value::Ref(Some(marker)));
         }
         if matches!(
@@ -7049,8 +7107,14 @@ impl Host for StdHost {
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
                 ("next", "()Ljava/lang/Object;") => {
+                    // Every JDK collection iterator throws a bare
+                    // `NoSuchElementException` past its end.
                     let value = values.get(*index).cloned().ok_or_else(|| {
-                        NativeError::Metadata("java/util/Iterator exhausted".into())
+                        NativeError::UncaughtException {
+                            class: "java/util/NoSuchElementException".into(),
+                            message: None,
+                            frame: None,
+                        }
                     })?;
                     *index += 1;
                     return Ok(value);
@@ -10947,6 +11011,19 @@ fn collection_values(value: &Value) -> Result<Vec<String>, NativeError> {
         return Ok(Vec::new());
     }
     split_capture_markers(values)
+}
+
+/// The class a host collection marker was constructed as
+/// (`java/util/ArrayList#3`, `java/util/ArrayList#neutral0`), or the kind of
+/// an encoded value (`set/...` is `set`).
+fn iterated_kind(marker: &str) -> Option<String> {
+    if let Some((class, _)) = marker.split_once('#')
+        && class.starts_with("java/util/")
+    {
+        return Some(class.to_owned());
+    }
+    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
+    matches!(kind, "list" | "set").then(|| kind.to_owned())
 }
 
 fn host_collection_values(host: &StdHost, value: &Value) -> Result<Vec<String>, NativeError> {
@@ -19392,8 +19469,12 @@ impl<H: Host> Runtime<'_, H> {
             // zero-argument `Supplier` (`HashMap::new`) has no values at all,
             // so this comes before the receiver split below.
             if callback.target.name == "<init>" {
+                // `String::new` over a `char[]`/`int[]` builds its text; any
+                // other `String::new` is counted (`string_constructors.rs`).
+                if let Some(text) = string_constructors::build(self, &callback.target, &values)? {
+                    return Ok(Some(Value::Ref(Some(text))));
+                }
                 let object = self.new_object(&callback.target.owner);
-                // `String::new` is counted (`string_constructors.rs`).
                 if string_constructors::count(self, &callback.target)?.is_none() {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
@@ -19894,6 +19975,15 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 let marker = self.new_array(class, method);
                 self.arrays.insert(marker.clone(), values);
+                // The copy is an array of the original's class (the overloads
+                // without a `Class` argument), so `System.arraycopy` and
+                // `getClass()` see its component (`array_copy.rs`).
+                if !r.descriptor.contains("Ljava/lang/Class;")
+                    && let Some(component) = expect_ref(StdHost::argument(r, args, 0)?)
+                        .and_then(|original| self.array_component(original))
+                {
+                    self.record_array_component(&marker, &component);
+                }
                 Ok(Some(Value::Ref(Some(marker))))
             }
             ("fill", descriptor) if descriptor.starts_with('[') => {
@@ -24040,6 +24130,20 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // FML's `InterModComms` (`neoforge_imc.rs`).
                         value
+                    } else if let Some(text) =
+                        invoke_or_catch!(at, string_constructors::build(self, &r, &args))
+                    {
+                        // `new String(char[]|int[], ..)` (`string_constructors.rs`):
+                        // the allocation marker becomes the text it built.
+                        if let Some(marker @ Value::Ref(Some(_))) = receiver.as_ref() {
+                            let built = Value::Ref(Some(text));
+                            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                                if slot == marker {
+                                    *slot = built.clone();
+                                }
+                            }
+                        }
+                        Value::Void
                     } else if let Some(value) =
                         invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
@@ -24106,6 +24210,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         self.invoke_reflect_array(&r, &args, class, method)?
                     {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_array_copy(&r, &args))
+                    {
+                        // `System.arraycopy` (`array_copy.rs`).
                         value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
                         value
