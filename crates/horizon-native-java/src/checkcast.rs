@@ -200,7 +200,8 @@ impl<H: Host> Runtime<'_, H> {
     ) -> (Verdict, Option<String>) {
         let marker = match value {
             // A boxed number is a JDK object, never a jar type.
-            Value::Int(_) | Value::Long(_) | Value::Float(_) => {
+            // A host model's object (`Value::Host`) is a JDK object too.
+            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) | Value::Host(_) => {
                 return (Verdict::No, class_of_value(value));
             }
             Value::Void | Value::Ref(None) => return (Verdict::Yes, None),
@@ -242,20 +243,11 @@ impl<H: Host> Runtime<'_, H> {
                 Some(class.to_owned()),
             );
         }
-        // A JDK value the runtime builds itself (a box, a collection, an
+        // A JDK value the runtime builds itself (a collection, an
         // optional, a stream, a path): JDK classes never extend or implement a
         // jar type.
         let jdk_kind = [
-            "integer:",
-            "long:",
-            "short:",
-            "byte:",
-            "character:",
-            "float:",
-            "double:",
-            "boolean:",
             "string-builder/",
-            "optional/",
             "stream/",
             "path:",
             "list/",
@@ -266,7 +258,7 @@ impl<H: Host> Runtime<'_, H> {
         .any(|prefix| marker.starts_with(prefix))
             || matches!(
                 marker,
-                "list" | "set" | "map" | "optional" | "true" | "false"
+                                "list" | "set" | "map" | "true" | "false"
             )
             // An object `new` made of a JDK class (`java/util/ArrayList#3`).
             || marker

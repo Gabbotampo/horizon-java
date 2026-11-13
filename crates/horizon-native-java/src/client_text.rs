@@ -86,7 +86,7 @@ fn codes_of(value: &Value) -> Option<String> {
 fn boxed_true(value: Option<&Value>) -> Option<bool> {
     match value? {
         Value::Int(v) => Some(*v != 0),
-        Value::Ref(Some(text)) => text.strip_prefix("boolean:").map(|v| v == "true"),
+        Value::Boxed(crate::Boxed::Boolean(v)) => Some(*v),
         _ => None,
     }
 }
@@ -260,7 +260,7 @@ pub(super) fn text_call(object: &str, r: &MethodRef, args: &[Value]) -> Option<V
         ("isFormat", "Z") => Some(flag(colour.is_none() && code != 'r')),
         // A boxed `Integer`, null for a format.
         ("getColor", _) => Some(match colour {
-            Some(rgb) => marker(format!("integer:{rgb}")),
+            Some(rgb) => Value::Boxed(crate::Boxed::Integer(rgb as i32)),
             None => Value::Ref(None),
         }),
         _ => None,
@@ -295,7 +295,7 @@ mod tests {
                 "withBold",
                 "(Ljava/lang/Boolean;)Lnet/minecraft/network/chat/Style;",
             ),
-            &[marker("boolean:true")],
+            &[Value::Boxed(crate::Boxed::Boolean(true))],
         )
         .unwrap();
         let with_style = method(

@@ -1422,14 +1422,15 @@ pub(super) fn unboxed_instance_of(value: &Value, wanted: &str) -> bool {
             | "java/lang/constant/ConstantDesc"
     );
     match value {
-        Value::Float(number) => {
-            shared
-                || wanted == "java/lang/Double"
-                || (wanted == "java/lang/Float"
-                    && (number.is_nan() || f64::from(*number as f32) == *number))
-        }
+        // A `Float` is a `Boxed::Float`; a bare floating-point value is a
+        // `Double`.
+        Value::Float(_) => shared || wanted == "java/lang/Double",
         Value::Long(_) => shared || wanted == "java/lang/Long",
         Value::Int(_) => shared || wanted == "java/lang/Integer",
+        Value::Boxed(boxed) => crate::jdk_model::class_instance_of(boxed.class(), wanted),
+        // A host model's object (an `Optional`) is an instance of its class.
+        Value::Host(_) => crate::class_of_value(value)
+            .is_some_and(|class| crate::jdk_model::class_instance_of(&class, wanted)),
         _ => false,
     }
 }

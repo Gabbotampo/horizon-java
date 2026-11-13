@@ -847,21 +847,17 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
     if crate::reflect_generic::annotated_type_instance_of(marker, wanted) {
         return true;
     }
-    let class = if let Some((class, _)) = marker.split_once('#') {
-        class
-    } else {
-        match marker.split_once(':').map(|(prefix, _)| prefix) {
-            Some("integer") => "java/lang/Integer",
-            Some("long") => "java/lang/Long",
-            Some("short") => "java/lang/Short",
-            Some("byte") => "java/lang/Byte",
-            Some("float") => "java/lang/Float",
-            Some("double") => "java/lang/Double",
-            Some("character") => "java/lang/Character",
-            Some("boolean") => "java/lang/Boolean",
-            _ => return false,
-        }
+    let Some((class, _)) = marker.split_once('#') else {
+        return false;
     };
+    class_instance_of(class, wanted)
+}
+
+/// Whether an instance of the platform class `class` is a `wanted`.
+pub(crate) fn class_instance_of(class: &str, wanted: &str) -> bool {
+    if class == wanted {
+        return true;
+    }
     let known = match platform_supertypes(class) {
         [] => crate::java_immutable::supertypes(class),
         known => known,
@@ -903,6 +899,7 @@ pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Valu
         return None;
     }
     let primitive = match value {
+        Value::Boxed(boxed) => boxed.primitive(),
         Value::Ref(Some(_)) => match descriptor {
             "C" => super::boxed_character(value).map(Value::Int),
             "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
@@ -937,49 +934,6 @@ pub(crate) fn class_access_flags(file: &crate::ClassFile) -> Option<u16> {
     reader.skip(4).ok()?;
     crate::read_pool(&mut reader).ok()?;
     reader.u2().ok()
-}
-
-/// The text `String.valueOf` gives a boxed value, for a concatenation
-/// operand typed `desc`.
-///
-/// `"" + Boolean.TRUE` is `"true"`; the runtime's box marker is
-/// `boolean:true`, and pasting the marker made Xaero's config codec reject a
-/// 12-character boolean against its 5-character bound. Only an operand typed
-/// as a box, `Number`, `Comparable`, `Serializable` or `Object` is read as a
-/// box: a `String` operand is text, whatever it spells.
-pub(crate) fn boxed_text(marker: &str, desc: &str) -> Option<String> {
-    if !matches!(
-        desc,
-        "Ljava/lang/Object;"
-            | "Ljava/lang/Number;"
-            | "Ljava/lang/Comparable;"
-            | "Ljava/io/Serializable;"
-            | "Ljava/lang/Boolean;"
-            | "Ljava/lang/Integer;"
-            | "Ljava/lang/Long;"
-            | "Ljava/lang/Short;"
-            | "Ljava/lang/Byte;"
-            | "Ljava/lang/Character;"
-            | "Ljava/lang/Float;"
-            | "Ljava/lang/Double;"
-    ) {
-        return None;
-    }
-    let (prefix, rest) = marker.split_once(':')?;
-    match prefix {
-        "boolean" => matches!(rest, "true" | "false").then(|| rest.to_owned()),
-        "integer" | "long" | "short" | "byte" => {
-            rest.parse::<i64>().ok().map(|value| value.to_string())
-        }
-        "character" => rest
-            .parse::<u32>()
-            .ok()
-            .and_then(char::from_u32)
-            .map(String::from),
-        "double" => rest.parse::<f64>().ok().map(super::format_java_float),
-        "float" => rest.parse::<f64>().ok().map(super::format_java_float32),
-        _ => None,
-    }
 }
 
 /// Whether `marker` names an object this runtime or the host built
