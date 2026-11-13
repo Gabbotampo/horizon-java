@@ -281,6 +281,12 @@ fn build_site(
     Ok((out, method_descriptor))
 }
 
+/// The error a JDK body's call returns when the host counted the call and
+/// answered a neutral `null` the body would dereference. The skeleton frame
+/// turns it into the body's own neutral answer, so the run stays counted
+/// (`ran-hollow`) without an NPE Java would never throw.
+pub(crate) const ABANDONED: &str = "JDK body stopped at a counted host answer";
+
 /// A Java exception of `class` with `message`, as a JDK body throws it.
 pub(crate) fn throw(class: &str, message: Option<String>) -> NativeError {
     NativeError::UncaughtException {
@@ -321,7 +327,18 @@ impl<H: Host> Runtime<'_, H> {
         let mut values = Vec::with_capacity(args.len() + 1);
         values.push(receiver.clone());
         values.extend_from_slice(args);
-        self.run_site(kind, &r, &values)
+        let counted = self.host.counted_unknown_calls();
+        let value = self.run_site(kind, &r, &values)?;
+        // A counted, neutral `null` where the JDK body goes on to use the
+        // answer (an iterator, a view): the body stops rather than throw an
+        // NPE Java never would into the jar.
+        if value == Value::Ref(None)
+            && self.host.counted_unknown_calls() > counted
+            && return_desc(descriptor).starts_with("Ljava/util/")
+        {
+            return Err(NativeError::Metadata(ABANDONED.into()));
+        }
+        Ok(value)
     }
 
     /// `owner.name(args)` as `invokestatic`, through a call-site frame.
@@ -357,6 +374,37 @@ impl<H: Host> Runtime<'_, H> {
         };
         let answer = self.run_site(Site::InstanceOf, &r, std::slice::from_ref(value))?;
         Ok(matches!(answer, Value::Int(flag) if flag != 0))
+    }
+
+    /// `throw new <class>(cause)` in a JDK body's `catch`, with `error` the
+    /// caught exception: the cause becomes an object (the very object a jar
+    /// threw, through `jar_throwables.rs`, or a new one carrying its message),
+    /// the new throwable records it through `Throwable(Throwable)` (message
+    /// `cause.toString()`), and it is thrown as the object in flight, so the
+    /// handler sees `getCause()` as the JDK chains it. Anything that is not a
+    /// Java exception passes through unchanged.
+    pub(crate) fn throw_caused(&mut self, class: &str, error: NativeError) -> NativeError {
+        let NativeError::UncaughtException {
+            class: caught,
+            message,
+            ..
+        } = error
+        else {
+            return error;
+        };
+        let cause = self.caught_throwable(&caught, message);
+        let thrown = self.new_object(class);
+        let init = MethodRef {
+            owner: class.to_owned(),
+            name: "<init>".into(),
+            descriptor: "(Ljava/lang/Throwable;)V".into(),
+        };
+        if let Err(error) = self.host.invoke_instance(&init, &thrown, &[cause]) {
+            return error;
+        }
+        let text = expect_ref(&thrown).and_then(|marker| self.host.throwable_message(marker));
+        jar_throwables::note_in_flight(class, &text, &thrown);
+        throw(class, text)
     }
 
     /// Run one call-site frame.
