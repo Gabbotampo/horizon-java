@@ -9,8 +9,8 @@
 //! `handler.invoke(proxy, method, args)` with a `Method` for the interface
 //! method and the arguments boxed into an `Object[]` (null when there are
 //! none); the handler's answer is unboxed to the method's return type. That
-//! is what happens here: the `Method` is the same `reflect-method/` marker the
-//! reflection surface hands out, so `getName`, `getDeclaringClass`,
+//! is what happens here: the `Method` is the same handle (`host_reflect.rs`)
+//! the reflection surface hands out, so `getName`, `getDeclaringClass`,
 //! `getReturnType` and `isDefault` answer from the class file.
 //!
 //! `Object`'s `equals`, `hashCode` and `toString` on a proxy also go to the
@@ -274,10 +274,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
         };
-        let method = Value::Ref(Some(format!(
-            "reflect-method/{declaring}#{}{}",
-            r.name, r.descriptor
-        )));
+        let method = self.reflected_method(&declaring, &r.name, Some(&r.descriptor));
         // The JVM passes null, not an empty array, for a no-argument method.
         let parameters = descriptor_arguments(&r.descriptor);
         let arguments = if parameters.is_empty() {
@@ -365,12 +362,25 @@ impl<H: Host> Runtime<'_, H> {
                 Ok(Some(Value::Ref(Some(LOOKUP_MARKER.into()))))
             }
             ("java/lang/invoke/MethodHandles$Lookup", "unreflect" | "unreflectSpecial", _) => {
-                let Some(method) = args.first().and_then(expect_ref) else {
+                let Some(method) = args.first().filter(|method| **method != Value::Ref(None))
+                else {
                     return Err(npe(None));
                 };
-                if !method.starts_with("reflect-method/") {
+                // The handle text names the member as `reflect-method/<class>#
+                // <name><descriptor>` (read back by `parse_handle`), so only
+                // a method the runtime read from a class file goes in: a name
+                // a lookup could not settle is the jar's own text (counted).
+                let Some(host_reflect::Member {
+                    class,
+                    name,
+                    descriptor: Some(descriptor),
+                    access: Some(_),
+                    ..
+                }) = host_reflect::method_of(method)
+                else {
                     return Ok(None);
-                }
+                };
+                let method = format!("reflect-method/{class}#{name}{descriptor}");
                 let kind = if r.name == "unreflectSpecial" {
                     "special"
                 } else {

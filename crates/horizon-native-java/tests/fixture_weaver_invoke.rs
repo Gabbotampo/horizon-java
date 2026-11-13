@@ -6,6 +6,9 @@
 //! callback sees the call, and `ci.cancel()` suppresses only the selected call
 //! while the woven method keeps running.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, weave_invoke, weave_invoke_plan,
 };
@@ -121,12 +124,8 @@ fn java() -> Option<PathBuf> {
     Some(path)
 }
 
-fn compile(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-invoke-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn compile(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("weaver-invoke-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(src.join("demo")).unwrap();
@@ -152,7 +151,7 @@ fn compile(name: &str) -> PathBuf {
         .status()
         .unwrap();
     assert!(status.success(), "javac failed for {name}");
-    classes
+    root.into_path(classes)
 }
 
 fn read_class(classes: &Path, name: &str) -> Vec<u8> {
@@ -173,11 +172,7 @@ fn site(owner: &str, name: &str, descriptor: &str) -> MethodRef {
 
 fn run(classes: &Path, target: &[u8], which: &str) -> Option<Vec<String>> {
     let java = java()?;
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-invoke-run-{which}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("weaver-invoke-run-{which}"));
     fs::create_dir_all(root.join("demo")).unwrap();
     fs::create_dir_all(root.join("org/spongepowered/asm/mixin/injection/callback")).unwrap();
     for entry in fs::read_dir(classes.join("demo")).unwrap() {

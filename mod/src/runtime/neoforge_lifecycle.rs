@@ -83,7 +83,6 @@ const LOAD_COMPLETE: &str = "net/neoforged/fml/event/lifecycle/FMLLoadCompleteEv
 const PAYLOAD_HANDLERS: &str = "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent";
 const NEOFORGE_CLIENT: &str = "net/neoforged/neoforge/client/";
 const EVENT_MARKER: &str = "neoforge-lifecycle|";
-const FUTURE_MARKER: &str = "neoforge-deferred-work/";
 
 /// One step of NeoForge's loading after the constructors, in the order it runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +226,7 @@ impl StdHost {
                     work,
                     supplier: r.descriptor.contains("Supplier"),
                 });
-                Some(Value::Ref(Some(format!("{FUTURE_MARKER}{}", tasks.len()))))
+                Some(crate::runtime::host_events::deferred_work(tasks.len()))
             }
             _ => None,
         }
@@ -305,10 +304,7 @@ impl NativeJar {
         id: &str,
         priority: Option<u8>,
     ) -> Vec<BusListener> {
-        let bus = match crate::runtime::neoforge_bus::mod_bus(Some(id)) {
-            Value::Ref(Some(bus)) => bus,
-            _ => return Vec::new(),
-        };
+        let bus = crate::runtime::neoforge_bus::mod_bus(Some(id));
         let mut listeners: Vec<BusListener> = host
             .neoforge_bus
             .listeners
@@ -326,6 +322,23 @@ impl NativeJar {
 
     /// Runs `listeners` with `event`; the first that throws ends the post.
     fn post(
+        &self,
+        stage: LoadingStage,
+        id: &str,
+        listeners: &[BusListener],
+        event: &Value,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<(), String> {
+        // `dispatchParallelTask` posts with the container active; `postEvent` sets none.
+        let active = (stage != LoadingStage::NetworkSetup).then_some(id);
+        let previous = crate::runtime::neoforge_imc::set_active(host, active);
+        let posted = self.post_listeners(stage, id, listeners, event, host, budget);
+        crate::runtime::neoforge_imc::set_active(host, previous.as_deref());
+        posted
+    }
+
+    fn post_listeners(
         &self,
         stage: LoadingStage,
         id: &str,
@@ -376,12 +389,16 @@ impl NativeJar {
                     .or_default() += 1;
                 continue;
             };
-            if let Err(error) = self.invoke_listener_callback(&callback, Vec::new(), host, budget) {
-                let container = task
-                    .container
-                    .strip_prefix("neoforge-mod-container/")
-                    .and_then(|rest| rest.split('/').next())
-                    .unwrap_or(&task.container);
+            let container = task
+                .container
+                .strip_prefix("neoforge-mod-container/")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or(&task.container);
+            // `DeferredWorkQueue.lambda$makeRunnable$0` runs a task with its owner active.
+            let previous = crate::runtime::neoforge_imc::set_active(host, Some(container));
+            let ran = self.invoke_listener_callback(&callback, Vec::new(), host, budget);
+            crate::runtime::neoforge_imc::set_active(host, previous.as_deref());
+            if let Err(error) = ran {
                 failures.push(format!("deferred work of {container}: {error}"));
             }
         }

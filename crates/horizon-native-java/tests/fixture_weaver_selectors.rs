@@ -11,6 +11,9 @@
 //! classes pin the insertion offsets, the frame table and the exception-range
 //! rejection that javac output cannot conveniently express.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, NativeJar, ReturnMode,
     callback_info_returnable_class, weave_class,
@@ -26,7 +29,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 const TARGET: &str = r#"package demo;
@@ -139,21 +141,13 @@ fn jdk_tool(name: &str) -> PathBuf {
 }
 
 /// A fresh directory: tests run in parallel, so every call gets its own.
-fn scratch(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-selectors-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    root
+fn scratch(name: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("weaver-selectors-{name}"))
 }
 
 /// Compile `demo/Target` and `demo/Callback` against the synthetic
 /// `CallbackInfoReturnable` the weaver emits.
-fn compile(name: &str) -> PathBuf {
+fn compile(name: &str) -> scratch::Scratch {
     let root = scratch(name);
     let src = root.join("src");
     let classes = root.join("classes");
@@ -182,7 +176,7 @@ fn compile(name: &str) -> PathBuf {
         "javac failed for {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    classes
+    root.into_path(classes)
 }
 
 fn read_class(classes: &Path, name: &str) -> Vec<u8> {

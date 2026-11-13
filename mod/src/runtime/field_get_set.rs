@@ -38,7 +38,7 @@
 //! call on a `Field` the reflection lookups handed out is counted at the host,
 //! `get` and `set` included: none is answered without the JDK's checks.
 //!
-//! * the field marker carries its flags and the declaring class is one of the
+//! * the `Field` handle carries its flags and the declaring class is one of the
 //!   running jar's own classes (fields of game, JDK or linked-jar classes are
 //!   never modelled here);
 //! * the `Field` object's own `override` is known (`reflect_override`);
@@ -64,7 +64,6 @@
 //!   launch flags decide. Counting it stays correct under either.
 
 use super::field_access::{FIELD, package_of};
-use super::reflect_override::{FIELD_PREFIX, canonical_field};
 use super::*;
 
 const ACC_STATIC: u16 = 0x0008;
@@ -193,42 +192,37 @@ fn value_text(value: &Value, of: Prim) -> String {
 /// `valueOf` of a primitive, as the interpreter's own boxes look.
 fn boxed(value: &Value, of: Prim) -> Value {
     match (of, value) {
-        (Prim::Boolean, Value::Int(v)) => Value::Ref(Some(format!("boolean:{}", *v != 0))),
-        (Prim::Byte, Value::Int(v)) => Value::Ref(Some(format!("byte:{v}"))),
-        (Prim::Char, Value::Int(v)) => Value::Ref(Some(format!("character:{v}"))),
-        (Prim::Short, Value::Int(v)) => Value::Ref(Some(format!("short:{v}"))),
-        (Prim::Int, Value::Int(v)) => Value::Ref(Some(format!("integer:{v}"))),
+        (Prim::Boolean, Value::Int(v)) => Value::Boxed(Boxed::Boolean(*v != 0)),
+        (Prim::Byte, Value::Int(v)) => Value::Boxed(Boxed::Byte(*v as i8)),
+        (Prim::Char, Value::Int(v)) => Value::Boxed(Boxed::Character(*v as u16)),
+        (Prim::Short, Value::Int(v)) => Value::Boxed(Boxed::Short(*v as i16)),
+        (Prim::Int, Value::Int(v)) => Value::Boxed(Boxed::Integer(*v)),
+        (Prim::Float, Value::Float(v)) => Value::Boxed(Boxed::float(*v)),
         _ => value.clone(),
     }
 }
 
-/// The primitive inside a box whose class the value model keeps. `Float` and
-/// `Double` share `Value::Float` and a bare `Value::Int` may be any of the
-/// int-like boxes, so neither is read here.
+/// The primitive inside a box whose class the value model keeps. A bare
+/// `Value::Int` may be any of the int-like boxes and a bare `Value::Float` is
+/// a `Double`, so neither is read here.
 fn unbox(value: &Value) -> Option<(Prim, Value)> {
-    if let Value::Long(v) = value {
-        return Some((Prim::Long, Value::Long(*v)));
-    }
-    let marker = expect_ref(value)?;
-    let (of, text) = [
-        ("integer:", Prim::Int),
-        ("short:", Prim::Short),
-        ("byte:", Prim::Byte),
-        ("character:", Prim::Char),
-        ("long:", Prim::Long),
-    ]
-    .into_iter()
-    .find_map(|(prefix, of)| marker.strip_prefix(prefix).map(|text| (of, text)))
-    .or_else(|| {
-        let flag = marker.strip_prefix("boolean:").unwrap_or(marker);
-        matches!(flag, "true" | "false").then_some((Prim::Boolean, flag))
-    })?;
-    let value = match of {
-        Prim::Boolean => Value::Int(i32::from(text == "true")),
-        Prim::Long => Value::Long(text.parse().ok()?),
-        _ => Value::Int(text.parse().ok()?),
+    let boxed = match value {
+        Value::Long(v) => return Some((Prim::Long, Value::Long(*v))),
+        Value::Boxed(boxed) => *boxed,
+        _ => return None,
     };
-    Some((of, value))
+    if let Boxed::Float(_) = boxed {
+        return Some((Prim::Float, boxed.primitive()));
+    }
+    let of = match boxed {
+        Boxed::Boolean(_) => Prim::Boolean,
+        Boxed::Byte(_) => Prim::Byte,
+        Boxed::Short(_) => Prim::Short,
+        Boxed::Character(_) => Prim::Char,
+        Boxed::Integer(_) => Prim::Int,
+        Boxed::Float(_) => Prim::Float,
+    };
+    Some((of, Value::Int(boxed.int())))
 }
 
 /// `Class.getName()` of a field descriptor.
@@ -406,9 +400,8 @@ impl<H: Host> Runtime<'_, H> {
         let Some(op) = Op::parse(&r.name, &r.descriptor) else {
             return Ok(None);
         };
-        let Some(receiver) = receiver.filter(|receiver| {
-            expect_ref(receiver).is_some_and(|marker| marker.starts_with(FIELD_PREFIX))
-        }) else {
+        let Some(receiver) = receiver.filter(|receiver| host_reflect::field_of(receiver).is_some())
+        else {
             return Ok(None);
         };
         if let Some(value) = self.decide_field_get_set(op, receiver, args, caller)? {
@@ -427,25 +420,20 @@ impl<H: Host> Runtime<'_, H> {
         args: &[Value],
         caller: &str,
     ) -> Result<Option<Value>, NativeError> {
-        let Some(marker) = expect_ref(receiver).cloned() else {
-            return Ok(None);
-        };
-        let Some((declaring, member)) = canonical_field(&marker)
-            .strip_prefix(FIELD_PREFIX)
-            .and_then(|rest| rest.split_once('#'))
+        // Only a `Field` `getDeclaredField(s)`/`getField(s)` built from the
+        // declaring class's own field table carries its flags.
+        let Some(host_reflect::Member {
+            class: declaring,
+            name,
+            descriptor: Some(descriptor),
+            access: Some(access),
+            ..
+        }) = host_reflect::field_of(receiver)
         else {
             return Ok(None);
         };
-        // Only a marker `getDeclaredField(s)`/`getField(s)` built from the
-        // declaring class's own field table carries its flags.
-        let mut parts = member.split(':');
-        let (Some(name), Some(descriptor), Some(access)) = (
-            parts.next(),
-            parts.next(),
-            parts.next().and_then(|flags| flags.parse::<u16>().ok()),
-        ) else {
-            return Ok(None);
-        };
+        let (declaring, name, descriptor) =
+            (declaring.as_str(), name.as_str(), descriptor.as_str());
         if !self.classes.contains_key(declaring) {
             return Ok(None);
         }
@@ -456,7 +444,7 @@ impl<H: Host> Runtime<'_, H> {
             access,
         };
         // This `Field` object's own `override` (`reflect_override`).
-        let Some(overridden) = self.field_override(&marker) else {
+        let Some(overridden) = self.field_override(receiver) else {
             return Ok(None);
         };
         let object = args.first().cloned().unwrap_or(Value::Ref(None));

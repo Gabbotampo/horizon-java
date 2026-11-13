@@ -152,7 +152,7 @@ impl<H: Host> Runtime<'_, H> {
                         crate::boolean_value(matches!(default, Value::Int(v) if *v != 0))
                     }
                     p if p.starts_with('I') => match default {
-                        Value::Int(v) => Value::Ref(Some(format!("integer:{v}"))),
+                        Value::Int(v) => Value::Boxed(crate::Boxed::Integer(*v)),
                         _ => return None,
                     },
                     p if p.starts_with('D') => match default {

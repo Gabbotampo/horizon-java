@@ -3,9 +3,9 @@
 //! Config libraries find a type's one-argument and no-argument constructors by
 //! listing them and checking `getParameterCount()` (Armor Hider's
 //! `ConfigurationItemFactoryRegistry`), so the list must be the class's real
-//! `<init>` methods. Each entry is the `reflect-constructor/<class>#<descriptor>`
-//! marker `getDeclaredConstructor` already hands out, so `getParameterCount`
-//! and `newInstance` answer it unchanged. A class the runtime does not hold
+//! `<init>` methods. Each entry is the `Constructor` handle
+//! `getDeclaredConstructor` already hands out (`host_reflect.rs`), so
+//! `getParameterCount` and `newInstance` answer it unchanged. A class the runtime does not hold
 //! keeps the host's answer.
 
 use super::*;
@@ -30,16 +30,15 @@ impl<H: Host> Runtime<'_, H> {
         let Some(file) = self.class(&class) else {
             return Ok(None);
         };
-        let constructors = file
+        let descriptors: Vec<String> = file
             .methods
             .iter()
             .filter(|method| method.name == "<init>" && (!public_only || method.access & 1 != 0))
-            .map(|method| {
-                Value::Ref(Some(format!(
-                    "reflect-constructor/{class}#{}",
-                    method.descriptor
-                )))
-            })
+            .map(|method| method.descriptor.clone())
+            .collect();
+        let constructors = descriptors
+            .iter()
+            .map(|descriptor| self.reflected_constructor(&class, Some(descriptor)))
             .collect();
         let marker = self.new_array("java/lang/reflect/Constructor", &r.name);
         self.arrays.insert(marker.clone(), constructors);

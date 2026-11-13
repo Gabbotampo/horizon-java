@@ -36,9 +36,20 @@ impl State {
     /// Runs every jar once, the first time content is asked for, and keeps its runtime for the
     /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
     /// the two hooks one pass.
-    pub(crate) fn ensure_loaded(&mut self, context: &RegistrationContext) {
+    ///
+    /// `game_version` is the running game's Minecraft version as the game reports it
+    /// ([`registration_game_version`], or `ConfigHost::game_version` where a host exists). Every
+    /// jar's host is seeded with it, so `minecraft`'s mod container (Fabric's `getAllMods` and
+    /// `getModContainer`, FML's `ModList`) and `DetectedVersion`/`SharedConstants
+    /// .getCurrentVersion()` answer the game's own value. `None` leaves both unanswered (counted),
+    /// as the runtime does for a host that was not told, rather than inventing a release.
+    pub(crate) fn ensure_loaded(
+        &mut self,
+        context: &RegistrationContext,
+        game_version: Option<&str>,
+    ) {
         let owned = owned_namespaces(context);
-        self.ensure_loaded_with(read_jar_files, &owned);
+        self.ensure_loaded_with(read_jar_files, &owned, game_version);
     }
 
     /// [`State::ensure_loaded`] with the folder read injected, so a test can count how often the
@@ -47,6 +58,7 @@ impl State {
         &mut self,
         read: impl FnOnce() -> Vec<(String, Vec<u8>)>,
         owned: &[String],
+        game_version: Option<&str>,
     ) {
         if self.loaded {
             return;
@@ -72,6 +84,14 @@ impl State {
             .map(|(file, jar)| (file.as_str(), jar.as_ref()))
             .collect();
         let plan = runtime::dependencies::plan(&refs);
+        // FML's `InterModComms` queues, one per game (`runtime::neoforge_imc`): every jar that
+        // loads is in `ModList` before any constructor runs, so any of them can be sent to.
+        let imc = runtime::neoforge_imc::ImcBus::new();
+        for &index in &plan.order {
+            if !plan.missing.contains_key(&index) {
+                imc.add_mods(&parsed[index].1);
+            }
+        }
         for &index in &plan.order {
             let (file, jar) = parsed[index].clone();
             if let Some(missing) = plan.missing.get(&index) {
@@ -92,7 +112,7 @@ impl State {
                     (file.clone(), Arc::clone(jar))
                 })
                 .collect();
-            match load_jar(file, jar, &links) {
+            match load_jar(file, jar, &links, &imc, game_version) {
                 Ok(loaded) => {
                     log::info!("{LOG}: {}", loaded.row);
                     self.jars.push(loaded);
@@ -106,25 +126,41 @@ impl State {
         // NeoForge's loading stages after the constructors (`runtime::neoforge_lifecycle`): each
         // stage posts its event to every jar's containers, then runs every jar's deferred work, as
         // FML runs a step's `DeferredWorkQueue` once every mod's event was posted.
+        // While the stages run, every jar's host but the running one's is lent to the IMC bus, so
+        // a jar reading another's message can run that jar's supplier.
+        for jar in &mut self.jars {
+            imc.lend(
+                &jar.row.file,
+                Arc::clone(&jar.jar),
+                std::mem::take(&mut jar.host),
+            );
+        }
         for stage in runtime::neoforge_lifecycle::LoadingStage::ALL {
             for jar in &mut self.jars {
-                jar.run_loading_stage(stage);
+                on_own_host(&imc, jar, |jar| jar.run_loading_stage(stage));
             }
             for jar in &mut self.jars {
-                jar.run_deferred_work(stage);
+                on_own_host(&imc, jar, |jar| jar.run_deferred_work(stage));
             }
             // NeoForge's `RegisterEvent` for `neoforge:attachment_types`, in load order
             // (`runtime::neoforge_attachments`): the registry step that follows construction.
             if stage == runtime::neoforge_lifecycle::LoadingStage::Construct {
                 for jar in &mut self.jars {
-                    let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
-                    for problem in jar.jar.register_attachment_types(&mut jar.host, &budget) {
-                        log::warn!(
-                            "{LOG}: {}: attachment type not registered: {problem}",
-                            jar.row.id
-                        );
-                    }
+                    on_own_host(&imc, jar, |jar| {
+                        let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
+                        for problem in jar.jar.register_attachment_types(&mut jar.host, &budget) {
+                            log::warn!(
+                                "{LOG}: {}: attachment type not registered: {problem}",
+                                jar.row.id
+                            );
+                        }
+                    });
                 }
+            }
+        }
+        for jar in &mut self.jars {
+            if let Some(host) = imc.reclaim(&jar.row.file) {
+                jar.host = host;
             }
         }
         for jar in &mut self.jars {
@@ -151,6 +187,23 @@ impl State {
     }
 }
 
+/// Runs `step` on `jar` with its own host taken back from the IMC bus, and lends it again after.
+fn on_own_host(
+    imc: &runtime::neoforge_imc::ImcBus,
+    jar: &mut LoadedJar,
+    step: impl FnOnce(&mut LoadedJar),
+) {
+    if let Some(host) = imc.reclaim(&jar.row.file) {
+        jar.host = host;
+    }
+    step(jar);
+    imc.lend(
+        &jar.row.file,
+        Arc::clone(&jar.jar),
+        std::mem::take(&mut jar.host),
+    );
+}
+
 /// The namespaces this mod may declare content in, exactly as the game's fence checks them
 /// (`horizon-mod-api/src/parts/owned_namespaces.rs`): its own id, then the installed package's
 /// manifest `namespaces`. A jar's namespace is learned at install time, so it is not here unless
@@ -160,6 +213,20 @@ pub(crate) fn owned_namespaces(context: &RegistrationContext) -> Vec<String> {
         Some(package) => package.namespaces().map(str::to_owned).collect(),
         None => vec![MOD_ID.to_owned()],
     }
+}
+
+/// The game's Minecraft version from a registration context (`RegistrationContext::game_version`,
+/// which the game captures before the first registration hook).
+///
+/// That accessor panics on a context made without the game's registration data (the fallback in
+/// `HorizonJava::ensure_jars` makes one at server start). The instance folder comes from the same
+/// data (`RegistrationContext::new` takes both from it), so its presence says the version may be
+/// asked; without it the caller has a host to ask instead.
+pub(crate) fn registration_game_version(context: &RegistrationContext) -> Option<&str> {
+    context
+        .instance_dir()
+        .is_ok()
+        .then(|| context.game_version())
 }
 
 /// Whether `id` (`namespace:path`) is in one of `owned`'s namespaces.
@@ -206,7 +273,7 @@ pub(crate) fn declare_blocks(
     context: &RegistrationContext,
     event: &mut BlocksEvent<'_>,
 ) {
-    state.ensure_loaded(context);
+    state.ensure_loaded(context, registration_game_version(context));
     let owned = owned_namespaces(context);
     let mut declared = BTreeSet::new();
     let mut count = 0;
@@ -259,7 +326,7 @@ pub(crate) fn declare_items(
     context: &RegistrationContext,
     event: &mut ItemsEvent<'_>,
 ) {
-    state.ensure_loaded(context);
+    state.ensure_loaded(context, registration_game_version(context));
     let owned = owned_namespaces(context);
     let mut declared = BTreeSet::new();
     let mut count = 0;
@@ -495,6 +562,7 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         state.ensure_loaded_with(
             || {
@@ -502,6 +570,7 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         assert_eq!(reads, 1);
         assert!(state.loaded);
@@ -519,6 +588,7 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         state.reset_server();
         state.ensure_loaded_with(
@@ -527,9 +597,52 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         assert_eq!(reads, 1);
         assert!(state.loaded);
+    }
+
+    /// The content pass puts every jar on one `InterModComms` bus (`runtime::neoforge_imc`): what
+    /// one jar sends in `InterModEnqueueEvent` another reads in `InterModProcessEvent`, and the
+    /// receiver's `get()` runs the sender's supplier in the sender's runtime, with its state (the
+    /// `count` supplier's second call answers 20). Lines from `neoforge_imc/oracle.jsonl`.
+    #[test]
+    fn the_content_pass_shares_imc_between_jars() {
+        let (send, receive) = runtime::neoforge_imc::tests::jar_bytes();
+        let mut state = State::default();
+        state.ensure_loaded_with(
+            || {
+                vec![
+                    ("imc-a-send.jar".to_owned(), send.clone()),
+                    ("imc-b-receive.jar".to_owned(), receive.clone()),
+                ]
+            },
+            &[],
+            None,
+        );
+        assert_eq!(state.jars.len(), 2);
+        let sent = state.jars[0].host.take_stdout();
+        let received = state.jars[1].host.take_stdout();
+        for line in [
+            "S got receiver sender back from-receiver",
+            "S supplier count runs 2",
+        ] {
+            assert!(sent.lines().any(|out| out == line), "{line}: {sent}");
+        }
+        assert!(!sent.contains("S supplier unread runs"), "{sent}");
+        for line in [
+            "R value hello",
+            "R again 20",
+            "R then sender deferred from-work",
+            "R left minecraft late",
+        ] {
+            assert!(
+                received.lines().any(|out| out == line),
+                "{line}: {received}"
+            );
+        }
+        assert!(state.jars.iter().all(|jar| jar.failures.is_empty()));
     }
 
     /// A NeoForge jar's loading stages run in the content pass, after every jar's constructors:
@@ -540,7 +653,7 @@ mod tests {
     fn the_content_pass_runs_neoforges_loading_stages() {
         let bytes = runtime::neoforge_lifecycle::tests::fixture_jar_bytes().to_vec();
         let mut state = State::default();
-        state.ensure_loaded_with(|| vec![("life.jar".to_owned(), bytes)], &[]);
+        state.ensure_loaded_with(|| vec![("life.jar".to_owned(), bytes)], &[], None);
         let jar = &mut state.jars[0];
         let printed = jar.host.take_stdout();
         for line in [
