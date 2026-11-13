@@ -363,92 +363,17 @@ impl<H: Host> Runtime<'_, H> {
     /// interface's default method), the return type, the declaring class and name, the parameter
     /// types joined by `,`, and `throws` with the `Exceptions` attribute's classes.
     pub(crate) fn method_text(&self, class: &str, method: &Method) -> String {
-        let file = self.class(class);
-        let interface = file
-            .and_then(crate::runtime::jdk_model::class_access_flags)
-            .is_some_and(|access| access & ACC_INTERFACE != 0);
-        let modifiers = method.access & 0x0D3F;
-        let default = interface && method.access & (0x0400 | 0x0001 | 0x0008) == 0x0001;
-        let words = |mask: u16| -> Vec<&'static str> {
-            [
-                (0x0001, "public"),
-                (0x0004, "protected"),
-                (0x0002, "private"),
-                (0x0400, "abstract"),
-                (0x0008, "static"),
-                (0x0010, "final"),
-                (0x0020, "synchronized"),
-                (0x0100, "native"),
-                (0x0800, "strictfp"),
-            ]
-            .into_iter()
-            .filter(|(bit, _)| mask & bit != 0)
-            .map(|(_, word)| word)
-            .collect()
-        };
-        let mut text = String::new();
-        if !default {
-            if modifiers != 0 {
-                text.push_str(&words(modifiers).join(" "));
-                text.push(' ');
-            }
-        } else {
-            let access = modifiers & 0x0007;
-            if access != 0 {
-                text.push_str(&words(access).join(" "));
-                text.push(' ');
-            }
-            text.push_str("default ");
-            let rest = modifiers & !0x0007;
-            if rest != 0 {
-                text.push_str(&words(rest).join(" "));
-                text.push(' ');
-            }
-        }
-        let returns = crate::runtime::return_desc(&method.descriptor);
-        let parameters: Vec<String> = crate::runtime::descriptor_arguments(&method.descriptor)
-            .iter()
-            .map(|parameter| type_name(parameter))
-            .collect();
-        text.push_str(&format!(
-            "{} {}.{}({})",
-            type_name(returns),
-            class.replace('/', "."),
-            method.name,
-            parameters.join(",")
-        ));
-        let thrown = file
-            .and_then(|file| method_exceptions(file, &method.name, &method.descriptor))
-            .unwrap_or_default();
-        if !thrown.is_empty() {
-            let names: Vec<String> = thrown.iter().map(|name| name.replace('/', ".")).collect();
-            text.push_str(" throws ");
-            text.push_str(&names.join(","));
-        }
-        text
-    }
-}
-
-/// `Class#getTypeName` of a field descriptor: `int`, `java.lang.String`, `java.lang.String[]`.
-fn type_name(descriptor: &str) -> String {
-    if let Some(component) = descriptor.strip_prefix('[') {
-        return format!("{}[]", type_name(component));
-    }
-    match descriptor {
-        "Z" => "boolean".into(),
-        "B" => "byte".into(),
-        "C" => "char".into(),
-        "S" => "short".into(),
-        "I" => "int".into(),
-        "J" => "long".into(),
-        "F" => "float".into(),
-        "D" => "double".into(),
-        "V" => "void".into(),
-        other => other
-            .strip_prefix('L')
-            .and_then(|name| name.strip_suffix(';'))
-            .unwrap_or(other)
-            .replace('/', "."),
+        let declared = self
+            .class(class)
+            .and_then(|file| {
+                crate::runtime::host_reflect::Declared::of(file, &method.name, &method.descriptor)
+            })
+            .unwrap_or(crate::runtime::host_reflect::Declared {
+                access: method.access,
+                interface: false,
+                throws: Vec::new(),
+            });
+        crate::runtime::host_reflect::method_text(class, &method.name, &method.descriptor, &declared)
     }
 }
 
@@ -457,7 +382,7 @@ fn value_of_class(descriptor: &str) -> String {
     if descriptor.starts_with('[') {
         format!("class {}", descriptor.replace('/', "."))
     } else {
-        type_name(descriptor)
+        crate::runtime::host_reflect::type_name(descriptor)
     }
 }
 
@@ -471,7 +396,11 @@ fn simple_name(class: &str) -> &str {
 }
 
 /// The classes one method's `Exceptions` attribute names, read back from the class bytes.
-fn method_exceptions(file: &ClassFile, name: &str, descriptor: &str) -> Option<Vec<String>> {
+pub(crate) fn method_exceptions(
+    file: &ClassFile,
+    name: &str,
+    descriptor: &str,
+) -> Option<Vec<String>> {
     let mut r = Reader::new(&file.raw);
     if r.u4().ok()? != 0xCAFE_BABE {
         return None;

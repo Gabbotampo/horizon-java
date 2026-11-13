@@ -166,6 +166,14 @@ pub enum HostKind {
     WatchService,
     WatchKey,
     WatchEvent,
+    /// `java.lang.reflect.Field`: key the member's facts in the nested-key
+    /// encoding, then `#<copy>` for a copy a lookup minted (`host_reflect.rs`).
+    ReflectField,
+    /// `java.lang.reflect.Method`: key the member's facts (`host_reflect.rs`).
+    ReflectMethod,
+    /// `java.lang.reflect.Constructor`: key the member's facts
+    /// (`host_reflect.rs`).
+    ReflectConstructor,
     /// A NeoForge `IEventBus`: key `game`, or `mod` with its id when known
     /// (`host_events.rs`; every key below holds its parts escaped).
     NeoForgeBus,
@@ -448,6 +456,27 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("sun/nio/fs/AbstractWatchKey$Event"),
         canonical: always_canonical,
         methods: &crate::runtime::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::ReflectField,
+        tag: "rfld",
+        class: ClassRule::Fixed(crate::runtime::host_reflect::FIELD),
+        canonical: crate::runtime::host_reflect::field_canonical,
+        methods: &crate::runtime::host_reflect::MEMBER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ReflectMethod,
+        tag: "rmth",
+        class: ClassRule::Fixed(crate::runtime::host_reflect::METHOD),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_reflect::MEMBER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ReflectConstructor,
+        tag: "rctr",
+        class: ClassRule::Fixed(crate::runtime::host_reflect::CONSTRUCTOR),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_reflect::MEMBER_METHODS,
     },
     KindInfo {
         kind: HostKind::NeoForgeBus,
