@@ -27,13 +27,17 @@
 //!
 //! # Keys
 //!
-//! A key is plain text, compared whole: for every kind, two handles with equal
-//! keys are equal objects (`equals` is `true`, `hashCode` agrees), so a key
-//! must be the canonical form of the kind's `equals` (an `OptionalDouble`
-//! keys `Double.doubleToLongBits`, so every `NaN` is one key and `-0.0` is not
-//! `0.0`). A kind whose `equals` runs jar code (an `Optional` holding a jar
-//! object) still compares keys as a first answer; its `equals` method is the
-//! exact one.
+//! A key is plain text, compared whole. It holds **one way**: two handles
+//! with equal keys are equal objects (`equals` is `true`, `hashCode` agrees),
+//! so a key is built from the canonical form of the kind's `equals` where the
+//! kind can (an `OptionalDouble` keys `Double.doubleToLongBits`: every `NaN`
+//! one key, `-0.0` not `0.0`). The converse does not hold: two equal objects
+//! may have different keys when a held value is not canonical text (two
+//! `List.of(1)` are two allocation markers; two jar objects equal by their
+//! own `equals`). So a reader never treats different keys as "not equal":
+//! `equals` is the row's method, which asks the held values. What does hold
+//! both ways is identity: one object never gets two keys, so different keys
+//! are different objects (`if_acmp`, [`HostRef::same_object`]).
 //!
 //! A key that holds values (an optional's value, a pair, a list's elements)
 //! is built by [`HostRef::of_values`] and read by [`HostRef::values`], the one
@@ -65,9 +69,10 @@
 
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     hash::{Hash, Hasher},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
 };
@@ -286,26 +291,36 @@ const KINDS: &[KindInfo] = &[
 ];
 
 impl HostKind {
+    /// The kind's row: `KINDS` is in declaration order, so the discriminant
+    /// indexes it (a unit test checks every row's place).
     fn info(self) -> &'static KindInfo {
-        KINDS
-            .iter()
-            .find(|info| info.kind == self)
-            .expect("every HostKind has a row in KINDS")
+        &KINDS[self as usize]
     }
 
     fn from_tag(tag: &str) -> Option<Self> {
-        KINDS
-            .iter()
-            .find(|info| info.tag == tag)
-            .map(|info| info.kind)
+        static BY_TAG: OnceLock<HashMap<&'static str, HostKind>> = OnceLock::new();
+        BY_TAG
+            .get_or_init(|| KINDS.iter().map(|info| (info.tag, info.kind)).collect())
+            .get(tag)
+            .copied()
     }
 
-    /// The kind of a fixed-class kind whose class is `class`.
+    /// The kind of a fixed-class kind whose class is `class` (asked on every
+    /// `checkcast`, so a map, not a scan).
     pub(crate) fn of_class(class: &str) -> Option<Self> {
-        KINDS
-            .iter()
-            .find(|info| matches!(info.class, ClassRule::Fixed(fixed) if fixed == class))
-            .map(|info| info.kind)
+        static BY_CLASS: OnceLock<HashMap<&'static str, HostKind>> = OnceLock::new();
+        BY_CLASS
+            .get_or_init(|| {
+                KINDS
+                    .iter()
+                    .filter_map(|info| match info.class {
+                        ClassRule::Fixed(class) => Some((class, info.kind)),
+                        ClassRule::FromKey(_) => None,
+                    })
+                    .collect()
+            })
+            .get(class)
+            .copied()
     }
 }
 
@@ -433,6 +448,9 @@ mod tests {
     #[test]
     fn every_kind_has_one_row_with_a_unique_tag_and_class() {
         for (index, info) in KINDS.iter().enumerate() {
+            // `HostKind::info` indexes the table by discriminant.
+            assert_eq!(info.kind as usize, index, "{:?}", info.kind);
+            assert_eq!(HostKind::from_tag(info.tag), Some(info.kind));
             assert!(
                 KINDS[index + 1..].iter().all(|other| other.tag != info.tag
                     && other.kind != info.kind

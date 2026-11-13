@@ -12129,7 +12129,7 @@ fn class_marker_like(
     {
         return true;
     }
-    const NON_CLASS_PREFIXES: [&str; 14] = [
+    const NON_CLASS_PREFIXES: [&str; 13] = [
         "@",
         "array/",
         "capability/",
@@ -12139,7 +12139,6 @@ fn class_marker_like(
         "list",
         "map",
         "number-format/",
-        "optional",
         "path:",
         "reflect-",
         "resource-",
