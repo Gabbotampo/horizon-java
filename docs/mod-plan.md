@@ -495,8 +495,8 @@ The game version is pinned beside it as `game = "26.3"`, and `mixins` at the for
 `MIXINS_REV` (`5a64af938ec86b00d53d16a408aabc0038fb3e57`) because the manifest requires all three.
 The mod runs no mixins yet.
 
-`mod/vendor.lock` records the **horizon-java** commit the vendored runtime was copied from, with a
-SHA-256 per file. Update it with `python3 tools/vendor.py` after changing the runtime.
+The vendored runtime in `mod/src/runtime/` is the **horizon-java** runtime of the same commit:
+re-vendor it with `python3 tools/vendor.py` in every commit that changes the runtime.
 
 ## One crate, vendored
 
@@ -504,22 +504,21 @@ A native mod cannot have a path dependency, so `crates/horizon-native-java/src` 
 `mod/src/runtime/`:
 
 ```sh
-python3 tools/vendor.py             # write mod/src/runtime and mod/vendor.lock
-python3 tools/vendor.py --check-lock  # the copy is what mod/vendor.lock says (no hand edits)
-python3 tools/vendor.py --check       # ...and it matches the runtime source as it is now
+python3 tools/vendor.py          # write (or refresh) mod/src/runtime
+python3 tools/vendor.py --check  # the copy is exactly what that writes from the runtime source now
 ```
 
-- **The mod carries the runtime commit `mod/vendor.lock` records**, not whatever the runtime says on
-  every later commit. The two checks say which is which, so a runtime PR is not taxed:
-  - `--check-lock` always applies (the Python tests run it, and so CI): it fails on a hand edit to
-    `mod/src/runtime/`, never because the runtime crate changed.
-  - `--check` is required of a PR that changes `mod/**` or `tools/vendor.py`; CI runs it only for
-    those (`.github/workflows/ci.yml` diffs the PR's changed files against its base) and on `main`
-    as a non-blocking warning. **Refresh in a mod PR, and before a mod release, by re-running
-    `python3 tools/vendor.py`.**
+- **The mod carries the runtime of its own commit.** Every commit that changes
+  `crates/horizon-native-java/src` re-vendors in the same commit, and CI runs `--check` on every PR
+  and push. `--check` regenerates the copy in memory and compares it byte for byte with
+  `mod/src/runtime/`, so one check catches a hand edit to the copy, a runtime change that was not
+  re-vendored (an embedded data file included), a missing file and a stray one.
 - **Vendored files are committed.** A clean clone builds the mod with no generation step, and
-  `tests/test_vendor_mod.py` proves a one-byte edit fails `--check-lock` while a runtime-only change
-  fails only `--check`.
+  `tests/test_vendor_mod.py` proves a one-byte hand edit, an un-vendored runtime change and an
+  orphaned vendored file each fail `--check`.
+- **No lock file.** `mod/vendor.lock` (per-file SHA-256s and a source commit) used to pin the copy
+  instead. It changed in nearly every runtime PR, so any two runtime PRs conflicted on it, and it
+  guarded nothing the regenerate-and-compare check does not, so it was removed.
 - `lib.rs` becomes `runtime/mod.rs` and every `crate::` path becomes `crate::runtime::`, because the
   runtime is no longer a crate root but a module of the mod's crate.
 - `main.rs` (the command-line probe) is not vendored.
