@@ -34483,7 +34483,7 @@ mandatory = true
             .unwrap();
         assert_eq!(
             first,
-            Value::Ref(Some("mod-container/fabric-api/unknown".into()))
+            Value::Ref(Some("mod-container/fabric-api/0.165.0+26.3".into()))
         );
         let present = MethodRef {
             owner: "java/util/Optional".into(),

@@ -20,7 +20,8 @@ public final class Probe {
         for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
             String id = container.getMetadata().getId();
             if (id.equals("alpha") || id.equals("beta") || id.equals("gamma")
-                || id.equals("fabricloader") || id.equals("mixinextras")) {
+                || id.equals("fabricloader") || id.equals("mixinextras")
+                || id.equals("fabric-api-base")) {
                 out.append(Describe.line(container.getMetadata())).append('\n');
             }
         }

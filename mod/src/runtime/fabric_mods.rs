@@ -34,10 +34,16 @@
 //! in the run that ships its own MixinExtras keeps its own metadata, where
 //! Fabric would pick the newest version.
 //!
+//! **The Fabric API modules the host provides** (`fabric-api`,
+//! `fabric-api-base`, `fabric-command-api-v2`, `fabric-lifecycle-events-v1`,
+//! `fabric-resource-loader-v1`) answer the metadata those modules carry in
+//! `fabric-api-0.165.0+26.3`, the release the host's Fabric API model
+//! reproduces (`events.rs`): the same named departure, Horizon reports the
+//! release whose behaviour it reproduces. A jar in the run that ships its own
+//! copy of one of these keeps its own metadata.
+//!
 //! **`java` and `minecraft`** are the loader's `BuiltinModMetadata` (see
-//! `builtin_metadata`). The Fabric API ids the host provides answer `getId`;
-//! every other read on them is counted, as their metadata depends on a Fabric
-//! API release Horizon does not have.
+//! `builtin_metadata`).
 //!
 //! **Counted, not answered:** iterating a custom object or array
 //! (`serde_json` here keeps object keys sorted, not in file order),
@@ -71,6 +77,17 @@ const LOADER_METADATA: &str = r#"{"schemaVersion":1,"id":"fabricloader","name":"
 /// MixinExtras 0.5.5's `fabric.mod.json` (MIT), the jar Fabric Loader 0.19.5
 /// bundles, less its `mixins` list.
 const MIXINEXTRAS_METADATA: &str = r#"{"schemaVersion":1,"id":"mixinextras","provides":["com_github_llamalad7_mixinextras"],"version":"0.5.5","name":"MixinExtras","description":"Companion library to Mixin with lots of features to improve the compatibility and concision of your mixins!","authors":["LlamaLad7"],"contact":{"homepage":"https://github.com/LlamaLad7/MixinExtras","sources":"https://github.com/LlamaLad7/MixinExtras"},"license":"MIT","environment":"*","depends":{"fabricloader":">=0.14.25"},"custom":{"modmenu":{"badges":["library"]}}}"#;
+
+/// The Fabric API modules the host provides, as `fabric-api-0.165.0+26.3`
+/// (Apache-2.0) ships them: the umbrella jar's and its nested module jars'
+/// own `fabric.mod.json`, less their `depends`, `entrypoints`, `mixins`,
+/// `accessWidener` and `jars`. That is the release the host's Fabric API
+/// event model reproduces (`events.rs`).
+const FABRIC_API_METADATA: &str = r#"{"schemaVersion":1,"id":"fabric-api","name":"Fabric API","version":"0.165.0+26.3","environment":"*","description":"Core API module providing key hooks and intercompatibility features.","license":"Apache-2.0","icon":"assets/fabric/icon.png","contact":{"homepage":"https://fabricmc.net","irc":"irc://irc.esper.net:6667/fabric","issues":"https://github.com/FabricMC/fabric/issues","sources":"https://github.com/FabricMC/fabric"},"authors":["FabricMC"]}"#;
+const FABRIC_API_BASE_METADATA: &str = r#"{"schemaVersion":1,"id":"fabric-api-base","name":"Fabric API Base","version":"2.0.6+fcdff87f5d","environment":"*","description":"Contains the essentials for Fabric API modules.","license":"Apache-2.0","icon":"assets/fabric-api-base/icon.png","contact":{"homepage":"https://fabricmc.net","irc":"irc://irc.esper.net:6667/fabric","issues":"https://github.com/FabricMC/fabric/issues","sources":"https://github.com/FabricMC/fabric"},"authors":["FabricMC"],"custom":{"fabric-api:module-lifecycle":"stable"}}"#;
+const FABRIC_COMMAND_API_V2_METADATA: &str = r#"{"schemaVersion":1,"id":"fabric-command-api-v2","name":"Fabric Command API (v2)","version":"3.1.2+fcdff87f5d","environment":"*","description":"Adds command-related hooks.","license":"Apache-2.0","icon":"assets/fabric-command-api-v2/icon.png","contact":{"homepage":"https://fabricmc.net","irc":"irc://irc.esper.net:6667/fabric","issues":"https://github.com/FabricMC/fabric/issues","sources":"https://github.com/FabricMC/fabric"},"authors":["FabricMC"],"custom":{"fabric-api:module-lifecycle":"stable"}}"#;
+const FABRIC_LIFECYCLE_EVENTS_V1_METADATA: &str = r#"{"schemaVersion":1,"id":"fabric-lifecycle-events-v1","name":"Fabric Lifecycle Events (v1)","version":"4.1.9+ffef5f675d","environment":"*","description":"Events for the game's lifecycle.","license":"Apache-2.0","icon":"assets/fabric-lifecycle-events-v1/icon.png","contact":{"homepage":"https://fabricmc.net","irc":"irc://irc.esper.net:6667/fabric","issues":"https://github.com/FabricMC/fabric/issues","sources":"https://github.com/FabricMC/fabric"},"authors":["FabricMC"],"custom":{"fabric-api:module-lifecycle":"stable"}}"#;
+const FABRIC_RESOURCE_LOADER_V1_METADATA: &str = r#"{"schemaVersion":1,"id":"fabric-resource-loader-v1","name":"Fabric Resource Loader (v1)","version":"3.1.0+5af7744b5d","environment":"*","description":"Asset and data resource loading.","license":"Apache-2.0","icon":"assets/fabric-resource-loader-v1/icon.png","contact":{"homepage":"https://fabricmc.net","irc":"irc://irc.esper.net:6667/fabric","issues":"https://github.com/FabricMC/fabric/issues","sources":"https://github.com/FabricMC/fabric"},"authors":["FabricMC"],"custom":{"fabric-api:module-lifecycle":"stable"}}"#;
 
 /// `java.specification.version` on the Java 25 that Minecraft 26.3 requires
 /// (`ModDiscoverer.createJavaMod` strips a leading `1.`; there is none).
@@ -151,6 +168,11 @@ impl StdHost {
         let loader = match id {
             "fabricloader" => LOADER_METADATA,
             "mixinextras" => MIXINEXTRAS_METADATA,
+            "fabric-api" => FABRIC_API_METADATA,
+            "fabric-api-base" => FABRIC_API_BASE_METADATA,
+            "fabric-command-api-v2" => FABRIC_COMMAND_API_V2_METADATA,
+            "fabric-lifecycle-events-v1" => FABRIC_LIFECYCLE_EVENTS_V1_METADATA,
+            "fabric-resource-loader-v1" => FABRIC_RESOURCE_LOADER_V1_METADATA,
             _ => return None,
         };
         serde_json::from_str(loader)
@@ -403,8 +425,7 @@ impl StdHost {
     /// `java.specification.version`; its name is `java.vm.name`, which
     /// depends on the JDK's vendor, so it is counted. `minecraft`'s name is
     /// `Minecraft` and its version the game version a caller seeded (counted
-    /// without one). The Fabric API ids the host provides are real jars of a
-    /// release Horizon does not have: only their id is known.
+    /// without one).
     fn builtin_metadata(&mut self, r: &MethodRef, id: &str) -> Result<Value, NativeError> {
         if r.name == "getId" && r.descriptor == "()Ljava/lang/String;" {
             return Ok(text(id));

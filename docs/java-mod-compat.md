@@ -1385,7 +1385,10 @@ MixinExtras 0.5.5 that loader bundles, because 0.19.5 is the loader this runtime
 and checked against. `java` is Loader's built-in for Java 25 (version `25`; its `java.vm.name`
 depends on the JDK vendor and is counted). `minecraft` is the game version the host was seeded
 with, and is counted without one (the game's mod has no API for it at the pinned fork). The
-Fabric API ids the host provides answer only their id.
+Fabric API modules the host provides (`fabric-api`, `fabric-api-base`, `fabric-command-api-v2`,
+`fabric-lifecycle-events-v1`, `fabric-resource-loader-v1`) report their own metadata from
+`fabric-api-0.165.0+26.3`, the release the host's Fabric API model reproduces (`events.rs`): the
+same departure, for the same reason.
 
 ## The mapping
 
