@@ -1,6 +1,6 @@
 //! `new String(...)` is counted, never answered with the allocation marker,
-//! until a model builds its text (the `char[]` and code-point constructors
-//! now do: `string_constructors.rs`).
+//! until a model builds its text (the `char[]`, code-point, `byte[]`, empty
+//! and copy constructors now do: `string_constructors.rs`).
 //!
 //! On `main` before this test, every `String` constructor left the
 //! `java/lang/String#n` marker where Java has the text, silently:
@@ -123,17 +123,25 @@ fn jar() -> NativeJar {
     NativeJar::from_path(&jar_path).unwrap()
 }
 
-/// The `char[]` and code-point constructors are modelled
-/// (`string_constructors.rs`): they answer the Java 25 values the comments
-/// above record, with nothing counted.
+/// The modelled constructors (`string_constructors.rs`) answer the Java 25
+/// values the comments above record, with nothing counted.
 #[test]
-fn char_and_code_point_constructors_answer_java_25() {
+fn modelled_constructors_answer_java_25() {
     let jar = jar();
     let cases = [
         ("chars", "ab|2|true"),
         ("charsRange", "bc"),
         ("codePoints", "a\u{1F600}b"),
         ("reference", "q"),
+        ("bytes", "hi"),
+        ("bytesRange", "b"),
+        ("bytesCharset", "\u{e9}"),
+        ("bytesRangeCharset", "bc"),
+        ("bytesName", "ab"),
+        ("bytesRangeName", "ab"),
+        ("empty", "0"),
+        ("copy", "xy"),
+        ("supplier", "0"),
     ];
     for (name, expected) in cases {
         let mut host = StdHost::new();
@@ -166,19 +174,12 @@ fn every_string_constructor_is_counted_until_it_is_modelled() {
     let jar = jar();
     // (method, the constructor descriptor it must be counted under)
     let cases = [
-        ("bytes", "([B)V"),
-        ("bytesRange", "([BII)V"),
-        ("bytesCharset", "([BLjava/nio/charset/Charset;)V"),
-        ("bytesRangeCharset", "([BIILjava/nio/charset/Charset;)V"),
-        ("bytesName", "([BLjava/lang/String;)V"),
-        ("bytesRangeName", "([BIILjava/lang/String;)V"),
         ("hibyte", "([BI)V"),
         ("hibyteRange", "([BIII)V"),
-        ("empty", "()V"),
-        ("copy", "(Ljava/lang/String;)V"),
         ("builder", "(Ljava/lang/StringBuilder;)V"),
         ("buffer", "(Ljava/lang/StringBuffer;)V"),
-        ("supplier", "()V"),
+        // A `MethodHandle` constructor is counted for every overload
+        // (`method_handles.rs`), modelled or not.
         ("handle", "(Ljava/lang/String;)V"),
     ];
     for (name, descriptor) in cases {

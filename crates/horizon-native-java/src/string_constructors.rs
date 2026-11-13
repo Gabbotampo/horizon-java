@@ -29,9 +29,27 @@
 //!   same way (`"codePoints"` in the NPE), then each code point: an invalid one
 //!   throws `IllegalArgumentException` with the code point in decimal.
 //!
-//! Every other constructor (`String()`, `String(String)`, the `byte[]` and
-//! charset ones, `StringBuilder`/`StringBuffer`) is still counted: the `byte[]`
-//! and charset constructors are Gabbotampo's #6. So is a `char[]`/`int[]`
+//! * `String()` is empty and `String(String original)` copies `original`; a
+//!   null `original` throws `NullPointerException: Cannot read field "value"
+//!   because "original" is null`.
+//! * The `byte[]` constructors decode with the charset they name, or UTF-8
+//!   (the default charset since JDK 18) when they name none. The charset is
+//!   checked first: a null `Charset` or name throws `NullPointerException`
+//!   with no message, an unknown name `UnsupportedEncodingException`. Then a
+//!   null array throws `NullPointerException: Cannot read the array length
+//!   because "bytes" is null`, and a bad range the same
+//!   `StringIndexOutOfBoundsException` as above.
+//!
+//! The `byte[]` constructors are answered only where the decoding is exact
+//! here: ISO-8859-1 (one byte, one char), US-ASCII (a byte over 0x7F is
+//! U+FFFD) and well-formed UTF-8. Malformed UTF-8 is counted, because JDK 25
+//! does not replace it the way Rust's `from_utf8_lossy` does (`ED A0 80` is
+//! one U+FFFD in Java, three in Rust); so is any other charset (UTF-16, a
+//! name the host does not model), which also covers the unknown names Java
+//! throws on.
+//!
+//! Every other constructor (`StringBuilder`/`StringBuffer`, the deprecated
+//! hibyte `(byte[], int)` pair) is still counted. So is a `char[]`/`int[]`
 //! constructor whose text has an unpaired surrogate, which the runtime's
 //! strings cannot hold. A `String` constructor reached through a
 //! `MethodHandle` (`String::new`) is answered or counted the same way.
@@ -59,9 +77,105 @@ fn check_range(offset: i32, count: i32, length: usize) -> Result<(), NativeError
     Ok(())
 }
 
-/// The text a `char[]`/`int[]` `String` constructor builds; `Ok(None)` for any
-/// other constructor (counted by [`count`]) and for text with an unpaired
-/// surrogate.
+/// The charsets whose `byte[]` decoding is exact here.
+#[derive(Clone, Copy)]
+enum ExactCharset {
+    Utf8,
+    UsAscii,
+    Latin1,
+}
+
+impl ExactCharset {
+    fn named(canonical: &str) -> Option<Self> {
+        match canonical {
+            "UTF-8" => Some(Self::Utf8),
+            "US-ASCII" => Some(Self::UsAscii),
+            "ISO-8859-1" => Some(Self::Latin1),
+            _ => None,
+        }
+    }
+
+    /// The text, or `None` for malformed UTF-8 (see the module comment).
+    fn decode(self, bytes: &[u8]) -> Option<String> {
+        match self {
+            Self::Utf8 => std::str::from_utf8(bytes).ok().map(str::to_owned),
+            Self::UsAscii => Some(
+                bytes
+                    .iter()
+                    .map(|byte| {
+                        if byte.is_ascii() {
+                            char::from(*byte)
+                        } else {
+                            '\u{FFFD}'
+                        }
+                    })
+                    .collect(),
+            ),
+            Self::Latin1 => Some(bytes.iter().map(|byte| char::from(*byte)).collect()),
+        }
+    }
+}
+
+/// The charset argument of a `byte[]` constructor: a `Charset` (`charset/<name>`
+/// marker) or a name. `Ok(None)` when it is not one decoded exactly here.
+fn byte_charset(value: &Value, by_name: bool) -> Result<Option<ExactCharset>, NativeError> {
+    let Value::Ref(Some(marker)) = value else {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        });
+    };
+    let canonical = if by_name {
+        jdk_model::canonical_charset(marker)
+    } else {
+        marker.strip_prefix("charset/")
+    };
+    Ok(canonical.and_then(ExactCharset::named))
+}
+
+/// The text a `byte[]` constructor builds, after its charset (if any) was
+/// resolved: `offset`/`count` index the array when the descriptor has them.
+fn decode_bytes<H: Host>(
+    runtime: &Runtime<'_, H>,
+    r: &MethodRef,
+    args: &[Value],
+    range: bool,
+    charset: ExactCharset,
+) -> Result<Option<String>, NativeError> {
+    let values = match args.first() {
+        Some(array @ Value::Ref(Some(_))) => runtime.array(array)?.clone(),
+        _ => {
+            return Err(thrown(
+                "java/lang/NullPointerException",
+                "Cannot read the array length because \"bytes\" is null".into(),
+            ));
+        }
+    };
+    // A byte the runtime does not hold as an int is not guessed.
+    let Some(bytes) = values
+        .iter()
+        .map(|value| match value {
+            Value::Int(byte) => Some(*byte as u8),
+            _ => None,
+        })
+        .collect::<Option<Vec<u8>>>()
+    else {
+        return Ok(None);
+    };
+    let bytes = if range {
+        let offset = expect_int(r, StdHost::argument(r, args, 1)?)?;
+        let count = expect_int(r, StdHost::argument(r, args, 2)?)?;
+        check_range(offset, count, bytes.len())?;
+        &bytes[offset as usize..(offset + count) as usize]
+    } else {
+        &bytes[..]
+    };
+    Ok(charset.decode(bytes))
+}
+
+/// The text a `String` constructor builds; `Ok(None)` for a constructor
+/// counted by [`count`] (see the module comment).
 pub(crate) fn build<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,
@@ -90,6 +204,40 @@ pub(crate) fn build<H: Host>(
         expect_int(r, StdHost::argument(r, args, index)?)
     };
     let text = match r.descriptor.as_str() {
+        "()V" => Some(String::new()),
+        "(Ljava/lang/String;)V" => match args.first() {
+            Some(Value::Ref(Some(original))) if value_class::is_plain_string(original) => {
+                Some(original.clone())
+            }
+            Some(Value::Ref(None)) | None => {
+                return Err(thrown(
+                    "java/lang/NullPointerException",
+                    "Cannot read field \"value\" because \"original\" is null".into(),
+                ));
+            }
+            Some(_) => None,
+        },
+        "([B)V" | "([BII)V" => {
+            return decode_bytes(
+                runtime,
+                r,
+                args,
+                r.descriptor == "([BII)V",
+                ExactCharset::Utf8,
+            );
+        }
+        "([BLjava/nio/charset/Charset;)V"
+        | "([BLjava/lang/String;)V"
+        | "([BIILjava/nio/charset/Charset;)V"
+        | "([BIILjava/lang/String;)V" => {
+            let range = r.descriptor.starts_with("([BII");
+            let by_name = r.descriptor.ends_with("Ljava/lang/String;)V");
+            let charset = StdHost::argument(r, args, if range { 3 } else { 1 })?;
+            return match byte_charset(charset, by_name)? {
+                Some(charset) => decode_bytes(runtime, r, args, range, charset),
+                None => Ok(None),
+            };
+        }
         "([C)V" => {
             let units = codes(runtime, "value")?;
             String::from_utf16(&units.iter().map(|unit| *unit as u16).collect::<Vec<_>>()).ok()

@@ -43,15 +43,17 @@ const LONE: &str = r#"package demo;
 
 public final class Probe {
     public static String run() {
-        return new String(new char[] {'a', '\uD800'}) + "|" + new String(new byte[] {104, 105});
+        return new String(new char[] {'a', '\uD800'}) + "|"
+            + new String(new byte[] {(byte) 0xED, (byte) 0xA0, (byte) 0x80});
     }
 }
 "#;
 
-/// An unpaired surrogate (which the runtime's strings cannot hold) and the
-/// `byte[]` constructors (Gabbotampo's #6) stay counted.
+/// An unpaired surrogate (which the runtime's strings cannot hold) and
+/// malformed UTF-8 (JDK 25 decodes `ED A0 80` to one U+FFFD, Rust's lossy
+/// decoder to three) stay counted.
 #[test]
-fn unpaired_surrogates_and_byte_constructors_stay_counted() {
+fn unpaired_surrogates_and_malformed_utf8_stay_counted() {
     let fixture = Fixture::build("string-chars-counted", &[("demo/Probe.java", LONE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
     fixture.text_on(&mut host, "run");

@@ -9821,38 +9821,6 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
 
-/// Decode `bytes` as `new String(bytes, charset)` does, for the charsets
-/// whose decoding is exact here: UTF-8 (malformed input replaced with U+FFFD,
-/// as Java's decoder does), US-ASCII (a byte over 0x7F becomes U+FFFD) and
-/// ISO-8859-1 (one byte, one char). `charset` is a `charset/<name>` marker or
-/// a charset name; any other charset answers `None`.
-fn decode_java_bytes(bytes: &[u8], charset: &Value) -> Option<String> {
-    let named = expect_ref(charset)?;
-    let name = named
-        .strip_prefix("charset/")
-        .unwrap_or(named)
-        .to_ascii_uppercase();
-    match name.as_str() {
-        "UTF-8" | "UTF8" => Some(String::from_utf8_lossy(bytes).into_owned()),
-        "US-ASCII" | "ASCII" => Some(
-            bytes
-                .iter()
-                .map(|b| {
-                    if b.is_ascii() {
-                        char::from(*b)
-                    } else {
-                        '\u{FFFD}'
-                    }
-                })
-                .collect(),
-        ),
-        "ISO-8859-1" | "ISO8859_1" | "LATIN1" => {
-            Some(bytes.iter().map(|b| char::from(*b)).collect())
-        }
-        _ => None,
-    }
-}
-
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
     if !matches!(
@@ -22495,67 +22463,6 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// The text a `java.lang.String` constructor builds from its arguments, for
-    /// the shapes the bounded runtime models: none, a `String`, a `byte[]`
-    /// (whole or a range) and a `char[]` (whole or a range). Bytes decode with
-    /// the charset the call names (a `charset/<name>` marker or a name) when it
-    /// is UTF-8, US-ASCII or ISO-8859-1, and as UTF-8 (Java 18's default) when
-    /// it names none; any other charset, or an array element that isn't an
-    /// int, answers `None` so the call stays on the normal path instead of
-    /// guessing text.
-    fn string_constructor_text(&self, descriptor: &str, args: &[Value]) -> Option<String> {
-        let range =
-            |len: usize, offset: Option<&Value>, count: Option<&Value>| match (offset, count) {
-                (Some(Value::Int(offset)), Some(Value::Int(count))) => {
-                    let start = usize::try_from(*offset).ok()?;
-                    let end = start.checked_add(usize::try_from(*count).ok()?)?;
-                    (end <= len).then_some(start..end)
-                }
-                _ => Some(0..len),
-            };
-        let ints = |value: &Value| {
-            self.array(value).ok().and_then(|values| {
-                values
-                    .iter()
-                    .map(|value| match value {
-                        Value::Int(value) => Some(*value),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<_>>>()
-            })
-        };
-        let bytes_of = |values: &[i32]| values.iter().map(|b| *b as u8).collect::<Vec<_>>();
-        match descriptor {
-            "()V" => Some(String::new()),
-            "(Ljava/lang/String;)V" => args.first().and_then(expect_ref).cloned(),
-            "([B)V" => Some(String::from_utf8_lossy(&bytes_of(&ints(args.first()?)?)).into_owned()),
-            "([BLjava/nio/charset/Charset;)V" | "([BLjava/lang/String;)V" => {
-                let bytes = bytes_of(&ints(args.first()?)?);
-                decode_java_bytes(&bytes, args.get(1)?)
-            }
-            "([BII)V" | "([BIILjava/nio/charset/Charset;)V" | "([BIILjava/lang/String;)V" => {
-                let values = ints(args.first()?)?;
-                let range = range(values.len(), args.get(1), args.get(2))?;
-                let bytes = bytes_of(&values[range]);
-                match args.get(3) {
-                    None => Some(String::from_utf8_lossy(&bytes).into_owned()),
-                    Some(charset) => decode_java_bytes(&bytes, charset),
-                }
-            }
-            "([C)V" | "([CII)V" => {
-                let chars = ints(args.first()?)?;
-                let range = if descriptor == "([C)V" {
-                    0..chars.len()
-                } else {
-                    range(chars.len(), args.get(1), args.get(2))?
-                };
-                let units = chars[range].iter().map(|c| *c as u16).collect::<Vec<_>>();
-                Some(String::from_utf16_lossy(&units))
-            }
-            _ => None,
-        }
-    }
-
     /// A `byte[]` marker holding `bytes`, as `InputStream#readAllBytes`
     /// answers.
     fn io_bytes_array(&mut self, bytes: Vec<u8>, class: &str, method: &str) -> Value {
@@ -24941,25 +24848,6 @@ impl<H: Host> Runtime<'_, H> {
                         && matches!(receiver, Some(Value::Ref(None)))
                     {
                         self.pending_skipped_new.pop();
-                        continue;
-                    }
-                    // Strings are values here, so `new String(bytes, UTF_8)`
-                    // and its siblings turn the allocated object, wherever the
-                    // frame holds it, into the text the constructor builds.
-                    if op == 0xb7
-                        && r.name == "<init>"
-                        && r.owner == "java/lang/String"
-                        && let Some(Value::Ref(Some(object))) = receiver.as_ref()
-                        && let Some(text) = self.string_constructor_text(&r.descriptor, &args)
-                    {
-                        let object = object.clone();
-                        let text = Value::Ref(Some(text));
-                        for slot in stack.iter_mut().chain(locals.iter_mut()) {
-                            if matches!(slot, Value::Ref(Some(marker)) if *marker == object) {
-                                *slot = text.clone();
-                            }
-                        }
-                        self.calls += 1;
                         continue;
                     }
                     self.calls += 1;
@@ -29288,30 +29176,6 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
-
-    /// `new String(bytes, charset)` decodes exactly for UTF-8, US-ASCII and
-    /// ISO-8859-1, by marker or by name, and refuses any other charset.
-    #[test]
-    fn java_bytes_decode_only_with_exact_charsets() {
-        let charset = |name: &str| Value::Ref(Some(name.to_owned()));
-        assert_eq!(
-            decode_java_bytes(b"caf\xc3\xa9", &charset("charset/UTF-8")).as_deref(),
-            Some("café")
-        );
-        assert_eq!(
-            decode_java_bytes(b"caf\xe9", &charset("charset/ISO-8859-1")).as_deref(),
-            Some("café")
-        );
-        assert_eq!(
-            decode_java_bytes(b"caf\xe9", &charset("US-ASCII")).as_deref(),
-            Some("caf\u{FFFD}")
-        );
-        assert_eq!(
-            decode_java_bytes(b"\xfe\xff\x00a", &charset("charset/UTF-16")),
-            None
-        );
-        assert_eq!(decode_java_bytes(b"a", &Value::Ref(None)), None);
-    }
 
     /// A class with one static `m()V` that returns, the smallest shape the
     /// weaver accepts. Pool: 1 name, 2 Class 1, 3 `java/lang/Object`, 4 Class 3,
