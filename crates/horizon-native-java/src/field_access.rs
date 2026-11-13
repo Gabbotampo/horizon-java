@@ -152,6 +152,8 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
+        let (declaring, name, descriptor) =
+            (declaring.as_str(), name.as_str(), descriptor.as_str());
         let Some(overridden) = self.field_override(field) else {
             return Ok(None);
         };

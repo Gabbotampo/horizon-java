@@ -432,6 +432,8 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
+        let (declaring, name, descriptor) =
+            (declaring.as_str(), name.as_str(), descriptor.as_str());
         if !self.classes.contains_key(declaring) {
             return Ok(None);
         }

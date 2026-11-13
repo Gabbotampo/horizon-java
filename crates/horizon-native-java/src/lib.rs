@@ -6374,44 +6374,39 @@ impl Host for StdHost {
             return Ok(value);
         }
         // A `Field`/`Method` handle's own facts (`host_reflect.rs`); its
-        // `toString` is the kind's row.
+        // `toString` is the kind's row. A field the runtime did not read (a
+        // game or JDK class, an inherited field it could not follow) knows
+        // only its name: its type, modifiers and declaring class (maybe a
+        // superclass) fall through and are counted.
         if r.owner == "java/lang/reflect/Field"
-            && matches!(
-                r.name.as_str(),
-                "getName" | "getType" | "getModifiers" | "getDeclaringClass"
-            )
             && let Some(field) = host_reflect::field_of(receiver)
+            && (r.name == "getName" || field.access.is_some())
         {
-            return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(field.name.to_owned()))),
-                ("getType", "()Ljava/lang/Class;") => Ok(Value::Ref(Some(erased_field_type(
-                    field.descriptor.unwrap_or_default(),
-                )))),
-                ("getModifiers", "()I") => Ok(Value::Int(i32::from(field.access.unwrap_or(0)))),
-                // The class the lookup read the field from declares it.
-                ("getDeclaringClass", "()Ljava/lang/Class;") => {
-                    Ok(Value::Ref(Some(field.class.to_owned())))
+            match (r.name.as_str(), r.descriptor.as_str(), field.descriptor) {
+                ("getName", "()Ljava/lang/String;", _) => return Ok(Value::Ref(Some(field.name))),
+                ("getType", "()Ljava/lang/Class;", Some(descriptor)) => {
+                    return Ok(Value::Ref(Some(erased_field_type(&descriptor))));
                 }
-                _ => Err(NativeError::MissingMethod(format!(
-                    "java/lang/reflect/Field#{}{}",
-                    r.name, r.descriptor
-                ))),
-            };
+                ("getModifiers", "()I", _) => {
+                    return Ok(Value::Int(i32::from(field.access.unwrap_or(0))));
+                }
+                // The class whose field table the lookup found it in.
+                ("getDeclaringClass", "()Ljava/lang/Class;", _) => {
+                    return Ok(Value::Ref(Some(field.class)));
+                }
+                _ => {}
+            }
         }
         if r.owner == "java/lang/reflect/Method"
-            && matches!(r.name.as_str(), "getName" | "getParameterCount")
             && let Some(method) = host_reflect::method_of(receiver)
         {
-            return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some(method.name.to_owned()))),
-                ("getParameterCount", "()I") => {
-                    Ok(Value::Int(method.descriptor.map_or(0, arg_count) as i32))
+            match (r.name.as_str(), r.descriptor.as_str(), method.descriptor) {
+                ("getName", "()Ljava/lang/String;", _) => return Ok(Value::Ref(Some(method.name))),
+                ("getParameterCount", "()I", Some(descriptor)) => {
+                    return Ok(Value::Int(arg_count(&descriptor) as i32));
                 }
-                _ => Err(NativeError::MissingMethod(format!(
-                    "java/lang/reflect/Method#{}{}",
-                    r.name, r.descriptor
-                ))),
-            };
+                _ => {}
+            }
         }
         if is_item_handler_owner(&r.owner) {
             let marker = expect_ref(receiver)
@@ -20783,15 +20778,13 @@ impl<H: Host> Runtime<'_, H> {
             let field = receiver.and_then(host_reflect::field_of).ok_or_else(|| {
                 NativeError::Metadata("malformed java/lang/reflect/Field handle".into())
             })?;
-            let (class, name) = (field.class, field.name);
-            let descriptor = field.descriptor.map(str::to_owned).or_else(|| {
-                self.class(class).and_then(|file| {
-                    file.fields
-                        .iter()
-                        .find(|field| field.name == name)
-                        .map(|field| field.descriptor.clone())
-                })
-            });
+            // A field the runtime did not read has no type to answer
+            // (counted); a read one's is the class file's.
+            let Some(descriptor) = field.descriptor.filter(|_| field.access.is_some()) else {
+                return Ok(None);
+            };
+            let (class, name) = (field.class.as_str(), field.name.as_str());
+            let descriptor = Some(descriptor);
             let signature = descriptor.as_deref().and_then(|descriptor| {
                 self.class(class)
                     .and_then(|file| file.field_signature(name, descriptor))
@@ -20981,21 +20974,22 @@ impl<H: Host> Runtime<'_, H> {
             && r.descriptor == "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
         {
             let class = reflection_class_name(receiver, r)?.to_owned();
-            let name = expect_string(StdHost::argument(r, args, 0)?);
-            let declared = self
-                .class(&class)
-                .and_then(|file| {
-                    file.fields.iter().find(|field| {
-                        field.name == name
-                            && (r.name == "getDeclaredField" || field.access & 1 != 0)
-                    })
-                })
-                .map(|field| (field.descriptor.clone(), field.access));
-            let name = name.to_owned();
-            let declared = declared
-                .as_ref()
-                .map(|(descriptor, access)| (descriptor.as_str(), *access));
-            return Ok(Some(self.field_copy(&class, &name, declared)));
+            let name = expect_string(StdHost::argument(r, args, 0)?).to_owned();
+            // The field is what the class files say; a name no held class
+            // declares throws as on the JVM, and a search that reaches a
+            // class the runtime does not hold hands out a field it did not
+            // read (its facts are counted, `host_reflect.rs`).
+            return Ok(Some(
+                match self.field_lookup(&class, &name, r.name == "getDeclaredField") {
+                    host_reflect::FieldLookup::Found(declaring, descriptor, access) => {
+                        self.field_copy(&declaring, &name, Some((&descriptor, access)))
+                    }
+                    host_reflect::FieldLookup::Absent => {
+                        return Err(host_reflect::no_such_field(&name));
+                    }
+                    host_reflect::FieldLookup::Unknown => self.field_copy(&class, &name, None),
+                },
+            ));
         }
         if r.owner == "java/lang/Class"
             && matches!(r.name.as_str(), "getMethods" | "getDeclaredMethods")
@@ -21015,6 +21009,23 @@ impl<H: Host> Runtime<'_, H> {
             let name = expect_string(StdHost::argument(r, args, 0)?);
             let parameter_types = self.parameter_types(args);
             let descriptor = self.reflected_descriptor(class, name, &parameter_types);
+            // `getDeclaredMethod` on a class the runtime holds: its methods
+            // are the class file's, so a miss throws Java's exception
+            // (`getMethod` also searches supertypes and is not decided here).
+            if r.name == "getDeclaredMethod"
+                && let Some(file) = self.class(class)
+                && match descriptor.as_deref() {
+                    Some(descriptor) => file.method(name, descriptor).is_none(),
+                    // A parameter that names no type leaves it undecided.
+                    None => parameter_types.is_empty(),
+                }
+                && let Some(parameters) = parameter_types
+                    .iter()
+                    .map(|parameter| expect_ref(parameter).cloned())
+                    .collect::<Option<Vec<_>>>()
+            {
+                return Err(host_reflect::no_such_method(class, name, &parameters));
+            }
             return Ok(Some(self.reflected_method(
                 class,
                 name,
@@ -21126,7 +21137,11 @@ impl<H: Host> Runtime<'_, H> {
             let found = receiver
                 .and_then(host_reflect::method_of)
                 .and_then(|method| {
-                    let (class, name, descriptor) = (method.class, method.name, method.descriptor);
+                    let (class, name, descriptor) = (
+                        method.class.as_str(),
+                        method.name.as_str(),
+                        method.descriptor.as_deref(),
+                    );
                     let file = self.class(class)?;
                     let method = file.methods.iter().find(|candidate| {
                         candidate.name == name
@@ -21145,9 +21160,10 @@ impl<H: Host> Runtime<'_, H> {
             let field = receiver.and_then(host_reflect::field_of).ok_or_else(|| {
                 NativeError::Metadata("malformed java/lang/reflect/Field handle".into())
             })?;
-            let (class, name) = (field.class, field.name);
+            let (class, name) = (field.class.as_str(), field.name.as_str());
             let declared = field
                 .descriptor
+                .as_deref()
                 .map(|descriptor| (descriptor.to_owned(), field.access.unwrap_or(0)))
                 .or_else(|| {
                     self.class(class).and_then(|file| {
@@ -21205,14 +21221,16 @@ impl<H: Host> Runtime<'_, H> {
                     NativeError::Metadata("malformed java/lang/reflect/Constructor handle".into())
                 })?;
             let (class, descriptor) = (
-                constructor.class,
-                constructor.descriptor.unwrap_or_default(),
+                constructor.class.as_str(),
+                constructor.descriptor.as_deref().unwrap_or_default(),
             );
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getName", "()Ljava/lang/String;") => {
                     return Ok(Some(Value::Ref(Some(class.replace('/', ".")))));
                 }
-                ("getParameterCount", "()I") => {
+                // A constructor whose parameters a lookup could not name has
+                // no count to answer (counted).
+                ("getParameterCount", "()I") if constructor.descriptor.is_some() => {
                     return Ok(Some(Value::Int(arg_count(descriptor) as i32)));
                 }
                 ("newInstance", "([Ljava/lang/Object;)Ljava/lang/Object;") => {
@@ -21247,7 +21265,11 @@ impl<H: Host> Runtime<'_, H> {
             let method = receiver.and_then(host_reflect::method_of).ok_or_else(|| {
                 NativeError::Metadata("malformed java/lang/reflect/Method handle".into())
             })?;
-            let (owner, name, descriptor) = (method.class, method.name, method.descriptor);
+            let (owner, name, descriptor) = (
+                method.class.as_str(),
+                method.name.as_str(),
+                method.descriptor.as_deref(),
+            );
             let invocation_args = StdHost::argument(r, args, 1)?;
             let invocation_args = if matches!(invocation_args, Value::Ref(None)) {
                 Vec::new()
@@ -21359,9 +21381,9 @@ impl<H: Host> Runtime<'_, H> {
     /// so the call keeps its host answer.
     fn element_annotations(&self, receiver: &Value) -> Option<Vec<Annotation>> {
         if let Some(field) = host_reflect::field_of(receiver) {
-            let (class, name) = (field.class, field.name);
+            let (class, name) = (field.class.as_str(), field.name.as_str());
             let file = self.class(class)?;
-            let descriptor = match field.descriptor {
+            let descriptor = match field.descriptor.as_deref() {
                 Some(descriptor) => descriptor.to_owned(),
                 None => file
                     .fields
@@ -21375,8 +21397,11 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(executable) =
             host_reflect::method_of(receiver).or_else(|| host_reflect::constructor_of(receiver))
         {
-            let (class, name, descriptor) =
-                (executable.class, executable.name, executable.descriptor);
+            let (class, name, descriptor) = (
+                executable.class.as_str(),
+                executable.name.as_str(),
+                executable.descriptor.as_deref(),
+            );
             let file = self.class(class)?;
             let method = file.methods.iter().find(|candidate| {
                 candidate.name == name
@@ -37376,7 +37401,12 @@ mandatory = true
             .unwrap();
         let member = host_reflect::method_of(&method).unwrap();
         assert_eq!(
-            (member.class, member.name, member.descriptor, member.access),
+            (
+                member.class.as_str(),
+                member.name.as_str(),
+                member.descriptor.as_deref(),
+                member.access
+            ),
             ("demo/Reflective", "answer", Some("()I"), Some(9))
         );
         let methods_lookup = MethodRef {
@@ -37477,7 +37507,10 @@ mandatory = true
             .unwrap()
             .unwrap();
         assert_eq!(
-            host_reflect::method_of(&overloaded).unwrap().descriptor,
+            host_reflect::method_of(&overloaded)
+                .unwrap()
+                .descriptor
+                .as_deref(),
             Some("(I)I")
         );
         assert_eq!(

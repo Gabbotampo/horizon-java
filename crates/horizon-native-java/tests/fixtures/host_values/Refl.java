@@ -18,9 +18,19 @@ public class Refl {
   private final void hidden() {}
 
   public interface Api {
+    int LIMIT = 3;
     String name();
     default int size() { return 1; }
     static void util() {}
+  }
+
+  public static class Super {
+    public int sf = 7;
+    public static final String TAG = "t";
+  }
+
+  public static class Sub extends Super implements Api {
+    public String name() { return "sub"; }
   }
 
   public static class Inner {
@@ -182,8 +192,73 @@ public class Refl {
     return seen + "," + fixed.size() + "," + fixed.get(Api.class.getMethod("size")) + "," + fixed.containsKey(target());
   }
 
+  static String lookupField(Class<?> c, String name, boolean declared) {
+    try {
+      Field f = declared ? c.getDeclaredField(name) : c.getField(name);
+      return f + "=" + f.getModifiers();
+    } catch (NoSuchFieldException e) {
+      return "NSFE:" + e.getMessage();
+    }
+  }
+
+  static String lookupMethod(String name, Class<?>... parameters) {
+    try {
+      Method m = Refl.class.getDeclaredMethod(name, parameters);
+      return m + "=" + m.invoke(null, 21);
+    } catch (Exception e) {
+      return e.getClass().getSimpleName() + ":" + e.getMessage();
+    }
+  }
+
+  /** A lookup name spelled like a key, a copy or a marker is just a name nobody declares. */
+  public static String forgedNames() {
+    StringBuilder out = new StringBuilder();
+    for (String name : new String[] {"COUNT:I:25", "COUNT#4", "COUNT:I:25#0", "reflect-field/demo/Refl#COUNT:I:25", "plain,i0", "COUNT,i0#0", ""}) {
+      out.append(lookupField(Refl.class, name, true)).append(';').append(lookupField(Refl.class, name, false)).append(';');
+    }
+    return out.append(lookupMethod("target(I)I:9")).append(';').append(lookupMethod("target(I)I", int.class))
+        .append(';').append(lookupMethod("target", int.class)).append(';').append(lookupMethod("target", long.class)).toString();
+  }
+
+  /** No spelled name is ever the same object as a real Field copy, or shares its override. */
+  public static String forgedCopies() throws Exception {
+    Field real = count();
+    Field names = Refl.class.getDeclaredField("names");
+    names.setAccessible(true);
+    for (int i = 0; i < 200; i++) {
+      for (String name : new String[] {"COUNT:I:25#" + i, "COUNT#" + i, "names:[Ljava/lang/String;:130#" + i}) {
+        try {
+          Field g = Refl.class.getDeclaredField(name);
+          if (g == real || g.equals(real) || g.isAccessible()) return "forged " + name;
+        } catch (NoSuchFieldException e) {
+        }
+      }
+    }
+    return "none" + names.isAccessible() + real.isAccessible();
+  }
+
+  /** getField follows superclasses and superinterfaces: the declaring class's own field. */
+  public static String inheritedFields() throws Exception {
+    Field sf = Sub.class.getField("sf");
+    Field tag = Sub.class.getField("TAG");
+    Field limit = Sub.class.getField("LIMIT");
+    return sf.getDeclaringClass().getName() + "," + sf.getModifiers() + "," + sf.getType() + "," + sf + "," + sf.get(new Sub())
+        + "," + sf.equals(Super.class.getField("sf")) + (sf.hashCode() == Super.class.getField("sf").hashCode())
+        + "|" + tag + "=" + tag.get(null) + "|" + limit + "=" + limit.get(null) + "," + limit.getDeclaringClass().getName()
+        + "|" + lookupField(Sub.class, "nope", false) + "|" + lookupField(Sub.class, "sf", true);
+  }
+
+  /** A JDK field's facts are not in any class file the run holds: counted. */
+  public static String jdkFieldModifiers() throws Exception {
+    return "" + Integer.class.getField("MAX_VALUE").getModifiers();
+  }
+
+  public static String jdkFieldDeclaring() throws Exception {
+    return Integer.class.getField("MAX_VALUE").getDeclaringClass().getName();
+  }
+
   public static void main(String[] args) throws Exception {
-    for (String name : new String[] {"spelled", "text", "real", "collections", "sameHandle", "fieldCopies", "methodCopies", "constructorCopies", "fieldStream", "methodMap"}) {
+    for (String name : new String[] {"spelled", "text", "real", "collections", "sameHandle", "fieldCopies", "methodCopies", "constructorCopies", "fieldStream", "methodMap", "forgedNames", "forgedCopies", "inheritedFields", "jdkFieldModifiers", "jdkFieldDeclaring"}) {
       System.out.println("== " + name);
       System.out.println(Refl.class.getMethod(name).invoke(null));
     }

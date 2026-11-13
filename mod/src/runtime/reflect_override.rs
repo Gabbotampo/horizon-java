@@ -116,7 +116,7 @@ pub(super) fn module_descriptor_in(resources: &BTreeMap<String, String>) -> Opti
 /// The class a `Field`, `Method` or `Constructor` handle is declared by,
 /// when it names a member the declaring class has (a lookup miss carries no
 /// descriptor, and a field miss no flags either).
-fn declaring_class(value: &Value) -> Option<&str> {
+fn declaring_class(value: &Value) -> Option<String> {
     if let Some(field) = host_reflect::field_of(value) {
         return field.access.is_some().then_some(field.class);
     }
@@ -246,7 +246,7 @@ impl<H: Host> Runtime<'_, H> {
     /// passes for a reason the runtime can see (module docs): `false` means
     /// "not decided", never "denied".
     fn can_set_accessible(&self, member: &Value, caller: &str) -> bool {
-        declaring_class(member).is_some_and(|declaring| self.module_open_to(declaring, caller))
+        declaring_class(member).is_some_and(|declaring| self.module_open_to(&declaring, caller))
     }
 
     /// Answer `setAccessible`, `trySetAccessible` and `isAccessible` (a

@@ -367,16 +367,20 @@ impl<H: Host> Runtime<'_, H> {
                     return Err(npe(None));
                 };
                 // The handle text names the member as `reflect-method/<class>#
-                // <name><descriptor>` (read by `parse_handle`).
-                let Some(member) = host_reflect::method_of(method) else {
+                // <name><descriptor>` (read back by `parse_handle`), so only
+                // a method the runtime read from a class file goes in: a name
+                // a lookup could not settle is the jar's own text (counted).
+                let Some(host_reflect::Member {
+                    class,
+                    name,
+                    descriptor: Some(descriptor),
+                    access: Some(_),
+                    ..
+                }) = host_reflect::method_of(method)
+                else {
                     return Ok(None);
                 };
-                let method = format!(
-                    "reflect-method/{}#{}{}",
-                    member.class,
-                    member.name,
-                    member.descriptor.unwrap_or_default()
-                );
+                let method = format!("reflect-method/{class}#{name}{descriptor}");
                 let kind = if r.name == "unreflectSpecial" {
                     "special"
                 } else {

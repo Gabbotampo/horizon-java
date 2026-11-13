@@ -430,18 +430,22 @@ fn annotation_lookup_reports_absence_for_a_class_without_the_annotation() {
 }
 
 #[test]
-fn unknown_reflective_member_fails_with_a_bounded_diagnostic() {
+fn unknown_reflective_member_throws_java_no_such_method_exception() {
     let error = Fixture::build("missing")
         .call("missingMember", "()V")
         .unwrap_err();
     let diagnostic = error.to_string();
+    // `getDeclaredMethod` on a class the runtime holds throws Java's
+    // `NoSuchMethodException` with `Class.methodToString`'s message (OpenJDK 25:
+    // `demo.Model.nope()`), so the caller's `catch` sees what the JVM throws.
     assert!(
-        matches!(&error, NativeError::MissingMethod(member) if member == "demo/Model#nope"),
+        matches!(
+            &error,
+            NativeError::UncaughtException { class, message: Some(message), .. }
+                if class == "java/lang/NoSuchMethodException" && message == "demo.Model.nope()"
+        ),
         "unexpected diagnostic: {diagnostic}"
     );
-    // The diagnostic names both the class and the member, so a loader can report which
-    // reflective call failed instead of panicking.
-    assert!(diagnostic.contains("demo/Model#nope"), "{diagnostic}");
 }
 
 #[test]

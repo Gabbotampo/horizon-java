@@ -95,6 +95,40 @@ const CASES: &[(&str, Outcome)] = &[
     // A `HashMap` keyed by `Method`, copied, iterated and wrapped (counted
     // while a `Method` had no `hashCode`; DazzleConf's default-method map).
     ("methodMap", Exact("2,2,size,false")),
+    // A lookup name is the jar's text, never key syntax: names spelled like
+    // a key, a copy number or an old marker are names nobody declares
+    // (Java's `NoSuchFieldException`/`NoSuchMethodException`, with Java's
+    // messages), and a parameter list that names no method throws too.
+    (
+        "forgedNames",
+        Exact(concat!(
+            "NSFE:COUNT:I:25;NSFE:COUNT:I:25;NSFE:COUNT#4;NSFE:COUNT#4;NSFE:COUNT:I:25#0;",
+            "NSFE:COUNT:I:25#0;NSFE:reflect-field/demo/Refl#COUNT:I:25;",
+            "NSFE:reflect-field/demo/Refl#COUNT:I:25;NSFE:plain,i0;NSFE:plain,i0;NSFE:COUNT,i0#0;",
+            "NSFE:COUNT,i0#0;NSFE:;NSFE:;NoSuchMethodException:demo.Refl.target(I)I:9();",
+            "NoSuchMethodException:demo.Refl.target(I)I(int);",
+            "public static int demo.Refl.target(int) throws java.io.IOException=42;",
+            "NoSuchMethodException:demo.Refl.target(long)"
+        )),
+    ),
+    // No spelled name is ever a real copy (`==`, `equals`) or shares its
+    // `override`.
+    ("forgedCopies", Exact("nonetruefalse")),
+    // `getField` follows the superclass and superinterfaces to the field's
+    // own declaring class, modifiers and type; a name no held class declares
+    // throws.
+    (
+        "inheritedFields",
+        Exact(concat!(
+            "demo.Refl$Super,1,int,public int demo.Refl$Super.sf,7,truetrue",
+            "|public static final java.lang.String demo.Refl$Super.TAG=t",
+            "|public static final int demo.Refl$Api.LIMIT=3,demo.Refl$Api|NSFE:nope|NSFE:sf"
+        )),
+    ),
+    // A JDK class's field was not read from any class file the run holds:
+    // Java says `25` and `java.lang.Integer`; counted, never `0` or a guess.
+    ("jdkFieldModifiers", Counted),
+    ("jdkFieldDeclaring", Counted),
 ];
 
 #[test]

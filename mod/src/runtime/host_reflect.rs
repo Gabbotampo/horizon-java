@@ -11,18 +11,21 @@
 //!
 //! # Keys
 //!
-//! A key names the member and, when the lookup found it in a class the
-//! runtime holds, what `toString` prints about it (its access flags, whether
-//! the declaring class is an interface, its `throws` clause). A key without
-//! them is a member the runtime could not read (a game or JDK class, or a
-//! lookup that named no exact member); its `toString` and `hashCode` are
-//! unknown and counted, since the declaring class may be a superclass.
+//! A key is a list of values in the one nested-key encoding (`value_marker`,
+//! separators escaped, as `HostRef::of_values`):
+//! `[class, name, descriptor|null, access|null, throws|null, flags]`, where
+//! `flags` (bit 0: the declaring class is an interface) is always last and
+//! always the runtime's own number. A `Field` copy appends `#<copy>` after it.
+//! Every name and class a jar spells is an escaped string element, read back
+//! as that string and nothing else: a lookup of `"COUNT:I:25#0"` names a
+//! field called `COUNT:I:25#0`, never `COUNT`'s flags or a copy. Only the
+//! runtime fills the descriptor, access, `throws` and copy, from the class
+//! file a lookup found the member in.
 //!
-//! * `Field`: `<class>#<name>[:<descriptor>:<access>][#<copy>]`;
-//! * `Method`: `<class>#<name>[<descriptor>[:<access>[i][:<throws>]]]`, `i`
-//!   when the declaring class is an interface, `<throws>` the `Exceptions`
-//!   attribute's classes joined by `,`;
-//! * `Constructor`: `<class>#[<descriptor>[:<access>[:<throws>]]]`.
+//! A key without access flags is a member the runtime could not read (a game
+//! or JDK class, or a lookup it could not settle); its `toString`,
+//! `hashCode`, `getModifiers` and `getDeclaringClass` are unknown and
+//! counted, since its declaring class may be a superclass.
 //!
 //! # Identity
 //!
@@ -45,28 +48,71 @@ pub(crate) const CONSTRUCTOR: &str = "java/lang/reflect/Constructor";
 const ACC_INTERFACE: u16 = 0x0200;
 
 /// One reflected member, read from its handle's key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Member<'a> {
-    pub(crate) class: &'a str,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Member {
+    pub(crate) class: String,
     /// The member's name; `<init>` for a constructor.
-    pub(crate) name: &'a str,
+    pub(crate) name: String,
     /// A method's or constructor's descriptor, a field's type descriptor;
     /// `None` when the lookup named no exact member.
-    pub(crate) descriptor: Option<&'a str>,
+    pub(crate) descriptor: Option<String>,
     /// The class file's access flags, when the runtime read the member.
     pub(crate) access: Option<u16>,
     /// Whether the declaring class is an interface (methods only).
     pub(crate) interface: bool,
     /// The `Exceptions` attribute's classes joined by `,` (executables).
-    pub(crate) throws: &'a str,
+    pub(crate) throws: String,
 }
 
-impl Member<'_> {
-    /// `<class>#<name><descriptor>`: what `equals` compares (declaring class,
-    /// name and, for a field, its type; for an executable its parameter and
-    /// return types).
+impl Member {
+    /// What `equals` compares: the declaring class, the name and, for a
+    /// field, its type; for an executable its parameter and return types.
     fn identity(&self) -> (&str, &str, Option<&str>) {
-        (self.class, self.name, self.descriptor)
+        (&self.class, &self.name, self.descriptor.as_deref())
+    }
+}
+
+/// What `Class.getField`/`getDeclaredField` finds, read off the classes the
+/// runtime holds.
+pub(crate) enum FieldLookup {
+    /// The field, its declaring class, descriptor and access flags.
+    Found(String, String, u16),
+    /// Every class the search visits is held and none declares it: Java's
+    /// `NoSuchFieldException`.
+    Absent,
+    /// The search reaches a class the runtime does not hold (a game or JDK
+    /// class), which may declare it.
+    Unknown,
+}
+
+/// How deep `getField` follows superclasses and superinterfaces before it
+/// stops deciding.
+const MAX_FIELD_SEARCH: usize = 64;
+
+/// `NoSuchFieldException(name)`, as `getField`/`getDeclaredField` throw it.
+pub(crate) fn no_such_field(name: &str) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/NoSuchFieldException".into(),
+        message: Some(name.into()),
+        frame: None,
+    }
+}
+
+/// `NoSuchMethodException` as `getDeclaredMethod` throws it
+/// (`Class.methodToString`): `<class>.<name>(<parameter class names>)`.
+pub(crate) fn no_such_method(class: &str, name: &str, parameters: &[String]) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/NoSuchMethodException".into(),
+        message: Some(format!(
+            "{}.{name}({})",
+            class.replace('/', "."),
+            parameters
+                .iter()
+                .map(|parameter| parameter.replace('/', "."))
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+        frame: None,
     }
 }
 
@@ -96,6 +142,48 @@ impl Declared {
 }
 
 impl<H: Host> Runtime<'_, H> {
+    /// `Class.getDeclaredField(name)` (`declared`) or `getField(name)` on
+    /// `class`. `getField` searches as `Class.getField0` does: the class's
+    /// own public fields, then each superinterface in order, then (for a
+    /// class) its superclass, each recursively; a branch through a class the
+    /// runtime does not hold makes the answer unknown (it may declare the
+    /// field). `Object` declares no public field.
+    pub(crate) fn field_lookup(&self, class: &str, name: &str, declared: bool) -> FieldLookup {
+        self.field_search(class, name, declared, 0)
+    }
+
+    fn field_search(&self, class: &str, name: &str, declared: bool, depth: usize) -> FieldLookup {
+        if !declared && class == "java/lang/Object" {
+            return FieldLookup::Absent;
+        }
+        let Some(file) = self.class(class).filter(|_| depth < MAX_FIELD_SEARCH) else {
+            return FieldLookup::Unknown;
+        };
+        if let Some(field) = file
+            .fields
+            .iter()
+            .find(|field| field.name == name && (declared || field.access & 1 != 0))
+        {
+            return FieldLookup::Found(class.into(), field.descriptor.clone(), field.access);
+        }
+        if declared {
+            return FieldLookup::Absent;
+        }
+        let interface = crate::runtime::jdk_model::class_access_flags(file)
+            .is_some_and(|access| access & ACC_INTERFACE != 0);
+        let mut parents = file.interface_names();
+        if !interface && !file.super_name.is_empty() {
+            parents.push(file.super_name.clone());
+        }
+        for parent in parents {
+            match self.field_search(&parent, name, false, depth + 1) {
+                FieldLookup::Absent => {}
+                found_or_unknown => return found_or_unknown,
+            }
+        }
+        FieldLookup::Absent
+    }
+
     /// The `Method` a lookup hands out for `class.name descriptor`, with the
     /// class file's facts when the class declares exactly that method.
     pub(crate) fn reflected_method(
@@ -117,6 +205,32 @@ impl<H: Host> Runtime<'_, H> {
     }
 }
 
+/// The key's facts, in the one nested-key encoding; `flags` (the runtime's
+/// own number) is always last, so no jar text ends a key.
+fn facts(class: &str, name: &str, descriptor: Option<&str>, declared: Option<&Declared>) -> String {
+    let text =
+        |text: Option<&str>| text.map_or(Value::Ref(None), |text| Value::Ref(Some(text.into())));
+    let throws = declared
+        .filter(|declared| !declared.throws.is_empty())
+        .map(|declared| declared.throws.join(","));
+    [
+        text(Some(class)),
+        text(Some(name)),
+        text(descriptor),
+        declared.map_or(Value::Ref(None), |declared| {
+            Value::Int(i32::from(declared.access))
+        }),
+        text(throws.as_deref()),
+        Value::Int(i32::from(
+            declared.is_some_and(|declared| declared.interface),
+        )),
+    ]
+    .iter()
+    .map(crate::runtime::value_marker)
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
 /// A `Field` handle: `declared` is `(descriptor, access)` when the class's
 /// field table named it, and `copy` the copy number a lookup gives it.
 pub(crate) fn field(
@@ -125,29 +239,21 @@ pub(crate) fn field(
     declared: Option<(&str, u16)>,
     copy: Option<u64>,
 ) -> Value {
-    let mut key = format!("{class}#{name}");
-    if let Some((descriptor, access)) = declared {
-        key.push_str(&format!(":{descriptor}:{access}"));
-        if let Some(copy) = copy {
-            key.push_str(&format!("#{copy}"));
-        }
+    let facts_of = declared.map(|(_, access)| Declared {
+        access,
+        interface: false,
+        throws: Vec::new(),
+    });
+    let mut key = facts(
+        class,
+        name,
+        declared.map(|(descriptor, _)| descriptor),
+        facts_of.as_ref(),
+    );
+    if let (Some(_), Some(copy)) = (declared, copy) {
+        key.push_str(&format!("#{copy}"));
     }
     Value::Host(HostRef::new(HostKind::ReflectField, key))
-}
-
-fn executable_key(head: String, declared: Option<&Declared>, interface_flag: bool) -> String {
-    let mut key = head;
-    if let Some(declared) = declared {
-        key.push_str(&format!(":{}", declared.access));
-        if interface_flag && declared.interface {
-            key.push('i');
-        }
-        if !declared.throws.is_empty() {
-            key.push(':');
-            key.push_str(&declared.throws.join(","));
-        }
-    }
-    key
 }
 
 /// A `Method` handle (`declared` only with a descriptor).
@@ -157,11 +263,10 @@ pub(crate) fn method(
     descriptor: Option<&str>,
     declared: Option<&Declared>,
 ) -> Value {
-    let head = format!("{class}#{name}{}", descriptor.unwrap_or_default());
     let declared = declared.filter(|_| descriptor.is_some());
     Value::Host(HostRef::new(
         HostKind::ReflectMethod,
-        executable_key(head, declared, true),
+        facts(class, name, descriptor, declared),
     ))
 }
 
@@ -171,74 +276,56 @@ pub(crate) fn constructor(
     descriptor: Option<&str>,
     declared: Option<&Declared>,
 ) -> Value {
-    let head = format!("{class}#{}", descriptor.unwrap_or_default());
     let declared = declared.filter(|_| descriptor.is_some());
     Value::Host(HostRef::new(
         HostKind::ReflectConstructor,
-        executable_key(head, declared, false),
+        facts(class, "<init>", descriptor, declared),
     ))
 }
 
-/// The copy number a lookup appended to a field key's member part
-/// (`name:descriptor:flags#n`): `(member, copy)`.
-fn split_field_copy(member: &str) -> (&str, Option<&str>) {
-    match member.rsplit_once('#') {
-        Some((field, number))
-            if !number.is_empty()
-                && number.bytes().all(|byte| byte.is_ascii_digit())
-                && field.matches(':').count() == 2 =>
+/// A key without its copy number, and the copy. The facts always end with
+/// the runtime's `flags` element (`i<n>`), so any `#` a jar's name put in
+/// them is followed by a `,` and never reads as a copy.
+fn split_copy(key: &str) -> (&str, Option<&str>) {
+    match key.rsplit_once('#') {
+        Some((facts, copy))
+            if !facts.is_empty()
+                && !copy.is_empty()
+                && copy.bytes().all(|b| b.is_ascii_digit()) =>
         {
-            (field, Some(number))
+            (facts, Some(copy))
         }
-        _ => (member, None),
+        _ => (key, None),
     }
 }
 
-fn parse_field(key: &str) -> Option<Member<'_>> {
-    let (class, member) = key.split_once('#')?;
-    let (member, _) = split_field_copy(member);
-    let mut parts = member.split(':');
-    let name = parts.next().unwrap_or(member);
-    let descriptor = parts.next();
-    let access = parts.next().and_then(|access| access.parse().ok());
+/// The member a key's facts name.
+fn parse(key: &str) -> Option<Member> {
+    let (facts, _) = split_copy(key);
+    let values = crate::runtime::split_capture_markers(facts)
+        .ok()?
+        .iter()
+        .map(|marker| crate::runtime::parse_value_marker(marker).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let text = |value: &Value| match value {
+        Value::Ref(Some(text)) => Some(Some(text.clone())),
+        Value::Ref(None) => Some(None),
+        _ => None,
+    };
+    let [class, name, descriptor, access, throws, Value::Int(flags)] = values.as_slice() else {
+        return None;
+    };
     Some(Member {
-        class,
-        name,
-        descriptor,
-        access,
-        interface: false,
-        throws: "",
+        class: text(class)??,
+        name: text(name)??,
+        descriptor: text(descriptor)?,
+        access: match access {
+            Value::Int(access) => Some(u16::try_from(*access).ok()?),
+            _ => None,
+        },
+        interface: flags & 1 != 0,
+        throws: text(throws)?.unwrap_or_default(),
     })
-}
-
-/// `<descriptor>[:<access>[i][:<throws>]]` after an executable's name.
-fn parse_executable<'a>(class: &'a str, name: &'a str, rest: &'a str) -> Member<'a> {
-    let mut parts = rest.splitn(3, ':');
-    let descriptor = parts.next().filter(|descriptor| !descriptor.is_empty());
-    let flags = parts.next();
-    let interface = flags.is_some_and(|flags| flags.ends_with('i'));
-    let access = flags.and_then(|flags| flags.trim_end_matches('i').parse().ok());
-    Member {
-        class,
-        name,
-        descriptor,
-        access,
-        interface,
-        throws: parts.next().unwrap_or_default(),
-    }
-}
-
-fn parse_method(key: &str) -> Option<Member<'_>> {
-    let (class, member) = key.split_once('#')?;
-    Some(match member.find('(') {
-        Some(at) => parse_executable(class, &member[..at], &member[at..]),
-        None => parse_executable(class, member, ""),
-    })
-}
-
-fn parse_constructor(key: &str) -> Option<Member<'_>> {
-    let (class, rest) = key.split_once('#')?;
-    Some(parse_executable(class, "<init>", rest))
 }
 
 fn handle_of(value: &Value, kind: HostKind) -> Option<&HostRef> {
@@ -249,22 +336,22 @@ fn handle_of(value: &Value, kind: HostKind) -> Option<&HostRef> {
 }
 
 /// The member a `Field` handle names.
-pub(crate) fn field_of(value: &Value) -> Option<Member<'_>> {
-    parse_field(handle_of(value, HostKind::ReflectField)?.key())
+pub(crate) fn field_of(value: &Value) -> Option<Member> {
+    parse(handle_of(value, HostKind::ReflectField)?.key())
 }
 
 /// The member a `Method` handle names.
-pub(crate) fn method_of(value: &Value) -> Option<Member<'_>> {
-    parse_method(handle_of(value, HostKind::ReflectMethod)?.key())
+pub(crate) fn method_of(value: &Value) -> Option<Member> {
+    parse(handle_of(value, HostKind::ReflectMethod)?.key())
 }
 
 /// The member a `Constructor` handle names (`name` is `<init>`).
-pub(crate) fn constructor_of(value: &Value) -> Option<Member<'_>> {
-    parse_constructor(handle_of(value, HostKind::ReflectConstructor)?.key())
+pub(crate) fn constructor_of(value: &Value) -> Option<Member> {
+    parse(handle_of(value, HostKind::ReflectConstructor)?.key())
 }
 
 /// The member any of the three handles names.
-pub(crate) fn member_of(value: &Value) -> Option<Member<'_>> {
+pub(crate) fn member_of(value: &Value) -> Option<Member> {
     field_of(value)
         .or_else(|| method_of(value))
         .or_else(|| constructor_of(value))
@@ -273,16 +360,14 @@ pub(crate) fn member_of(value: &Value) -> Option<Member<'_>> {
 /// The key every copy of a field shares: what the `override` table keys a
 /// field by (`reflect_override.rs`), and what a copy-less key is as is.
 pub(crate) fn field_copy_free(value: &Value) -> Option<&str> {
-    let key = handle_of(value, HostKind::ReflectField)?.key();
-    let (class, member) = key.split_once('#')?;
-    let (stripped, _) = split_field_copy(member);
-    Some(&key[..class.len() + 1 + stripped.len()])
+    Some(split_copy(handle_of(value, HostKind::ReflectField)?.key()).0)
 }
 
 /// The key of a reflection handle of any of the three kinds: the receiver
 /// text of its entries in the runtime's field table (`reflect_override.rs`).
-/// The key itself, not its encoding, so the heap collector finds a `Field`
-/// copy's entries through the copy's own key (`heap.rs`).
+/// The key itself, not its encoding: a `Field` copy's key ends in its copy
+/// number (`#<n>`), so the heap collector finds the copy's entries through
+/// the copy's own key (`heap.rs`).
 pub(crate) fn member_key(value: &Value) -> Option<&str> {
     match value {
         Value::Host(handle)
@@ -347,7 +432,7 @@ fn modifier_words(mask: u16) -> String {
 /// the modifiers are `0` (the JVM's recognized field flags, so a synthetic
 /// field prints a lone space), the type's and the declaring class's type
 /// names, and the name.
-fn field_text(field: &Member<'_>) -> Option<String> {
+fn field_text(field: &Member) -> Option<String> {
     let modifiers = field.access? & 0x50df;
     let prefix = if modifiers == 0 {
         String::new()
@@ -356,7 +441,7 @@ fn field_text(field: &Member<'_>) -> Option<String> {
     };
     Some(format!(
         "{prefix}{} {}.{}",
-        type_name(field.descriptor?),
+        type_name(field.descriptor.as_deref()?),
         field.class.replace('/', "."),
         field.name
     ))
@@ -370,12 +455,12 @@ pub(crate) fn declared_field_text(
     access: u16,
 ) -> String {
     field_text(&Member {
-        class,
-        name,
-        descriptor: Some(descriptor),
+        class: class.into(),
+        name: name.into(),
+        descriptor: Some(descriptor.into()),
         access: Some(access),
         interface: false,
-        throws: "",
+        throws: String::new(),
     })
     .unwrap_or_default()
 }
@@ -387,15 +472,14 @@ pub(crate) fn method_text(
     descriptor: &str,
     declared: &Declared,
 ) -> String {
-    let throws = declared.throws.join(",");
     executable_text(
         &Member {
-            class,
-            name,
-            descriptor: Some(descriptor),
+            class: class.into(),
+            name: name.into(),
+            descriptor: Some(descriptor.into()),
             access: Some(declared.access),
             interface: declared.interface,
-            throws: &throws,
+            throws: declared.throws.join(","),
         },
         false,
     )
@@ -407,9 +491,9 @@ pub(crate) fn method_text(
 /// (`Method`: return type, class and name; `Constructor`: class), the
 /// parameter type names joined by `,`, and ` throws ` with the
 /// `Exceptions` attribute's classes.
-fn executable_text(member: &Member<'_>, constructor: bool) -> Option<String> {
+fn executable_text(member: &Member, constructor: bool) -> Option<String> {
     let access = member.access?;
-    let descriptor = member.descriptor?;
+    let descriptor = member.descriptor.as_deref()?;
     let (mask, default) = if constructor {
         (0x0007, false)
     } else {
@@ -461,22 +545,22 @@ fn executable_text(member: &Member<'_>, constructor: bool) -> Option<String> {
 }
 
 /// `getDeclaringClass().getName().hashCode()`.
-fn class_hash(member: &Member<'_>) -> i32 {
+fn class_hash(member: &Member) -> i32 {
     java_string_hash(&member.class.replace('/', "."))
 }
 
 /// `Field.hashCode`/`Method.hashCode`: the declaring class's name's hash
 /// `^` the name's, known only for a member the runtime read (an unread one's
 /// declaring class may be a superclass).
-fn member_hash(member: Option<Member<'_>>) -> Option<i32> {
+fn member_hash(member: Option<Member>) -> Option<i32> {
     let member = member.filter(|member| member.access.is_some())?;
-    Some(class_hash(&member) ^ java_string_hash(member.name))
+    Some(class_hash(&member) ^ java_string_hash(&member.name))
 }
 
 /// `equals` of two members of one kind: the same declaring class, name and
 /// types is `true`; two read members that differ are `false`; anything else
 /// rests on a lookup the runtime could not read (unknown).
-fn member_equals(this: Option<Member<'_>>, other: Option<Member<'_>>) -> Option<bool> {
+fn member_equals(this: Option<Member>, other: Option<Member>) -> Option<bool> {
     let Some(other) = other else {
         // `obj instanceof Field/Method/Constructor` is false.
         return Some(false);
@@ -511,12 +595,11 @@ fn instance_of(handle: &HostRef, wanted: &str, _: &dyn ClassHierarchy) -> Option
 /// A `Field` copy is one object per key; a copy-less key (a lookup miss) is
 /// not.
 pub(crate) fn field_canonical(key: &str) -> bool {
-    key.split_once('#')
-        .is_some_and(|(_, member)| split_field_copy(member).1.is_some())
+    split_copy(key).1.is_some()
 }
 
 /// The same member's handle as `other`, read through the same parser.
-fn other_of(other: &Value, kind: HostKind) -> Option<Member<'_>> {
+fn other_of(other: &Value, kind: HostKind) -> Option<Member> {
     match kind {
         HostKind::ReflectField => field_of(other),
         HostKind::ReflectMethod => method_of(other),
@@ -524,12 +607,8 @@ fn other_of(other: &Value, kind: HostKind) -> Option<Member<'_>> {
     }
 }
 
-fn this_of(handle: &HostRef) -> Option<Member<'_>> {
-    match handle.kind() {
-        HostKind::ReflectField => parse_field(handle.key()),
-        HostKind::ReflectMethod => parse_method(handle.key()),
-        _ => parse_constructor(handle.key()),
-    }
+fn this_of(handle: &HostRef) -> Option<Member> {
+    parse(handle.key())
 }
 
 fn to_string(handle: &HostRef, _: &mut dyn Nested) -> Result<Option<String>, NativeError> {
@@ -591,22 +670,118 @@ mod tests {
             Some(&declared),
         );
         let member = method_of(&value).unwrap();
-        assert_eq!(member.descriptor, Some("()Ljava/lang/String;"));
+        assert_eq!(member.descriptor.as_deref(), Some("()Ljava/lang/String;"));
         assert_eq!(member.access, Some(0x0401));
         assert!(member.interface);
         assert_eq!(member.throws, "java/io/IOException,demo/E");
-        let value = constructor("demo/C", Some("(I)V"), None);
-        let member = constructor_of(&value).unwrap();
+        let member = constructor_of(&constructor("demo/C", Some("(I)V"), None)).unwrap();
         assert_eq!(
-            (member.name, member.descriptor, member.access),
+            (
+                member.name.as_str(),
+                member.descriptor.as_deref(),
+                member.access
+            ),
             ("<init>", Some("(I)V"), None)
         );
         let value = field("demo/C", "x", Some(("I", 9)), Some(12));
-        assert_eq!(field_copy_free(&value), Some("demo/C#x:I:9"));
         assert_eq!(field_of(&value).unwrap().access, Some(9));
         assert!(field_canonical(member_key(&value).unwrap()));
-        assert!(!field_canonical("demo/C#x"));
+        assert!(!field_canonical(field_copy_free(&value).unwrap()));
         // A string spelled like a key is no member.
-        assert_eq!(member_of(&Value::Ref(Some("demo/C#x:I:9#12".into()))), None);
+        let text = Value::Ref(Some(member_key(&value).unwrap().to_owned()));
+        assert_eq!(member_of(&text), None);
+    }
+
+    /// A deterministic generator (xorshift) of names over every character the
+    /// key layers treat specially.
+    struct Gen(u64);
+
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn name(&mut self) -> String {
+            const ALPHABET: &[&str] = &[
+                ":", "#", "(", ")", ",", "\\", "/", ";", "I", "x", "0", "9", "25", "null", "i",
+                "r", "l", "h", "rfld:", "COUNT", "é", "😀", "\\,", "#0", ":I:25",
+            ];
+            let length = self.next() % 8;
+            (0..length)
+                .map(|_| ALPHABET[(self.next() % ALPHABET.len() as u64) as usize])
+                .collect()
+        }
+    }
+
+    /// A lookup name containing any separator reads back as its own literal
+    /// name with no facts, and never aliases another member: not a read
+    /// member of the same class (`COUNT:I:25#0` is not `COUNT`'s copy 0),
+    /// not a miss under another name, not a copy.
+    #[test]
+    fn spelled_names_round_trip_as_their_own_literal_names() {
+        let real_field = field("demo/C", "COUNT", Some(("I", 25)), Some(0));
+        let real_method = method(
+            "demo/C",
+            "target",
+            Some("(I)I"),
+            Some(&Declared {
+                access: 9,
+                interface: false,
+                throws: Vec::new(),
+            }),
+        );
+        let mut generator = Gen(0x2545_f491_4f6c_dd1d);
+        let mut names: Vec<String> = [
+            "COUNT:I:25#0",
+            "COUNT:I:25",
+            "COUNT#4",
+            "target(I)I:9",
+            "target(I)I",
+            "x,i0",
+            "x,i0#3",
+            "rCOUNT",
+            "",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        names.extend((0..3000).map(|_| generator.name()));
+        let mut seen = std::collections::BTreeMap::new();
+        for name in &names {
+            for class in ["demo/C", name.as_str()] {
+                let spelled = [
+                    field(class, name, None, None),
+                    method(class, name, None, None),
+                    constructor(class, None, None),
+                ];
+                for value in &spelled {
+                    let member = member_of(value).unwrap();
+                    assert_eq!(member.class, class, "{name:?}");
+                    assert_eq!((member.descriptor.as_ref(), member.access), (None, None));
+                    assert!(!field_canonical(member_key(value).unwrap()), "{name:?}");
+                    assert_ne!(member_key(value), member_key(&real_field), "{name:?}");
+                    assert_ne!(member_key(value), member_key(&real_method), "{name:?}");
+                }
+                assert_eq!(field_of(&spelled[0]).unwrap().name, *name);
+                assert_eq!(method_of(&spelled[1]).unwrap().name, *name);
+                // Distinct (class, name) pairs have distinct keys.
+                let key = member_key(&spelled[0]).unwrap().to_owned();
+                if let Some(previous) = seen.insert(key, (class.to_owned(), name.clone())) {
+                    assert_eq!(previous, (class.to_owned(), name.clone()));
+                }
+            }
+            // A runtime-minted copy of a field whose real name is spelled so
+            // keeps that name and its own copy.
+            let copy = field("demo/C", name, Some(("I", 1)), Some(7));
+            let member = field_of(&copy).unwrap();
+            assert_eq!(
+                (member.name.as_str(), member.access),
+                (name.as_str(), Some(1))
+            );
+            assert!(field_canonical(member_key(&copy).unwrap()));
+        }
     }
 }
