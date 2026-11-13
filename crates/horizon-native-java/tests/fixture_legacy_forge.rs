@@ -2,17 +2,16 @@
 //! The class files are deliberately created in a temporary directory: this is
 //! an integration fixture, not a mod shipped with Horizon.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{Host, MethodRef, NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
 
 #[test]
 fn source_built_legacy_forge_fixture_discovers_mod_and_records_aliases() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-forge-fixture-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("forge-fixture");
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(src.join("demo")).unwrap();

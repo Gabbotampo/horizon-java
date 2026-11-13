@@ -1599,6 +1599,15 @@ fn log_stdout(id: &str, host: &mut StdHost) {
             log::info!("{LOG}: {id}: {}", line.trim_end());
         }
     }
+    // A started thread's body never runs (`Thread.start` is counted): name what it would
+    // have run, so a parked file watcher reads differently from an update checker.
+    for thread in host.take_new_parked_threads() {
+        log::info!(
+            "{LOG}: {id}: parked thread {} ({}): started, its body never runs",
+            thread.name.as_deref().unwrap_or("<unnamed>"),
+            thread.runnable,
+        );
+    }
 }
 
 /// Answers a command the bridge could not map with the jar's own failure text.

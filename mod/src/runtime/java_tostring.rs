@@ -25,6 +25,13 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         crate::runtime::EMPTY_OPTIONAL_DOUBLE => return Some("java/util/OptionalDouble".to_owned()),
         _ => {}
     }
+    // A host map entry, when the text is one (a string that merely starts
+    // like one stays a string).
+    if marker.starts_with("map-entry/")
+        && crate::runtime::map_entry_parts(&Value::Ref(Some(marker.to_owned()))).is_ok()
+    {
+        return Some("java/util/Map$Entry".to_owned());
+    }
     // Prefix families the host models before any class marker.
     let prefix = [
         ("identifier/", "net/minecraft/resources/Identifier"),

@@ -7,6 +7,9 @@
 //! the host and is recorded with its arguments; a check that the interpreter
 //! answered wrongly records `false` and an unanswered shape fails the run.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
@@ -44,13 +47,9 @@ fn build_jar(
     mut sources: BTreeMap<&str, &str>,
     resources: &[(&str, &str)],
     excluded: &[&str],
-) -> std::path::PathBuf {
+) -> scratch::Scratch {
     sources.insert("demo/Probe.java", PROBE);
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-entrypoint-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("entrypoint-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();
@@ -93,7 +92,7 @@ fn build_jar(
         zip.write_all(&fs::read(class).unwrap()).unwrap();
     }
     zip.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 fn checks(host: &StdHost) -> BTreeMap<String, bool> {
