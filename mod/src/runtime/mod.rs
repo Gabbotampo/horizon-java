@@ -48,6 +48,7 @@ mod facade_text;
 mod facade_world;
 mod field_access;
 mod field_get_set;
+mod file_attributes;
 mod files_copy;
 mod files_move;
 mod frame_bound;
@@ -61,8 +62,10 @@ mod guava_text;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
+mod host_entry;
 mod jar_operands;
 mod jar_text;
+mod jar_throwables;
 mod java_format;
 mod java_format_args;
 mod java_identifier;
@@ -109,6 +112,8 @@ mod null_checks;
 mod object_methods;
 mod open_options;
 mod optionull;
+mod parked_threads;
+pub use parked_threads::ParkedThread;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -2654,6 +2659,8 @@ pub struct StdHost {
     heap: heap::JavaHeap,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
+    /// The threads the jar made and started (`parked_threads.rs`).
+    threads: parked_threads::ThreadTable,
     strict_unknown_host_calls: bool,
     next_lazy_optional: usize,
     next_fabric_event: usize,
@@ -2762,6 +2769,7 @@ impl StdHost {
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             unknown_host_calls: BTreeMap::new(),
+            threads: parked_threads::ThreadTable::default(),
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
             next_fabric_event: 0,
@@ -5680,17 +5688,40 @@ impl Host for StdHost {
             let marker = expect_ref(receiver)
                 .ok_or_else(|| NativeError::Metadata("malformed Throwable marker".into()))?;
             if r.name == "<init>" {
-                let message = args.first().and_then(|value| match value {
-                    Value::Ref(Some(text)) => Some(text.clone()),
-                    Value::Ref(None) => None,
-                    _ => None,
-                });
-                let cause = args.iter().find_map(|value| match value {
-                    Value::Ref(Some(value)) if is_throwable_marker(value) => {
-                        Some(Value::Ref(Some(value.clone())))
-                    }
-                    _ => None,
-                });
+                // The cause is the `Throwable` parameter, whatever class the
+                // argument is (a jar exception's name need not end in
+                // `Exception`); `Throwable(Throwable cause)`'s message is
+                // `cause.toString()`, `null` for a null cause.
+                let parameters = descriptor_arguments(&r.descriptor);
+                let cause = parameters
+                    .iter()
+                    .position(|parameter| parameter == "Ljava/lang/Throwable;")
+                    .and_then(|index| args.get(index))
+                    .filter(|value| **value != Value::Ref(None))
+                    .cloned();
+                let message = if r.descriptor == "(Ljava/lang/Throwable;)V" {
+                    cause.as_ref().and_then(expect_ref).map(|cause| {
+                        let class = cause
+                            .split_once('#')
+                            .map_or(cause.as_str(), |(class, _)| class);
+                        let name = class.replace('/', ".");
+                        match self.throwable_messages.get(cause).cloned().flatten() {
+                            Some(message) => format!("{name}: {message}"),
+                            None => name,
+                        }
+                    })
+                } else {
+                    args.first().and_then(|value| match value {
+                        Value::Ref(Some(text))
+                            if parameters
+                                .first()
+                                .is_none_or(|p| p != "Ljava/lang/Throwable;") =>
+                        {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+                };
                 self.throwable_messages.insert(marker.clone(), message);
                 self.throwable_causes.insert(marker.clone(), cause);
                 return Ok(Value::Void);
@@ -5720,9 +5751,10 @@ impl Host for StdHost {
                     let class = marker
                         .split_once('#')
                         .map_or(marker.as_str(), |(class, _)| class);
-                    let class = class.rsplit('/').next().unwrap_or(class);
+                    // `getClass().getName()`: the binary name, package included.
+                    let class = class.replace('/', ".");
                     let Some(Some(message)) = self.throwable_messages.get(marker) else {
-                        return Ok(Value::Ref(Some(class.to_owned())));
+                        return Ok(Value::Ref(Some(class)));
                     };
                     return Ok(Value::Ref(Some(format!("{class}: {message}"))));
                 }
@@ -5742,7 +5774,11 @@ impl Host for StdHost {
                 ));
             }
             return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("<init>", _) => Ok(Value::Void),
+                ("<init>", descriptor) => {
+                    let marker = marker.clone();
+                    self.note_thread_made(&marker, descriptor, args);
+                    Ok(Value::Void)
+                }
                 ("getName", "()Ljava/lang/String;") => Ok(Value::Ref(Some("main".into()))),
                 ("isDaemon", "()Z") => Ok(Value::Int(0)),
                 ("setDaemon", "(Z)V") => Ok(Value::Void),
@@ -5752,7 +5788,12 @@ impl Host for StdHost {
                 // when strict). Running the body inline instead would run a
                 // worker loop (a file watcher, an update check, a metrics
                 // server) to the budget on the entrypoint's thread.
-                ("start", "()V") => self.unknown_host_call(r),
+                // `parked_threads.rs` names what never ran in the report.
+                ("start", "()V") => {
+                    let marker = marker.clone();
+                    self.note_thread_parked(&marker);
+                    self.unknown_host_call(r)
+                }
                 // Loader diagnostics and IDE detection scan the current
                 // thread's frames. The bounded runtime has no Java stack to
                 // hand out, so the truthful answer is an empty owned array.
@@ -7191,11 +7232,14 @@ impl Host for StdHost {
                 // The runtime answers it (`object_methods.rs`, `host_value_hash`):
                 // a jar key's own `hashCode` is not the host's to run.
                 ("hashCode", "()I") => self.unknown_host_call(r),
-                // `key + "=" + value`, each through `String.valueOf`.
-                ("toString", "()Ljava/lang/String;") => {
-                    let text = format!("{}={}", object_text(self, &key), object_text(self, &value));
-                    Ok(Value::Ref(Some(text)))
-                }
+                // JDK 25: `key + "=" + value`, each `String.valueOf`'d (a box
+                // as Java prints it; a jar object, which the host cannot run,
+                // counted as in any collection's text).
+                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
+                    "{}={}",
+                    object_text(self, &key),
+                    object_text(self, &value)
+                )))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "{}#{}{}",
                     r.owner, r.name, r.descriptor
@@ -10822,7 +10866,7 @@ fn map_entry_value(key: &Value, value: &Value) -> Value {
     )))
 }
 
-fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
+pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
     let marker = expect_ref(value)
         .and_then(|marker| marker.strip_prefix("map-entry/"))
         .ok_or_else(|| NativeError::Metadata("expected a native map entry marker".into()))?;
@@ -11993,11 +12037,51 @@ fn array_operand_error(
     }
 }
 
+/// An array creation's length. A negative one is the JVM's
+/// `NegativeArraySizeException` (its message is the length), which a jar's
+/// handler may catch; one over the runtime's bound is refused.
 fn array_length(value: i32) -> Result<usize, NativeError> {
+    if value < 0 {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NegativeArraySizeException".into(),
+            message: Some(value.to_string()),
+            frame: None,
+        });
+    }
     usize::try_from(value)
         .ok()
         .filter(|length| *length <= 1 << 20)
         .ok_or_else(|| NativeError::Metadata("array length is invalid".into()))
+}
+
+/// The null checks a method reference's adapter makes before its target runs
+/// (`LambdaMetafactory`'s generated code): a `null` receiver of an instance
+/// method, or a `null` for a primitive parameter (unboxing), throws
+/// `NullPointerException` with no message, since that code is the JDK's, not
+/// the jar's.
+fn method_ref_null_check(
+    descriptor: &str,
+    receiver: Option<&Value>,
+    args: &[Value],
+) -> Result<(), NativeError> {
+    let primitive_null =
+        descriptor_arguments(descriptor)
+            .iter()
+            .zip(args)
+            .any(|(parameter, value)| {
+                matches!(
+                    parameter.as_str(),
+                    "I" | "S" | "B" | "C" | "Z" | "J" | "F" | "D"
+                ) && *value == Value::Ref(None)
+            });
+    if receiver == Some(&Value::Ref(None)) || primitive_null {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    Ok(())
 }
 
 fn array_index(value: i32) -> Result<usize, NativeError> {
@@ -12665,7 +12749,7 @@ impl std::fmt::Display for NativeError {
                     None => write!(f, "uncaught exception {class}")?,
                 }
                 if let Some(frame) = frame {
-                    write!(f, " (at {frame})")?;
+                    write!(f, " (at {})", jar_throwables::printed_frame(frame))?;
                 }
                 Ok(())
             }
@@ -15887,6 +15971,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -16048,6 +16133,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut callback_infos,
@@ -16193,6 +16279,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos,
@@ -18641,6 +18728,11 @@ struct Runtime<'a, H> {
     /// never touches the host filesystem: a bootstrap that saves defaults and
     /// reads them back sees these bytes and nothing else.
     io_files: BTreeMap<String, String>,
+    /// The directories this invocation made (`createDirectory`,
+    /// `createDirectories`, `File.mkdir`/`mkdirs`), by path text. They also
+    /// sit in `io_files` as empty entries; this set tells them from empty
+    /// files (`file_attributes.rs`).
+    io_dirs: BTreeSet<String>,
     /// Annotation values `Class#getAnnotation`/`Method#getAnnotation` handed
     /// out, keyed by the proxy marker a member query answers from.
     annotations: BTreeMap<String, Annotation>,
@@ -19580,6 +19672,7 @@ impl<H: Host> Runtime<'_, H> {
             values.extend_from_slice(args);
             let expected = arg_count(&callback.target.descriptor);
             if values.len() == expected && callback.target.name != "<init>" {
+                method_ref_null_check(&callback.target.descriptor, None, &values)?;
                 jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut values);
                 // A jar object argument no model can read is counted
                 // (`jar_operands.rs`), as for the direct call.
@@ -19612,6 +19705,7 @@ impl<H: Host> Runtime<'_, H> {
             // zero-argument `Supplier` (`HashMap::new`) has no values at all,
             // so this comes before the receiver split below.
             if callback.target.name == "<init>" {
+                method_ref_null_check(&callback.target.descriptor, None, &values)?;
                 // `String::new` over a `char[]`/`int[]` builds its text; any
                 // other `String::new` is counted (`string_constructors.rs`).
                 if let Some(text) = string_constructors::build(self, &callback.target, &values)? {
@@ -19628,6 +19722,7 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(None);
             };
             let (receiver, mut rest) = (receiver.clone(), rest.to_vec());
+            method_ref_null_check(&callback.target.descriptor, Some(&receiver), &rest)?;
             jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut rest);
             // `Collection::size` on a jar object runs the object's own body
             // (`jvm_dispatch.rs`); a JDK body over its data is counted
@@ -19650,6 +19745,14 @@ impl<H: Host> Runtime<'_, H> {
                 self.count_unmodelled_jar_operand(&callback.target, 0xb9, Some(&receiver), &rest)?
             {
                 return Ok(Some(value));
+            }
+            // `Object::toString` on a host entry: its text, as the direct call
+            // prints it (`host_entry.rs`).
+            if callback.target.name == "toString"
+                && callback.target.descriptor == "()Ljava/lang/String;"
+                && let Some(text) = self.host_entry_text(&receiver, "callback", "callback")?
+            {
+                return Ok(Some(text));
             }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
@@ -19716,6 +19819,12 @@ impl<H: Host> Runtime<'_, H> {
         if !args_consumed {
             target_args.extend_from_slice(args);
         }
+        let instance = !target_is_static && callback.target.name != "<init>";
+        method_ref_null_check(
+            &callback.target.descriptor,
+            receiver.as_ref().filter(|_| instance),
+            &target_args,
+        )?;
         // An erased `Integer` argument unboxed into an `int` parameter
         // (`lambda_boxing.rs`).
         jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut target_args);
@@ -19784,12 +19893,9 @@ impl<H: Host> Runtime<'_, H> {
             let Some(supplied) = self.invoke_callback(callback, &[])? else {
                 return Ok(None);
             };
+            // The supplied object itself is thrown (`jar_throwables.rs`).
             return Err(match supplied {
-                Value::Ref(Some(_)) => NativeError::UncaughtException {
-                    class: thrown_class(&supplied),
-                    message: thrown_message(&supplied, self.host),
-                    frame: None,
-                },
+                Value::Ref(Some(_)) => self.throw_object(&supplied, None),
                 other => thrown_from_supplied(other),
             });
         }
@@ -20000,7 +20106,8 @@ impl<H: Host> Runtime<'_, H> {
                 return true;
             }
             let Some(file) = self.class(&current) else {
-                return false;
+                // A JDK throwable superclass and its JDK ancestors.
+                return jar_throwables::throwable_is_instance(&current, wanted);
             };
             if file
                 .interface_names()
@@ -21269,10 +21376,14 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-                    ("exists", "()Z") | ("isFile", "()Z") => {
-                        Value::Int(i32::from(self.io_files.contains_key(&path)))
-                    }
-                    ("isDirectory", "()Z") => Value::Int(0),
+                    ("exists", "()Z") => Value::Int(i32::from(self.io_files.contains_key(&path))),
+                    // `file_attributes.rs`: what the model knows the path to be.
+                    ("isFile", "()Z") => Value::Int(i32::from(
+                        self.file_kind(&path) == file_attributes::FileKind::RegularFile,
+                    )),
+                    ("isDirectory", "()Z") => Value::Int(i32::from(
+                        self.file_kind(&path) == file_attributes::FileKind::Directory,
+                    )),
                     ("length", "()J") => {
                         Value::Long(self.io_files.get(&path).map_or(0, |text| text.len() as i64))
                     }
@@ -21298,10 +21409,14 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("toPath", "()Ljava/nio/file/Path;") => path_value(&path),
                     ("mkdir", "()Z") | ("mkdirs", "()Z") | ("createNewFile", "()Z") => {
+                        if r.name != "createNewFile" {
+                            self.io_dirs.insert(path.clone());
+                        }
                         self.io_files.entry(path).or_default();
                         Value::Int(1)
                     }
                     ("delete", "()Z") => {
+                        self.io_dirs.remove(&path);
                         self.io_files.remove(&path);
                         Value::Int(1)
                     }
@@ -21394,6 +21509,7 @@ impl<H: Host> Runtime<'_, H> {
                     ("createDirectories" | "createDirectory", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        self.io_dirs.insert(path.clone());
                         self.io_files.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
@@ -21406,6 +21522,7 @@ impl<H: Host> Runtime<'_, H> {
                     ("delete" | "deleteIfExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        self.io_dirs.remove(&path);
                         self.io_files.remove(&path);
                         Value::Int(1)
                     }
@@ -22647,7 +22764,17 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The throwable value a Java handler receives for a throw the host or a
     /// nested frame raised, tagged with the message the throw carries.
-    fn caught_throwable(&mut self, class: &str, message: Option<String>) -> Value {
+    fn caught_throwable(
+        &mut self,
+        class: &str,
+        message: Option<String>,
+        frame: Option<&str>,
+    ) -> Value {
+        // The object thrown from `frame`, the error's origin
+        // (`jar_throwables.rs`).
+        if let Some(value) = self.caught_object(class, &message, frame) {
+            return value;
+        }
         let value = self.new_object(class);
         if let Some(marker) = expect_ref(&value) {
             self.host.record_throwable(marker, message);
@@ -23048,6 +23175,10 @@ impl<H: Host> Runtime<'_, H> {
         if method != "<clinit>" {
             self.ensure_initialized(class)?;
         }
+        // An execution's first frame: no earlier throw can be caught in it.
+        if self.depth == 0 {
+            jar_throwables::start_execution();
+        }
         self.depth += 1;
         stack_walk::enter(class, method);
         let result = self.invoke_frame(class, method, desc, receiver, args);
@@ -23220,7 +23351,7 @@ impl<H: Host> Runtime<'_, H> {
                         if let Some(handler) =
                             self.exception_handler(file, method, desc, $at, &thrown)?
                         {
-                            let value = self.caught_throwable(&thrown, message);
+                            let value = self.caught_throwable(&thrown, message, frame.as_deref());
                             stack.clear();
                             stack.push(value);
                             pc = handler;
@@ -23895,7 +24026,7 @@ impl<H: Host> Runtime<'_, H> {
                     let atype = *code.get(pc).ok_or(NativeError::Truncated)?;
                     pc += 1;
                     let length = pop_int(&mut stack, class, method, at)?;
-                    let length = array_length(length)?;
+                    let length = invoke_or_catch!(at, array_length(length));
                     if !(4..=11).contains(&atype) {
                         return Err(NativeError::InvalidClass("invalid newarray type"));
                     }
@@ -23916,7 +24047,8 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
-                    let length = array_length(pop_int(&mut stack, class, method, at)?)?;
+                    let length =
+                        invoke_or_catch!(at, array_length(pop_int(&mut stack, class, method, at)?));
                     let component = class_name(&file.pool, i)?.to_owned();
                     let marker = self.new_array(class, method);
                     self.arrays
@@ -23995,13 +24127,21 @@ impl<H: Host> Runtime<'_, H> {
                             "multianewarray dimensions exceed the array descriptor",
                         ));
                     }
-                    let mut counts = Vec::with_capacity(dimensions);
+                    let mut raw = Vec::with_capacity(dimensions);
                     for _ in 0..dimensions {
-                        counts.push(array_length(pop_int(&mut stack, class, method, at)?)?);
+                        raw.push(pop_int(&mut stack, class, method, at)?);
                     }
                     // The JVM takes count1 (outermost) from the deepest slot;
-                    // pop_int read them innermost first.
-                    counts.reverse();
+                    // pop_int read them innermost first. HotSpot checks the
+                    // counts outermost first, so the first negative one names
+                    // the exception.
+                    raw.reverse();
+                    let counts = invoke_or_catch!(
+                        at,
+                        raw.iter()
+                            .map(|count| array_length(*count))
+                            .collect::<Result<Vec<_>, _>>()
+                    );
                     let marker = self.new_multidim_array(&descriptor, class, method, &counts);
                     if let Some(component) = value_class::component_of_array_class(&descriptor) {
                         self.record_array_component(&marker, &component);
@@ -24276,6 +24416,12 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
+                    {
+                        // A jar exception's inherited `Throwable` text members
+                        // (`jar_throwables.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
@@ -24348,7 +24494,7 @@ impl<H: Host> Runtime<'_, H> {
                             || r.descriptor
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
-                        format_java_string_call(self, &r, &args)?
+                        invoke_or_catch!(at, format_java_string_call(self, &r, &args))
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_string_join(&r, &args))
                     {
@@ -24360,7 +24506,7 @@ impl<H: Host> Runtime<'_, H> {
                         // `String`'s regex methods (`regex_calls.rs`).
                         value
                     } else if let Some(value) =
-                        self.invoke_reflect_array(&r, &args, class, method)?
+                        invoke_or_catch!(at, self.invoke_reflect_array(&r, &args, class, method))
                     {
                         value
                     } else if let Some(value) =
@@ -24368,7 +24514,9 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         // `System.arraycopy` (`array_copy.rs`).
                         value
-                    } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_arrays(&r, &args, class, method))
+                    {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_code_points(&r, receiver.as_ref(), &args))
@@ -24481,9 +24629,10 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_color_collection(&r, receiver.as_ref(), &args)
                     ) {
                         value
-                    } else if let Some(value) =
-                        self.invoke_callback_info(&r, receiver.as_ref(), &args)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_callback_info(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if r.owner == "java/lang/Class"
                         && r.name == "forName"
@@ -24507,7 +24656,7 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         value
                     } else if let Some(value) =
-                        self.invoke_jdk_runtime(&r, receiver.as_ref(), &args)?
+                        invoke_or_catch!(at, self.invoke_jdk_runtime(&r, receiver.as_ref(), &args))
                     {
                         value
                     } else if let Some(value) = invoke_or_catch!(
@@ -24517,9 +24666,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.invoke_game_enum_values(&r, class, method) {
                         value
-                    } else if let Some(value) =
-                        self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)
+                    ) {
                         value
                     } else if let Some((owner, jar_owned)) =
                         self.dispatch_owner(&r, op, receiver.as_ref())
@@ -24529,9 +24679,10 @@ impl<H: Host> Runtime<'_, H> {
                             name: r.name.clone(),
                             descriptor: r.descriptor.clone(),
                         };
-                        if let Some(value) =
-                            self.invoke_enum_member(&resolved, receiver.as_ref(), &args)?
-                        {
+                        if let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_enum_member(&resolved, receiver.as_ref(), &args)
+                        ) {
                             value
                         } else if jar_owned {
                             jar_body = true;
@@ -24837,7 +24988,9 @@ impl<H: Host> Runtime<'_, H> {
                     if thrown == Value::Ref(None) {
                         invoke_or_catch!(at, Err(null_checks::throw_null()))
                     }
-                    let thrown_class = thrown_class(&thrown);
+                    // A jar class extending a JDK exception is its own class
+                    // (`jar_throwables.rs`).
+                    let thrown_class = self.throwable_class(&thrown);
                     if let Some(handler) =
                         self.exception_handler(file, method, desc, at, &thrown_class)?
                     {
@@ -24846,11 +24999,10 @@ impl<H: Host> Runtime<'_, H> {
                         pc = handler;
                         continue;
                     }
-                    return Err(NativeError::UncaughtException {
-                        class: thrown_class,
-                        message: thrown_message(&thrown, self.host),
-                        frame: Some(format!("{class}#{method} +{at}")),
-                    });
+                    // The handler that catches this throw gets this object
+                    // (`jar_throwables.rs`): it is filed under this
+                    // instruction, the error's origin.
+                    return Err(self.throw_object(&thrown, Some(format!("{class}#{method} +{at}"))));
                 }
                 // `freturn`/`dreturn` round to the declared width so a host
                 // value that arrived as a `double` still answers as a `float`.
@@ -28938,6 +29090,7 @@ mod tests {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -28997,6 +29150,7 @@ mod tests {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36031,6 +36185,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36185,6 +36340,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36392,6 +36548,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36703,6 +36860,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36986,6 +37144,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -38147,7 +38306,8 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&to_string, &error, &[]).unwrap(),
-            Value::Ref(Some("IllegalStateException: bad state".into()))
+            // JDK 25: `getClass().getName() + ": " + message`, the binary name.
+            Value::Ref(Some("java.lang.IllegalStateException: bad state".into()))
         );
     }
 
@@ -42124,6 +42284,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -42170,6 +42331,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),

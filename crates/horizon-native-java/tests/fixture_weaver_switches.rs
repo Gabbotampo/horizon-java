@@ -14,6 +14,9 @@
 //! loaded in a fresh `URLClassLoader`, invoked, and its callback counter read
 //! back: the verifier is the real judge of a relocated switch.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, ReturnMode, weave_class, weave_head, weave_return,
 };
@@ -156,12 +159,8 @@ fn java() -> Option<PathBuf> {
 }
 
 /// Compile `Target`, `Callback` and `Wide` into a fresh directory.
-fn compile(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-switches-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn compile(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("weaver-switches-{name}"));
     let src = root.join("src/demo");
     let classes = root.join("classes");
     fs::create_dir_all(&src).unwrap();
@@ -186,7 +185,7 @@ fn compile(name: &str) -> PathBuf {
         .status()
         .unwrap();
     assert!(status.success(), "javac failed for {name}");
-    classes
+    root.into_path(classes)
 }
 
 fn read_class(classes: &Path, name: &str) -> Vec<u8> {
@@ -672,11 +671,7 @@ fn run(
     label: &str,
 ) -> Option<String> {
     let java = java()?;
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-switches-run-{}-{label}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("weaver-switches-run-{label}"));
     fs::create_dir_all(root.join("demo")).unwrap();
     for entry in fs::read_dir(classes.join("demo")).unwrap() {
         let path = entry.unwrap().path();
@@ -1070,11 +1065,7 @@ fn javac_reports_the_relocated_switches() {
         return;
     };
     let woven = head_and_check(&classes, "demo/Target", "dense", "(I)I", "dense", "(I)V");
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-switches-javap-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("weaver-switches-javap");
     fs::create_dir_all(root.join("demo")).unwrap();
     fs::write(root.join("demo/Target.class"), woven).unwrap();
     let output = Command::new(javap)

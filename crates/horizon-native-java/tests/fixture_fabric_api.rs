@@ -7,6 +7,9 @@
 //! packaged in the jar, mirroring a real install where Fabric API is a host
 //! surface: every API call crosses `Host` and is observable on `StdHost`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{EventDispatch, HostInvocation, NativeError, NativeJar, StdHost, Value};
 use std::{
     collections::BTreeMap,
@@ -14,7 +17,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 use zip::write::SimpleFileOptions;
 
@@ -52,15 +54,8 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn scratch_root(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-fabric-api-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    root
+fn scratch_root(name: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("fabric-api-{name}"))
 }
 
 fn write_sources(root: &Path, tree: &BTreeMap<&str, &str>) -> Vec<PathBuf> {
@@ -92,7 +87,7 @@ fn build_jar(
     stubs: &BTreeMap<&str, &str>,
     sources: &BTreeMap<&str, &str>,
     metadata: &[u8],
-) -> (PathBuf, PathBuf) {
+) -> (scratch::Scratch, PathBuf) {
     let root = scratch_root(name);
     let stub_classes = root.join("stub-classes");
     let classes = root.join("classes");
@@ -239,7 +234,7 @@ public final class FabricApiMod implements ModInitializer {
     }
 }
 
-fn build_fabric_api_mod() -> (PathBuf, NativeJar) {
+fn build_fabric_api_mod() -> (scratch::Scratch, NativeJar) {
     let (root, jar_path) = build_jar(
         "bootstrap",
         &fabric_api_stubs(),

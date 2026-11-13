@@ -10,6 +10,9 @@
 //! The rewritten class is loaded in a fresh JVM and compared with the unwoven
 //! original, and a plain class without condy still round-trips byte-for-byte.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{ClassFile, MethodRef, MixinInjectionPlan, weave_class};
 use std::{
     fs,
@@ -76,12 +79,8 @@ fn java() -> Option<PathBuf> {
     Some(path)
 }
 
-fn compile(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-condy-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn compile(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("weaver-condy-{name}"));
     let src = root.join("src/demo");
     let classes = root.join("classes");
     fs::create_dir_all(&src).unwrap();
@@ -98,7 +97,7 @@ fn compile(name: &str) -> PathBuf {
         .status()
         .unwrap();
     assert!(status.success(), "javac failed for {name}");
-    classes
+    root.into_path(classes)
 }
 
 fn read_class(classes: &Path, name: &str) -> Vec<u8> {
@@ -469,11 +468,7 @@ fn run(classes: &Path, target: &[u8], label: &str) -> Vec<String> {
     let Some(java) = java() else {
         return Vec::new();
     };
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-condy-run-{label}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("weaver-condy-run-{label}"));
     fs::create_dir_all(root.join("demo")).unwrap();
     for entry in fs::read_dir(classes.join("demo")).unwrap() {
         let path = entry.unwrap().path();
