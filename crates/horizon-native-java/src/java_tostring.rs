@@ -17,14 +17,8 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
     if crate::value_class::is_plain_string(marker) {
         return None;
     }
-    // The empty primitive optionals carry a bare marker (`EMPTY_OPTIONAL_*`
-    // in lib.rs); an `Optional` is a `Value::Host` ([`modelled`]).
-    match marker {
-        crate::EMPTY_OPTIONAL_INT => return Some("java/util/OptionalInt".to_owned()),
-        crate::EMPTY_OPTIONAL_LONG => return Some("java/util/OptionalLong".to_owned()),
-        crate::EMPTY_OPTIONAL_DOUBLE => return Some("java/util/OptionalDouble".to_owned()),
-        _ => {}
-    }
+    // The optionals are host handles (`host_ref.rs`), printed through
+    // [`modelled`].
     // A host map entry, when the text is one (a string that merely starts
     // like one stays a string).
     if marker.starts_with("map-entry/")
@@ -39,9 +33,6 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("path:", "java/nio/file/Path"),
         ("duration/", "java/time/Duration"),
         ("tag-key/", "net/minecraft/tags/TagKey"),
-        ("optional-int/", "java/util/OptionalInt"),
-        ("optional-long/", "java/util/OptionalLong"),
-        ("optional-double/", "java/util/OptionalDouble"),
         ("regex-pattern/", "java/util/regex/Pattern"),
         ("watch-kind/", "java/nio/file/WatchEvent$Kind"),
         ("charset/", "java/nio/charset/Charset"),

@@ -792,6 +792,12 @@ impl<H: Host> Runtime<'_, H> {
                 (_, Value::Ref(None)) if param.starts_with('L') => Arg::Text(None),
                 // `append(Object)` of a box is `String.valueOf`: its value.
                 ("Ljava/lang/Object;", Value::Boxed(boxed)) => Arg::Text(Some(boxed.text())),
+                // A host handle (an optional) prints through its kind's model.
+                ("Ljava/lang/Object;", Value::Host(_)) => match self.host.modelled_to_string(value)
+                {
+                    Some(text) => Arg::Text(Some(text)),
+                    None => return Ok(None),
+                },
                 // An `Integer`/`Long`/`Double` the runtime holds as its value
                 // (one read back from a collection, a lambda's box).
                 ("Ljava/lang/Object;", Value::Int(_) | Value::Long(_) | Value::Float(_)) => {

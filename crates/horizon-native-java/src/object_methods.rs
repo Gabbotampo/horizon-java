@@ -241,11 +241,17 @@ impl<H: Host> Runtime<'_, H> {
     /// The hash of a host-modelled value: a list, set or map by the JDK's
     /// formula over its elements, an identifier by `Identifier.hashCode`.
     fn host_value_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
-        // `Optional.hashCode`: `Objects.hashCode(value)`.
-        if is_optional(value) {
-            return match optional_present(value) {
-                Some(held) => self.java_hash(&held),
-                None => Ok(Some(0)),
+        // `Optional.hashCode`: `Objects.hashCode(value)`; the primitive
+        // optionals hash their value's box (`0` when empty).
+        if let Value::Host(host) = value {
+            return match host.kind {
+                HostKind::Optional => match optional_present(value) {
+                    Some(held) => self.java_hash(&held),
+                    None => Ok(Some(0)),
+                },
+                HostKind::OptionalInt | HostKind::OptionalLong | HostKind::OptionalDouble => {
+                    Ok(host_hash(value))
+                }
             };
         }
         let Some(marker) = expect_ref(value) else {

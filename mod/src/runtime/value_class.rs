@@ -40,10 +40,6 @@ const SEPARATOR_FREE_MARKERS: &[&str] = &[
     "guava-cache-builder",
     "mixin-environment",
     "stack-walker",
-    // The empty primitive optionals (`EMPTY_OPTIONAL_*` in lib.rs).
-    "optional-int",
-    "optional-long",
-    "optional-double",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
