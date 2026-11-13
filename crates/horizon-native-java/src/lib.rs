@@ -58,7 +58,9 @@ mod gson_model;
 mod gson_tree;
 mod guava_model;
 mod guava_text;
+mod hash_collections;
 mod hash_map_order;
+mod hash_table;
 mod heap;
 mod hook_shapes;
 mod host_entry;
@@ -2254,6 +2256,28 @@ pub trait Host {
         None
     }
 
+    /// Whether the host keeps a collection row for `marker`.
+    fn has_mutable_collection(&self, _marker: &str) -> bool {
+        false
+    }
+
+    /// The bucket table (`hash_table.rs`) of a hash collection, taken out
+    /// until [`Self::store_hash_table`] puts it back.
+    fn take_hash_table(&mut self, _marker: &str) -> Option<hash_table::HashTable> {
+        None
+    }
+
+    fn store_hash_table(&mut self, _marker: &str, _table: hash_table::HashTable) {}
+
+    /// Remember that `marker` is the copy a map's `keySet()`/`values()`/
+    /// `entrySet()` answered (from the map `source`), whose mutators cannot
+    /// reach the map.
+    fn note_view_copy(&mut self, _marker: &str, _source: &str) {}
+
+    fn is_view_copy(&self, _marker: &str) -> bool {
+        false
+    }
+
     /// The guard a fail-fast iterator carries (`iteration_guard.rs`).
     fn iterator_guard(&self, _marker: &str) -> Option<iteration_guard::IteratorGuard> {
         None
@@ -2269,6 +2293,18 @@ pub trait Host {
     /// The map a `keySet()`/`values()`/`entrySet()` copy was taken from.
     fn view_copy_source(&self, _marker: &str) -> Option<String> {
         None
+    }
+
+    /// Which view (`keySet`, `values`, `entrySet`) a copy is.
+    fn note_view_kind(&mut self, _marker: &str, _kind: &str) {}
+
+    fn view_copy_kind(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// The view copies taken from the map `source`.
+    fn view_copies_of(&self, _source: &str) -> Vec<String> {
+        Vec::new()
     }
 
     /// The collection a `Collections.synchronized*` view wraps, when
@@ -2698,6 +2734,13 @@ pub struct StdHost {
     /// `List.reversed()` views: view marker → (its list, whether it writes
     /// through) (`sequenced.rs`).
     reversed_views: BTreeMap<String, (String, bool)>,
+    /// The bucket table a JDK hash collection would have, by marker
+    /// (`hash_table.rs`, `hash_collections.rs`).
+    hash_tables: BTreeMap<String, hash_table::HashTable>,
+    /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
+    view_copies: BTreeMap<String, String>,
+    /// Which view each copy is (`keySet`, `values`, `entrySet`).
+    view_kinds: BTreeMap<String, String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2841,6 +2884,9 @@ impl StdHost {
             charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
+            hash_tables: BTreeMap::new(),
+            view_copies: BTreeMap::new(),
+            view_kinds: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -4225,6 +4271,50 @@ impl Host for StdHost {
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn has_mutable_collection(&self, marker: &str) -> bool {
+        self.mutable_collections.contains_key(marker)
+    }
+
+    fn take_hash_table(&mut self, marker: &str) -> Option<hash_table::HashTable> {
+        self.hash_tables.remove(marker)
+    }
+
+    fn store_hash_table(&mut self, marker: &str, table: hash_table::HashTable) {
+        self.hash_tables.insert(marker.to_owned(), table);
+    }
+
+    fn note_view_copy(&mut self, marker: &str, source: &str) {
+        self.view_copies
+            .insert(marker.to_owned(), source.to_owned());
+    }
+
+    fn view_copy_source(&self, marker: &str) -> Option<String> {
+        self.view_copies.get(marker).cloned()
+    }
+
+    fn is_view_copy(&self, marker: &str) -> bool {
+        self.view_copies.contains_key(marker)
+    }
+
+    fn note_view_kind(&mut self, marker: &str, kind: &str) {
+        self.view_kinds.insert(marker.to_owned(), kind.to_owned());
+    }
+
+    fn view_copy_kind(&self, marker: &str) -> Option<String> {
+        self.view_kinds.get(marker).cloned()
+    }
+
+    fn view_copies_of(&self, source: &str) -> Vec<String> {
+        if self.view_copies.is_empty() {
+            return Vec::new();
+        }
+        self.view_copies
+            .iter()
+            .filter(|(_, from)| from.as_str() == source)
+            .map(|(view, _)| view.clone())
+            .collect()
     }
 
     fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
@@ -24673,6 +24763,13 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A model handed a jar object it has no state for
                         // counts it instead of answering (`jar_operands.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_hash_collection(&r, op, receiver.as_ref(), &mut args)
+                    ) {
+                        // `HashMap`/`HashSet` order and lookups
+                        // (`hash_collections.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
