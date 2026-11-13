@@ -113,6 +113,7 @@ mod registry_contents;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
+mod string_constructors;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
@@ -19450,8 +19451,11 @@ impl<H: Host> Runtime<'_, H> {
             // so this comes before the receiver split below.
             if callback.target.name == "<init>" {
                 let object = self.new_object(&callback.target.owner);
-                self.host
-                    .invoke_instance(&callback.target, &object, &values)?;
+                // `String::new` is counted (`string_constructors.rs`).
+                if string_constructors::count(self, &callback.target)?.is_none() {
+                    self.host
+                        .invoke_instance(&callback.target, &object, &values)?;
+                }
                 return Ok(Some(object));
             }
             let Some((receiver, rest)) = values.split_first() else {
@@ -24035,6 +24039,11 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         // FML's `InterModComms` (`neoforge_imc.rs`).
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, string_constructors::count(self, &r))
+                    {
+                        // `new String(...)` builds no text yet: counted.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
