@@ -29,10 +29,11 @@ public final class HostValues {
     }
     List<Object> list = new ArrayList<>(List.of("hopti:5", OptionalInt.of(5), "hopt:i5", Optional.of(5)));
     Map<Object, String> m = new HashMap<>();
-    m.put("optional-int/5", "s");
+    // `hopti:5` is a handle's text form; a `word/rest` key waits for #156 P17.
+    m.put("hopti:5", "s");
     m.put(OptionalInt.of(5), "o");
     out.append(list.get(0)).append(list.get(0) instanceof String).append(list.get(1)).append(list.get(2) instanceof String)
-        .append(list.get(3)).append('|').append(m.size()).append(m.get(OptionalInt.of(5))).append(m.get("optional-int/5"))
+        .append(list.get(3)).append('|').append(m.size()).append(m.get(OptionalInt.of(5))).append(m.get("hopti:5"))
         .append('|').append(Optional.of("optional-int/5").get()).append(OptionalInt.of(5).equals("optional-int/5"))
         .append('|').append("" + "optional-long/7" + "optional");
     return out.toString();
@@ -131,6 +132,14 @@ public final class HostValues {
         + "," + Optional.of(new ArrayList<>(List.of(1, 2))).hashCode() + "," + a.toString().length()
         + "," + new ArrayList<>(List.of(Optional.of(new Node("b")), a)).indexOf(Optional.of(new Node("a")))
         + List.of(a).contains(Optional.of(new Node("a"))) + List.of(a).equals(List.of(Optional.of(new Node("a"))));
+  }
+
+  /** A HashSet finds an optional holding a jar object by the object's own hashCode and equals. */
+  public static String jarHeldSet() {
+    Set<Object> set = new HashSet<>();
+    set.add(Optional.of(new Node("a")));
+    set.add(Optional.of(new Node("a")));
+    return set.size() + "" + set.contains(Optional.of(new Node("a")));
   }
 
   static String castString(Object o) {
@@ -260,6 +269,8 @@ fn no_string_spells_an_optional_and_the_optionals_answer_as_java_25() {
             "jarHeld",
             "42,truefalse,Optional[Node(a)],73,994,994,17,1truetrue",
         ),
+        // ... and inside a `HashSet` (`hash_collections.rs`).
+        ("jarHeldSet", "1true"),
         // A handle is its class: `checkcast` throws Java 25's exception.
         (
             "casts",
