@@ -327,7 +327,7 @@ impl Hooks for HorizonJava {
     ) {
         // The content hooks normally ran before any server; a game that never asked them still
         // gets milestone 1's rows, just without content.
-        self.ensure_jars();
+        self.ensure_jars(host.game_version());
         let mut state = self.lock();
         state.dedicated = event.dedicated;
         state.players.clear();
@@ -1167,11 +1167,13 @@ impl HorizonJava {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Runs the jars if the content phase has not done so yet.
-    fn ensure_jars(&self) {
+    /// Runs the jars if the content phase has not done so yet. Outside registration the context
+    /// carries no game facts, so the game version comes from the server's host
+    /// (`ConfigHost::game_version`).
+    fn ensure_jars(&self, game_version: &str) {
         use mod_api::__private::game::RegistrationContextNew;
         self.lock()
-            .ensure_loaded(&mod_api::RegistrationContext::new());
+            .ensure_loaded(&mod_api::RegistrationContext::new(), Some(game_version));
     }
 
     /// Fires one runtime event with its context to every jar's listeners and returns what they
@@ -1579,6 +1581,15 @@ fn log_stdout(id: &str, host: &mut StdHost) {
         if !line.trim().is_empty() {
             log::info!("{LOG}: {id}: {}", line.trim_end());
         }
+    }
+    // A started thread's body never runs (`Thread.start` is counted): name what it would
+    // have run, so a parked file watcher reads differently from an update checker.
+    for thread in host.take_new_parked_threads() {
+        log::info!(
+            "{LOG}: {id}: parked thread {} ({}): started, its body never runs",
+            thread.name.as_deref().unwrap_or("<unnamed>"),
+            thread.runnable,
+        );
     }
 }
 
@@ -2075,6 +2086,7 @@ fn load_jar(
     jar: Arc<NativeJar>,
     links: &[(String, Arc<NativeJar>)],
     imc: &runtime::neoforge_imc::ImcBus,
+    game_version: Option<&str>,
 ) -> Result<LoadedJar, JarRow> {
     let id = jar_id(&jar, &file);
     let entrypoints = jar.role_entrypoints(false);
@@ -2086,7 +2098,13 @@ fn load_jar(
         };
         return Err(JarRow::refused(&file, id, reason.to_owned()));
     }
-    let mut host = jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+    // The game's own version, when it gave one, answers `minecraft`'s container and
+    // `DetectedVersion` (`State::ensure_loaded`).
+    let mut seed = StdHost::new().with_environment_type("SERVER");
+    if let Some(version) = game_version {
+        seed = seed.with_game_version(version);
+    }
+    let mut host = jar.seed_host(seed);
     // Every jar of the game shares FML's `InterModComms` queues, from the constructors on.
     imc.join(&file, &jar, &mut host);
     for (link, dependency) in links {
@@ -2601,10 +2619,54 @@ mod tests {
             jar,
             &[],
             &runtime::neoforge_imc::ImcBus::new(),
+            None,
         ) {
             Ok(loaded) => (loaded.row.verdict, loaded.row.reason),
             Err(row) => (row.verdict, row.reason),
         }
+    }
+
+    /// A loaded jar's host answers the version the game reported, as a jar reading
+    /// `DetectedVersion.tryDetectVersion()` (what `SharedConstants.getCurrentVersion()` returns)
+    /// and then `WorldVersion.name()` would see it. Without a version the host answers `null`
+    /// instead of inventing one.
+    #[test]
+    fn a_loaded_jar_sees_the_game_version_it_was_given() {
+        use runtime::{Host, MethodRef, Value};
+        let detected = MethodRef {
+            owner: "net/minecraft/DetectedVersion".into(),
+            name: "tryDetectVersion".into(),
+            descriptor: "()Lnet/minecraft/WorldVersion;".into(),
+        };
+        let name = MethodRef {
+            owner: "net/minecraft/WorldVersion".into(),
+            name: "name".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        let load = |version: Option<&str>| {
+            load_jar(
+                "demo.jar".to_owned(),
+                two_stage_jar(Some(false), Some(false)),
+                &[],
+                &runtime::neoforge_imc::ImcBus::new(),
+                version,
+            )
+            .unwrap_or_else(|row| panic!("refused: {row}"))
+        };
+
+        let mut loaded = load(Some("26.3"));
+        let version = loaded.host.invoke(&detected, &[]).unwrap();
+        assert!(matches!(version, Value::Ref(Some(_))), "{version:?}");
+        assert_eq!(
+            loaded.host.invoke_instance(&name, &version, &[]).unwrap(),
+            Value::Ref(Some("26.3".to_owned()))
+        );
+
+        let mut loaded = load(None);
+        assert_eq!(
+            loaded.host.invoke(&detected, &[]).unwrap(),
+            Value::Ref(None)
+        );
     }
 
     /// Fabric's `Hooks.startServer` runs `main` and then `server`; the bridge runs both, records
@@ -2698,6 +2760,9 @@ mod tests {
             player: 7,
             name: "Alex",
             was_death: true,
+            // The hook-scoped view of the old player (fork pin `1cc882b8e0`); the context
+            // reads only the flag and the UUID, so any token does.
+            original: mod_api::__private::game::original_player_ref(1),
         };
         assert!(!player_clone_context(&event).flag);
         let event = PlayerCloneEvent {

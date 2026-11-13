@@ -648,8 +648,8 @@ impl<H: Host> Runtime<'_, H> {
         };
         if r.name == "<init>" {
             return match r.owner.as_str() {
-                "java/util/TreeMap" => self.construct_tree(receiver, true, args),
-                "java/util/TreeSet" => self.construct_tree(receiver, false, args),
+                "java/util/TreeMap" => self.construct_tree(receiver, true, &r.descriptor, args),
+                "java/util/TreeSet" => self.construct_tree(receiver, false, &r.descriptor, args),
                 _ => Ok(None),
             };
         }
@@ -960,6 +960,7 @@ impl<H: Host> Runtime<'_, H> {
         &mut self,
         receiver: &Value,
         map: bool,
+        descriptor: &str,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         let Some(marker) = expect_ref(receiver).cloned() else {
@@ -975,18 +976,27 @@ impl<H: Host> Runtime<'_, H> {
             name: "<init>".into(),
             descriptor: "()V".into(),
         };
-        let source = match args {
-            [] => None,
-            [arg] if self.host_collection_kind(arg).is_some() => Some(arg.clone()),
-            [Value::Ref(None)] => return Err(thrown("java/lang/NullPointerException")),
-            [comparator] => {
+        // javac's overload decides, not the argument's class: only
+        // `(SortedSet)`/`(SortedMap)` take the source's comparator.
+        let sorted = matches!(
+            descriptor,
+            "(Ljava/util/SortedSet;)V" | "(Ljava/util/SortedMap;)V"
+        );
+        let source = match (descriptor, args) {
+            ("()V", []) => None,
+            ("(Ljava/util/Comparator;)V", [comparator]) => {
+                // A `null` comparator is natural order.
                 self.host.invoke_instance(&empty, receiver, &[])?;
-                self.host
-                    .set_collection_comparator(&marker, comparator.clone());
+                if *comparator != Value::Ref(None) {
+                    self.host
+                        .set_collection_comparator(&marker, comparator.clone());
+                }
                 self.host
                     .store_red_black_tree(&marker, RedBlackTree::default());
                 return Ok(Some(Value::Void));
             }
+            (_, [Value::Ref(None)]) => return Err(thrown("java/lang/NullPointerException")),
+            (_, [arg]) if self.host_collection_kind(arg).is_some() => Some(arg.clone()),
             _ => return Ok(None),
         };
         self.host.invoke_instance(&empty, receiver, &[])?;
@@ -995,15 +1005,18 @@ impl<H: Host> Runtime<'_, H> {
         let Some(source) = source else {
             return Ok(Some(Value::Void));
         };
-        // A sorted source lends its comparator (`TreeMap(SortedMap)`,
-        // `TreeSet(SortedSet)`); `TreeMap(Map)`/`TreeSet(Collection)` start
-        // with natural order and copy it with `putAll`/`addAll`.
+        // `TreeMap(SortedMap)`/`TreeSet(SortedSet)` take the source's
+        // comparator; `TreeMap(Map)`/`TreeSet(Collection)` start with
+        // natural order, whatever the source is. Both copy with
+        // `putAll`/`addAll`, whose bulk path (`buildFromSorted`, no
+        // comparisons) needs a sorted source with an equal comparator.
         let wanted = if map {
             CollectionKind::Map
         } else {
             CollectionKind::Set
         };
-        if self.tree_kind(&source) == Some(map)
+        if sorted
+            && self.tree_kind(&source) == Some(map)
             && self.host_collection_kind(&source) == Some(wanted)
             && let Some(comparator) =
                 expect_ref(&source).and_then(|source| self.host.collection_comparator(source))

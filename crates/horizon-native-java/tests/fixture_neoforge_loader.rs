@@ -7,6 +7,9 @@
 //! the same words for the side and path questions; the version is the value
 //! the caller seeded, which the real loader reads from the game.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
@@ -82,11 +85,7 @@ public final class LoaderProbe {
 
 #[test]
 fn source_built_loader_probe_reads_host_side_paths_and_version() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-neoforge-loader-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("neoforge-loader");
     let src = root.join("src");
     let classes = root.join("classes");
     let mut sources = Vec::new();

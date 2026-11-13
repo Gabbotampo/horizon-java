@@ -670,7 +670,7 @@ impl<H: Host> Runtime<'_, H> {
             Shape::BoolConstant => {
                 let value = matches!(arg(1), Value::Int(value) if value != 0);
                 (
-                    Some(Value::Ref(Some(format!("boolean:{value}")))),
+                    Some(Value::Boxed(Boxed::Boolean(value))),
                     None,
                     Value::Int(1),
                     None,
@@ -705,10 +705,9 @@ impl<H: Host> Runtime<'_, H> {
                     return Err(illegal_argument("Range min must be less then max.".into()));
                 }
                 let constant = (!supplied).then(|| match number {
-                    Number::Int => Value::Ref(Some(format!(
-                        "integer:{}",
-                        boxed_integer(&arg(1)).unwrap_or(0)
-                    ))),
+                    Number::Int => {
+                        Value::Boxed(Boxed::Integer(boxed_integer(&arg(1)).unwrap_or(0)))
+                    }
                     Number::Long => long_value(boxed_long(&arg(1)).unwrap_or(0)),
                     Number::Double => double_value(boxed_number(&arg(1)).unwrap_or(0.0)),
                 });

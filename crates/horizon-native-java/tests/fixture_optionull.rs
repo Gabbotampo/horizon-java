@@ -8,6 +8,9 @@
 //! is JDK 25's for a member class whose outer class was recompiled without
 //! it (`Pair` v2 beside `Pair$Member` from v1).
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
@@ -314,11 +317,7 @@ fn compile(root: &std::path::Path, name: &str, source: &str) -> PathBuf {
 
 #[test]
 fn enclosing_class_throws_when_the_outer_class_disagrees() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-enclosing-disagree-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("enclosing-disagree");
     let v1 = compile(
         &root,
         "v1",

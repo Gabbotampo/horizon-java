@@ -8,6 +8,9 @@
 //! that covers the verifier - real JVM runs of rewritten classes inside a fresh
 //! `URLClassLoader`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, NativeJar, ReturnMode,
     callback_info_returnable_class, weave_class, weave_class_with_extras,
@@ -149,12 +152,8 @@ fn jdk_tool(name: &str) -> PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-returns-value-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn scratch(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("returns-value-{name}"));
     fs::create_dir_all(&root).unwrap();
     root
 }
@@ -168,7 +167,7 @@ fn write_callback_info(classes: &Path) {
 
 /// Compile `demo/Target`, `demo/Callback` and any extra sources against the
 /// synthetic `CallbackInfoReturnable`.
-fn compile(name: &str, extra: &[(&str, &str)]) -> PathBuf {
+fn compile(name: &str, extra: &[(&str, &str)]) -> scratch::Scratch {
     let root = scratch(name);
     let src = root.join("src");
     let classes = root.join("classes");
@@ -202,7 +201,7 @@ fn compile(name: &str, extra: &[(&str, &str)]) -> PathBuf {
         "javac failed for {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    classes
+    root.into_path(classes)
 }
 
 /// Compile the driver against no `demo` class at all.

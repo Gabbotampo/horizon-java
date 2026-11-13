@@ -10,6 +10,9 @@
 //! `URLClassLoader` and invoked: the verifier is the real judge of a relocated
 //! frame, and the callback's counter proves the insert ran.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, ReturnMode, weave_class, weave_head, weave_return,
 };
@@ -122,12 +125,8 @@ fn java() -> Option<PathBuf> {
 }
 
 /// Compile `Target`, `Callback` and `Wide` into a fresh directory.
-fn compile(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-frames-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn compile(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("weaver-frames-{name}"));
     let src = root.join("src/demo");
     let classes = root.join("classes");
     fs::create_dir_all(&src).unwrap();
@@ -150,7 +149,7 @@ fn compile(name: &str) -> PathBuf {
         .status()
         .unwrap();
     assert!(status.success(), "javac failed for {name}");
-    classes
+    root.into_path(classes)
 }
 
 fn read_class(classes: &Path, name: &str) -> Vec<u8> {
@@ -743,11 +742,7 @@ class Runner {
 /// `result=... calls=... total=...` line.
 fn run(classes: &Path, woven: &[u8], name: &str, argument: i32, label: &str) -> Option<String> {
     let java = java()?;
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-weaver-frames-run-{}-{label}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("weaver-frames-run-{label}"));
     fs::create_dir_all(root.join("demo")).unwrap();
     for class in ["demo/Target", "demo/Callback"] {
         fs::copy(

@@ -11,6 +11,9 @@
 //! The helpers are a self-contained copy of `real_mod_runtime.rs` with one
 //! addition: `build_catalog_jar` compiles stubs separately from the mod.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{HostInvocation, NativeError, NativeJar, StdHost, Value};
 use std::{
     collections::BTreeMap,
@@ -18,7 +21,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 use zip::write::SimpleFileOptions;
 
@@ -59,15 +61,8 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn scratch_root(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-catalog-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    root
+fn scratch_root(name: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("catalog-{name}"))
 }
 
 fn write_sources(root: &Path, tree: &BTreeMap<&str, &str>) -> Vec<PathBuf> {
@@ -100,7 +95,7 @@ fn build_catalog_jar(
     sources: &BTreeMap<&str, &str>,
     metadata_path: &str,
     metadata: &[u8],
-) -> (PathBuf, PathBuf) {
+) -> (scratch::Scratch, PathBuf) {
     let root = scratch_root(name);
     let stub_classes = root.join("stub-classes");
     let classes = root.join("classes");

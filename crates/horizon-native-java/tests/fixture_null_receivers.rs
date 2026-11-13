@@ -8,6 +8,9 @@
 //! real JVM (`java -cp`): the expected values are whatever OpenJDK does, and the
 //! bounded runtime has to agree with it.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{ExecutionReport, NativeError, NativeJar, StdHost};
 use std::{
     fs,
@@ -25,12 +28,8 @@ fn jdk_tool(name: &str) -> PathBuf {
 
 /// Compile one entrypoint source (nested classes included), run its `main` on
 /// the JVM as the oracle, and package every class as a Fabric jar.
-fn build_fixture(tag: &str, entrypoint: &str, source: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-null-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_fixture(tag: &str, entrypoint: &str, source: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("null-{tag}"));
     let class = entrypoint.replace('.', "/");
     let source_path = root.join("src").join(format!("{class}.java"));
     let classes = root.join("classes");
@@ -78,7 +77,7 @@ fn build_fixture(tag: &str, entrypoint: &str, source: &str) -> PathBuf {
         zip.write_all(&fs::read(&path).unwrap()).unwrap();
     }
     zip.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 fn execute(jar_path: &Path) -> (Result<ExecutionReport, NativeError>, StdHost) {
