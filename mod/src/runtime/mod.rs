@@ -17,6 +17,7 @@ use std::{
 };
 
 mod annotation_values;
+mod array_deque;
 mod attachment_codec;
 mod block_item_id;
 pub mod brigadier;
@@ -2237,6 +2238,18 @@ pub trait Host {
         None
     }
 
+    /// Which view (`keySet`, `values`, `entrySet`) a copy is.
+    fn note_view_kind(&mut self, _marker: &str, _kind: &str) {}
+
+    fn view_copy_kind(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// The view copies taken from the map `source`.
+    fn view_copies_of(&self, _source: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// A collection's `modCount` (`mod_count.rs`).
     fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
         mod_count::ModStamp::default()
@@ -2255,6 +2268,18 @@ pub trait Host {
     fn sub_lists_of(&self, _parent: &str) -> Vec<(String, mod_count::SubListLink)> {
         Vec::new()
     }
+
+    /// How many `subList` copies are linked at all.
+    fn sub_lists_of_any(&self) -> usize {
+        0
+    }
+
+    /// An `ArrayDeque`'s physical layout (`array_deque.rs`).
+    fn deque_layout(&self, _marker: &str) -> Option<array_deque::DequeLayout> {
+        None
+    }
+
+    fn store_deque_layout(&mut self, _marker: &str, _layout: Option<array_deque::DequeLayout>) {}
 
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
@@ -2617,6 +2642,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// `Collections.emptyList()`/`emptySet()`/`emptyMap()` markers, whose
+    /// mutators JDK 25 does not all refuse (`java_immutable.rs`).
+    empty_collections: std::collections::BTreeSet<String>,
     /// UTF-8 decoders `Charset.newDecoder` made (`charset_decoder.rs`).
     charset_decoders: BTreeMap<String, charset_decoder::DecoderState>,
     /// `Collections.synchronized*` views and the collection each wraps
@@ -2632,6 +2660,8 @@ pub struct StdHost {
     collection_comparators: BTreeMap<String, Value>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
     view_copies: BTreeMap<String, String>,
+    /// Which view each copy is (`keySet`, `values`, `entrySet`).
+    view_kinds: BTreeMap<String, String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2650,6 +2680,8 @@ pub struct StdHost {
     mod_stamps: BTreeMap<String, mod_count::ModStamp>,
     /// `subList` copies and where they sit in their parents.
     sub_lists: BTreeMap<String, mod_count::SubListLink>,
+    /// `ArrayDeque`s' physical layouts (`array_deque.rs`).
+    deque_layouts: BTreeMap<String, array_deque::DequeLayout>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -2763,12 +2795,14 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            empty_collections: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
             hash_tables: BTreeMap::new(),
             collection_comparators: BTreeMap::new(),
             view_copies: BTreeMap::new(),
+            view_kinds: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -2776,6 +2810,7 @@ impl StdHost {
             iterator_guards: BTreeMap::new(),
             mod_stamps: BTreeMap::new(),
             sub_lists: BTreeMap::new(),
+            deque_layouts: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
@@ -4186,6 +4221,25 @@ impl Host for StdHost {
         self.view_copies.contains_key(marker)
     }
 
+    fn note_view_kind(&mut self, marker: &str, kind: &str) {
+        self.view_kinds.insert(marker.to_owned(), kind.to_owned());
+    }
+
+    fn view_copy_kind(&self, marker: &str) -> Option<String> {
+        self.view_kinds.get(marker).cloned()
+    }
+
+    fn view_copies_of(&self, source: &str) -> Vec<String> {
+        if self.view_copies.is_empty() {
+            return Vec::new();
+        }
+        self.view_copies
+            .iter()
+            .filter(|(_, from)| from.as_str() == source)
+            .map(|(view, _)| view.clone())
+            .collect()
+    }
+
     fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
         self.iterator_guards.get(marker).cloned()
     }
@@ -4218,7 +4272,25 @@ impl Host for StdHost {
         };
     }
 
+    fn sub_lists_of_any(&self) -> usize {
+        self.sub_lists.len()
+    }
+
+    fn deque_layout(&self, marker: &str) -> Option<array_deque::DequeLayout> {
+        self.deque_layouts.get(marker).copied()
+    }
+
+    fn store_deque_layout(&mut self, marker: &str, layout: Option<array_deque::DequeLayout>) {
+        match layout {
+            Some(layout) => self.deque_layouts.insert(marker.to_owned(), layout),
+            None => self.deque_layouts.remove(marker),
+        };
+    }
+
     fn sub_lists_of(&self, parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        if self.sub_lists.is_empty() {
+            return Vec::new();
+        }
         self.sub_lists
             .iter()
             .filter(|(_, link)| link.parent() == parent)
@@ -24591,6 +24663,9 @@ impl<H: Host> Runtime<'_, H> {
                         // An object operand concatenates as its own
                         // `toString` (`jar_text.rs`), then reads as a `String`.
                         let mut captured = captured;
+                        // A `subList` operand's `toString` checks its list
+                        // (`mod_count.rs`).
+                        invoke_or_catch!(at, self.sync_sub_list_operands(&captured));
                         invoke_or_catch!(
                             at,
                             self.concat_object_texts(&mut captured, &mut arguments, class, method)
