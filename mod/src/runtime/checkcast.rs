@@ -184,7 +184,7 @@ impl<H: Host> Runtime<'_, H> {
     ) -> (Verdict, Option<String>) {
         let marker = match value {
             // A boxed number is a JDK object, never a jar type.
-            Value::Int(_) | Value::Long(_) | Value::Float(_) => {
+            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) => {
                 return (Verdict::No, class_of_value(value));
             }
             Value::Void | Value::Ref(None) => return (Verdict::Yes, None),
@@ -226,18 +226,10 @@ impl<H: Host> Runtime<'_, H> {
                 Some(class.to_owned()),
             );
         }
-        // A JDK value the runtime builds itself (a box, a collection, an
+        // A JDK value the runtime builds itself (a collection, an
         // optional, a stream, a path): JDK classes never extend or implement a
         // jar type.
         let jdk_kind = [
-            "integer:",
-            "long:",
-            "short:",
-            "byte:",
-            "character:",
-            "float:",
-            "double:",
-            "boolean:",
             "string-builder/",
             "optional/",
             "stream/",

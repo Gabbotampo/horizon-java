@@ -43,16 +43,18 @@ pub(crate) enum Arg {
     /// (a `StringBuilder`, a modelled library object).
     Str(String),
     Bool(bool),
-    /// The runtime's bare `true`/`false`: a boxed `Boolean` or a `String` of
-    /// that text, which only `%s` prints alike.
-    BoolOrString(bool),
     Byte(i8),
     Short(i16),
     Int(i32),
     Long(i64),
     /// A `Character`: one UTF-16 code unit.
     Char(u16),
+    /// A box known to be a `Double`/`Float`. Nothing builds one yet: a
+    /// `Value::Float` cannot say which (`FloatOrDouble`), and the text
+    /// markers that once could (`double:1.0`) were Strings in disguise.
+    #[cfg_attr(not(test), allow(dead_code))]
     Double(f64),
+    #[cfg_attr(not(test), allow(dead_code))]
     Float(f32),
     /// The runtime keeps a boxed `Float` and a boxed `Double` as the same
     /// value (a `float` is stored widened), so their `toString` and
@@ -313,10 +315,9 @@ impl Spec {
         match self.conversion {
             'b' => self.print_string(
                 match arg {
-                    Arg::Null | Arg::Bool(false) => "false",
                     // `Boolean.FALSE` prints `false`, the string `"false"`
                     // prints `true`.
-                    Arg::BoolOrString(false) => return None,
+                    Arg::Null | Arg::Bool(false) => "false",
                     _ => "true",
                 }
                 .to_owned(),
@@ -598,7 +599,7 @@ fn java_to_string(arg: &Arg) -> Option<String> {
     Some(match arg {
         Arg::Null => "null".to_owned(),
         Arg::Str(text) => text.clone(),
-        Arg::Bool(value) | Arg::BoolOrString(value) => value.to_string(),
+        Arg::Bool(value) => value.to_string(),
         Arg::Byte(value) => value.to_string(),
         Arg::Short(value) => value.to_string(),
         Arg::Int(value) => value.to_string(),
@@ -732,7 +733,7 @@ fn java_hash(arg: &Arg) -> Option<i32> {
                 value.to_bits() as i32
             }
         }
-        Arg::Null | Arg::BoolOrString(_) | Arg::FloatOrDouble(_) | Arg::Opaque => return None,
+        Arg::Null | Arg::FloatOrDouble(_) | Arg::Opaque => return None,
     })
 }
 
@@ -876,8 +877,8 @@ mod tests {
             ("%b", &[Null], "false"),
             ("%b", &[Str("false".into())], "true"),
             ("%b", &[Int(0)], "true"),
-            ("%b", &[BoolOrString(true)], "true"),
-            ("%s", &[BoolOrString(false)], "false"),
+            ("%s", &[Bool(false)], "false"),
+            ("%s", &[Str("false".into())], "false"),
             ("%.2b", &[Bool(false)], "fa"),
             ("%-7B|", &[Bool(true)], "TRUE   |"),
             ("%f", &[Double(5e-7)], "0.000001"),
@@ -1036,9 +1037,6 @@ mod tests {
             // A boxed `Float` and `Double` print differently here.
             ("%s", &[FloatOrDouble(f64::from(0.1f32))]),
             ("%h", &[FloatOrDouble(1.5)]),
-            // `Boolean.FALSE` and the string `"false"` differ here.
-            ("%b", &[BoolOrString(false)]),
-            ("%h", &[BoolOrString(true)]),
             ("%1$<s", &[Int(1)]),
             ("%99999s", &[Int(1)]),
         ];

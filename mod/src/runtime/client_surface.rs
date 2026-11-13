@@ -1423,7 +1423,7 @@ impl StdHost {
         if let Some(option) = object.strip_prefix(OPTION) {
             return match (option, name) {
                 ("renderDistance", "get") => {
-                    Some(marker(format!("integer:{}", frame.render_distance)))
+                    Some(Value::Boxed(crate::runtime::Boxed::Integer(frame.render_distance)))
                 }
                 ("mainHand", "get") => Some(marker(format!(
                     "enum/net/minecraft/world/entity/HumanoidArm/{}",

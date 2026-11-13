@@ -39,7 +39,7 @@
 
 use serde_json::{Map, Value as Json, json};
 
-use crate::{Host, MethodRef, NativeError, Runtime, Value, expect_ref, format_java_float};
+use crate::{Boxed, Host, MethodRef, NativeError, Runtime, Value, expect_ref, format_java_float};
 
 pub(crate) const JSON_PREFIX: &str = "component/json/";
 const LITERAL_PREFIX: &str = "component/literal/";
@@ -119,18 +119,10 @@ fn argument(value: &Value) -> Json {
         Value::Float(v) => serde_json::Number::from_f64(*v)
             .map_or_else(|| json!(format_java_float(*v)), Json::Number),
         Value::Ref(None) => json!("null"),
-        Value::Ref(Some(text)) => {
-            if let Some(n) = text
-                .strip_prefix("integer:")
-                .and_then(|n| n.parse::<i64>().ok())
-            {
-                json!(n)
-            } else if let Some(b) = text.strip_prefix("boolean:") {
-                json!(b == "true")
-            } else {
-                json!(text)
-            }
-        }
+        Value::Boxed(Boxed::Boolean(b)) => json!(b),
+        Value::Boxed(boxed @ Boxed::Character(_)) => json!(boxed.text()),
+        Value::Boxed(boxed) => json!(boxed.int()),
+        Value::Ref(Some(text)) => json!(text),
         Value::Void => json!(""),
     }
 }
@@ -377,7 +369,12 @@ mod tests {
     #[test]
     fn arguments_serialise_as_vanilla_keeps_them() {
         assert_eq!(argument(&Value::Int(7)), json!(7));
-        assert_eq!(argument(&Value::Ref(Some("integer:3".into()))), json!(3));
+        assert_eq!(argument(&Value::Boxed(Boxed::Integer(3))), json!(3));
+        // A String spelled like the old box marker is text.
+        assert_eq!(
+            argument(&Value::Ref(Some("integer:3".into()))),
+            json!("integer:3")
+        );
         assert_eq!(argument(&Value::Ref(Some("Alex".into()))), json!("Alex"));
         assert_eq!(
             argument(&Value::Ref(Some("component/literal/Alex".into()))),

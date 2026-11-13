@@ -16,6 +16,7 @@ use std::{
 mod annotation_values;
 mod attachment_codec;
 mod block_item_id;
+mod boxed;
 pub mod brigadier;
 mod checkcast;
 mod class_init;
@@ -127,6 +128,7 @@ use weaver::{
     InvokeShift, Shift, SiteSelector, SliceBounds, weave_extended_classes_with_instance_callbacks,
 };
 
+pub use boxed::Boxed;
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use heap::{CallLogMark, JavaHeap};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
@@ -158,6 +160,9 @@ pub enum Value {
     /// `Double.equals` is modelled separately through the bit comparison.
     Float(f64),
     Ref(Option<String>),
+    /// A boxed `Boolean`/`Byte`/`Short`/`Character`/`Integer` (`boxed.rs`):
+    /// never text, so no `String` can pass for one.
+    Boxed(Boxed),
     Void,
 }
 
@@ -1893,12 +1898,9 @@ fn adapt_value(desc: &str, value: Value, context: &str) -> Result<Option<Value>,
                 (Value::Float(float), "D") => return Ok(Some(Value::Float(*float))),
                 _ => {}
             }
-            let integer = if let Some(flag) =
-                expect_ref(&value).and_then(|marker| marker.strip_prefix("boolean:"))
-            {
-                Some(i32::from(flag == "true"))
-            } else {
-                boxed_character(&value).or_else(|| boxed_number(&value).map(|value| value as i32))
+            let integer = match &value {
+                Value::Boxed(boxed) => Some(boxed.int()),
+                _ => boxed_number(&value).map(|value| value as i32),
             };
             let integer = integer.ok_or_else(|| {
                 NativeError::Metadata(format!(
@@ -1913,7 +1915,7 @@ fn adapt_value(desc: &str, value: Value, context: &str) -> Result<Option<Value>,
             }))
         }
         _ => match value {
-            Value::Ref(_) => Ok(Some(value)),
+            Value::Ref(_) | Value::Boxed(_) => Ok(Some(value)),
             Value::Int(_) | Value::Long(_) | Value::Float(_) => {
                 Err(NativeError::Metadata(format!(
                     "{context} {} is primitive but return {desc} is a reference",
@@ -4471,11 +4473,11 @@ impl Host for StdHost {
                         "invalid short argument for java/lang/Short.valueOf".into(),
                     )
                 })?;
-                Ok(Value::Ref(Some(format!("short:{value}"))))
+                Ok(Value::Boxed(Boxed::Short(value)))
             }
             ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
-                Ok(Value::Ref(Some(format!("integer:{value}"))))
+                Ok(Value::Boxed(Boxed::Integer(value)))
             }
             ("java/lang/Integer", "compare", "(II)I") => {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -4491,7 +4493,7 @@ impl Host for StdHost {
             ))),
             ("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
-                Ok(Value::Ref(Some(format!("character:{value}"))))
+                Ok(Value::Boxed(Boxed::Character(value as u16)))
             }
             ("java/lang/Double", "parseDouble", "(Ljava/lang/String;)D") => {
                 Ok(double_value(parse_java_float(Self::argument(r, args, 0)?)?))
@@ -4617,11 +4619,11 @@ impl Host for StdHost {
             }
             ("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)? != 0;
-                Ok(Value::Ref(Some(format!("boolean:{value}"))))
+                Ok(Value::Boxed(Boxed::Boolean(value)))
             }
             ("java/lang/Boolean", "valueOf", "(Ljava/lang/String;)Ljava/lang/Boolean;") => {
                 let value = expect_string(Self::argument(r, args, 0)?).eq_ignore_ascii_case("true");
-                Ok(Value::Ref(Some(format!("boolean:{value}"))))
+                Ok(Value::Boxed(Boxed::Boolean(value)))
             }
             (
                 "java/lang/Enum",
@@ -9078,29 +9080,14 @@ fn class_of_value(value: &Value) -> Option<String> {
         Value::Int(_) => Some("java/lang/Integer".into()),
         Value::Long(_) => Some("java/lang/Long".into()),
         Value::Float(_) => Some("java/lang/Float".into()),
+        Value::Boxed(boxed) => Some(boxed.class().into()),
         Value::Void => None,
         Value::Ref(None) => None,
         Value::Ref(Some(marker)) => {
             if let Some((class, _)) = marker.split_once('#') {
                 return Some(class.to_owned());
             }
-            let class = if marker.starts_with("integer:") {
-                "java/lang/Integer"
-            } else if marker.starts_with("long:") {
-                "java/lang/Long"
-            } else if marker.starts_with("short:") {
-                "java/lang/Short"
-            } else if marker.starts_with("byte:") {
-                "java/lang/Byte"
-            } else if marker.starts_with("character:") {
-                "java/lang/Character"
-            } else if marker.starts_with("float:") {
-                "java/lang/Float"
-            } else if marker.starts_with("double:") {
-                "java/lang/Double"
-            } else if marker == "true" || marker == "false" || marker.starts_with("boolean:") {
-                "java/lang/Boolean"
-            } else if marker.starts_with("string-builder/") {
+            let class = if marker.starts_with("string-builder/") {
                 "java/lang/StringBuilder"
             } else if marker.starts_with("optional/") || marker == "optional" {
                 "java/util/Optional"
@@ -9201,9 +9188,10 @@ fn builder_append_text<H: Host>(
         | "(Ljava/lang/Object;)Ljava/lang/StringBuffer;" => match value {
             // `append(Object)` is `String.valueOf`: an object a model owns
             // prints its `toString`, and a box prints its value.
-            Value::Ref(Some(value)) => crate::java_tostring::modelled_marker(host, value)
-                .or_else(|| jdk_model::boxed_text(value, "Ljava/lang/Object;"))
-                .unwrap_or_else(|| value.clone()),
+            Value::Ref(Some(value)) => {
+                crate::java_tostring::modelled_marker(host, value).unwrap_or_else(|| value.clone())
+            }
+            Value::Boxed(boxed) => boxed.text(),
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
             Value::Long(value) => value.to_string(),
@@ -9377,9 +9365,8 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
         Value::Float(value) => format_java_float(*value),
-        Value::Ref(Some(value)) => {
-            jdk_model::boxed_text(value, desc).unwrap_or_else(|| value.clone())
-        }
+        Value::Ref(Some(value)) => value.clone(),
+        Value::Boxed(boxed) => boxed.text(),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => String::new(),
     }
@@ -9655,6 +9642,7 @@ fn value_marker(value: &Value) -> String {
                 .replace('\\', "\\\\")
                 .replace(',', "\\,")
         ),
+        Value::Boxed(boxed) => boxed.marker(),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
     }
@@ -10047,6 +10035,7 @@ fn capability_text(value: &Value) -> String {
         Value::Long(value) => value.to_string(),
         Value::Float(value) => format_java_float(*value),
         Value::Ref(Some(value)) => value.replace("\\,", ",").replace("\\\\", "\\"),
+        Value::Boxed(boxed) => boxed.text(),
         Value::Ref(None) => "".to_owned(),
         Value::Void => "void".to_owned(),
     }
@@ -10173,11 +10162,9 @@ fn collection_empty(kind: &str) -> Value {
 
 fn value_text(value: &Value) -> String {
     match value {
+        // A box prints its value (`Short.valueOf("1")` is `1`).
+        Value::Boxed(boxed) => boxed.text(),
         Value::Ref(Some(value)) => {
-            // A box prints its value (`Short.valueOf("1")` is `1`).
-            if let Some(text) = jdk_model::boxed_text(value, "Ljava/lang/Object;") {
-                return text;
-            }
             // A marker whose Java `toString` is its payload: string
             // concatenation goes through `String.valueOf`, not the modelled
             // instance method.
@@ -10226,10 +10213,7 @@ fn format_java_string_call<H: Host>(
 
 fn boxed_integer(value: &Value) -> Option<i32> {
     match value {
-        Value::Int(value) => Some(*value),
-        Value::Ref(Some(value)) => value
-            .strip_prefix("integer:")
-            .and_then(|value| value.parse::<i32>().ok()),
+        Value::Int(value) | Value::Boxed(Boxed::Integer(value)) => Some(*value),
         _ => None,
     }
 }
@@ -10239,10 +10223,7 @@ fn boxed_character(value: &Value) -> Option<i32> {
         // Java `char` is an unsigned UTF-16 code unit, so isolated surrogates
         // are valid boxed values even though they are not Rust scalar values.
         Value::Int(value) => (0..=0xffff).contains(value).then_some(*value),
-        Value::Ref(Some(value)) => value
-            .strip_prefix("character:")
-            .and_then(|value| value.parse::<i32>().ok())
-            .and_then(|value| (0..=0xffff).contains(&value).then_some(value)),
+        Value::Boxed(Boxed::Character(unit)) => Some(i32::from(*unit)),
         _ => None,
     }
 }
@@ -10255,14 +10236,10 @@ fn boxed_number(value: &Value) -> Option<f64> {
         Value::Int(value) => Some(f64::from(*value)),
         Value::Long(value) => Some(*value as f64),
         Value::Float(value) => Some(*value),
-        Value::Ref(Some(value)) => value
-            .strip_prefix("integer:")
-            .or_else(|| value.strip_prefix("byte:"))
-            .or_else(|| value.strip_prefix("short:"))
-            .or_else(|| value.strip_prefix("long:"))
-            .or_else(|| value.strip_prefix("double:"))
-            .or_else(|| value.strip_prefix("float:"))
-            .and_then(|value| value.parse::<f64>().ok()),
+        // A `Character`/`Boolean` is not a `Number`.
+        Value::Boxed(boxed @ (Boxed::Integer(_) | Boxed::Short(_) | Boxed::Byte(_))) => {
+            Some(f64::from(boxed.int()))
+        }
         _ => None,
     }
 }
@@ -10270,11 +10247,6 @@ fn boxed_number(value: &Value) -> Option<f64> {
 fn number_int_value(value: &Value) -> Option<i32> {
     match value {
         Value::Long(value) => Some(*value as i32),
-        Value::Ref(Some(value)) if value.starts_with("long:") => value
-            .strip_prefix("long:")?
-            .parse::<i64>()
-            .ok()
-            .map(|v| v as i32),
         _ => boxed_number(value).map(|v| v as i32),
     }
 }
@@ -10282,9 +10254,6 @@ fn number_int_value(value: &Value) -> Option<i32> {
 fn number_long_value(value: &Value) -> Option<i64> {
     match value {
         Value::Long(value) => Some(*value),
-        Value::Ref(Some(value)) if value.starts_with("long:") => {
-            value.strip_prefix("long:")?.parse::<i64>().ok()
-        }
         _ => boxed_number(value).map(|v| v as i64),
     }
 }
@@ -10300,9 +10269,7 @@ fn number_byte_value(value: &Value) -> Option<i32> {
 fn boxed_byte(value: &Value) -> Option<i8> {
     match value {
         Value::Int(value) => i8::try_from(*value).ok(),
-        Value::Ref(Some(value)) => value
-            .strip_prefix("byte:")
-            .and_then(|value| value.parse::<i8>().ok()),
+        Value::Boxed(Boxed::Byte(value)) => Some(*value),
         _ => None,
     }
 }
@@ -10310,9 +10277,7 @@ fn boxed_byte(value: &Value) -> Option<i8> {
 fn boxed_short(value: &Value) -> Option<i16> {
     match value {
         Value::Int(value) => i16::try_from(*value).ok(),
-        Value::Ref(Some(value)) => value
-            .strip_prefix("short:")
-            .and_then(|value| value.parse::<i16>().ok()),
+        Value::Boxed(Boxed::Short(value)) => Some(*value),
         _ => None,
     }
 }
@@ -10346,9 +10311,6 @@ fn boxed_long(value: &Value) -> Option<i64> {
     match value {
         Value::Int(value) => Some(i64::from(*value)),
         Value::Long(value) => Some(*value),
-        Value::Ref(Some(value)) => value
-            .strip_prefix("long:")
-            .and_then(|value| value.parse::<i64>().ok()),
         _ => None,
     }
 }
@@ -10362,25 +10324,14 @@ fn expect_long(r: &MethodRef, value: &Value) -> Result<i64, NativeError> {
 fn boxed_boolean(value: &Value) -> Option<bool> {
     match value {
         Value::Int(value) => Some(*value != 0),
-        // `boolean:true` is the canonical boxed marker. The bare `true`/`false`
-        // markers are still read: they are what the host answered for
-        // `Boolean.TRUE`/`FALSE` before the two forms converged, and a marker
-        // already inside a running jar keeps its meaning.
-        Value::Ref(Some(value)) => value.strip_prefix("boolean:").map_or_else(
-            || match value.as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            },
-            |value| value.parse::<bool>().ok(),
-        ),
+        Value::Boxed(Boxed::Boolean(value)) => Some(*value),
         _ => None,
     }
 }
 
-/// The canonical boxed-`Boolean` marker.
+/// A boxed `Boolean`.
 fn boolean_value(value: bool) -> Value {
-    Value::Ref(Some(format!("boolean:{value}")))
+    Value::Boxed(Boxed::Boolean(value))
 }
 
 fn parse_java_float(value: &Value) -> Result<f64, NativeError> {
@@ -10421,10 +10372,6 @@ fn boxed_float(value: &Value) -> Option<f64> {
         Value::Int(value) => Some(f64::from(*value)),
         Value::Long(value) => Some(*value as f64),
         Value::Float(value) => Some(*value),
-        Value::Ref(Some(value)) => value
-            .strip_prefix("double:")
-            .or_else(|| value.strip_prefix("float:"))
-            .and_then(|value| value.parse::<f64>().ok()),
         _ => None,
     }
 }
@@ -11033,16 +10980,15 @@ fn collection_text(
 /// object its `toString`.
 fn object_text(host: &mut StdHost, value: &Value) -> String {
     match value {
-        Value::Ref(Some(marker)) => jdk_model::boxed_text(marker, "Ljava/lang/Object;")
-            .or_else(|| host.modelled_to_string(value))
-            .unwrap_or_else(|| {
-                // An object no model prints (a jar object, an identity hash)
-                // is counted; the element keeps its marker in the text.
-                if jar_text::object_marker_class(marker).is_some() {
-                    let _ = host.unknown_host_call(&jar_text::object_to_string());
-                }
-                marker.clone()
-            }),
+        Value::Boxed(boxed) => boxed.text(),
+        Value::Ref(Some(marker)) => host.modelled_to_string(value).unwrap_or_else(|| {
+            // An object no model prints (a jar object, an identity hash)
+            // is counted; the element keeps its marker in the text.
+            if jar_text::object_marker_class(marker).is_some() {
+                let _ = host.unknown_host_call(&jar_text::object_to_string());
+            }
+            marker.clone()
+        }),
         other => value_text(other),
     }
 }
@@ -11745,6 +11691,7 @@ fn describe_value(value: &Value) -> String {
         Value::Int(value) => format!("int {value}"),
         Value::Long(value) => format!("long {value}"),
         Value::Float(value) => format!("float {value}"),
+        Value::Boxed(boxed) => format!("{} {}", boxed.class(), boxed.text()),
         Value::Void => "void".into(),
         Value::Ref(None) => "null".into(),
         Value::Ref(Some(marker)) if marker.chars().count() > MAX_MARKER => {
@@ -18087,6 +18034,9 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
     }
     if marker == "void" {
         return Ok(Value::Void);
+    }
+    if let Some(boxed) = Boxed::parse_marker(marker) {
+        return Ok(Value::Boxed(boxed));
     }
     if let Some(value) = marker.strip_prefix('i') {
         return value
@@ -28701,9 +28651,9 @@ mod tests {
                 (
                     "array/test/args/1".into(),
                     vec![
-                        Value::Ref(Some("boolean:false".into())),
+                        Value::Boxed(Boxed::Boolean(false)),
                         Value::Float(5e-7),
-                        Value::Ref(Some("short:-2".into())),
+                        Value::Boxed(Boxed::Short(-2)),
                     ],
                 ),
             ]),
@@ -30603,7 +30553,7 @@ mandatory = true
             descriptor: "Ljava/lang/Boolean;".into(),
         };
         let true_value = host.get_static(&true_field).unwrap();
-        assert_eq!(true_value, Value::Ref(Some("boolean:true".into())));
+        assert_eq!(true_value, Value::Boxed(Boxed::Boolean(true)));
         let boolean_value = MethodRef {
             owner: "java/lang/Boolean".into(),
             name: "booleanValue".into(),
@@ -30614,11 +30564,11 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
-        // The bare marker written before the two forms converged keeps working.
-        assert_eq!(
+        // A String spelled `true` is a String, not a `Boolean` (the bare
+        // `true` marker this test once kept working was that confusion).
+        assert!(
             host.invoke_instance(&boolean_value, &Value::Ref(Some("true".into())), &[])
-                .unwrap(),
-            Value::Int(1)
+                .is_err()
         );
     }
 
@@ -30922,7 +30872,7 @@ mandatory = true
                 &[Value::Ref(Some("101".into())), Value::Int(2)],
             )
             .unwrap(),
-            Value::Ref(Some("integer:5".into()))
+            Value::Boxed(Boxed::Integer(5))
         );
         let compare = MethodRef {
             owner: "java/lang/Integer".into(),
@@ -30963,8 +30913,7 @@ mandatory = true
             Value::Ref(Some("ff".into()))
         );
         assert_eq!(
-            host.invoke(&long_hex, &[Value::Ref(Some("long:-1".into()))])
-                .unwrap(),
+            host.invoke(&long_hex, &[Value::Long(-1)]).unwrap(),
             Value::Ref(Some("ffffffffffffffff".into()))
         );
         assert_eq!(
@@ -31899,7 +31848,7 @@ mandatory = true
             ..letter.clone()
         };
         let boxed = host.invoke(&value_of, &[Value::Int('Z' as i32)]).unwrap();
-        assert_eq!(boxed, Value::Ref(Some("character:90".into())));
+        assert_eq!(boxed, Value::Boxed(Boxed::Character(90)));
         assert_eq!(
             host.invoke_instance(
                 &MethodRef {
@@ -31949,7 +31898,7 @@ mandatory = true
         let boxed = host
             .invoke(&value_of, &[Value::Ref(Some("127".into()))])
             .unwrap();
-        assert_eq!(boxed, Value::Ref(Some("byte:127".into())));
+        assert_eq!(boxed, Value::Boxed(Boxed::Byte(127)));
         assert_eq!(
             host.invoke_instance(
                 &MethodRef {
@@ -32002,7 +31951,7 @@ mandatory = true
         let boxed = host
             .invoke(&value_of, &[Value::Ref(Some("32767".into()))])
             .unwrap();
-        assert_eq!(boxed, Value::Ref(Some("short:32767".into())));
+        assert_eq!(boxed, Value::Boxed(Boxed::Short(32767)));
         assert_eq!(
             host.invoke_instance(
                 &MethodRef {
@@ -32148,7 +32097,7 @@ mandatory = true
             name: name.into(),
             descriptor: descriptor.into(),
         };
-        let long = Value::Ref(Some("long:4294967297".into()));
+        let long = Value::Long(4294967297);
         assert_eq!(
             host.invoke_instance(&number("intValue", "()I"), &long, &[])
                 .unwrap(),
@@ -32906,10 +32855,7 @@ mandatory = true
         };
         let empty_long = host.invoke(&long_empty, &[]).unwrap();
         let long = host
-            .invoke(
-                &long_of,
-                &[Value::Ref(Some("long:9007199254740991".into()))],
-            )
+            .invoke(&long_of, &[Value::Long(9007199254740991)])
             .unwrap();
         assert_eq!(empty_long, Value::Ref(Some(EMPTY_OPTIONAL_LONG.into())));
         assert_eq!(
@@ -32931,12 +32877,8 @@ mandatory = true
             Value::Long(9_007_199_254_740_991)
         );
         assert_eq!(
-            host.invoke_instance(
-                &long_or_else,
-                &empty_long,
-                &[Value::Ref(Some("long:7".into()))]
-            )
-            .unwrap(),
+            host.invoke_instance(&long_or_else, &empty_long, &[Value::Long(7)])
+                .unwrap(),
             Value::Long(7)
         );
 
@@ -39944,11 +39886,11 @@ mandatory = true
         // javac boxes the primitive, so `setReturnValue` sees a reference that
         // is unboxed against the target's declared descriptor.
         infos
-            .set_return(marker, Value::Ref(Some("integer:7".into())))
+            .set_return(marker, Value::Boxed(Boxed::Integer(7)))
             .unwrap();
         assert_eq!(
             infos.current(marker).unwrap(),
-            Value::Ref(Some("integer:7".into())),
+            Value::Boxed(Boxed::Integer(7)),
             "getReturnValue reads the override once one exists"
         );
         assert_eq!(
@@ -41795,13 +41737,12 @@ mandatory = true
             Some("demo/Model".into())
         );
         assert_eq!(
-            class_of_value(&Value::Ref(Some("integer:7".into()))),
+            class_of_value(&Value::Boxed(Boxed::Integer(7))),
             Some("java/lang/Integer".into())
         );
-        assert_eq!(
-            class_of_value(&Value::Ref(Some("true".into()))),
-            Some("java/lang/Boolean".into())
-        );
+        // A String spelled like a box is a String's text, not a box.
+        assert_eq!(class_of_value(&Value::Ref(Some("integer:7".into()))), None);
+        assert_eq!(class_of_value(&Value::Ref(Some("true".into()))), None);
         assert_eq!(class_of_value(&Value::Ref(None)), None);
     }
 
