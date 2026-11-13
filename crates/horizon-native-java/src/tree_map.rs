@@ -931,6 +931,20 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 }
             }
+            (false, "containsAll" | "removeAll" | "retainAll", [other])
+                if r.descriptor == "(Ljava/util/Collection;)Z" =>
+            {
+                match self.tree_set_bulk(r, tree, comparator, &mut values, other)? {
+                    Some(answer) => answer,
+                    None => return Ok(None),
+                }
+            }
+            (false, "equals", [other]) if r.descriptor == "(Ljava/lang/Object;)Z" => {
+                match self.tree_set_equals(r, receiver, tree, comparator, other)? {
+                    Some(answer) => answer,
+                    None => return Ok(None),
+                }
+            }
             _ => return Ok(None),
         };
         self.write_tree(receiver, tree, map, &values);
@@ -1023,6 +1037,10 @@ enum TreeCallback {
     MapForEach,
     /// `TreeSet.forEach(Consumer)`, which is `Iterable.forEach`.
     SetForEach,
+    /// `TreeMap.replaceAll(BiFunction)`.
+    ReplaceAll,
+    /// `TreeSet.removeIf`, which is `Collection.removeIf`.
+    SetRemoveIf,
 }
 
 impl TreeCallback {
@@ -1041,6 +1059,8 @@ impl TreeCallback {
             (true, "merge", MERGE) => Self::Merge,
             (true, "forEach", "(Ljava/util/function/BiConsumer;)V") => Self::MapForEach,
             (false, "forEach", "(Ljava/util/function/Consumer;)V") => Self::SetForEach,
+            (true, "replaceAll", "(Ljava/util/function/BiFunction;)V") => Self::ReplaceAll,
+            (false, "removeIf", "(Ljava/util/function/Predicate;)Z") => Self::SetRemoveIf,
             _ => return None,
         })
     }
@@ -1144,6 +1164,12 @@ impl<H: Host> Runtime<'_, H> {
             return self.host.unknown_operand_call(r).map(|_| None);
         }
         match callback {
+            TreeCallback::ReplaceAll => self
+                .tree_replace_all(receiver, marker, &comparator, tree, entries, &function)
+                .map(Some),
+            TreeCallback::SetRemoveIf => self
+                .tree_set_remove_if(receiver, marker, &comparator, tree, &function)
+                .map(Some),
             TreeCallback::MapForEach | TreeCallback::SetForEach => self
                 .tree_for_each(
                     receiver,
@@ -1329,5 +1355,291 @@ impl<H: Host> Runtime<'_, H> {
         }
         self.host.store_red_black_tree(marker, tree);
         Ok(Value::Void)
+    }
+}
+
+impl<H: Host> Runtime<'_, H> {
+    /// Whether `value`'s iteration order is the JDK's: a list, a tree, or a
+    /// hash collection whose table order is known.
+    fn iteration_order_known(&mut self, value: &Value) -> bool {
+        if self.host_collection_kind(value) == Some(CollectionKind::List)
+            || self.tree_kind(value).is_some()
+        {
+            return true;
+        }
+        let Some(marker) = expect_ref(value) else {
+            return false;
+        };
+        if self.hash_table_kind(value).is_none() {
+            return false;
+        }
+        match self.host.take_hash_table(marker) {
+            Some(table) => {
+                let known = !table.order_unknown();
+                self.host.store_hash_table(marker, table);
+                known
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a jar `compareTo`/`equals` or a comparator takes part, which
+    /// the host's answers skip.
+    fn tree_bulk_engaged(
+        &self,
+        tree: &RedBlackTree,
+        comparator: &Option<Value>,
+        others: &[Value],
+    ) -> bool {
+        comparator.is_some()
+            || tree
+                .keys()
+                .iter()
+                .chain(others)
+                .any(|value| self.equality_of(value) != object_methods::Equality::Platform)
+    }
+
+    /// Walk the tree in order, deleting the keys `doomed` picks, as an
+    /// iterator's `remove()` does: a node with two children takes its
+    /// successor's key, which is then the iterator's `next`.
+    fn tree_remove_where(
+        &mut self,
+        r: &MethodRef,
+        tree: &mut RedBlackTree,
+        values: &mut BTreeMap<String, Value>,
+        mut doomed: impl FnMut(&mut Self, &Value) -> Result<Option<bool>, NativeError>,
+    ) -> Result<bool, NativeError> {
+        let mut modified = false;
+        let mut at = tree.first();
+        while let Some(node) = at {
+            let key = tree.node(node).key.clone();
+            let mut next = tree.successor(node);
+            match doomed(self, &key)? {
+                Some(true) => {
+                    if tree.node(node).left.is_some() && tree.node(node).right.is_some() {
+                        next = Some(node);
+                    }
+                    values.remove(&collection_item_marker(&key));
+                    tree.delete_entry(node);
+                    modified = true;
+                }
+                Some(false) => {}
+                None => {
+                    // `c.contains` this runtime cannot answer: counted.
+                    self.host.unknown_operand_call(r)?;
+                    break;
+                }
+            }
+            at = next;
+        }
+        Ok(modified)
+    }
+
+    /// `TreeSet.containsAll` (`AbstractCollection`'s: `contains(e)` for each
+    /// of `c`'s elements, in `c`'s order, each a walk of the tree),
+    /// `removeAll` (`AbstractSet`'s: `remove(e)` for each of `c`'s elements
+    /// when this set is larger, else this set's iterator removing what
+    /// `c.contains`) and `retainAll` (the iterator removing what `c` does not
+    /// contain). `None` leaves the call to the host.
+    fn tree_set_bulk(
+        &mut self,
+        r: &MethodRef,
+        tree: &mut RedBlackTree,
+        comparator: &Option<Value>,
+        values: &mut BTreeMap<String, Value>,
+        other: &Value,
+    ) -> Result<Option<Value>, NativeError> {
+        if *other == Value::Ref(None) {
+            return Err(thrown("java/lang/NullPointerException"));
+        }
+        if self.host_collection_kind(other).is_none() {
+            return Ok(None);
+        }
+        let others = self.collection_elements(other)?;
+        if !self.tree_bulk_engaged(tree, comparator, &others) {
+            return Ok(None);
+        }
+        let size = tree.keys().len();
+        let walks_other = r.name == "containsAll" || (r.name == "removeAll" && size > others.len());
+        if walks_other && !self.iteration_order_known(other) {
+            return self.host.unknown_operand_call(r).map(|_| None);
+        }
+        let answer = match r.name.as_str() {
+            "containsAll" => {
+                let mut all = true;
+                for element in &others {
+                    if self.tree_get(tree, comparator, element)?.is_none() {
+                        all = false;
+                        break;
+                    }
+                }
+                all
+            }
+            "removeAll" if walks_other => {
+                let mut modified = false;
+                for element in &others {
+                    if let Some(node) = self.tree_get(tree, comparator, element)? {
+                        let key = tree.node(node).key.clone();
+                        values.remove(&collection_item_marker(&key));
+                        tree.delete_entry(node);
+                        modified = true;
+                    }
+                }
+                modified
+            }
+            name => {
+                let retain = name == "retainAll";
+                let other = other.clone();
+                self.tree_remove_where(r, tree, values, |this, key| {
+                    Ok(this
+                        .hash_aware_contains(&other, key)?
+                        .map(|contained| contained != retain))
+                })?
+            }
+        };
+        Ok(Some(Value::Int(i32::from(answer))))
+    }
+
+    /// `AbstractSet.equals`: the same object; not a set; another size; else
+    /// `containsAll(o)`, where a `ClassCastException` or
+    /// `NullPointerException` means `false`.
+    fn tree_set_equals(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        tree: &mut RedBlackTree,
+        comparator: &Option<Value>,
+        other: &Value,
+    ) -> Result<Option<Value>, NativeError> {
+        if other == receiver {
+            return Ok(Some(Value::Int(1)));
+        }
+        match self.host_collection_kind(other) {
+            Some(CollectionKind::Set) => {}
+            Some(_) => return Ok(Some(Value::Int(0))),
+            None => return Ok(None),
+        }
+        let others = self.collection_elements(other)?;
+        if !self.tree_bulk_engaged(tree, comparator, &others) {
+            return Ok(None);
+        }
+        if others.len() != tree.keys().len() {
+            return Ok(Some(Value::Int(0)));
+        }
+        if !self.iteration_order_known(other) {
+            return self.host.unknown_operand_call(r).map(|_| None);
+        }
+        for element in &others {
+            match self.tree_get(tree, comparator, element) {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(Some(Value::Int(0))),
+                Err(NativeError::UncaughtException { class, .. })
+                    if class == "java/lang/ClassCastException"
+                        || class == "java/lang/NullPointerException" =>
+                {
+                    return Ok(Some(Value::Int(0)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Some(Value::Int(1)))
+    }
+
+    /// `TreeMap.replaceAll`: `e.value = function.apply(e.key, e.value)` in key
+    /// order, and a `ConcurrentModificationException` right after the call
+    /// that changed the structure (the value is stored first).
+    fn tree_replace_all(
+        &mut self,
+        receiver: &Value,
+        marker: &str,
+        comparator: &Option<Value>,
+        mut tree: RedBlackTree,
+        mut entries: Vec<Value>,
+        function: &Value,
+    ) -> Result<Value, NativeError> {
+        let set_value = |entries: &mut Vec<Value>, key: &Value, value: Value| {
+            let wanted = collection_item_marker(key);
+            if let Some(index) = entries
+                .chunks(2)
+                .position(|pair| collection_item_marker(&pair[0]) == wanted)
+            {
+                entries[index * 2 + 1] = value;
+            }
+        };
+        let mut at = tree.first();
+        while let Some(node) = at {
+            let key = tree.node(node).key.clone();
+            let value = stored_value(&entries, &key);
+            let function = function.clone();
+            let call = [key.clone(), value];
+            let (replaced, live) =
+                self.tree_callback(receiver, marker, comparator, true, tree, |this| {
+                    this.apply_callback(&function, &call)
+                })?;
+            let Some((live, live_entries)) = live else {
+                let mut now = self.collection_elements(receiver)?;
+                set_value(&mut now, &key, replaced);
+                self.host.replace_mutable_collection(receiver, now);
+                return Err(concurrent_modification());
+            };
+            tree = live;
+            entries = live_entries;
+            set_value(&mut entries, &key, replaced);
+            self.host
+                .replace_mutable_collection(receiver, entries.clone());
+            at = tree.successor(node);
+        }
+        self.host.store_red_black_tree(marker, tree);
+        Ok(Value::Void)
+    }
+
+    /// `Collection.removeIf` on a `TreeSet`: the iterator tests each key in
+    /// order and `remove()`s it at once (so a predicate that throws leaves
+    /// the earlier removals done); `next()`/`remove()` throw after a change
+    /// the predicate made, and a change at the last key ends the loop.
+    fn tree_set_remove_if(
+        &mut self,
+        receiver: &Value,
+        marker: &str,
+        comparator: &Option<Value>,
+        mut tree: RedBlackTree,
+        predicate: &Value,
+    ) -> Result<Value, NativeError> {
+        let mut removed = false;
+        let mut at = tree.first();
+        while let Some(node) = at {
+            let key = tree.node(node).key.clone();
+            let mut next = tree.successor(node);
+            let predicate = predicate.clone();
+            let test = key.clone();
+            let (holds, live) =
+                self.tree_callback(receiver, marker, comparator, false, tree, |this| {
+                    Ok(Value::Int(i32::from(
+                        this.predicate_holds(&predicate, &test)?,
+                    )))
+                })?;
+            let holds = holds == Value::Int(1);
+            let Some((live, _)) = live else {
+                // `remove()` checks first; else `hasNext` is `next != null`.
+                if holds || next.is_some() {
+                    return Err(concurrent_modification());
+                }
+                return Ok(Value::Int(i32::from(removed)));
+            };
+            tree = live;
+            if holds {
+                if tree.node(node).left.is_some() && tree.node(node).right.is_some() {
+                    next = Some(node);
+                }
+                tree.delete_entry(node);
+                self.write_tree(receiver, &tree, false, &BTreeMap::new());
+                // The iterator's own `remove()` bumps `modCount` and takes it.
+                self.bump_mod_count(marker, false);
+                removed = true;
+            }
+            at = next;
+        }
+        self.host.store_red_black_tree(marker, tree);
+        Ok(Value::Int(i32::from(removed)))
     }
 }
