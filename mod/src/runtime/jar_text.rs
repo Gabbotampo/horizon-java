@@ -192,6 +192,17 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // A host handle prints its kind's `toString` (`host_ref.rs`); one
+        // whose held value has no text here is counted.
+        if let Value::Host(handle) = value {
+            return match self.host_ref_text(handle, class, method)? {
+                Some(text) => Ok(Some(Value::Ref(Some(text)))),
+                None => self
+                    .host
+                    .unknown_operand_call(&object_to_string())
+                    .map(Some),
+            };
+        }
         let Some(marker) = expect_ref(value) else {
             return Ok(None);
         };
@@ -228,10 +239,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<String, NativeError> {
-        if let Value::Host(_) = value
-            && let Some(text) = self.host.modelled_to_string(value)
-        {
-            return Ok(text);
+        if let Value::Host(handle) = value {
+            if let Some(text) = self.host_ref_text(handle, class, method)? {
+                return Ok(text);
+            }
+            self.host.unknown_operand_call(&object_to_string())?;
         }
         if matches!(value, Value::Ref(Some(_))) {
             match self.runtime_value_of(value, class, method)? {

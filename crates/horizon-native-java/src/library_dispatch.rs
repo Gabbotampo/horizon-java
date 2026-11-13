@@ -468,6 +468,11 @@ impl<H: Host> Runtime<'_, H> {
     /// The `instanceof` answers this module and the proxy model add to the
     /// opcode's own: unboxed boxes and proxies.
     pub(super) fn library_instance_of(&self, value: &Value, wanted: &str) -> bool {
+        // A host handle answers by its kind's row (`host_ref.rs`); an unknown
+        // answer is `instance_of_is_guess`'s to count.
+        if let Value::Host(handle) = value {
+            return handle.instance_of(wanted, self) == Some(true);
+        }
         unboxed_instance_of(value, wanted)
             || expect_ref(value).is_some_and(|marker| {
                 self.proxy_instance_of(marker, wanted)
@@ -522,6 +527,26 @@ impl<H: Host> Runtime<'_, H> {
         }
         if is_null || instance {
             return Ok(Some(value));
+        }
+        // A host handle, or a cast to a handle kind's class (`checkcast.rs`):
+        // `Cannot cast <getClass().getName()> to <getName()>`, or counted.
+        match self.host_cast(&value, &wanted) {
+            Some(crate::checkcast::HostCast::Throws(class)) => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/ClassCastException".into(),
+                    message: Some(format!(
+                        "Cannot cast {} to {}",
+                        class.replace('/', "."),
+                        wanted.replace('/', ".")
+                    )),
+                    frame: None,
+                });
+            }
+            Some(crate::checkcast::HostCast::Unknown) => {
+                self.count_cast(&value, &wanted)?;
+                return Ok(Some(value));
+            }
+            Some(crate::checkcast::HostCast::Fits) | None => {}
         }
         // Only a class the runtime can judge throws; anything else keeps the
         // value, as the opcode-level `checkcast` does.
@@ -1428,9 +1453,8 @@ pub(super) fn unboxed_instance_of(value: &Value, wanted: &str) -> bool {
         Value::Long(_) => shared || wanted == "java/lang/Long",
         Value::Int(_) => shared || wanted == "java/lang/Integer",
         Value::Boxed(boxed) => crate::jdk_model::class_instance_of(boxed.class(), wanted),
-        // A host model's object (an `Optional`) is an instance of its class.
-        Value::Host(_) => crate::class_of_value(value)
-            .is_some_and(|class| crate::jdk_model::class_instance_of(&class, wanted)),
+        // A host handle is `library_instance_of`'s (it needs the hierarchy).
+        Value::Host(_) => false,
         _ => false,
     }
 }

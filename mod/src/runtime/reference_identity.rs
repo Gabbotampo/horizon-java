@@ -313,6 +313,30 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<bool, NativeError> {
         // The old answer, kept when the comparison is counted.
         let equal = lhs == rhs;
+        // A host handle (`host_ref.rs`): different handles are different
+        // objects, a canonical kind's equal handles one object, and so is a
+        // handle and its own clone (`HostRef::same_object`); other equal
+        // handles are one object only when the same producer provably flows
+        // to both sides. Equal keys never answer identity.
+        if let (Value::Host(left), Value::Host(right)) = (lhs, rhs) {
+            if let Some(same) = left.same_object(right) {
+                return Ok(same);
+            }
+            let same = frame
+                .flow
+                .get_or_insert_with(|| flow(file, method, desc, is_static, code))
+                .as_ref()
+                .and_then(|flow| flow.compares.get(&(at as u32)).copied())
+                .is_some_and(|(l, r)| l.source.is_some() && l.source == r.source && !l.repeats);
+            if !same {
+                self.host.unknown_operand_call(&MethodRef {
+                    owner: "java/lang/Object".into(),
+                    name: "if_acmp".into(),
+                    descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
+                })?;
+            }
+            return Ok(true);
+        }
         let boxed = match (box_key(lhs), box_key(rhs)) {
             (Some(a), Some(b)) if a.same_box(&b) => Some(a),
             // Two boxes of different values or classes are different objects.

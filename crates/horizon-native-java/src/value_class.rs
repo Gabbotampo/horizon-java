@@ -40,10 +40,6 @@ const SEPARATOR_FREE_MARKERS: &[&str] = &[
     "guava-cache-builder",
     "mixin-environment",
     "stack-walker",
-    // The empty primitive optionals (`EMPTY_OPTIONAL_*` in lib.rs).
-    "optional-int",
-    "optional-long",
-    "optional-double",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
@@ -90,7 +86,7 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
 /// The class marker of an array whose elements are `component`: the JVM's
 /// descriptor form (`[Ljava/lang/String;`, `[I`, `[[I`), which the class
 /// surface already reads as an array class.
-fn array_class_marker(component: &str) -> String {
+pub(crate) fn array_class_marker(component: &str) -> String {
     let element = match component {
         "boolean" => "Z".to_owned(),
         "byte" => "B".to_owned(),

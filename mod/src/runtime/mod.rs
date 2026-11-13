@@ -69,6 +69,8 @@ mod heap;
 mod hook_shapes;
 mod host_entry;
 mod host_list_iterator;
+mod host_optional;
+mod host_ref;
 mod immutable_collections;
 mod iteration_guard;
 mod jar_compare;
@@ -170,6 +172,12 @@ pub use boxed::Boxed;
 pub use class_precedence::RunLoader;
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use heap::{CallLogMark, JavaHeap};
+pub(crate) use host_optional::{
+    empty_optional, empty_optional_for, is_optional, optional_double, optional_double_value,
+    optional_int, optional_int_value, optional_long, optional_long_value, optional_payload,
+    optional_present, optional_wrap,
+};
+pub use host_ref::{HostKind, HostRef};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
 pub use mixin_plugins::ConfigPluginReport;
@@ -209,11 +217,11 @@ pub enum Value {
     /// A boxed `Boolean`/`Byte`/`Short`/`Character`/`Integer`/`Float`
     /// (`boxed.rs`): never text, so no `String` can pass for one.
     Boxed(Boxed),
-    /// An object a host model built and keeps, named by its marker: never a
-    /// `String`, whatever a `String` with the same text spells. `Optional`
-    /// is one (`optional/<payload marker>`, `optional` for the empty one);
-    /// the other host families are still `Ref` markers.
-    Host(String),
+    /// An object a host model built (`host_ref.rs`): a typed handle, never a
+    /// `String`, whatever a `String` with the same text spells. The
+    /// `Optional` family is one; the other host families are still `Ref`
+    /// markers (#156).
+    Host(HostRef),
     Void,
 }
 
@@ -2246,6 +2254,14 @@ pub trait Host {
     /// through the generic `Host` boundary, so the table is exposed here
     /// rather than only on [`StdHost`].
     fn mutable_collection_values(&self, _value: &Value) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The values a mutable collection marker holds as the host keeps them
+    /// (`Value`s, not their markers), so a host handle keeps its
+    /// construction (`HostRef::same_object`). `None` when the host keeps no
+    /// such table for `value`.
+    fn mutable_collection_entries(&self, _value: &Value) -> Option<Vec<Value>> {
         None
     }
 
@@ -4330,6 +4346,11 @@ impl Host for StdHost {
         self.mutable_values(value)
     }
 
+    fn mutable_collection_entries(&self, value: &Value) -> Option<Vec<Value>> {
+        let marker = self.synchronized_target(expect_ref(value)?);
+        self.mutable_collections.get(marker).cloned()
+    }
+
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
         if let Some(marker) = expect_ref(value) {
             let marker = self.synchronized_target(marker).to_owned();
@@ -5182,32 +5203,23 @@ impl Host for StdHost {
                 })
             }
             ("java/util/OptionalInt", "empty", "()Ljava/util/OptionalInt;") => {
-                Ok(Value::Ref(Some(EMPTY_OPTIONAL_INT.into())))
+                Ok(host_optional::empty_of(HostKind::OptionalInt))
             }
             ("java/util/OptionalInt", "of", "(I)Ljava/util/OptionalInt;") => {
-                Ok(Value::Ref(Some(format!(
-                    "optional-int/{}",
-                    expect_int(r, Self::argument(r, args, 0)?)?
-                ))))
+                Ok(optional_int(expect_int(r, Self::argument(r, args, 0)?)?))
             }
             ("java/util/OptionalLong", "empty", "()Ljava/util/OptionalLong;") => {
-                Ok(Value::Ref(Some(EMPTY_OPTIONAL_LONG.into())))
+                Ok(host_optional::empty_of(HostKind::OptionalLong))
             }
             ("java/util/OptionalLong", "of", "(J)Ljava/util/OptionalLong;") => {
-                Ok(Value::Ref(Some(format!(
-                    "optional-long/{}",
-                    expect_long(r, Self::argument(r, args, 0)?)?
-                ))))
+                Ok(optional_long(expect_long(r, Self::argument(r, args, 0)?)?))
             }
             ("java/util/OptionalDouble", "empty", "()Ljava/util/OptionalDouble;") => {
-                Ok(Value::Ref(Some(EMPTY_OPTIONAL_DOUBLE.into())))
+                Ok(host_optional::empty_of(HostKind::OptionalDouble))
             }
-            ("java/util/OptionalDouble", "of", "(D)Ljava/util/OptionalDouble;") => {
-                Ok(Value::Ref(Some(format!(
-                    "optional-double/{}",
-                    expect_float(r, Self::argument(r, args, 0)?)?
-                ))))
-            }
+            ("java/util/OptionalDouble", "of", "(D)Ljava/util/OptionalDouble;") => Ok(
+                optional_double(expect_float(r, Self::argument(r, args, 0)?)?),
+            ),
             // Keep Arrays.asList bounded when the interpreter passes an
             // opaque array marker. The marker is retained as the list's
             // single value; expanding runtime-owned array storage here would
@@ -8493,23 +8505,16 @@ impl Host for StdHost {
             ("net/fabricmc/api/EnvType", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
             }
-            ("java/util/Optional", "toString", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(match optional_payload(receiver) {
-                    Some(payload) => format!("Optional[{}]", object_text(self, &payload)),
-                    None => "Optional.empty".to_owned(),
-                })))
-            }
-            // `Objects.hashCode(value)`: a string's or a box's own hash.
-            ("java/util/Optional", "hashCode", "()I") => Ok(Value::Int(optional_hash(receiver))),
-            ("java/util/Optional", "equals", "(Ljava/lang/Object;)Z") => {
-                let left = optional_payload(receiver);
-                let right = optional_payload(Self::argument(r, args, 0)?);
-                let canonical = |value: &Option<Value>| {
-                    value
-                        .as_ref()
-                        .map(|value| boxed::canonical(value).into_owned())
-                };
-                Ok(Value::Int((canonical(&left) == canonical(&right)) as i32))
+            // A handle's `toString`/`hashCode`/`equals` are its kind's row in the
+            // kind table (`host_ref.rs`), whatever class the call names.
+            // A host `null` typed as an optional reads as the empty one.
+            (owner, "toString", "()Ljava/lang/String;")
+            | (owner, "hashCode", "()I")
+            | (owner, "equals", "(Ljava/lang/Object;)Z")
+                if matches!(receiver, Value::Host(_))
+                    || (*receiver == Value::Ref(None) && HostKind::of_class(owner).is_some()) =>
+            {
+                self.host_object_method(r, receiver, args)
             }
             ("java/util/Optional", "isPresent", "()Z") => {
                 Ok(Value::Int(optional_present(receiver).is_some() as i32))
@@ -8535,19 +8540,6 @@ impl Host for StdHost {
             ("java/util/OptionalInt", "orElse", "(I)I") => Ok(Value::Int(
                 optional_int_value(receiver).unwrap_or(expect_int(r, Self::argument(r, args, 0)?)?),
             )),
-            ("java/util/OptionalInt", "toString", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(match optional_int_value(receiver) {
-                    Some(value) => format!("OptionalInt[{}]", value),
-                    None => "OptionalInt.empty".into(),
-                })))
-            }
-            ("java/util/OptionalInt", "hashCode", "()I") => {
-                Ok(Value::Int(optional_int_value(receiver).unwrap_or(0)))
-            }
-            ("java/util/OptionalInt", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                (optional_int_value(receiver) == optional_int_value(Self::argument(r, args, 0)?))
-                    as i32,
-            )),
             ("java/util/OptionalLong", "isPresent", "()Z") => {
                 Ok(Value::Int(optional_long_value(receiver).is_some() as i32))
             }
@@ -8563,21 +8555,6 @@ impl Host for StdHost {
                 optional_long_value(receiver)
                     .unwrap_or(expect_long(r, Self::argument(r, args, 0)?)?),
             )),
-            ("java/util/OptionalLong", "toString", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(match optional_long_value(receiver) {
-                    Some(value) => format!("OptionalLong[{}]", value),
-                    None => "OptionalLong.empty".into(),
-                })))
-            }
-            ("java/util/OptionalLong", "hashCode", "()I") => Ok(Value::Int(
-                optional_long_value(receiver)
-                    .map(|value| stable_hash(&format!("optional-long/{value}")))
-                    .unwrap_or(0),
-            )),
-            ("java/util/OptionalLong", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                (optional_long_value(receiver) == optional_long_value(Self::argument(r, args, 0)?))
-                    as i32,
-            )),
             ("java/util/OptionalDouble", "isPresent", "()Z") => {
                 Ok(Value::Int(optional_double_value(receiver).is_some() as i32))
             }
@@ -8592,21 +8569,6 @@ impl Host for StdHost {
             ("java/util/OptionalDouble", "orElse", "(D)D") => Ok(double_value(
                 optional_double_value(receiver)
                     .unwrap_or(expect_float(r, Self::argument(r, args, 0)?)?),
-            )),
-            ("java/util/OptionalDouble", "toString", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(match optional_double_value(receiver) {
-                    Some(value) => format!("OptionalDouble[{}]", format_java_float(value)),
-                    None => "OptionalDouble.empty".into(),
-                })))
-            }
-            ("java/util/OptionalDouble", "hashCode", "()I") => Ok(Value::Int(
-                optional_double_value(receiver)
-                    .map(|value| stable_hash(&format!("optional-double/{value}")))
-                    .unwrap_or(0),
-            )),
-            ("java/util/OptionalDouble", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                (optional_double_bits(receiver)
-                    == optional_double_bits(Self::argument(r, args, 0)?)) as i32,
             )),
             (
                 "java/util/Optional",
@@ -9660,7 +9622,7 @@ fn class_of_value(value: &Value) -> Option<String> {
         // A `Float` is a `Boxed::Float`; the bare value is a `Double`.
         Value::Float(_) => Some("java/lang/Double".into()),
         Value::Boxed(boxed) => Some(boxed.class().into()),
-        Value::Host(_) => is_optional(value).then(|| "java/util/Optional".into()),
+        Value::Host(host) => Some(host.class().into()),
         Value::Void => None,
         Value::Ref(None) => None,
         Value::Ref(Some(marker)) => {
@@ -10172,6 +10134,9 @@ fn collection_item_marker(value: &Value) -> String {
     match value {
         // A `Field` copy is kept and compared as its field (`Field.equals`).
         Value::Ref(Some(value)) => format!("r{}", reflect_override::canonical_field(value)),
+        // A handle's own text form, unescaped like a reference's
+        // (`HostRef::encode`).
+        Value::Host(host) => host.encode(),
         other => value_marker(other),
     }
 }
@@ -10191,8 +10156,8 @@ fn value_marker(value: &Value) -> String {
         // An `Integer` is one key however it was boxed (`boxed::canonical`).
         Value::Boxed(Boxed::Integer(value)) => format!("i{value}"),
         Value::Boxed(boxed) => boxed.marker(),
-        // `h` and the host object's marker, escaped like a reference's.
-        Value::Host(marker) => format!("h{}", marker.replace('\\', "\\\\").replace(',', "\\,")),
+        // A handle's text form (`HostRef::encode`), escaped like a reference's.
+        Value::Host(host) => host.encode().replace('\\', "\\\\").replace(',', "\\,"),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
     }
@@ -10632,133 +10597,120 @@ fn is_lazy_optional_owner(owner: &str) -> bool {
     )
 }
 
-/// The marker of an empty `java.util.Optional`.
-///
-/// `Optional.empty()` is an object in Java: `isPresent()`, `orElse` and
-/// `ifPresent` are ordinary calls on it, and only a real `null` receiver
-/// throws `NullPointerException`. It is the host value
-/// `Value::Host("optional")`; a present optional is
-/// `Value::Host("optional/<payload's value_marker>")`. A `Value::Host` is
-/// never a `String`, so no jar string can spell an optional, and a nested
-/// optional is its own payload.
-pub(crate) const EMPTY_OPTIONAL: &str = "optional";
-/// The empty `OptionalInt`; present ones are `optional-int/<value>`.
-pub(crate) const EMPTY_OPTIONAL_INT: &str = "optional-int";
-/// The empty `OptionalLong`; present ones are `optional-long/<value>`.
-pub(crate) const EMPTY_OPTIONAL_LONG: &str = "optional-long";
-/// The empty `OptionalDouble`; present ones are `optional-double/<value>`.
-pub(crate) const EMPTY_OPTIONAL_DOUBLE: &str = "optional-double";
-
-pub(crate) fn empty_optional() -> Value {
-    Value::Host(EMPTY_OPTIONAL.into())
-}
-
-/// Whether `value` is an `Optional` (empty or present).
-pub(crate) fn is_optional(value: &Value) -> bool {
-    matches!(value, Value::Host(marker) if marker == EMPTY_OPTIONAL || marker.starts_with("optional/"))
-}
-
-/// The empty marker for a method whose declared result is one of the JDK's
-/// optional types, so a host answer of `null` for it becomes the empty
-/// optional Java would have returned (no JDK or library API returns a
-/// `null` Optional).
-fn empty_optional_for(descriptor: &str) -> Option<Value> {
-    let marker = match return_desc(descriptor) {
-        "Ljava/util/Optional;" => return Some(empty_optional()),
-        "Ljava/util/OptionalInt;" => EMPTY_OPTIONAL_INT,
-        "Ljava/util/OptionalLong;" => EMPTY_OPTIONAL_LONG,
-        "Ljava/util/OptionalDouble;" => EMPTY_OPTIONAL_DOUBLE,
-        _ => return None,
-    };
-    Some(Value::Ref(Some(marker.into())))
-}
-
-/// The value a present optional holds, `None` when it is empty or no
-/// optional at all.
-pub(crate) fn optional_present(value: &Value) -> Option<Value> {
-    let Value::Host(marker) = value else {
-        return None;
-    };
-    parse_value_marker(&unescape_marker(marker.strip_prefix("optional/")?)).ok()
-}
-
-/// [`optional_present`].
-pub(crate) fn optional_payload(value: &Value) -> Option<Value> {
-    optional_present(value)
-}
-
-/// `Optional.ofNullable(value)`: the empty optional for `null`, otherwise an
-/// optional holding the value as it is (a `String`, a box, another
-/// optional), never read as an optional itself.
-pub(crate) fn optional_wrap(value: Value) -> Value {
-    match value {
-        Value::Ref(None) | Value::Void => empty_optional(),
-        value => Value::Host(format!("optional/{}", value_marker(&value))),
-    }
-}
-
-/// `Optional.hashCode()`: `Objects.hashCode(value)` of what it holds, a
-/// string's or a box's own hash, an inner optional's in turn.
-fn optional_hash(optional: &Value) -> i32 {
-    match optional_present(optional) {
-        None => 0,
-        Some(Value::Ref(Some(text))) => stable_hash(&text),
-        Some(inner) if is_optional(&inner) => optional_hash(&inner),
-        Some(other) => object_methods::platform_hash(&other).unwrap_or(0),
-    }
-}
-
-/// `toString()` of a host object as far as its text alone says it:
-/// `Optional[<value>]`, `Optional.empty`. A model that prints a held jar
-/// object runs through the host instead (`java_tostring::modelled`).
+/// A host handle's `toString` for a caller with no runtime (a value's text in
+/// a model, a facade's JSON): [`HostNested`] without a host prints a held jar
+/// object by its marker, as before.
 fn host_text(value: &Value) -> String {
-    match optional_present(value) {
-        Some(held) => format!("Optional[{}]", value_text(&held)),
-        None if is_optional(value) => "Optional.empty".to_owned(),
-        None => match value {
-            Value::Host(marker) => marker.clone(),
-            other => value_text(other),
-        },
+    match value {
+        Value::Host(handle) => handle
+            .to_string(&mut MarkerText)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        other => value_text(other),
     }
 }
 
-/// Undo [`value_marker`]'s separator escapes (`\,`, `\\`) for a marker read
-/// back whole.
-fn unescape_marker(marker: &str) -> String {
-    let mut text = String::with_capacity(marker.len());
-    let mut chars = marker.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => text.extend(chars.next()),
-            other => text.push(other),
+/// [`host_ref::Nested`] for [`host_text`]'s callers, which can neither run
+/// jar code nor count (a facade's JSON, a diagnostic): a held value prints
+/// as [`value_text`] does, a marker as itself. Answers nothing else.
+struct MarkerText;
+
+impl host_ref::Nested for MarkerText {
+    fn hash(&mut self, _value: &Value) -> Result<Option<i32>, NativeError> {
+        Ok(None)
+    }
+
+    fn equals(&mut self, _a: &Value, _b: &Value) -> Result<Option<bool>, NativeError> {
+        Ok(None)
+    }
+
+    fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        Ok(Some(match value {
+            Value::Host(handle) => return handle.to_string(self),
+            other => value_text(other),
+        }))
+    }
+}
+
+/// [`host_ref::Nested`] for the host, which cannot run jar code. It answers
+/// only what it knows: a string, a box and a handle by value, and (with a
+/// host) the text a model prints for its own object. Any other object (a jar
+/// object, a collection, a game object) is unknown here (`None`), and the
+/// caller counts the call instead of printing or hashing its marker.
+struct HostNested<'a>(Option<&'a mut StdHost>);
+
+impl host_ref::Nested for HostNested<'_> {
+    fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        Ok(match value {
+            Value::Host(handle) => return handle.hash_code(self),
+            Value::Ref(Some(text)) if value_class::is_plain_string(text) => Some(stable_hash(text)),
+            Value::Ref(Some(_)) | Value::Void => None,
+            Value::Ref(None) => Some(0),
+            other => object_methods::platform_hash(other),
+        })
+    }
+
+    fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
+        Ok(match a {
+            Value::Host(handle) => return handle.equals(b, self),
+            // `a == b` answers `Objects.equals` for any object; otherwise an
+            // object's own `equals` is not the host's to run.
+            Value::Ref(Some(text)) if !value_class::is_plain_string(text) => {
+                (a == b).then_some(true)
+            }
+            _ => Some(boxed::canonical(a) == boxed::canonical(b)),
+        })
+    }
+
+    fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        Ok(match (value, self.0.as_deref_mut()) {
+            (Value::Host(handle), _) => return handle.to_string(self),
+            (Value::Ref(Some(text)), _) if value_class::is_plain_string(text) => Some(text.clone()),
+            (Value::Ref(Some(_)), Some(host)) => host.modelled_to_string(value),
+            (Value::Ref(Some(_)), None) => None,
+            (other, _) => Some(value_text(other)),
+        })
+    }
+}
+
+impl StdHost {
+    /// A handle's `toString`/`hashCode`/`equals` through its kind's row
+    /// (`host_ref.rs`). One a held value leaves unknown (a held jar object's
+    /// `hashCode`, which only the runtime can run) is counted.
+    fn host_object_method(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let handle = match receiver {
+            Value::Host(handle) => handle.clone(),
+            Value::Ref(None) => match HostKind::of_class(&r.owner) {
+                Some(kind) => HostRef::new(kind, ""),
+                None => return self.unknown_host_call(r),
+            },
+            _ => return self.unknown_host_call(r),
+        };
+        let answer = match r.name.as_str() {
+            "toString" => handle
+                .to_string(&mut HostNested(Some(self)))?
+                .map(|text| Value::Ref(Some(text))),
+            "hashCode" => handle
+                .hash_code(&mut HostNested(Some(self)))?
+                .map(Value::Int),
+            _ => {
+                let other = Self::argument(r, args, 0)?;
+                handle
+                    .equals(other, &mut HostNested(Some(self)))?
+                    .map(|equal| Value::Int(i32::from(equal)))
+            }
+        };
+        match answer {
+            Some(answer) => Ok(answer),
+            None => self.unknown_host_call(r),
         }
     }
-    text
-}
-
-fn optional_int_value(value: &Value) -> Option<i32> {
-    expect_ref(value)
-        .and_then(|marker| marker.strip_prefix("optional-int/"))
-        .and_then(|value| value.parse().ok())
-}
-
-fn optional_long_value(value: &Value) -> Option<i64> {
-    match value {
-        Value::Long(value) => Some(*value),
-        _ => expect_ref(value)
-            .and_then(|marker| marker.strip_prefix("optional-long/"))
-            .and_then(|value| value.parse().ok()),
-    }
-}
-
-fn optional_double_value(value: &Value) -> Option<f64> {
-    expect_ref(value)
-        .and_then(|marker| marker.strip_prefix("optional-double/"))
-        .and_then(|value| value.parse().ok())
-}
-
-fn optional_double_bits(value: &Value) -> Option<u64> {
-    optional_double_value(value).map(f64::to_bits)
 }
 
 fn collection_empty(kind: &str) -> Value {
@@ -11671,6 +11623,15 @@ fn collection_text(
 fn object_text(host: &mut StdHost, value: &Value) -> String {
     match value {
         Value::Boxed(boxed) => boxed.text(),
+        // A handle prints its kind's `toString`; one holding an object the
+        // host cannot print is counted, and keeps the old text.
+        Value::Host(handle) => match handle.to_string(&mut HostNested(Some(host))) {
+            Ok(Some(text)) => text,
+            _ => {
+                let _ = host.unknown_host_call(&jar_text::object_to_string());
+                host_text(value)
+            }
+        },
         Value::Ref(Some(marker)) => host.modelled_to_string(value).unwrap_or_else(|| {
             // An object no model prints (a jar object, an identity hash)
             // is counted; the element keeps its marker in the text.
@@ -12220,7 +12181,7 @@ fn class_marker_like(
     {
         return true;
     }
-    const NON_CLASS_PREFIXES: [&str; 14] = [
+    const NON_CLASS_PREFIXES: [&str; 13] = [
         "@",
         "array/",
         "capability/",
@@ -12230,7 +12191,6 @@ fn class_marker_like(
         "list",
         "map",
         "number-format/",
-        "optional",
         "path:",
         "reflect-",
         "resource-",
@@ -12382,7 +12342,7 @@ fn describe_value(value: &Value) -> String {
         Value::Long(value) => format!("long {value}"),
         Value::Float(value) => format!("float {value}"),
         Value::Boxed(boxed) => format!("{} {}", boxed.class(), boxed.text()),
-        Value::Host(marker) => format!("host object {marker:?}"),
+        Value::Host(host) => format!("{:?} {:?}", host.kind(), host.key()),
         Value::Void => "void".into(),
         Value::Ref(None) => "null".into(),
         Value::Ref(Some(marker)) if marker.chars().count() > MAX_MARKER => {
@@ -18782,8 +18742,8 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
     if let Some(boxed) = Boxed::parse_marker(marker) {
         return Ok(Value::Boxed(boxed));
     }
-    if let Some(host) = marker.strip_prefix('h') {
-        return Ok(Value::Host(host.to_owned()));
+    if let Some(host) = HostRef::decode(marker) {
+        return Ok(Value::Host(host));
     }
     if let Some(value) = marker.strip_prefix('i') {
         return value
@@ -20161,6 +20121,18 @@ impl<H: Host> Runtime<'_, H> {
                 && let Some(text) = self.host_entry_text(&receiver, "callback", "callback")?
             {
                 return Ok(Some(text));
+            }
+            // `Object::toString`/`hashCode`/`equals` on a host handle: its
+            // kind's row, as the direct call runs it (`host_ref.rs`).
+            if let Some(value) = self.invoke_host_object_method(
+                &callback.target,
+                0xb9,
+                Some(&receiver),
+                &rest,
+                "callback",
+                "callback",
+            )? {
+                return Ok(Some(value));
             }
             // `StringBuilder::append` bound to a builder (`list.forEach(out::append)`):
             // the builder's text lives in the interpreter, so the call runs
@@ -24990,6 +24962,20 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
                         // `new String(...)` builds no text yet: counted.
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_host_object_method(
+                            &r,
+                            op,
+                            receiver.as_ref(),
+                            &args,
+                            class,
+                            method
+                        )
+                    ) {
+                        // A host handle's `toString`/`hashCode`/`equals`: its
+                        // kind's row, held jar objects run here (`host_ref.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -33876,8 +33862,8 @@ mandatory = true
         };
         let empty_value = host.invoke(&empty, &[]).unwrap();
         let value = host.invoke(&of, &[Value::Int(42)]).unwrap();
-        assert_eq!(empty_value, Value::Ref(Some(EMPTY_OPTIONAL_INT.into())));
-        assert_eq!(value, Value::Ref(Some("optional-int/42".into())));
+        assert_eq!(empty_value, host_optional::empty_of(HostKind::OptionalInt));
+        assert_eq!(value, optional_int(42));
 
         let present = MethodRef {
             owner: "java/util/OptionalInt".into(),
@@ -33937,11 +33923,8 @@ mandatory = true
         let long = host
             .invoke(&long_of, &[Value::Long(9007199254740991)])
             .unwrap();
-        assert_eq!(empty_long, Value::Ref(Some(EMPTY_OPTIONAL_LONG.into())));
-        assert_eq!(
-            long,
-            Value::Ref(Some("optional-long/9007199254740991".into()))
-        );
+        assert_eq!(empty_long, host_optional::empty_of(HostKind::OptionalLong));
+        assert_eq!(long, optional_long(9_007_199_254_740_991));
         let long_get = MethodRef {
             owner: "java/util/OptionalLong".into(),
             name: "getAsLong".into(),
@@ -33974,8 +33957,11 @@ mandatory = true
         };
         let empty_double = host.invoke(&double_empty, &[]).unwrap();
         let double = host.invoke(&double_of, &[Value::Float(3.5)]).unwrap();
-        assert_eq!(empty_double, Value::Ref(Some(EMPTY_OPTIONAL_DOUBLE.into())));
-        assert_eq!(double, Value::Ref(Some("optional-double/3.5".into())));
+        assert_eq!(
+            empty_double,
+            host_optional::empty_of(HostKind::OptionalDouble)
+        );
+        assert_eq!(double, optional_double(3.5));
         let double_get = MethodRef {
             owner: "java/util/OptionalDouble".into(),
             name: "getAsDouble".into(),

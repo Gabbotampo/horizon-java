@@ -346,6 +346,9 @@ impl<H: Host> Runtime<'_, H> {
         if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_MAP) {
             return self.identity_map_member(r, receiver, args);
         }
+        if let Some(answer) = self.identity_view_member(r, receiver, args)? {
+            return Ok(answer);
+        }
         let Some(marker) = expect_ref(receiver).cloned() else {
             return Ok(None);
         };
@@ -590,15 +593,155 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// `IdentityHashMap`: a lookup by a string or box whose equal value is a
-    /// key, and the iteration of two or more keys, are counted.
+    /// Whether `a == b` is unknown where the host compares `a.equals(b)`: two
+    /// equal strings or boxes (one object or two), or two equal host handles
+    /// of a kind that is not canonical from different constructions
+    /// (`HostRef::same_object`). Where it is known, the host's equality
+    /// answer is the identity answer: unequal values are different objects,
+    /// and an equal handle that is the same object is a hit.
+    fn identity_unknown(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Host(left), Value::Host(right)) => left.same_object(right).is_none(),
+            _ => self.equality_of(a) == Equality::Platform && a == b,
+        }
+    }
+
+    /// `compute`/`computeIfAbsent`/`computeIfPresent`/`merge` on an
+    /// `IdentityHashMap`, whose stored key equal to `key` (if any) is `key`
+    /// itself: `IdentityHashMap` keeps `Map`'s default bodies (`get`, the
+    /// function run through the interpreter, then `put` or `remove`), which
+    /// the host's own models could not run over a jar function. `Ok(None)`
+    /// for every other member.
+    fn identity_compute(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        entries: &[Value],
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let name = r.name.as_str();
+        let (key, function, incoming) = match (name, args) {
+            ("merge", [key, value, function]) => (key, function, Some(value)),
+            ("compute" | "computeIfAbsent" | "computeIfPresent", [key, function]) => {
+                (key, function, None)
+            }
+            _ => return Ok(None),
+        };
+        let null_pointer = || thrown("java/lang/NullPointerException", None);
+        if *function == Value::Ref(None) || incoming == Some(&Value::Ref(None)) {
+            return Err(null_pointer());
+        }
+        let present = |entries: &[Value]| entries.chunks(2).position(|pair| pair[0] == *key);
+        let old = present(entries).map_or(Value::Ref(None), |index| entries[index * 2 + 1].clone());
+        let new = match name {
+            // `v = get(k); if (v == null) { nv = f(k); if (nv != null) put }`.
+            "computeIfAbsent" if old != Value::Ref(None) => return Ok(Some(old)),
+            "computeIfAbsent" => self.apply_callback(function, std::slice::from_ref(key))?,
+            // `if ((old = get(k)) != null) { nv = f(k, old); put or remove }`.
+            "computeIfPresent" if old == Value::Ref(None) => return Ok(Some(Value::Ref(None))),
+            "computeIfPresent" | "compute" => {
+                self.apply_callback(function, &[key.clone(), old.clone()])?
+            }
+            // `nv = old == null ? value : f(old, value)`.
+            _ if old == Value::Ref(None) => incoming.cloned().unwrap_or(Value::Ref(None)),
+            _ => self.apply_callback(
+                function,
+                &[old.clone(), incoming.cloned().unwrap_or(Value::Ref(None))],
+            )?,
+        };
+        // The function may have changed the map: `put`/`remove` act on it as
+        // it is now.
+        let mut entries = match self.host.mutable_collection_entries(receiver) {
+            Some(entries) => entries,
+            None => self.collection_elements(receiver)?,
+        };
+        match (present(&entries), new == Value::Ref(None)) {
+            (Some(index), true) => {
+                // `compute`: `if (old != null || containsKey(k)) remove(k)`;
+                // the others remove only a present non-null value.
+                if name == "compute" || old != Value::Ref(None) {
+                    entries.drain(index * 2..index * 2 + 2);
+                }
+            }
+            (Some(index), false) => entries[index * 2 + 1] = new.clone(),
+            (None, true) => {}
+            (None, false) => entries.extend([key.clone(), new.clone()]),
+        }
+        self.host.replace_mutable_collection(receiver, entries);
+        Ok(Some(new))
+    }
+
+    /// A member of a `keySet()`/`values()`/`entrySet()` copy of an
+    /// `IdentityHashMap` (`hash_collections.rs` notes each copy's map): the
+    /// map compares keys, values and entries' parts with `==`, so an argument
+    /// whose identity with an equal stored one is unknown
+    /// ([`Self::identity_unknown`]) is counted. `None` for any other
+    /// receiver, or when the copy's equality answer is the identity one.
+    fn identity_view_member(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Option<Option<Value>>, NativeError> {
+        let Some(view) = expect_ref(receiver) else {
+            return Ok(None);
+        };
+        let Some(source) = self.host.view_copy_source(view) else {
+            return Ok(None);
+        };
+        let source = Value::Ref(Some(source));
+        if self.host_collection_class(&source).as_deref() != Some(IDENTITY_MAP) {
+            return Ok(None);
+        }
+        let entries = match self.host.mutable_collection_entries(&source) {
+            Some(entries) => entries,
+            None => self.collection_elements(&source)?,
+        };
+        let keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
+        let values: Vec<Value> = entries.iter().skip(1).step_by(2).cloned().collect();
+        // The arguments as the copy's elements: one, or a collection's.
+        let mut wanted = Vec::new();
+        for arg in args {
+            match self.host_collection_kind(arg) {
+                Some(_) => wanted.extend(self.collection_elements(arg).unwrap_or_default()),
+                None => wanted.push(arg.clone()),
+            }
+        }
+        let kind = self.host.view_copy_kind(view);
+        let unknown = |runtime: &Self, value: &Value, among: &[Value]| {
+            among
+                .iter()
+                .any(|stored| runtime.identity_unknown(value, stored))
+        };
+        let ambiguous = wanted.iter().any(|value| match kind.as_deref() {
+            Some("keySet") => unknown(self, value, &keys),
+            Some("values") => unknown(self, value, &values),
+            Some("entrySet") => map_entry_parts(value).is_ok_and(|(key, value)| {
+                unknown(self, &key, &keys) || unknown(self, &value, &values)
+            }),
+            _ => false,
+        });
+        if ambiguous {
+            return self.host.unknown_operand_call(r).map(|_| Some(None));
+        }
+        Ok(None)
+    }
+
+    /// `IdentityHashMap`: a lookup by a key whose identity with an equal key
+    /// is unknown ([`Self::identity_unknown`]), and the iteration of two or
+    /// more keys, are counted. A handle put twice is one key.
     fn identity_map_member(
         &mut self,
         r: &MethodRef,
         receiver: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let entries = self.collection_elements(receiver)?;
+        // The stored keys themselves: a handle's construction survives only
+        // in the `Value`, not in its marker.
+        let entries = match self.host.mutable_collection_entries(receiver) {
+            Some(entries) => entries,
+            None => self.collection_elements(receiver)?,
+        };
         let keyed = matches!(
             r.name.as_str(),
             "get"
@@ -617,8 +760,34 @@ impl<H: Host> Runtime<'_, H> {
             let Some(key) = args.first() else {
                 return Ok(None);
             };
-            let ambiguous = self.equality_of(key) == Equality::Platform
-                && entries.iter().step_by(2).any(|stored| stored == key);
+            let ambiguous = entries
+                .iter()
+                .step_by(2)
+                .any(|stored| self.identity_unknown(key, stored));
+            if ambiguous {
+                return self.host.unknown_operand_call(r).map(|_| None);
+            }
+            // Every stored key equal to `key` is `key` itself, or none is:
+            // the identity lookup is the equality one, so the host answers,
+            // except where the host's model cannot run the function.
+            return self.identity_compute(r, receiver, &entries, args);
+        }
+        // `putAll(map)`/`new IdentityHashMap<>(map)`: each of the source's
+        // keys is put by identity.
+        if matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("putAll", "(Ljava/util/Map;)V") | ("<init>", "(Ljava/util/Map;)V")
+        ) {
+            let Some(source) = args.first() else {
+                return Ok(None);
+            };
+            let incoming = self.collection_elements(source).unwrap_or_default();
+            let ambiguous = incoming.iter().step_by(2).any(|key| {
+                entries
+                    .iter()
+                    .step_by(2)
+                    .any(|stored| self.identity_unknown(key, stored))
+            });
             if ambiguous {
                 return self.host.unknown_operand_call(r).map(|_| None);
             }
@@ -628,12 +797,11 @@ impl<H: Host> Runtime<'_, H> {
             let Some(value) = args.first() else {
                 return Ok(None);
             };
-            let ambiguous = self.equality_of(value) == Equality::Platform
-                && entries
-                    .iter()
-                    .skip(1)
-                    .step_by(2)
-                    .any(|stored| stored == value);
+            let ambiguous = entries
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .any(|stored| self.identity_unknown(value, stored));
             if ambiguous {
                 return self.host.unknown_operand_call(r).map(|_| None);
             }
