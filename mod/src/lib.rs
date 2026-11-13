@@ -86,11 +86,11 @@ use mod_api::{
     LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef,
     LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
     LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
-    PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent,
-    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
-    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
-    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    Text,
+    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
+    PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext,
+    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
+    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
+    ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -990,6 +990,33 @@ impl Hooks for HorizonJava {
         }
     }
 
+    /// A player's break removed the block (Fabric's `PlayerBlockBreakEvents.AFTER`, which Fabric
+    /// API fires at the same `Block.destroy` call inside `ServerPlayerGameMode.destroyBlock`, once
+    /// `Level.removeBlock` succeeded; NeoForge has no event here). The level is the acting
+    /// player's (`destroyBlock`'s `this.level`), and the `BlockEntity` argument is `null` when no
+    /// block entity stood there.
+    fn player_destroyed_block(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut PlayerDestroyedBlockEvent,
+    ) {
+        let level = host
+            .players()
+            .acting_player()
+            .and_then(|player| player.entity().level(host))
+            .map(|level| level.dimension_id().to_owned());
+        let block = self.block_context(host, event.pos, event.state, None, None);
+        let context = destroyed_block_context(block, level, event.block_entity.as_ref());
+        self.fire_bridged(
+            Some(&mut *host),
+            Lifecycle::None,
+            GameEvent::BlockBreakAfter,
+            self.dedicated(),
+            context,
+            |_| true,
+        );
+    }
+
     /// A player left-clicked a block (Fabric's `AttackBlockCallback`, NeoForge's
     /// `PlayerInteractEvent.LeftClickBlock`).
     fn left_click_block(&self, host: &mut dyn ServerHost, event: &mut LeftClickBlockEvent) -> Flow {
@@ -1471,6 +1498,25 @@ fn entity_interact_context(
         }),
         level,
         ..EventContext::default()
+    }
+}
+
+/// The firing context of a completed break: the block context with the acting player's level
+/// and whether the removed block had a block entity.
+///
+/// `event.state` is the block the removal took out, which is `destroyBlock`'s `adjustedState`
+/// (what Fabric passes) except for a tripwire cut with shears, where `playerWillDestroy` sets
+/// `DISARMED` in the level but returns the armed state. The runtime's block state names only the
+/// block (`minecraft:tripwire` either way), so that difference does not reach a listener.
+fn destroyed_block_context(
+    block: EventContext,
+    level: Option<String>,
+    block_entity: Option<&mod_api::Compound>,
+) -> EventContext {
+    EventContext {
+        level,
+        block_entity: Some(block_entity.is_some()),
+        ..block
     }
 }
 
@@ -2943,6 +2989,32 @@ mod tests {
             assert_eq!((entity.id, entity.kind.as_str()), (3, "minecraft:cow"));
             assert_eq!(entity.level, level);
         }
+    }
+
+    /// `AFTER`'s `BlockEntity` is `null` only when no block entity stood at the position; the
+    /// level is the acting player's and the block and position come through unchanged.
+    #[test]
+    fn a_destroyed_block_names_its_level_and_whether_it_had_a_block_entity() {
+        let block = EventContext {
+            player: Some(7),
+            pos: Some([4, 64, -2]),
+            block: Some("minecraft:chest".to_owned()),
+            ..EventContext::default()
+        };
+        let saved = mod_api::Compound::default();
+        let context = destroyed_block_context(
+            block.clone(),
+            Some("minecraft:overworld".to_owned()),
+            Some(&saved),
+        );
+        assert_eq!(context.block_entity, Some(true));
+        assert_eq!(context.level.as_deref(), Some("minecraft:overworld"));
+        assert_eq!(context.pos, Some([4, 64, -2]));
+        assert_eq!(context.block.as_deref(), Some("minecraft:chest"));
+        assert_eq!(context.player, Some(7));
+        let context = destroyed_block_context(block, None, None);
+        assert_eq!(context.block_entity, Some(false));
+        assert_eq!(context.level, None);
     }
 
     /// `PlayerList.respawn` passes `keepAllPlayerData = false` for a death respawn and `true`
