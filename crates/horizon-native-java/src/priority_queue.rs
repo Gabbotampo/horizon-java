@@ -30,6 +30,8 @@ struct Heap {
     comparator: Option<Value>,
     /// The queue's row, which a callback may change behind `es`.
     receiver: Option<Value>,
+    /// Its `modCount` when the call began (`mod_count.rs`).
+    mc: mod_count::ModStamp,
 }
 
 fn thrown(class: &str) -> NativeError {
@@ -170,6 +172,7 @@ impl<H: Host> Runtime<'_, H> {
             es: self.collection_elements(receiver)?,
             comparator: self.host.collection_comparator(&marker),
             receiver: Some(receiver.clone()),
+            mc: self.mod_stamp(&marker),
         };
         let before = heap.es.clone();
         let result = self.priority_queue_member(r, receiver, &mut heap, args);
@@ -267,6 +270,11 @@ impl<H: Host> Runtime<'_, H> {
                 let action = action.clone();
                 let before = heap.es.clone();
                 let mut counted = false;
+                let marker = expect_ref(receiver).cloned().unwrap_or_default();
+                let changed = |this: &Self, heap: &Heap| -> Result<bool, NativeError> {
+                    Ok(this.mod_stamp(&marker) != heap.mc
+                        || this.collection_elements(receiver)? != before)
+                };
                 for element in before.clone() {
                     self.run_functional(
                         (
@@ -277,13 +285,14 @@ impl<H: Host> Runtime<'_, H> {
                         &action,
                         &[element],
                     )?;
-                    if !counted && self.collection_elements(receiver)? != before {
+                    if !counted && changed(self, heap)? {
                         self.host.unknown_operand_call(r)?;
                         counted = true;
                     }
                 }
+                let moved = changed(self, heap)?;
                 heap.es = self.collection_elements(receiver)?;
-                if heap.es != before {
+                if moved {
                     return Err(thrown("java/util/ConcurrentModificationException"));
                 }
                 Ok(Some(Value::Void))
@@ -321,7 +330,8 @@ impl<H: Host> Runtime<'_, H> {
         // a predicate that changed the queue leaves it as it made it.
         if let Some(receiver) = &heap.receiver {
             let live = self.collection_elements(receiver)?;
-            if live != heap.es {
+            let marker = expect_ref(receiver).cloned().unwrap_or_default();
+            if live != heap.es || self.mod_stamp(&marker) != heap.mc {
                 heap.es = live;
                 return Err(thrown("java/util/ConcurrentModificationException"));
             }
@@ -398,6 +408,7 @@ impl<H: Host> Runtime<'_, H> {
             es: elements,
             comparator: lent.clone(),
             receiver: None,
+            mc: mod_count::ModStamp::default(),
         };
         // A `SortedSet` is already in order; a `PriorityQueue` (exactly that
         // class) is already a heap; anything else is heapified.
