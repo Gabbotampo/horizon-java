@@ -308,13 +308,26 @@ pub enum CommandArgument {
     Float(f64),
     Double(f64),
     Str(String),
-    /// An entity selector that selected only players.
+    /// A players-only selector (`EntityArgument.player()`/`players()`), as the game resolved
+    /// it, in selection order.
     Players(Vec<u128>),
+    /// An any-entity selector (`EntityArgument.entity()`/`entities()`), as the game resolved
+    /// it, in selection order; the players among them are [`SelectedEntity::Player`].
+    Entities(Vec<SelectedEntity>),
     BlockPos([i32; 3]),
     Identifier(String),
     Uuid(u128),
     /// A dimension id.
     Dimension(String),
+}
+
+/// One entity an any-entity selector picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SelectedEntity {
+    /// An online player, by UUID: the `game/player/<uuid>` the façade answers.
+    Player(u128),
+    /// Any other entity, by its network id (`Entity.getId`).
+    Entity(i32),
 }
 
 /// One run of one command.
@@ -1085,50 +1098,11 @@ impl StdHost {
             | ("DoubleArgumentType", "getDouble", CommandArgument::Double(v)) => Value::Float(v),
             ("BoolArgumentType", "getBool", CommandArgument::Bool(v)) => Value::Int(i32::from(v)),
             ("StringArgumentType", "getString", CommandArgument::Str(v)) => marker(v),
-            ("EntityArgument", "getPlayer" | "getEntity", CommandArgument::Players(players)) => {
-                match players.as_slice() {
-                    [one] => marker(format!("game/player/{one:032x}")),
-                    [] => {
-                        let key = if r.name == "getPlayer" {
-                            "argument.player.notfound"
-                        } else {
-                            "argument.entity.notfound.entity"
-                        };
-                        self.brigadier
-                            .exception_texts
-                            .insert(key.into(), CommandText::key(key));
-                        return Some(Err(syntax_error(key)));
-                    }
-                    _ => return mismatch(),
-                }
-            }
             (
                 "EntityArgument",
-                "getPlayers" | "getOptionalPlayers" | "getEntities" | "getOptionalEntities",
-                CommandArgument::Players(players),
-            ) => {
-                if players.is_empty() && matches!(r.name.as_str(), "getPlayers" | "getEntities") {
-                    let key = if r.name == "getPlayers" {
-                        "argument.player.notfound"
-                    } else {
-                        "argument.entity.notfound.entity"
-                    };
-                    self.brigadier
-                        .exception_texts
-                        .insert(key.into(), CommandText::key(key));
-                    return Some(Err(syntax_error(key)));
-                }
-                let values = players
-                    .iter()
-                    .map(|uuid| marker(format!("game/player/{uuid:032x}")))
-                    .collect();
-                let list = format!(
-                    "java/util/ArrayList#brigadier-{}",
-                    stable_hash(&format!("{players:?}"))
-                );
-                self.mutable_collections.insert(list.clone(), values);
-                marker(list)
-            }
+                getter,
+                selection @ (CommandArgument::Players(_) | CommandArgument::Entities(_)),
+            ) => return self.entity_argument(getter, selection),
             (
                 "BlockPosArgument",
                 "getBlockPos" | "getLoadedBlockPos" | "getSpawnablePos",
@@ -1146,6 +1120,66 @@ impl StdHost {
             }
             _ => return mismatch(),
         }))
+    }
+
+    /// `EntityArgument.getEntity`/`getEntities`/`getOptionalEntities`/`getPlayer`/`getPlayers`/
+    /// `getOptionalPlayers` over the selection the game resolved, with `EntitySelector`'s checks:
+    /// `findSingleEntity` throws `argument.entity.notfound.entity` for none and
+    /// `argument.entity.toomany` for several, `findSinglePlayer` throws
+    /// `argument.entity.notfound.player` unless exactly one, and `getEntities`/`getPlayers` throw
+    /// their `notfound` for an empty list where the `getOptional` forms return it.
+    ///
+    /// A player getter on an any-entity selector is not answered (`None`, a counted unknown
+    /// call): `findPlayers` applies the selector's limit and sort among players only, a set the
+    /// game's entity resolution does not give. An entity getter on a players-only selector is
+    /// exact, since `findEntities` is `findPlayers` there.
+    fn entity_argument(
+        &mut self,
+        getter: &str,
+        selection: CommandArgument,
+    ) -> Option<Result<Value, NativeError>> {
+        let selected: Vec<SelectedEntity> = match selection {
+            CommandArgument::Players(players) => {
+                players.into_iter().map(SelectedEntity::Player).collect()
+            }
+            CommandArgument::Entities(entities) => {
+                if matches!(getter, "getPlayer" | "getPlayers" | "getOptionalPlayers") {
+                    return None;
+                }
+                entities
+            }
+            _ => return None,
+        };
+        let refuse = |this: &mut Self, key: &str| {
+            this.brigadier
+                .exception_texts
+                .insert(key.into(), CommandText::key(key));
+            Some(Err(syntax_error(key)))
+        };
+        let one = |entity: &SelectedEntity| match entity {
+            SelectedEntity::Player(uuid) => marker(format!("game/player/{uuid:032x}")),
+            SelectedEntity::Entity(id) => marker(format!("game/entity/{id}")),
+        };
+        match (getter, selected.as_slice()) {
+            ("getEntity", []) | ("getEntities", []) => {
+                refuse(self, "argument.entity.notfound.entity")
+            }
+            ("getEntity", [_, _, ..]) => refuse(self, "argument.entity.toomany"),
+            ("getPlayer", [] | [_, _, ..]) | ("getPlayers", []) => {
+                refuse(self, "argument.entity.notfound.player")
+            }
+            ("getEntity" | "getPlayer", [entity]) => Some(Ok(one(entity))),
+            ("getEntities" | "getOptionalEntities" | "getPlayers" | "getOptionalPlayers", _) => {
+                let values = selected.iter().map(one).collect();
+                let list = format!(
+                    "java/util/ArrayList#brigadier-{}",
+                    stable_hash(&format!("{selected:?}"))
+                );
+                self.mutable_collections.insert(list.clone(), values);
+                Some(Ok(marker(list)))
+            }
+            _ => None,
+        }
     }
 
     /// `context.getArgument(name, Class)`: the boxed value.

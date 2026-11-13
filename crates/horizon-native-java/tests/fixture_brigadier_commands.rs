@@ -174,9 +174,36 @@ const STUBS: &[(&str, &str)] = &[
         "package net.minecraft;\npublic enum ChatFormatting { AQUA, GOLD, BOLD }",
     ),
     (
+        "net/minecraft/world/entity/Entity.java",
+        "package net.minecraft.world.entity;\n\
+         public class Entity { public int getId() { return 0; } }",
+    ),
+    (
         "net/minecraft/server/level/ServerPlayer.java",
         "package net.minecraft.server.level;\n\
-         public class ServerPlayer { public String getScoreboardName() { return null; } }",
+         public class ServerPlayer extends net.minecraft.world.entity.Entity {\n\
+           public String getScoreboardName() { return null; } }",
+    ),
+    (
+        "net/minecraft/commands/arguments/EntityArgument.java",
+        "package net.minecraft.commands.arguments;\n\
+         import com.mojang.brigadier.context.CommandContext;\n\
+         import com.mojang.brigadier.exceptions.CommandSyntaxException;\n\
+         import net.minecraft.commands.CommandSourceStack;\n\
+         import net.minecraft.server.level.ServerPlayer;\n\
+         import net.minecraft.world.entity.Entity;\n\
+         import java.util.Collection;\n\
+         public class EntityArgument implements com.mojang.brigadier.arguments.ArgumentType<Object> {\n\
+           public static EntityArgument entity() { return null; }\n\
+           public static EntityArgument entities() { return null; }\n\
+           public static EntityArgument player() { return null; }\n\
+           public static EntityArgument players() { return null; }\n\
+           public static Entity getEntity(CommandContext<CommandSourceStack> c, String n) throws CommandSyntaxException { return null; }\n\
+           public static Collection<? extends Entity> getEntities(CommandContext<CommandSourceStack> c, String n) throws CommandSyntaxException { return null; }\n\
+           public static Collection<? extends Entity> getOptionalEntities(CommandContext<CommandSourceStack> c, String n) throws CommandSyntaxException { return null; }\n\
+           public static ServerPlayer getPlayer(CommandContext<CommandSourceStack> c, String n) throws CommandSyntaxException { return null; }\n\
+           public static Collection<ServerPlayer> getPlayers(CommandContext<CommandSourceStack> c, String n) throws CommandSyntaxException { return null; }\n\
+           public static Collection<ServerPlayer> getOptionalPlayers(CommandContext<CommandSourceStack> c, String n) throws CommandSyntaxException { return null; } }",
     ),
 ];
 
@@ -220,6 +247,39 @@ public final class CmdMod {
         ctx.getSource().registryAccess();
         return 1;
       }));
+      // Entity selectors, read the way jars read them (carryon's `/carryon clear <target>`).
+      dispatcher.register(Commands.literal("sel")
+        .then(Commands.argument("targets", net.minecraft.commands.arguments.EntityArgument.entities())
+          .executes(ctx -> net.minecraft.commands.arguments.EntityArgument.getEntities(ctx, "targets").size())));
+      dispatcher.register(Commands.literal("opt")
+        .then(Commands.argument("targets", net.minecraft.commands.arguments.EntityArgument.entities())
+          .executes(ctx -> net.minecraft.commands.arguments.EntityArgument.getOptionalEntities(ctx, "targets").size())));
+      dispatcher.register(Commands.literal("one")
+        .then(Commands.argument("target", net.minecraft.commands.arguments.EntityArgument.entity())
+          .executes(ctx -> {
+            net.minecraft.commands.arguments.EntityArgument.getEntity(ctx, "target");
+            return 1;
+          })));
+      dispatcher.register(Commands.literal("who")
+        .then(Commands.argument("targets", net.minecraft.commands.arguments.EntityArgument.players())
+          .executes(ctx -> {
+            String names = "";
+            java.util.Collection<net.minecraft.server.level.ServerPlayer> players =
+              net.minecraft.commands.arguments.EntityArgument.getPlayers(ctx, "targets");
+            for (net.minecraft.server.level.ServerPlayer player : players) names += player.getScoreboardName() + ";";
+            String line = names;
+            ctx.getSource().sendSuccess(() -> Component.literal(line), false);
+            return players.size();
+          })));
+      dispatcher.register(Commands.literal("me")
+        .then(Commands.argument("target", net.minecraft.commands.arguments.EntityArgument.players())
+          .executes(ctx -> {
+            net.minecraft.commands.arguments.EntityArgument.getPlayer(ctx, "target");
+            return 1;
+          })));
+      dispatcher.register(Commands.literal("selp")
+        .then(Commands.argument("targets", net.minecraft.commands.arguments.EntityArgument.entities())
+          .executes(ctx -> net.minecraft.commands.arguments.EntityArgument.getPlayers(ctx, "targets").size())));
     });
   }
 }
@@ -283,12 +343,20 @@ const ANA: u128 = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef;
 fn facade() -> Arc<EventFacade> {
     Arc::new(EventFacade {
         dedicated: true,
-        players: vec![FacadePlayer {
-            uuid: ANA,
-            name: "Ana".into(),
-            level: Some("minecraft:overworld".into()),
-            entity_id: Some(7),
-        }],
+        players: vec![
+            FacadePlayer {
+                uuid: ANA,
+                name: "Ana".into(),
+                level: Some("minecraft:overworld".into()),
+                entity_id: Some(7),
+            },
+            FacadePlayer {
+                uuid: BOB,
+                name: "Bob".into(),
+                level: Some("minecraft:overworld".into()),
+                entity_id: Some(8),
+            },
+        ],
         ..EventFacade::default()
     })
 }
@@ -482,6 +550,148 @@ fn a_registration_callback_builds_a_typed_tree_and_its_commands_run() {
     );
     match refused.outcome {
         CommandOutcome::Refused(reason) => assert!(reason.contains("registryAccess"), "{reason}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+const BOB: u128 = 0x0fed_cba9_8765_4321_0fed_cba9_8765_4321;
+
+/// `EntityArgument`'s getters over the selection the game resolved, with `EntitySelector`'s
+/// checks (`findSingleEntity`, `findSinglePlayer`, `getEntities`/`getPlayers` on an empty list):
+/// vanilla 26.3's `EntityArgument`/`EntitySelector`, its keys from `EntityArgument`'s exception
+/// types. A player getter on an any-entity selector is refused (counted), never answered.
+#[test]
+fn entity_selectors_answer_their_getters_with_vanillas_checks() {
+    use horizon_native_java::brigadier::SelectedEntity;
+    let root = scratch("selectors");
+    let Some(jar_path) = build_jar(&root) else {
+        eprintln!("skipped: no javac");
+        return;
+    };
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("main").unwrap();
+    let mut host = StdHost::new();
+    jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+    let listener = host
+        .game_listeners(&jar, true)
+        .listeners
+        .into_iter()
+        .find(|l| l.event == GameEvent::RegisterCommands)
+        .unwrap();
+    let mut firing = EventFiring::new(
+        GameEvent::RegisterCommands,
+        facade(),
+        EventContext::default(),
+    );
+    jar.run_game_listener(&listener, &mut firing, &mut host, &budget())
+        .unwrap();
+    let tree = host.command_tree();
+    let command = |literal: &str, kind: ArgumentKind| {
+        let (_, root) = tree
+            .roots()
+            .find(|(_, node)| node.kind.name() == literal)
+            .unwrap_or_else(|| panic!("/{literal} is registered"));
+        let argument = &tree.nodes[root.children[0]];
+        match &argument.kind {
+            NodeKind::Argument { kind: found, .. } => assert_eq!(found, &kind, "/{literal}"),
+            other => panic!("/{literal}: {other:?}"),
+        }
+        argument.command.clone().expect("executes")
+    };
+    let entities = ArgumentKind::Entity {
+        single: false,
+        players: false,
+    };
+    let players = ArgumentKind::Entity {
+        single: false,
+        players: true,
+    };
+    let sel = command("sel", entities.clone());
+    let opt = command("opt", entities.clone());
+    let selp = command("selp", entities);
+    let one = command(
+        "one",
+        ArgumentKind::Entity {
+            single: true,
+            players: false,
+        },
+    );
+    let who = command("who", players.clone());
+    let me = command("me", players);
+    let mut run = |command, name: &str, value: CommandArgument| {
+        jar.run_command(
+            command,
+            &CommandInvocation {
+                input: name.into(),
+                source: source(2, Some(ANA)),
+                arguments: vec![(name.into(), value)],
+            },
+            facade(),
+            &mut host,
+            &budget(),
+        )
+    };
+    let syntax = |key: &str| {
+        CommandOutcome::Syntax(CommandText {
+            text: key.into(),
+            translate: true,
+            component: None,
+        })
+    };
+    let picked = |entities: &[SelectedEntity]| CommandArgument::Entities(entities.to_vec());
+    let (ana, cow, pig) = (
+        SelectedEntity::Player(ANA),
+        SelectedEntity::Entity(42),
+        SelectedEntity::Entity(43),
+    );
+
+    // `getEntities`: the whole selection, players and mobs alike; none is `notfound.entity`.
+    assert_eq!(
+        run(&sel, "targets", picked(&[ana, cow, pig])).outcome,
+        CommandOutcome::Returned(3)
+    );
+    assert_eq!(
+        run(&sel, "targets", picked(&[])).outcome,
+        syntax("argument.entity.notfound.entity")
+    );
+    // `getOptionalEntities` returns the empty list.
+    assert_eq!(
+        run(&opt, "targets", picked(&[])).outcome,
+        CommandOutcome::Returned(0)
+    );
+    // `getEntity`: exactly one, else `notfound.entity` or `toomany`.
+    assert_eq!(
+        run(&one, "target", picked(&[cow])).outcome,
+        CommandOutcome::Returned(1)
+    );
+    assert_eq!(
+        run(&one, "target", picked(&[cow, pig])).outcome,
+        syntax("argument.entity.toomany")
+    );
+    assert_eq!(
+        run(&one, "target", picked(&[])).outcome,
+        syntax("argument.entity.notfound.entity")
+    );
+    // `getPlayers` on a players selector: every selected player, in order.
+    let both = run(&who, "targets", CommandArgument::Players(vec![BOB, ANA]));
+    assert_eq!(both.outcome, CommandOutcome::Returned(2));
+    assert_eq!(both.messages[0].text.text, "Bob;Ana;");
+    let none = run(&who, "targets", CommandArgument::Players(Vec::new()));
+    assert_eq!(none.outcome, syntax("argument.entity.notfound.player"));
+    // `getPlayer` (`findSinglePlayer`): anything but one player is `notfound.player`.
+    assert_eq!(
+        run(&me, "target", CommandArgument::Players(vec![ANA])).outcome,
+        CommandOutcome::Returned(1)
+    );
+    assert_eq!(
+        run(&me, "target", CommandArgument::Players(vec![ANA, BOB])).outcome,
+        syntax("argument.entity.notfound.player")
+    );
+    // A player getter on an any-entity selector: refused by name, not answered.
+    match run(&selp, "targets", picked(&[ana])).outcome {
+        CommandOutcome::Refused(reason) => assert!(reason.contains("getPlayers"), "{reason}"),
         other => panic!("expected a refusal, got {other:?}"),
     }
     let _ = fs::remove_dir_all(&root);
