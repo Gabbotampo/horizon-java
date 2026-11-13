@@ -96,9 +96,25 @@ public final class Probe {
         return take(entries.equals(map.entrySet()));
     }
 
+    static final NullPointerException SAVED = new NullPointerException();
+
+    /// A jar NPE that `AbstractSet.equals` swallows must not come back from
+    /// a later, unrelated host-raised NPE.
+    public static String swallowedThrowStaysSwallowed() {
+        Picky picky = new Picky("x", "y");
+        picky.throwInContains = SAVED;
+        boolean equal = picky.equals(new LinkedHashSet<>(List.of("x", "y")));
+        try {
+            java.util.Objects.requireNonNull(null);
+            return take("no");
+        } catch (NullPointerException e) {
+            return take(equal + "|" + (e == SAVED) + "|" + e.getMessage());
+        }
+    }
+
     public static String[] all() {
         return new String[] {"equalsCatchesJarCce", "equalsCatchesJarNpe", "equalsPropagatesJarIse",
-                "entrySetEqualsHashMapEntrySet"};
+                "entrySetEqualsHashMapEntrySet", "swallowedThrowStaysSwallowed"};
     }
 
     public static void main(String[] args) throws Exception {
@@ -117,5 +133,6 @@ fn review_119_runs_as_jdk_25_does() {
             "entrySetEqualsHashMapEntrySet",
             "sz ctentry gk1 gva => true",
         ),
+        ("swallowedThrowStaysSwallowed", "sz ctx => false|false|null"),
     ]);
 }

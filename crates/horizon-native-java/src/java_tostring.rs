@@ -38,6 +38,7 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("optional-double/", "java/util/OptionalDouble"),
         ("regex-pattern/", "java/util/regex/Pattern"),
         ("charset/", "java/nio/charset/Charset"),
+        ("coding-error-action/", "java/nio/charset/CodingErrorAction"),
         ("locale/", "java/util/Locale"),
         ("mod-origin/", "net/fabricmc/loader/api/metadata/ModOrigin"),
         ("unicode-block/", "java/lang/Character$UnicodeBlock"),
