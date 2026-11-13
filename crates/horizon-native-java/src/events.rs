@@ -1004,6 +1004,20 @@ pub struct FacadeEntity {
     pub level: Option<String>,
 }
 
+/// A clone's old player (`PlayerEvent.Clone#getOriginal`, Fabric `COPY_FROM`'s `oldPlayer`), as
+/// the game reads it during the clone hook. A fact the game does not give is `None`, and that
+/// read refuses (counted).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FacadeOriginal {
+    pub uuid: u128,
+    /// The player's name: the old and the new player share one game profile.
+    pub name: Option<String>,
+    /// The dimension id the old player was in (where they died, or the End).
+    pub level: Option<String>,
+    pub position: Option<[f64; 3]>,
+    pub health: Option<f32>,
+}
+
 /// The server state every firing exposes, snapshotted by the game.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EventFacade {
@@ -1062,6 +1076,9 @@ pub struct EventContext {
     /// What `player` holds and their game mode, read by the hook for this
     /// firing (`facade_world.rs`). `None` makes those reads refuse.
     pub held: Option<HeldItems>,
+    /// A clone's old player, for `PlayerEvent.Clone#getOriginal` and `COPY_FROM`'s `oldPlayer`.
+    /// `None` refuses `getOriginal` (counted).
+    pub original: Option<FacadeOriginal>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1136,6 +1153,15 @@ fn player_marker(uuid: u128) -> Value {
     marker(format!("game/player/{uuid:032x}"))
 }
 
+/// A clone's old player: its own holder (`neoforge_original.rs`) and façade, never the new
+/// player's `game/player/` marker.
+fn original_marker(uuid: u128) -> Value {
+    marker(format!(
+        "{}{uuid:032x}",
+        crate::neoforge_attachments::ORIGINAL_PREFIX
+    ))
+}
+
 fn dimension_key(id: &str) -> Value {
     marker(format!("resource-key/dimension/{id}"))
 }
@@ -1150,6 +1176,8 @@ enum Facade<'a> {
     PlayerList,
     Level(&'a str),
     Player(u128),
+    /// A clone's old player (`game/original-player/<uuid>`).
+    OriginalPlayer(u128),
     Connection(u128),
     Entity(i32),
     Event,
@@ -1174,6 +1202,7 @@ fn facade(marker: &str) -> Option<Facade<'_>> {
     Some(match kind {
         "level" => Facade::Level(id),
         "player" => Facade::Player(hex()?),
+        "original-player" => Facade::OriginalPlayer(hex()?),
         "connection" => Facade::Connection(hex()?),
         "entity" => Facade::Entity(id.parse().ok()?),
         _ => Facade::Opaque,
@@ -1563,6 +1592,30 @@ impl StdHost {
                     _ => None,
                 }
             }
+            // The old player's facts as the game read them for this clone; anything else (its
+            // inventory, entity id, held items) refuses.
+            Facade::OriginalPlayer(uuid) => {
+                let original = context.original.as_ref().filter(|o| o.uuid == *uuid)?;
+                let axis = |i: usize| original.position.map(|p| Value::Float(p[i]));
+                match (name, returns) {
+                    ("getUUID", _) => uuid_value(&uuid_text(*uuid)).ok(),
+                    ("getStringUUID", _) => Some(marker(uuid_text(*uuid))),
+                    ("getScoreboardName" | "getPlainTextName", _) => {
+                        original.name.clone().map(marker)
+                    }
+                    ("getName", _) => original
+                        .name
+                        .as_deref()
+                        .map(|name| component_value("literal", name)),
+                    ("level" | "serverLevel", _) => original.level.as_deref().map(level_marker),
+                    ("getX", "D") => axis(0),
+                    ("getY", "D") => axis(1),
+                    ("getZ", "D") => axis(2),
+                    ("getHealth", "F") => original.health.map(|h| Value::Float(f64::from(h))),
+                    ("getServer", _) => Some(marker(SERVER.into())),
+                    _ => None,
+                }
+            }
             Facade::Connection(uuid) => match (name, returns) {
                 ("getPlayer", _) => Some(player_marker(*uuid)),
                 _ => None,
@@ -1594,10 +1647,13 @@ impl StdHost {
                 // NeoForge `PlayerEvent.Clone#isWasDeath`: `ServerPlayer.restoreFrom(old,
                 // keepEverything)` posts `new Clone(this, old, !keepEverything)` (@371-382 of the
                 // 26.3 patched server). The firing's flag is Fabric `COPY_FROM`'s `alive`, which
-                // is that same `keepEverything`, so the answer is its negation. `getOriginal()`
-                // stays unanswered (counted): Horizon keeps one player across the copy and the
-                // game gives no view of the old one (docs/mod-plan.md, "Fork seams needed").
+                // is that same `keepEverything`, so the answer is its negation.
                 ("isWasDeath", "Z") if event == GameEvent::PlayerCopy => flag(!context.flag),
+                // `getOriginal()`: the old player the game lends for the clone hook (#3040).
+                ("getOriginal", _) if event == GameEvent::PlayerCopy => context
+                    .original
+                    .as_ref()
+                    .map(|original| original_marker(original.uuid)),
                 ("isCanceled", "Z") => flag(cancelled),
                 ("setCanceled", "V") => {
                     let cancel = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
@@ -2238,11 +2294,16 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             Value::Float(f64::from(context.amount)),
             Value::Int(i32::from(context.flag)),
         ],
-        // Horizon keeps one player across a respawn: the old and the new
-        // player are the same marker.
+        // `COPY_FROM(oldPlayer, newPlayer, alive)`: the old player is the clone's original. Without
+        // one (`AFTER_RESPAWN`, whose hook names no old player) both are the one marker Horizon
+        // keeps across a respawn.
         Shape::PlayerPair => {
             let player = player();
-            vec![player.clone(), player, Value::Int(i32::from(context.flag))]
+            let old = context
+                .original
+                .as_ref()
+                .map_or_else(|| player.clone(), |original| original_marker(original.uuid));
+            vec![old, player, Value::Int(i32::from(context.flag))]
         }
         Shape::ChangeLevel => vec![
             player(),
@@ -2843,6 +2904,39 @@ mod tests {
             .unwrap();
         assert_eq!(answered, Value::Long(0));
         assert_eq!(host.unknown_host_call_count(), before + 1);
+    }
+
+    /// Fabric `COPY_FROM(oldPlayer, newPlayer, alive)`: with the clone's original the two players
+    /// are different markers, the old one the original's own; without one they stay the one
+    /// player Horizon keeps across a respawn.
+    #[test]
+    fn copy_from_passes_the_original_as_the_old_player() {
+        let alex = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let firing = |original| {
+            EventFiring::new(
+                GameEvent::PlayerCopy,
+                Arc::new(EventFacade::default()),
+                EventContext {
+                    player: Some(alex),
+                    flag: true,
+                    original,
+                    ..EventContext::default()
+                },
+            )
+        };
+        let lent = FacadeOriginal {
+            uuid: alex,
+            ..FacadeOriginal::default()
+        };
+        let args = fabric_arguments(Shape::PlayerPair, &firing(Some(lent))).unwrap();
+        assert_eq!(
+            args[0],
+            marker("game/original-player/0123456789abcdef0011223344556677".into())
+        );
+        assert_eq!(args[1], player_marker(alex));
+        assert_eq!(args[2], Value::Int(1));
+        let args = fabric_arguments(Shape::PlayerPair, &firing(None)).unwrap();
+        assert_eq!(args[0], player_marker(alex));
     }
 
     /// A click's or an attack's entity argument is the target, not the acting player: vanilla's

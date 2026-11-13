@@ -249,7 +249,26 @@ drops", and it travels through the same bake. Without the package the item is na
   `player.level()` in vanilla, and the pin reads it as the player's entity's level
   (`EntitiesBackend::entity_level`, which the bridge already uses for the player list).
 
-- **The old player on `player_clone`.** Filed as [arismoko/horizon#3040](https://github.com/arismoko/horizon/issues/3040); the issue text, in the fork's template:
+- **The old player on `player_clone`** ([arismoko/horizon#3040](https://github.com/arismoko/horizon/issues/3040)).
+  Answered since the `1cc882b8e0` pin: `PlayerCloneEvent.original` lends the old player for the
+  hook. NeoForge's `getOriginal()` and Fabric `COPY_FROM`'s `oldPlayer` are now that player's own
+  marker (`game/original-player/<uuid>`), never the new player's:
+  - **Attachments.** The clone batch reads the old player's store (`Holder::OriginalPlayer`) before
+    the copy step, and the runtime keeps the Java objects it held for that player
+    (`neoforge_original.rs`). So `getOriginal().getData(T)` answers the object the jar last saw,
+    a non-`copyOnDeath` one included (carryon's `CarryOnData`), a saved value never decoded
+    decodes into the old player's own object, and an absent one runs the default. `setData`,
+    `removeData` and a default change only the old player's map, which is discarded with it, as
+    the old `ServerPlayer` is; nothing reaches the store (the fork refuses writes to the original).
+  - **Facts.** UUID and name (one game profile), level, `getX`/`getY`/`getZ` and `getHealth` come
+    from the `original_player_*` reads. Anything else on the old player (its inventory, entity id,
+    held items) is counted.
+  - **Departures.** The view ends with the hook, where a NeoForge listener could keep the old
+    object and read it later. The handle's store token is read through the API's
+    `__private::game::Fields` (it has no public accessor). Fabric `AFTER_RESPAWN` still passes the
+    one player twice: `player_respawned` names no old player.
+
+  The issue text, in the fork's template:
 
   > **Ask.** Let a `player_clone` listener read the player as they were before the copy: a
   > handle (say `event.original`), valid only during the hook, whose reads answer the old player's
@@ -397,7 +416,7 @@ crates/horizon-mod-package crates/cargo-horizon-mod docs/native-mods.md docs/mod
   - `entity_interact`: the event carries `hand` (#2797's carry). This mod still reads the acting hand
     from the host. Wiring the field is a follow-up.
   - `player_clone`: the event carries `original: OriginalPlayerRef`, a hook-scoped view of the old
-    player (#3040). Not used yet.
+    player (#3040), which the bridge now lends to `getOriginal`/`COPY_FROM` (see "Fork seams needed").
   - `right_click_block`: it now fires for spectators too, and `use_block`/`use_item` `Default` got
     exact vanilla rules. This mod never writes either field. It only fires `UseBlock` and cancels
     with the jar's `InteractionResult`, as before. Fabric's `UseBlockCallback` also fires for a

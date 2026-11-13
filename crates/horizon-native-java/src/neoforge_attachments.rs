@@ -61,6 +61,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "neoforge_original.rs"]
+mod original;
+pub use original::ORIGINAL_PREFIX;
+use original::{Original, original_uuid};
+
 use crate::attachment_codec::{Codecs, Coded, READ_FAILED};
 use crate::java_nbt::NbtCompound;
 use crate::{
@@ -253,6 +258,8 @@ pub struct AttachmentState {
     /// `SYNC_NOT_SENT` counts made in the open batch: accounting, not a neutral answer, so they
     /// do not taint.
     sync_in_batch: usize,
+    /// A clone's old player, while its batch is open (`neoforge_original.rs`).
+    original: Option<Original>,
 }
 
 impl AttachmentState {
@@ -283,6 +290,13 @@ impl AttachmentState {
         }
         for live in self.live.values() {
             value(&live.value, out);
+        }
+        for live in self
+            .original
+            .iter()
+            .flat_map(|original| original.live.values())
+        {
+            value(live, out);
         }
     }
 
@@ -361,6 +375,7 @@ impl StdHost {
     pub fn close_attachment_batch(&mut self) -> Vec<StoreWrite> {
         let state = &mut self.neoforge_attachments;
         state.view = None;
+        state.original = None;
         state.stats.live = state.live.len();
         std::mem::take(&mut state.journal)
     }
@@ -401,6 +416,7 @@ impl StdHost {
         state.live.clear();
         state.allocated.clear();
         state.view = None;
+        state.original = None;
         state.journal.clear();
     }
 
@@ -865,7 +881,8 @@ impl<H: Host> Runtime<'_, H> {
         let Some((op, by_supplier)) = holder_op(r) else {
             return Ok(None);
         };
-        let Some(player) = player_uuid(receiver) else {
+        let original = original_uuid(receiver);
+        let Some(player) = player_uuid(receiver).or(original) else {
             return Ok(None);
         };
         let Some(type_marker) =
@@ -895,10 +912,15 @@ impl<H: Host> Runtime<'_, H> {
                 "type not registered",
             )));
         };
+        let holder = receiver.cloned().unwrap_or(Value::Ref(None));
+        if original.is_some() {
+            return self
+                .original_holder_call(r, op, player, &id, &subject, &spec, &holder, args)
+                .map(Some);
+        }
         if let Err(why) = state.entry(player, &id) {
             return Ok(Some(self.attachment_refusal(r, &subject, &why)));
         }
-        let holder = receiver.cloned().unwrap_or(Value::Ref(None));
         let value = match op {
             HolderOp::Sync => {
                 // `Entity#syncData` → `AttachmentSync.syncEntityUpdate`: nothing without a sync

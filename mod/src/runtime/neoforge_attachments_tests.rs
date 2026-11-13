@@ -1028,6 +1028,88 @@ fn death_keeps_only_copy_on_death_types_as_new_objects() {
     fixture.close(0);
 }
 
+/// `PlayerEvent.Clone#getOriginal` is the old `ServerPlayer`, still whole when
+/// `ServerPlayer.restoreFrom` posts the event: its attachment map holds the very objects the jar
+/// last saw, the non-`copyOnDeath` ones included, while the new player starts from the death copy.
+/// A default made on the old player, or a value set on it, stays on the old player: nothing is
+/// journaled to the store, and the view ends with the batch.
+#[test]
+fn a_clones_original_keeps_the_old_players_objects() {
+    let original = text(&format!("game/original-player/{P:032x}"));
+    let on_original = |fixture: &mut Fixture, name: &str, which: i32| {
+        let descriptor = match name {
+            "has" => format!("({PLAYER}I)Z"),
+            _ => format!("({PLAYER}I)Ljava/lang/Object;"),
+        };
+        fixture
+            .call(name, &descriptor, &[original.clone(), Value::Int(which)])
+            .unwrap()
+    };
+    let mut fixture = Fixture::registered();
+    fixture.open();
+    let carried = fixture.on("get", DATA);
+    fixture.select(&carried, 2);
+    let kept = fixture.on("get", KEPT);
+    fixture.select(&kept, 5);
+    fixture.close(0);
+    // The game's view of the old player's store, taken before its death copy.
+    let ids = fixture.host.attachment_store_ids();
+    let before_death = ids
+        .iter()
+        .map(|id| {
+            let entry = match fixture.store.get(&(P, id.clone())) {
+                Some(Fake::Ours { token, .. }) => StoreEntry::Ours(*token),
+                Some(Fake::Raw(saved)) => StoreEntry::Raw(saved.clone()),
+                None => StoreEntry::Absent,
+            };
+            (id.clone(), entry)
+        })
+        .collect();
+    fixture.die();
+    fixture.open();
+    fixture.host.open_original_attachments(P, Ok(before_death));
+    fixture
+        .jar
+        .attachment_player_cloned(&mut fixture.host, &fixture.budget, P, true);
+    let runs = fixture.supplier_runs();
+
+    // The old player answers its own objects; carryon's type (no copyOnDeath) included.
+    assert_eq!(on_original(&mut fixture, "get", DATA), carried);
+    assert_eq!(fixture.selected(&carried), 2);
+    assert_eq!(on_original(&mut fixture, "get", KEPT), kept);
+    assert_eq!(on_original(&mut fixture, "has", TRANSIENT), Value::Int(0));
+    // The new player has the death copy: a new KEPT object, and DATA gone (a new default).
+    let kept_after = fixture.on("get", KEPT);
+    assert_ne!(kept_after, kept);
+    assert_eq!(fixture.selected(&kept_after), 5);
+    let carried_after = fixture.on("get", DATA);
+    assert_ne!(carried_after, carried);
+    assert_eq!(fixture.selected(&carried_after), -1);
+    assert_eq!(fixture.supplier_runs(), runs + 1);
+
+    // A value set on the old player stays there.
+    let nine = fixture.fresh(9);
+    let previous = fixture
+        .call(
+            "set",
+            &format!("({PLAYER}ILjava/lang/Object;)Ljava/lang/Object;"),
+            &[original.clone(), Value::Int(DATA), nine.clone()],
+        )
+        .unwrap();
+    assert_eq!(previous, carried);
+    assert_eq!(on_original(&mut fixture, "get", DATA), nine);
+    assert_eq!(fixture.on("get", DATA), carried_after);
+    // Only the new player's default reaches the store; the 9 set on the old player never does.
+    fixture.close(0);
+    assert_eq!(fixture.saved("demo:data"), Some(carry(&[])));
+
+    // After the batch the old player is gone: a read is refused, never answered.
+    fixture.open();
+    assert_eq!(on_original(&mut fixture, "get", DATA), Value::Ref(None));
+    assert_eq!(fixture.unknown("expired with its clone event"), 1);
+    fixture.close(0);
+}
+
 /// Bytecode-derived, not run: an End return (`restoreAll = true`, so `isDeath = false`) copies
 /// every serializable type through the copy handler, a new object, and never a type without a
 /// serializer (`copyAttachments` @20).
