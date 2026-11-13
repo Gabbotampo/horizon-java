@@ -95,6 +95,7 @@ mod nested_jars;
 mod night_config;
 mod null_checks;
 mod open_options;
+mod optionull;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -20201,6 +20202,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_reflect_simple_name(r, receiver)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_reflect_enclosing_class(r, receiver)? {
+            return Ok(Some(value));
+        }
         // `getSuperclass` walks the jar's own hierarchy: a config scanner that
         // recurses until it reaches `Object.class` must reach it. A class the
         // runtime does not hold (a game or JDK class) answers `Object`, the one
@@ -24199,6 +24203,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_collection_callback(&r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_optionull(&r, &args))
+                    {
+                        // The game's pure `Optionull` helper (`optionull.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
