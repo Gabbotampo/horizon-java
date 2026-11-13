@@ -13,6 +13,9 @@
 //! (`javac --release 21` in the same two stages, `java -cp`), pasted
 //! verbatim, exception messages included.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
@@ -139,11 +142,7 @@ public interface IW extends IX { @Override String who(); }
 /// Compile the shipped `lib/` interfaces on their own and read their class
 /// files back.
 fn shipped_lib(test: &str) -> Vec<(String, Vec<u8>)> {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-{test}-lib-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("{test}-lib"));
     let javac = std::env::var_os("JAVA_HOME")
         .map(|home| PathBuf::from(home).join("bin/javac"))
         .unwrap_or_else(|| "javac".into());
