@@ -45,6 +45,10 @@ impl DequeLayout {
         self.head
     }
 
+    pub(crate) fn capacity_of(self) -> usize {
+        self.capacity
+    }
+
     /// What slot `slot` holds: the element there, or `null`.
     pub(crate) fn slot(self, slot: usize, elements: &[Value]) -> Value {
         let index = (slot + self.capacity - self.head % self.capacity) % self.capacity;
