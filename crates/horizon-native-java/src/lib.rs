@@ -19569,12 +19569,9 @@ impl<H: Host> Runtime<'_, H> {
             let Some(supplied) = self.invoke_callback(callback, &[])? else {
                 return Ok(None);
             };
+            // The supplied object itself is thrown (`jar_throwables.rs`).
             return Err(match supplied {
-                Value::Ref(Some(_)) => NativeError::UncaughtException {
-                    class: thrown_class(&supplied),
-                    message: thrown_message(&supplied, self.host),
-                    frame: None,
-                },
+                Value::Ref(Some(_)) => self.throw_object(&supplied, None),
                 other => thrown_from_supplied(other),
             });
         }
@@ -19795,8 +19792,10 @@ impl<H: Host> Runtime<'_, H> {
                 return true;
             }
             let Some(file) = self.class(&current) else {
-                // A JDK skeleton superclass's own supertypes (`jdk_skeletons/`).
-                return jdk_skeletons::skeleton_is_instance(&current, wanted).unwrap_or(false);
+                // A JDK skeleton superclass's own supertypes (`jdk_skeletons/`),
+                // else a JDK throwable superclass and its JDK ancestors.
+                return jdk_skeletons::skeleton_is_instance(&current, wanted)
+                    .unwrap_or_else(|| jar_throwables::throwable_is_instance(&current, wanted));
             };
             if file
                 .interface_names()
@@ -22384,9 +22383,15 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The throwable value a Java handler receives for a throw the host or a
     /// nested frame raised, tagged with the message the throw carries.
-    fn caught_throwable(&mut self, class: &str, message: Option<String>) -> Value {
-        // The object a jar frame threw, when this is its throw.
-        if let Some(value) = jar_throwables::take_in_flight(class, &message) {
+    fn caught_throwable(
+        &mut self,
+        class: &str,
+        message: Option<String>,
+        frame: Option<&str>,
+    ) -> Value {
+        // The object thrown from `frame`, the error's origin
+        // (`jar_throwables.rs`).
+        if let Some(value) = self.caught_object(class, &message, frame) {
             return value;
         }
         let value = self.new_object(class);
@@ -22966,7 +22971,7 @@ impl<H: Host> Runtime<'_, H> {
                         if let Some(handler) =
                             self.exception_handler(file, method, desc, $at, &thrown)?
                         {
-                            let value = self.caught_throwable(&thrown, message);
+                            let value = self.caught_throwable(&thrown, message, frame.as_deref());
                             stack.clear();
                             stack.push(value);
                             pc = handler;
@@ -24022,6 +24027,12 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
+                    {
+                        // A jar exception's inherited `Throwable` text members
+                        // (`jar_throwables.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
@@ -24087,7 +24098,7 @@ impl<H: Host> Runtime<'_, H> {
                             || r.descriptor
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
-                        format_java_string_call(self, &r, &args)?
+                        invoke_or_catch!(at, format_java_string_call(self, &r, &args))
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_string_join(&r, &args))
                     {
@@ -24099,10 +24110,12 @@ impl<H: Host> Runtime<'_, H> {
                         // `String`'s regex methods (`regex_calls.rs`).
                         value
                     } else if let Some(value) =
-                        self.invoke_reflect_array(&r, &args, class, method)?
+                        invoke_or_catch!(at, self.invoke_reflect_array(&r, &args, class, method))
                     {
                         value
-                    } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_arrays(&r, &args, class, method))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -24205,9 +24218,10 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_color_collection(&r, receiver.as_ref(), &args)
                     ) {
                         value
-                    } else if let Some(value) =
-                        self.invoke_callback_info(&r, receiver.as_ref(), &args)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_callback_info(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if r.owner == "java/lang/Class"
                         && r.name == "forName"
@@ -24231,7 +24245,7 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         value
                     } else if let Some(value) =
-                        self.invoke_jdk_runtime(&r, receiver.as_ref(), &args)?
+                        invoke_or_catch!(at, self.invoke_jdk_runtime(&r, receiver.as_ref(), &args))
                     {
                         value
                     } else if let Some(value) = invoke_or_catch!(
@@ -24241,9 +24255,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.invoke_game_enum_values(&r, class, method) {
                         value
-                    } else if let Some(value) =
-                        self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)?
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)
+                    ) {
                         value
                     } else if let Some((owner, jar_owned)) =
                         self.dispatch_owner(&r, op, receiver.as_ref())
@@ -24253,9 +24268,10 @@ impl<H: Host> Runtime<'_, H> {
                             name: r.name.clone(),
                             descriptor: r.descriptor.clone(),
                         };
-                        if let Some(value) =
-                            self.invoke_enum_member(&resolved, receiver.as_ref(), &args)?
-                        {
+                        if let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_enum_member(&resolved, receiver.as_ref(), &args)
+                        ) {
                             value
                         } else if jar_owned {
                             jar_body = true;
@@ -24564,14 +24580,10 @@ impl<H: Host> Runtime<'_, H> {
                         pc = handler;
                         continue;
                     }
-                    let message = self.thrown_text(&thrown);
-                    // The handler that catches this throw gets this object.
-                    jar_throwables::note_in_flight(&thrown_class, &message, &thrown);
-                    return Err(NativeError::UncaughtException {
-                        class: thrown_class,
-                        message,
-                        frame: Some(format!("{class}#{method} +{at}")),
-                    });
+                    // The handler that catches this throw gets this object
+                    // (`jar_throwables.rs`): it is filed under this
+                    // instruction, the error's origin.
+                    return Err(self.throw_object(&thrown, Some(format!("{class}#{method} +{at}"))));
                 }
                 // `freturn`/`dreturn` round to the declared width so a host
                 // value that arrived as a `double` still answers as a `float`.
