@@ -599,6 +599,7 @@ fn execution_json(
         "host_calls": calls,
         "unknown_host_call_count": host.unknown_host_call_count(),
         "unknown_host_calls": host.unknown_host_calls(),
+        "parked_threads": parked_threads_json(host),
         "payload_directions": host
             .payload_registrations()
             .iter()
@@ -855,6 +856,7 @@ fn main() -> ExitCode {
                         "error": error.to_string(),
                         "unknown_host_call_count": host.unknown_host_call_count(),
                         "unknown_host_calls": host.unknown_host_calls(),
+                        "parked_threads": parked_threads_json(&host),
                     })
                 );
             } else {
@@ -996,6 +998,16 @@ fn game_listener_counts(
         "events": events,
         "unsupported": found.unsupported,
     })
+}
+
+/// The threads the jar started whose bodies never ran (`Thread.start` is a
+/// counted unknown call): what each would have run, and its name if the jar
+/// gave one.
+fn parked_threads_json(host: &StdHost) -> serde_json::Value {
+    host.parked_threads()
+        .iter()
+        .map(|thread| serde_json::json!({ "name": thread.name, "runnable": thread.runnable }))
+        .collect()
 }
 
 #[cfg(test)]

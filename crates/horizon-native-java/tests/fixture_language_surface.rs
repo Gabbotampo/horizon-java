@@ -1,6 +1,9 @@
 //! Source-built Fabric fixtures for the bounded runtime's string surface:
 //! `StringBuilder` mutation and `StringConcatFactory` call sites.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{ExecutionReport, NativeError, NativeJar, StdHost};
 use std::{
     fs,
@@ -13,12 +16,8 @@ use zip::write::SimpleFileOptions;
 /// Compile one entrypoint and package it as a Fabric jar, the same way the
 /// other source-built fixtures do. Each fixture gets its own directory so the
 /// tests never share a build root.
-fn build_fixture(tag: &str, id: &str, entrypoint: &str, source: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-language-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_fixture(tag: &str, id: &str, entrypoint: &str, source: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("language-{tag}"));
     let class = entrypoint.replace('.', "/");
     let source_path = root.join("src").join(format!("{class}.java"));
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -52,7 +51,7 @@ fn build_fixture(tag: &str, id: &str, entrypoint: &str, source: &str) -> PathBuf
     zip.write_all(&fs::read(root.join("classes").join(format!("{class}.class"))).unwrap())
         .unwrap();
     zip.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 fn execute(jar_path: &Path) -> Result<ExecutionReport, NativeError> {
