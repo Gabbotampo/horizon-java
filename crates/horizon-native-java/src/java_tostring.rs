@@ -81,9 +81,10 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
 /// The text `String.valueOf(value)` gives for a model object.
 pub(crate) fn modelled<H: Host>(host: &mut H, value: &Value) -> Option<String> {
     // A host object (an `Optional`) prints through its class's model.
-    if let Value::Host(_) = value {
+    if let Value::Host(handle) = value {
         let to_string = MethodRef {
-            owner: crate::class_of_value(value)?,
+            // A handle whose class is not known still has `Object.toString`.
+            owner: handle.class().unwrap_or("java/lang/Object").to_owned(),
             name: "toString".into(),
             descriptor: "()Ljava/lang/String;".into(),
         };

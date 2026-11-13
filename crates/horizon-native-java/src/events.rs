@@ -896,8 +896,9 @@ pub(crate) fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
         .map(|(_, event)| (*event, loader))
 }
 
-fn fabric_field(marker: &str) -> Option<&'static FabricField> {
-    let (owner, field) = marker.strip_prefix("fabric-event/")?.rsplit_once('.')?;
+/// The API field a Fabric event handle (`host_events.rs`) names.
+fn fabric_field(event: &Value) -> Option<&'static FabricField> {
+    let (owner, field) = crate::host_events::fabric_field_of(event)?;
     FABRIC_FIELDS
         .iter()
         .find(|row| row.owner == owner && row.field == field)
@@ -1257,8 +1258,8 @@ impl StdHost {
     }
 
     /// The statics a listener's registration and body read through the host:
-    /// a Fabric `Event` field keeps its name (`fabric-event/<owner>.<FIELD>`),
-    /// a Forge event's `BUS` names its event, and the façade answers
+    /// a Fabric `Event` field is the event handle naming its owner and field,
+    /// a Forge event's `BUS` the bus handle naming its event (`host_events.rs`), and the façade answers
     /// `InteractionResult` and dimension constants plus the field read of a
     /// join handler's `player`.
     pub(crate) fn game_event_static(&self, r: &MethodRef) -> Option<Value> {
@@ -1270,7 +1271,7 @@ impl StdHost {
         if r.descriptor == "Lnet/fabricmc/fabric/api/event/Event;"
             && r.owner.starts_with("net/fabricmc/fabric/api/")
         {
-            return Some(marker(format!("fabric-event/{}.{}", r.owner, r.name)));
+            return Some(crate::host_events::fabric_field_event(&r.owner, &r.name));
         }
         // `Event.DEFAULT_PHASE` and the `EventPriority` constants: what a
         // listener's order is registered with (`order.rs`).
@@ -1282,12 +1283,17 @@ impl StdHost {
         {
             return Some(marker(format!("enum/{}/{}", r.owner, r.name)));
         }
+        // Forge EventBus 7's per-event bus, typed exactly (a `BusGroup` is no
+        // `EventBus`).
         if r.name == "BUS"
             && r.owner.starts_with(FORGE_EVENT_ROOT)
-            && r.descriptor
-                .starts_with("Lnet/minecraftforge/eventbus/api/bus/")
+            && matches!(
+                r.descriptor.as_str(),
+                "Lnet/minecraftforge/eventbus/api/bus/EventBus;"
+                    | "Lnet/minecraftforge/eventbus/api/bus/CancellableEventBus;"
+            )
         {
-            return Some(marker(format!("forge-bus/{}", r.owner)));
+            return Some(crate::host_events::forge_bus(&r.owner));
         }
         match (r.owner.as_str(), r.name.as_str()) {
             ("net/minecraft/world/InteractionResult", name)
@@ -1914,10 +1920,10 @@ fn count_unsupported(out: &mut GameListeners, source: String) {
 fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameListeners) {
     let owner = invocation.method.owner.as_str();
     let name = invocation.method.name.as_str();
-    let receiver = invocation.receiver.as_ref().and_then(expect_ref);
+    let receiver = invocation.receiver.as_ref();
     // Fabric: `<Field>.addPhaseOrdering(first, second)`, kept for the order.
     if owner == FABRIC_EVENT && name == "addPhaseOrdering" {
-        if let Some(row) = receiver.and_then(|r| fabric_field(r))
+        if let Some(row) = receiver.and_then(fabric_field)
             && let [first, second] = invocation.args.as_slice()
         {
             out.phase_orderings.push(PhaseOrdering {
@@ -1930,14 +1936,14 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     }
     // Fabric: `<Field>.register([phase,] listener)` on a named Event field.
     if owner == FABRIC_EVENT && name == "register" {
-        let Some(receiver) = receiver else {
+        let Some(event) = receiver else {
             return;
         };
-        let Some(source) = receiver.strip_prefix("fabric-event/") else {
+        let Some(source) = crate::host_events::fabric_event_name(event) else {
             return;
         };
-        let Some(row) = fabric_field(receiver) else {
-            count_unsupported(out, source.to_owned());
+        let Some(row) = fabric_field(event) else {
+            count_unsupported(out, source);
             return;
         };
         let source = fabric_source(row);
@@ -1992,11 +1998,11 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     }
     // Forge EventBus 7: `<Event>.BUS.addListener([priority,] [alwaysCancelling,] listener)`.
     if FORGE_BUSES.contains(&owner) && name == "addListener" {
-        let Some(class) = receiver.and_then(|r| r.strip_prefix("forge-bus/")) else {
+        let Some(class) = receiver.and_then(crate::host_events::forge_bus_event) else {
             return;
         };
         push_bus_listener(
-            class,
+            &class,
             invocation,
             jar,
             out,
@@ -2742,22 +2748,27 @@ mod tests {
 
     #[test]
     fn client_events_name_their_fabric_fields_and_bus_classes() {
-        let row = fabric_field(
-            "fabric-event/net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.END_CLIENT_TICK",
+        let field =
+            |owner, name| fabric_field(&crate::host_events::fabric_field_event(owner, name));
+        let row = field(
+            "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents",
+            "END_CLIENT_TICK",
         )
         .unwrap();
         assert_eq!(
             (row.event, row.method, row.shape),
             (GameEvent::ClientTickEnd, "onEndTick", Shape::Minecraft)
         );
-        let join = fabric_field(
-            "fabric-event/net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents.JOIN",
+        let join = field(
+            "net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents",
+            "JOIN",
         )
         .unwrap();
         assert_eq!(join.event, GameEvent::ClientJoin);
         // The server's own `JOIN` stays the server's.
-        let server_join = fabric_field(
-            "fabric-event/net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents.JOIN",
+        let server_join = field(
+            "net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents",
+            "JOIN",
         )
         .unwrap();
         assert_eq!(server_join.event, GameEvent::PlayerJoin);

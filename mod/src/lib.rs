@@ -2811,8 +2811,8 @@ mod tests {
     /// cancels-last`.
     #[test]
     fn listeners_of_every_jar_run_in_one_priority_order() {
+        use crate::runtime::MethodRef;
         use crate::runtime::neoforge_bus::fixture_tests::fixture_jar_bytes;
-        use crate::runtime::{MethodRef, Value};
         let budget = ExecutionBudget::within(Duration::from_secs(20));
         let mut jars: Vec<LoadedJar> = ["first", "second"]
             .into_iter()
@@ -2826,7 +2826,7 @@ mod tests {
                         descriptor: "(Lnet/neoforged/bus/api/IEventBus;)V".into(),
                     },
                     None,
-                    &[Value::Ref(Some(runtime::neoforge_bus::GAME_BUS.into()))],
+                    &[runtime::neoforge_bus::game_bus()],
                     &mut host,
                     &budget,
                 )

@@ -44,7 +44,7 @@ fn instance_of(handle: &HostRef, wanted: &str, _: &dyn ClassHierarchy) -> Option
         HostKind::WatchKey => &["sun/nio/fs/AbstractWatchKey", "java/nio/file/WatchKey"],
         _ => &["java/nio/file/WatchEvent"],
     };
-    Some(wanted == "java/lang/Object" || wanted == handle.class() || types.contains(&wanted))
+    Some(wanted == "java/lang/Object" || handle.class() == Some(wanted) || types.contains(&wanted))
 }
 
 pub(crate) const WATCH_KIND: Methods = Methods {

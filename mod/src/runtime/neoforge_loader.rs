@@ -134,7 +134,7 @@ impl StdHost {
                 "net/neoforged/neoforge/common/NeoForge",
                 "EVENT_BUS",
                 "Lnet/neoforged/bus/api/IEventBus;",
-            ) => Some(Value::Ref(Some(crate::runtime::neoforge_bus::GAME_BUS.into()))),
+            ) => Some(crate::runtime::neoforge_bus::game_bus()),
             (
                 "net/minecraftforge/common/MinecraftForge",
                 "EVENT_BUS",

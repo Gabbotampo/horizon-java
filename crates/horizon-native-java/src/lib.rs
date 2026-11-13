@@ -65,6 +65,7 @@ mod hash_table;
 mod heap;
 mod hook_shapes;
 mod host_entry;
+mod host_events;
 mod host_list_iterator;
 mod host_optional;
 mod host_path;
@@ -88,6 +89,7 @@ mod java_tostring;
 mod jdk_call;
 mod jdk_character;
 mod jdk_character_table;
+mod jdk_closure;
 mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
@@ -172,6 +174,7 @@ pub use boxed::Boxed;
 pub use class_precedence::RunLoader;
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use heap::{CallLogMark, JavaHeap};
+pub use host_events::posted_event;
 pub(crate) use host_optional::{
     empty_optional, empty_optional_for, is_optional, optional_double, optional_double_value,
     optional_int, optional_int_value, optional_long, optional_long_value, optional_payload,
@@ -4608,9 +4611,7 @@ impl Host for StdHost {
     fn host_instance_of(&self, marker: &str, wanted: &str) -> bool {
         self.brigadier_instance_of(marker, wanted)
             || self.mod_container_instance_of(marker, wanted)
-            || neoforge_bus::bus_instance_of(marker, wanted)
             || neoforge_lifecycle::instance_of(marker, wanted)
-            || neoforge_imc::instance_of(marker, wanted)
     }
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
@@ -4971,9 +4972,9 @@ impl Host for StdHost {
             ("net/fabricmc/fabric/api/event/EventFactory", "createArrayBacked", descriptor)
                 if descriptor.ends_with("Lnet/fabricmc/fabric/api/event/Event;") =>
             {
-                let marker = format!("fabric-event/{}", self.next_fabric_event);
+                let event = host_events::fabric_array_event(self.next_fabric_event);
                 self.next_fabric_event = self.next_fabric_event.saturating_add(1);
-                Ok(Value::Ref(Some(marker)))
+                Ok(event)
             }
             // Fabric's per-registry entry-added event: `event(registry)` names
             // the one event for that registry (the loader keeps a map of them;
@@ -4984,10 +4985,9 @@ impl Host for StdHost {
                 "net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback",
                 "event",
                 "(Lnet/minecraft/core/Registry;)Lnet/fabricmc/fabric/api/event/Event;",
-            ) => Ok(Value::Ref(Some(format!(
-                "fabric-event/net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback.event/{}",
-                expect_string(Self::argument(r, args, 0)?)
-            )))),
+            ) => Ok(host_events::fabric_registry_event(expect_string(
+                Self::argument(r, args, 0)?,
+            ))),
             ("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
                 let value = i16::try_from(value).map_err(|_| {
@@ -7360,10 +7360,7 @@ impl Host for StdHost {
         if r.owner == "net/fabricmc/fabric/api/event/Event" {
             match r.name.as_str() {
                 "register" => return Ok(Value::Void),
-                "invoker" => {
-                    let marker = receiver_marker.unwrap_or_else(|| "fabric-event/unknown".into());
-                    return Ok(Value::Ref(Some(format!("{marker}/invoker"))));
-                }
+                "invoker" => return Ok(host_events::fabric_invoker(receiver)),
                 _ => {}
             }
         }
@@ -9600,7 +9597,8 @@ fn class_of_value(value: &Value) -> Option<String> {
         // A `Float` is a `Boxed::Float`; the bare value is a `Double`.
         Value::Float(_) => Some("java/lang/Double".into()),
         Value::Boxed(boxed) => Some(boxed.class().into()),
-        Value::Host(host) => Some(host.class().into()),
+        // `None` for a handle whose runtime class is not known: counted.
+        Value::Host(host) => host.class().map(Into::into),
         Value::Void => None,
         Value::Ref(None) => None,
         Value::Ref(Some(marker)) => {
@@ -9921,11 +9919,7 @@ fn utf16_last_index_of(haystack: &str, needle: &str) -> i32 {
 }
 
 fn event_is_cancelled(value: &Value) -> bool {
-    expect_ref(value).is_some_and(|marker| {
-        marker.starts_with("cancelled/")
-            || marker.starts_with("event/cancelled/")
-            || marker.starts_with("@cancelled:")
-    })
+    host_events::is_cancelled_event(value)
 }
 
 /// Forge 1.20-era event-bus names are ABI-compatible with the bounded
@@ -23741,9 +23735,8 @@ impl<H: Host> Runtime<'_, H> {
             // host answers the call (a lenient host as before, a strict one,
             // a game-hook firing, by refusing it), never a made-up default
             // that an `Allow` callback would read as "cancel".
-            if let Some(receiver @ Value::Ref(Some(marker))) = receiver.as_ref()
-                && marker.starts_with("fabric-event/")
-                && marker.ends_with("/invoker")
+            if let Some(receiver) = receiver.as_ref()
+                && host_events::key_of(receiver, HostKind::FabricInvoker).is_some()
             {
                 let r = MethodRef {
                     owner: class.to_owned(),
@@ -38459,7 +38452,7 @@ mandatory = true
                 ],
             )
             .unwrap();
-        assert_eq!(event, Value::Ref(Some("fabric-event/0".into())));
+        assert_eq!(event, crate::host_events::fabric_array_event(0));
         let register = MethodRef {
             owner: "net/fabricmc/fabric/api/event/Event".into(),
             name: "register".into(),
@@ -38479,8 +38472,7 @@ mandatory = true
             "net/fabricmc/fabric/api/event/Event"
         );
         assert_eq!(dispatches[0].event, Value::Ref(Some("demo-event".into())));
-        let cancelled_dispatches =
-            host.dispatch_event(Value::Ref(Some("event/cancelled/demo".into())));
+        let cancelled_dispatches = host.dispatch_event(crate::posted_event("demo", true));
         assert_eq!(cancelled_dispatches.len(), 1);
         assert_eq!(
             cancelled_dispatches[0].listener.method.owner,
@@ -38493,7 +38485,7 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&invoker, &event, &[]).unwrap(),
-            Value::Ref(Some("fabric-event/0/invoker".into()))
+            crate::host_events::fabric_invoker(&event)
         );
         let is_canceled = MethodRef {
             owner: "demo/Event".into(),
@@ -38505,13 +38497,19 @@ mandatory = true
             Value::Int(0)
         );
         assert_eq!(
+            host.invoke_instance(&is_canceled, &crate::posted_event("demo", true), &[])
+                .unwrap(),
+            Value::Int(1)
+        );
+        // A string spelled like the old cancelled marker is no event.
+        assert_eq!(
             host.invoke_instance(
                 &is_canceled,
                 &Value::Ref(Some("event/cancelled/demo".into())),
                 &[],
             )
             .unwrap(),
-            Value::Int(1)
+            Value::Int(0)
         );
     }
 
@@ -38562,7 +38560,7 @@ mandatory = true
             ],
         )
         .unwrap();
-        let dispatches = host.dispatch_event(Value::Ref(Some("event/cancelled/demo".into())));
+        let dispatches = host.dispatch_event(crate::posted_event("demo", true));
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args[0],
@@ -38592,7 +38590,7 @@ mandatory = true
             )
             .unwrap();
         assert_eq!(result, bus);
-        let dispatches = host.dispatch_event(Value::Ref(Some("event/cancelled/demo".into())));
+        let dispatches = host.dispatch_event(crate::posted_event("demo", true));
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
@@ -38623,7 +38621,7 @@ mandatory = true
             Value::Void
         );
         assert!(
-            host.dispatch_event(Value::Ref(Some("event/demo".into())))
+            host.dispatch_event(crate::posted_event("demo", false))
                 .is_empty()
         );
     }
@@ -38639,24 +38637,20 @@ mandatory = true
         let bus = Value::Ref(Some("net/neoforged/bus/api/IEventBus".into()));
 
         assert_eq!(
-            host.invoke_instance(&post, &bus, &[Value::Ref(Some("event/demo".into()))],)
+            host.invoke_instance(&post, &bus, &[crate::posted_event("demo", false)],)
                 .unwrap(),
             Value::Int(0)
         );
         assert_eq!(
-            host.invoke_instance(
-                &post,
-                &bus,
-                &[Value::Ref(Some("event/cancelled/demo".into()))],
-            )
-            .unwrap(),
+            host.invoke_instance(&post, &bus, &[crate::posted_event("demo", true)],)
+                .unwrap(),
             Value::Int(1)
         );
         assert_eq!(
             host.posted_events(),
             &[
-                Value::Ref(Some("event/demo".into())),
-                Value::Ref(Some("event/cancelled/demo".into())),
+                crate::posted_event("demo", false),
+                crate::posted_event("demo", true),
             ]
         );
     }
@@ -38726,18 +38720,11 @@ mandatory = true
             descriptor: "(Lnet/minecraftforge/eventbus/api/Event;)Z".into(),
         };
         assert_eq!(
-            host.invoke_instance(
-                &post,
-                &bus,
-                &[Value::Ref(Some("event/cancelled/forge".into()))]
-            )
-            .unwrap(),
+            host.invoke_instance(&post, &bus, &[crate::posted_event("forge", true)])
+                .unwrap(),
             Value::Int(1)
         );
-        assert_eq!(
-            host.posted_events(),
-            &[Value::Ref(Some("event/cancelled/forge".into()))]
-        );
+        assert_eq!(host.posted_events(), &[crate::posted_event("forge", true)]);
     }
 
     #[test]

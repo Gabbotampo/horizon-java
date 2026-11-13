@@ -12,7 +12,10 @@
 //!
 //! * **class**: [`HostRef::class`], from the row's [`ClassRule`]: one fixed
 //!   class (`java/util/Optional`), or, for a family (jar objects, collections,
-//!   game objects), a function of the key;
+//!   game objects), a function of the key; or not known at all (a lambda the
+//!   model stands for), when only the types the object surely is are known
+//!   ([`ClassRule::Unknown`]): then `getClass()` and every answer that needs
+//!   the exact class are counted, never answered with a declared type;
 //! * **identity**: [`HostRef::canonical`], the row's predicate on the key
 //!   (below);
 //! * **`toString`/`hashCode`/`equals`/`instanceof`**: the row's [`Methods`].
@@ -171,6 +174,25 @@ pub enum HostKind {
     /// `java.lang.reflect.Constructor`: key the member's facts
     /// (`host_reflect.rs`).
     ReflectConstructor,
+    /// A NeoForge `IEventBus`: key `game`, or `mod` with its id when known
+    /// (`host_events.rs`; every key below holds its parts escaped).
+    NeoForgeBus,
+    /// A Forge EventBus 7 per-event `BUS`: key the event class.
+    ForgeBus,
+    /// A Fabric `Event`: key an API field's owner and name, a
+    /// `createArrayBacked` serial, or a registry's text.
+    FabricEvent,
+    /// A Fabric event's `invoker()`: key the event's key.
+    FabricInvoker,
+    /// A NeoForge `InterModComms.IMCMessage`: key its index on the IMC bus.
+    ImcMessage,
+    /// The supplier of an IMC message another jar sent: key the message's index.
+    ImcSupplier,
+    /// The `CompletableFuture` `ParallelDispatchEvent.enqueueWork` answers: key the task's serial.
+    DeferredWork,
+    /// An event a host caller dispatches or posts: key its cancelled flag and
+    /// name.
+    PostedEvent,
 }
 
 /// How a kind's Java class follows from its key.
@@ -179,9 +201,44 @@ pub(crate) enum ClassRule {
     /// Every object of the kind is this class.
     Fixed(&'static str),
     /// A family whose objects are of many classes (jar objects, collections,
-    /// game objects): the class is read from the key.
-    #[allow(dead_code)] // The first family kinds arrive in P12/P14/P16.
+    /// game objects), or a class other values than handles may also be
+    /// (`CompletableFuture`): the class is read from the key.
     FromKey(fn(&str) -> &str),
+    /// The object's runtime class is not known (a jar's lambda, a proxy, a
+    /// loader class the runtime does not model). `declared` answers, for a
+    /// key, the types the object surely is (the call site's declared type).
+    /// [`HostRef::class`] is `None`, so `getClass()`, a
+    /// `ClassCastException`'s message and anything else that needs the exact
+    /// class are counted; `instanceof` and casts follow
+    /// [`instance_of_class`]: `true` for a declared type's supertype, `false`
+    /// only where [`proves_not_instance`] proves it, counted otherwise.
+    Unknown {
+        declared: fn(&str) -> &'static [&'static str],
+    },
+}
+
+/// `class`'s generated Java 25 row (`jdk_closure.rs`): whether it is final, and every supertype
+/// (the class itself left out).
+fn jdk_closed(class: &str) -> Option<(bool, &'static [&'static str])> {
+    crate::jdk_closure::class(class).map(|row| (row.is_final, row.supertypes.as_slice()))
+}
+
+/// Whether an object whose exact class is `class` is provably not a
+/// `wanted`: `wanted` is a `final` JDK class (Java 25's table) other than `class`,
+/// whose only instances are of that very class.
+pub(crate) fn exact_class_rules_out(class: &str, wanted: &str) -> bool {
+    class != wanted && jdk_closed(wanted).is_some_and(|(is_final, _)| is_final)
+}
+
+/// Whether no object can be both a `class` and a `declared`, proved: `class`
+/// is `final` and its whole supertype set is known without `declared`.
+/// Only the JDK classes of Java 25's table (`jdk_closure.rs`) qualify. A jar class never does:
+/// another jar's Mixin (or a class this runtime does not hold) can add an
+/// interface to it, which no single jar's runtime sees.
+pub(crate) fn proves_not_instance(class: &str, declared: &str) -> bool {
+    class != declared
+        && jdk_closed(class)
+            .is_some_and(|(is_final, supertypes)| is_final && !supertypes.contains(&declared))
 }
 
 /// Answers for the values a handle holds, for a kind's [`Methods`]. `None`
@@ -218,9 +275,15 @@ pub(crate) type CompareToFn =
 /// and in the runtime the jar's own classes (a jar object's superclasses and
 /// interfaces, a Mixin's added interface), which a family kind needs.
 pub(crate) trait ClassHierarchy {
-    /// Whether an object of class `class` is a `wanted` (internal names);
-    /// `None` when unknown (a class whose chain leaves what is held).
+    /// Whether an object of class `class` is a `wanted` (internal names).
+    /// `Some(false)` only when proved; `None` when unknown (a class whose
+    /// chain leaves what is known).
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool>;
+
+    /// Whether `class` is an interface; `None` when unknown.
+    fn is_interface(&self, class: &str) -> Option<bool> {
+        crate::jdk_closure::class(class).map(|row| row.is_interface)
+    }
 }
 
 /// The JDK's own hierarchy, for a caller with no runtime: a JDK class never
@@ -228,8 +291,26 @@ pub(crate) trait ClassHierarchy {
 pub(crate) struct JdkHierarchy;
 
 impl ClassHierarchy for JdkHierarchy {
+    /// `true` from the JDK models' supertypes; `false` only when proved: a
+    /// class of Java 25's table lacks `wanted`, `wanted` is a final JDK class
+    /// other than `class`, or a JDK class against a type outside every system
+    /// module's packages (the loaders that define JDK classes cannot see a
+    /// jar's or a game's). Unknown otherwise.
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
-        Some(wanted == "java/lang/Object" || crate::jdk_model::class_instance_of(class, wanted))
+        if wanted == "java/lang/Object"
+            || class == wanted
+            || crate::jdk_model::class_instance_of(class, wanted)
+        {
+            return Some(true);
+        }
+        if let Some((_, supertypes)) = jdk_closed(class) {
+            return Some(supertypes.contains(&wanted));
+        }
+        if exact_class_rules_out(class, wanted) {
+            return Some(false);
+        }
+        let jdk = crate::jdk_closure::in_jdk_package;
+        (jdk(class) && !jdk(wanted)).then_some(false)
     }
 }
 
@@ -266,7 +347,6 @@ pub(crate) fn canonical_when_empty(key: &str) -> bool {
 }
 
 /// The canonical predicate of a kind with one object per key.
-#[allow(dead_code)] // The first canonical families arrive in P1 (identifiers, enums).
 pub(crate) fn always_canonical(_key: &str) -> bool {
     true
 }
@@ -277,13 +357,32 @@ pub(crate) fn never_canonical(_key: &str) -> bool {
 }
 
 /// [`InstanceOfFn`] for a kind whose class is all it is: the class and its
-/// supertypes, as `hierarchy` knows them.
+/// supertypes, as `hierarchy` knows them. For a [`ClassRule::Unknown`] kind:
+/// `true` for a supertype of a declared type; `false` only where
+/// [`proves_not_instance`] proves a declared type rules `wanted` out; unknown
+/// (counted) otherwise.
 pub(crate) fn instance_of_class(
     handle: &HostRef,
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
-    hierarchy.is_instance(handle.class(), wanted)
+    let declared = match handle.kind.info().class {
+        ClassRule::Unknown { declared } => declared(handle.key()),
+        _ => return hierarchy.is_instance(handle.class()?, wanted),
+    };
+    if wanted == "java/lang/Object"
+        || declared
+            .iter()
+            .any(|class| hierarchy.is_instance(class, wanted) == Some(true))
+    {
+        return Some(true);
+    }
+    // The object is a `declared`; `wanted` is final and provably not one, so
+    // the object cannot be a `wanted`.
+    declared
+        .iter()
+        .any(|class| proves_not_instance(wanted, class))
+        .then_some(false)
 }
 
 /// Every kind: its tag, its class, its identity, its methods.
@@ -379,6 +478,71 @@ const KINDS: &[KindInfo] = &[
         canonical: never_canonical,
         methods: &crate::host_reflect::MEMBER_METHODS,
     },
+    KindInfo {
+        kind: HostKind::NeoForgeBus,
+        tag: "nfbus",
+        class: ClassRule::FromKey(crate::host_events::neoforge_bus_class),
+        canonical: crate::host_events::bus_canonical,
+        methods: &crate::host_events::NEOFORGE_BUS_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ForgeBus,
+        tag: "fgbus",
+        class: ClassRule::Unknown {
+            declared: crate::host_events::forge_bus_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricEvent,
+        tag: "fevt",
+        class: ClassRule::FromKey(crate::host_events::fabric_event_class),
+        canonical: always_canonical,
+        methods: &crate::host_events::FABRIC_EVENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricInvoker,
+        tag: "finv",
+        class: ClassRule::Unknown {
+            declared: crate::host_events::no_types,
+        },
+        // `register` builds a new invoker: two reads are not provably one.
+        canonical: never_canonical,
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ImcMessage,
+        tag: "imcm",
+        class: ClassRule::FromKey(crate::host_events::imc_message_class),
+        canonical: always_canonical,
+        methods: &crate::host_events::IMC_MESSAGE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ImcSupplier,
+        tag: "imcs",
+        class: ClassRule::Unknown {
+            declared: crate::host_events::supplier_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DeferredWork,
+        tag: "nfdw",
+        class: ClassRule::FromKey(crate::host_events::future_class),
+        canonical: always_canonical,
+        methods: &crate::host_events::DEFERRED_WORK_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::PostedEvent,
+        tag: "pev",
+        class: ClassRule::Unknown {
+            declared: crate::host_events::posted_event_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
 ];
 
 impl HostKind {
@@ -420,7 +584,7 @@ impl HostKind {
                     .iter()
                     .filter_map(|info| match info.class {
                         ClassRule::Fixed(class) => Some((class, info.kind)),
-                        ClassRule::FromKey(_) => None,
+                        ClassRule::FromKey(_) | ClassRule::Unknown { .. } => None,
                     })
                     .collect()
             })
@@ -473,10 +637,13 @@ impl HostRef {
     }
 
     /// The class this object is (`getClass()`), internal form.
-    pub fn class(&self) -> &str {
+    /// `None` when the runtime class is not known ([`ClassRule::Unknown`]):
+    /// the caller counts what needs it.
+    pub fn class(&self) -> Option<&str> {
         match self.kind.info().class {
-            ClassRule::Fixed(class) => class,
-            ClassRule::FromKey(class_of) => class_of(&self.key),
+            ClassRule::Fixed(class) => Some(class),
+            ClassRule::FromKey(class_of) => Some(class_of(&self.key)),
+            ClassRule::Unknown { .. } => None,
         }
     }
 
@@ -584,6 +751,40 @@ mod tests {
             if let ClassRule::Fixed(class) = info.class {
                 assert_eq!(HostKind::of_class(class), Some(info.kind));
             }
+        }
+    }
+
+    /// A kind whose runtime class is unknown is never found through a type it
+    /// declares: `Supplier` is not an IMC supplier's class, so a class check
+    /// on `Supplier` (`Class.isAssignableFrom`, a class walk) is not answered
+    /// as that kind's.
+    #[test]
+    fn unknown_class_kinds_are_not_found_by_their_declared_types() {
+        for info in KINDS {
+            let ClassRule::Unknown { declared } = info.class else {
+                continue;
+            };
+            let handle = HostRef::new(info.kind, "");
+            assert_eq!(handle.class(), None, "{:?}", info.kind);
+            for key in ["", "i1,rx", "i0,rx"] {
+                for class in declared(key) {
+                    assert_ne!(HostKind::of_class(class), Some(info.kind), "{class}");
+                }
+            }
+        }
+        for class in [
+            "java/util/function/Supplier",
+            "net/neoforged/bus/api/Event",
+            "net/neoforged/bus/api/ICancellableEvent",
+            "net/minecraftforge/eventbus/api/bus/EventBus",
+            "java/lang/Object",
+        ] {
+            assert_eq!(HostKind::of_class(class), None, "{class}");
+            assert_eq!(
+                HostKind::class_instance_of(class, "java/lang/Object", &JdkHierarchy),
+                None,
+                "{class}"
+            );
         }
     }
 
