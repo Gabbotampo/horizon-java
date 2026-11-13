@@ -109,9 +109,9 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             _ => None,
         },
         // A `WatchEvent.Kind` is only ever a token handed back to `register`
-        // or compared with `==` against the event a key reports. The marker
-        // keeps its enum name so `name()`/`toString` agree; the watch-service
-        // model below never produces an event, so none is ever compared.
+        // or compared with `==` against the event a key reports
+        // (`watch_service.rs`). The marker keeps its enum name so
+        // `name()`/`toString` agree.
         "java/nio/file/StandardWatchEventKinds" => match name {
             "ENTRY_CREATE" | "ENTRY_DELETE" | "ENTRY_MODIFY" | "OVERFLOW" => {
                 Some(Value::Ref(Some(format!("watch-kind/{name}"))))
@@ -275,8 +275,8 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             let pattern = expect_string(args.first()?);
             Some(Ok(Value::Ref(Some(format!("regex-pattern/{pattern}")))))
         }
-        // The default filesystem. Opening a watch service over it is modelled
-        // below; no call here touches the host's disk.
+        // The default filesystem. Its watch services are `watch_service.rs`'s;
+        // no call here touches the host's disk.
         ("java/nio/file/FileSystems", "getDefault", "()Ljava/nio/file/FileSystem;") => {
             Some(Ok(Value::Ref(Some("file-system/default".into()))))
         }
@@ -396,37 +396,9 @@ pub(crate) fn instance_call(
         };
     }
     if marker == "file-system/default" {
+        // `newWatchService` is `watch_service.rs`'s.
         return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("newWatchService", "()Ljava/nio/file/WatchService;") => {
-                Some(Ok(Value::Ref(Some("watch-service/default".into()))))
-            }
             ("getSeparator", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some("/".into())))),
-            _ => None,
-        };
-    }
-    if marker == "watch-service/default" {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            // The virtual filesystem has no external writer, so no event is
-            // ever pending; `poll` answering null is the JVM's "nothing
-            // happened yet", not an invented event. `take` would block the
-            // single thread for ever, so it stays unmodelled and counted.
-            ("poll", "()Ljava/nio/file/WatchKey;") => Some(Ok(Value::Ref(None))),
-            ("poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;") => {
-                Some(Ok(Value::Ref(None)))
-            }
-            ("close", "()V") => Some(Ok(Value::Void)),
-            _ => None,
-        };
-    }
-    if marker.starts_with("watch-key/") {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("pollEvents", "()Ljava/util/List;") => Some(Ok(Value::Ref(Some("list".into())))),
-            // A key with no pending events is still valid, so `reset` reports
-            // true and the mod keeps polling. `cancel` has no state to clear
-            // and `isValid` keeps answering true afterwards; a mod that
-            // cancels and then polls is outside the modelled surface.
-            ("reset" | "isValid", "()Z") => Some(Ok(Value::Int(1))),
-            ("cancel", "()V") => Some(Ok(Value::Void)),
             _ => None,
         };
     }
@@ -437,12 +409,6 @@ pub(crate) fn instance_call(
             }
             _ => None,
         };
-    }
-    // `Path.register(service, kinds...)`: the key names the watched path. The
-    // game never changes a file behind the mod's back, so the key will never
-    // report an event.
-    if r.owner == "java/nio/file/Path" && r.name == "register" {
-        return Some(Ok(Value::Ref(Some(format!("watch-key/{marker}")))));
     }
     None
 }
@@ -881,21 +847,17 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
     if crate::reflect_generic::annotated_type_instance_of(marker, wanted) {
         return true;
     }
-    let class = if let Some((class, _)) = marker.split_once('#') {
-        class
-    } else {
-        match marker.split_once(':').map(|(prefix, _)| prefix) {
-            Some("integer") => "java/lang/Integer",
-            Some("long") => "java/lang/Long",
-            Some("short") => "java/lang/Short",
-            Some("byte") => "java/lang/Byte",
-            Some("float") => "java/lang/Float",
-            Some("double") => "java/lang/Double",
-            Some("character") => "java/lang/Character",
-            Some("boolean") => "java/lang/Boolean",
-            _ => return false,
-        }
+    let Some((class, _)) = marker.split_once('#') else {
+        return false;
     };
+    class_instance_of(class, wanted)
+}
+
+/// Whether an instance of the platform class `class` is a `wanted`.
+pub(crate) fn class_instance_of(class: &str, wanted: &str) -> bool {
+    if class == wanted {
+        return true;
+    }
     let known = match platform_supertypes(class) {
         [] => crate::java_immutable::supertypes(class),
         known => known,
@@ -937,6 +899,7 @@ pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Valu
         return None;
     }
     let primitive = match value {
+        Value::Boxed(boxed) => boxed.primitive(),
         Value::Ref(Some(_)) => match descriptor {
             "C" => super::boxed_character(value).map(Value::Int),
             "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
@@ -971,49 +934,6 @@ pub(crate) fn class_access_flags(file: &crate::ClassFile) -> Option<u16> {
     reader.skip(4).ok()?;
     crate::read_pool(&mut reader).ok()?;
     reader.u2().ok()
-}
-
-/// The text `String.valueOf` gives a boxed value, for a concatenation
-/// operand typed `desc`.
-///
-/// `"" + Boolean.TRUE` is `"true"`; the runtime's box marker is
-/// `boolean:true`, and pasting the marker made Xaero's config codec reject a
-/// 12-character boolean against its 5-character bound. Only an operand typed
-/// as a box, `Number`, `Comparable`, `Serializable` or `Object` is read as a
-/// box: a `String` operand is text, whatever it spells.
-pub(crate) fn boxed_text(marker: &str, desc: &str) -> Option<String> {
-    if !matches!(
-        desc,
-        "Ljava/lang/Object;"
-            | "Ljava/lang/Number;"
-            | "Ljava/lang/Comparable;"
-            | "Ljava/io/Serializable;"
-            | "Ljava/lang/Boolean;"
-            | "Ljava/lang/Integer;"
-            | "Ljava/lang/Long;"
-            | "Ljava/lang/Short;"
-            | "Ljava/lang/Byte;"
-            | "Ljava/lang/Character;"
-            | "Ljava/lang/Float;"
-            | "Ljava/lang/Double;"
-    ) {
-        return None;
-    }
-    let (prefix, rest) = marker.split_once(':')?;
-    match prefix {
-        "boolean" => matches!(rest, "true" | "false").then(|| rest.to_owned()),
-        "integer" | "long" | "short" | "byte" => {
-            rest.parse::<i64>().ok().map(|value| value.to_string())
-        }
-        "character" => rest
-            .parse::<u32>()
-            .ok()
-            .and_then(char::from_u32)
-            .map(String::from),
-        "double" => rest.parse::<f64>().ok().map(super::format_java_float),
-        "float" => rest.parse::<f64>().ok().map(super::format_java_float32),
-        _ => None,
-    }
 }
 
 /// Whether `marker` names an object this runtime or the host built
@@ -1436,6 +1356,11 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             [key, value, merge] => (key.clone(), value.clone(), Some(merge.clone())),
             _ => return Ok(None),
         };
+        if !guava {
+            // `HashMap::new` with `putIfAbsent`/`merge` (`hash_bulk.rs`).
+            let map = self.hash_map_collect(&key_fn, &value_fn, merge_fn.as_ref(), values)?;
+            return Ok(Some(map));
+        }
         let mut entries: Vec<(Value, Value)> = Vec::new();
         for element in values {
             let key = self.apply_function(&key_fn, element)?;

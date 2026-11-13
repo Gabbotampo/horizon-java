@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use mod_api::{
     AttachmentForm, AttachmentPolicy, AttachmentStore, AttachmentWrite, Compound, Holder,
-    ServerHost, Tag,
+    OriginalPlayerRef, ServerHost, Tag,
 };
 
 use crate::runtime::neoforge_attachments::{StoreEntry, StoreWrite, StoreWriteKind};
@@ -44,8 +44,9 @@ pub(crate) enum Lifecycle {
     None,
     /// A player joined: saved values decode now (D3) and the initial self-sync is counted.
     Joined(u128),
-    /// A player's data was copied to their new player; `true` for a death.
-    Cloned(u128, bool),
+    /// A player's data was copied to their new player; `true` for a death. The old player the
+    /// game lends for the hook is read into the batch before the copy step (`getOriginal`).
+    Cloned(u128, bool, OriginalPlayerRef),
     /// A player respawned or changed dimension: NeoForge re-syncs the player to itself.
     Resynced(u128),
     /// A player left: the runtime's objects for them are dropped after the batch.
@@ -143,35 +144,48 @@ pub(crate) fn snapshot(
 ) -> BTreeMap<u128, Result<BTreeMap<String, StoreEntry>, String>> {
     players
         .iter()
-        .map(|&uuid| {
-            let holder = Holder::Player(uuid);
-            let entries = ids
-                .iter()
-                .map(|id| {
-                    let (namespace, name) = split_id(id);
-                    let entry = match store.decoded(holder, namespace, name) {
-                        Err(error) => return Err(format!("the game's store answered {error:?}")),
-                        Ok(Some(value)) => match value.downcast_ref::<JavaAttachment>() {
-                            Some(ours) if ours.jar == jar => StoreEntry::Ours(ours.token),
-                            _ => StoreEntry::Foreign,
-                        },
-                        Ok(None) => match store.saved(holder, namespace, name) {
-                            Ok(Some(saved)) => match to_runtime(&saved) {
-                                Ok(saved) => StoreEntry::Raw(saved),
-                                Err(why) => StoreEntry::Unreadable(why),
-                            },
-                            Ok(None) => StoreEntry::Absent,
-                            Err(error) => StoreEntry::Unreadable(format!(
-                                "the saved entry could not be read: {error:?}"
-                            )),
-                        },
-                    };
-                    Ok((id.clone(), entry))
-                })
-                .collect();
-            (uuid, entries)
+        .map(|&uuid| (uuid, holder_entries(store, jar, ids, Holder::Player(uuid))))
+        .collect()
+}
+
+/// One holder's entries for `ids`, read from the game's store, or why the store could not answer.
+fn holder_entries(
+    store: &mut dyn AttachmentStore,
+    jar: &str,
+    ids: &[String],
+    holder: Holder,
+) -> Result<BTreeMap<String, StoreEntry>, String> {
+    ids.iter()
+        .map(|id| {
+            let (namespace, name) = split_id(id);
+            let entry = match store.decoded(holder, namespace, name) {
+                Err(error) => return Err(format!("the game's store answered {error:?}")),
+                Ok(Some(value)) => match value.downcast_ref::<JavaAttachment>() {
+                    Some(ours) if ours.jar == jar => StoreEntry::Ours(ours.token),
+                    _ => StoreEntry::Foreign,
+                },
+                Ok(None) => match store.saved(holder, namespace, name) {
+                    Ok(Some(saved)) => match to_runtime(&saved) {
+                        Ok(saved) => StoreEntry::Raw(saved),
+                        Err(why) => StoreEntry::Unreadable(why),
+                    },
+                    Ok(None) => StoreEntry::Absent,
+                    Err(error) => StoreEntry::Unreadable(format!(
+                        "the saved entry could not be read: {error:?}"
+                    )),
+                },
+            };
+            Ok((id.clone(), entry))
         })
         .collect()
+}
+
+/// The game's store holder of a clone's old player (`Holder::OriginalPlayer`, valid during the
+/// hook). The handle's token has no public accessor, so it is read through the API's own field
+/// view.
+fn original_holder(original: OriginalPlayerRef) -> Holder {
+    use mod_api::__private::game::Fields;
+    Holder::OriginalPlayer(original.fields())
 }
 
 /// Applies the runtime's journal to the game's store, in order, and answers a line for each
@@ -257,7 +271,9 @@ pub(crate) fn open(
     let budget = ExecutionBudget::within(JAR_BUDGET);
     match lifecycle {
         Lifecycle::Joined(player) => jar.attachment_player_joined(host, &budget, player),
-        Lifecycle::Cloned(player, was_death) => {
+        Lifecycle::Cloned(player, was_death, original) => {
+            let entries = holder_entries(server.attachments(), id, &ids, original_holder(original));
+            host.open_original_attachments(player, entries);
             jar.attachment_player_cloned(host, &budget, player, was_death)
         }
         Lifecycle::Resynced(player) => host.count_attachment_initial_sync(player),
@@ -414,7 +430,7 @@ mod tests {
                     self.jar
                         .attachment_player_joined(&mut self.host, &budget, p)
                 }
-                Lifecycle::Cloned(p, death) => {
+                Lifecycle::Cloned(p, death, _) => {
                     self.jar
                         .attachment_player_cloned(&mut self.host, &budget, p, death)
                 }
@@ -514,12 +530,15 @@ mod tests {
         // `guest_respawn`: `copy_on_death` then `replace_contents`, before `player_clone`.
         let copy = run.store.copy_on_death().unwrap();
         run.store.replace_contents(copy);
-        let (kept, has_data) = run.batch(Lifecycle::Cloned(P, true), |run| {
-            (
-                run.call("get", KEPT).unwrap(),
-                run.call("has", DATA).unwrap(),
-            )
-        });
+        let (kept, has_data) = run.batch(
+            Lifecycle::Cloned(P, true, mod_api::__private::game::original_player_ref(1)),
+            |run| {
+                (
+                    run.call("get", KEPT).unwrap(),
+                    run.call("has", DATA).unwrap(),
+                )
+            },
+        );
         assert_eq!(has_data, Value::Int(0));
         assert_ne!(kept, Value::Ref(None));
         assert_eq!(run.host.attachment_stats().decoded, 1);
@@ -551,6 +570,80 @@ mod tests {
             view.get(&P),
             Some(&Err("the game's store answered MissingHolder".to_owned()))
         );
+    }
+
+    /// `getOriginal().getData(...)` on a death: the game lends the old player's own store
+    /// (`Holder::OriginalPlayer`), which still holds carryon's non-`copyOnDeath` value as this
+    /// jar's object, while the new player's store has only the death copy. The bridge reads the
+    /// original's entries from that holder, so the old player answers the very object it held and
+    /// the new one has nothing.
+    #[test]
+    fn the_original_player_answers_its_own_pre_death_object() {
+        struct Lent {
+            new: Attachments,
+            old: Attachments,
+        }
+        impl mod_api::AttachmentHost for Lent {
+            fn attachments(
+                &mut self,
+                holder: Holder,
+                _: mod_api::AttachmentAccess,
+            ) -> Result<&mut Attachments, AttachmentError> {
+                match holder {
+                    Holder::OriginalPlayer(7) => Ok(&mut self.old),
+                    Holder::Player(P) => Ok(&mut self.new),
+                    _ => Err(AttachmentError::MissingHolder),
+                }
+            }
+        }
+        let mut run = Run::new();
+        let carried = run.batch(Lifecycle::None, |run| {
+            let carried = run.call("get", DATA).unwrap();
+            run.select(&carried, 2);
+            carried
+        });
+        // `guest_respawn`: the old map is lent as it was, the new player gets the death copy.
+        let old = std::mem::take(&mut run.store);
+        let copy = old.copy_on_death().unwrap();
+        let mut new = Attachments::default();
+        new.replace_contents(copy);
+        let mut game = Lent { new, old };
+
+        let ids = run.host.attachment_store_ids();
+        let view = snapshot(&mut game, "demo", &ids, &[P]);
+        run.host.open_attachment_batch(view);
+        let original = original_holder(mod_api::__private::game::original_player_ref(7));
+        let entries = holder_entries(&mut game, "demo", &ids, original);
+        run.host.open_original_attachments(P, entries);
+        let budget = ExecutionBudget::within(Duration::from_secs(20));
+        run.jar
+            .attachment_player_cloned(&mut run.host, &budget, P, true);
+        let on = |run: &mut Run, holder: String, name: &str| {
+            let descriptor = match name {
+                "has" => format!("({PLAYER}I)Z"),
+                _ => format!("({PLAYER}I)Ljava/lang/Object;"),
+            };
+            run.jar
+                .invoke_persistent(
+                    &MethodRef {
+                        owner: "demo/Demo".into(),
+                        name: name.into(),
+                        descriptor,
+                    },
+                    None,
+                    &[Value::Ref(Some(holder)), Value::Int(DATA)],
+                    &mut run.host,
+                    &budget,
+                )
+                .unwrap()
+        };
+        let from_original = on(&mut run, format!("game/original-player/{P:032x}"), "get");
+        assert_eq!(from_original, carried);
+        assert_eq!(
+            on(&mut run, format!("game/player/{P:032x}"), "has"),
+            Value::Int(0)
+        );
+        run.host.close_attachment_batch();
     }
 
     #[test]

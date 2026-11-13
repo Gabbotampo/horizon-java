@@ -533,6 +533,30 @@ impl<H: Host> Runtime<'_, H> {
             }
             return self.host.unknown_operand_call(&counted).map(Some);
         }
+        // A host set of map entries (a map's `entrySet()`) asked
+        // `contains`/`remove` with a jar `Map.Entry`: the JDK reads the jar
+        // entry's `getKey`/`getValue` in an order that depends on the map
+        // (`HashMap`: key, key, value; `TreeMap`: value, key), which the host
+        // neither knows nor can run. Counted, never a silent `false`.
+        if matches!(opcode, 0xb6 | 0xb9)
+            && matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("contains" | "remove", "(Ljava/lang/Object;)Z")
+            )
+            && let (Some(receiver), [argument]) = (receiver, args)
+            && self.stateless_jar_object(argument).is_some()
+            && self.jar_map_entry(argument)
+            && runtime_collection_values(self.host, receiver).is_ok_and(|values| {
+                !values.is_empty()
+                    && values.iter().all(|value| {
+                        parse_collection_value(value).is_ok_and(|value| {
+                            expect_ref(&value).is_some_and(|m| m.starts_with("map-entry/"))
+                        })
+                    })
+            })
+        {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
         let classes = parameter_classes(&r.descriptor);
         let data_arguments = classes
             .iter()
@@ -578,6 +602,13 @@ impl<H: Host> Runtime<'_, H> {
             self.host.invoke_instance(&empty, receiver, &[])?;
         }
         Ok(Some(value))
+    }
+
+    /// Whether a jar object's class implements `java.util.Map.Entry`.
+    fn jar_map_entry(&self, value: &Value) -> bool {
+        expect_ref(value)
+            .and_then(|marker| jvm_dispatch::constructed_object_class(marker))
+            .is_some_and(|class| self.class_is_instance(class, "java/util/Map$Entry"))
     }
 
     /// Every data interface `receiver`'s class implements: through its jar

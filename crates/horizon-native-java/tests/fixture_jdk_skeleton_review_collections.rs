@@ -106,9 +106,46 @@ public final class Probe {
         return take(entries.contains(map.entrySet().iterator().next()));
     }
 
+    /// Only `List.of`/`List.copyOf` lists reject a `null` lookup; the other
+    /// unmodifiable lists the host keeps answer it like `AbstractList`.
+    static String nullLookup(java.util.function.Supplier<Object> lookup) {
+        try {
+            return take(lookup.get());
+        } catch (NullPointerException e) {
+            return take("NPE:" + e.getMessage());
+        }
+    }
+
+    public static String emptyListContainsNull() {
+        return nullLookup(() -> java.util.Collections.emptyList().contains(null));
+    }
+
+    public static String emptyListIndexOfNull() {
+        return nullLookup(() -> java.util.Collections.emptyList().indexOf(null));
+    }
+
+    public static String singletonListContainsNull() {
+        return nullLookup(() -> java.util.Collections.singletonList("x").contains(null));
+    }
+
+    public static String retainAllSingletonListWithNull() {
+        Coll c = new Coll("a", "x", null);
+        return nullLookup(() -> c.retainAll(java.util.Collections.singletonList("x")) + ":" + c.count);
+    }
+
+    public static String listOfIndexOfNull() {
+        return nullLookup(() -> List.of("x", "y", "z").indexOf(null));
+    }
+
+    public static String listCopyOfContainsNull() {
+        return nullLookup(() -> List.copyOf(List.of("x")).contains(null));
+    }
+
     public static String[] all() {
         return new String[] {"toArrayNull", "retainAllListOfWithNull", "containsHostEntry",
-                "containsHashMapEntry"};
+                "containsHashMapEntry", "emptyListContainsNull", "emptyListIndexOfNull",
+                "singletonListContainsNull", "retainAllSingletonListWithNull", "listOfIndexOfNull",
+                "listCopyOfContainsNull"};
     }
 
     public static void main(String[] args) throws Exception {
@@ -130,5 +167,25 @@ fn review_118_runs_as_jdk_25_does() {
             "it hn0 n0 gk1 gva it hn0 n0 gk1 gva hn1 => true,false",
         ),
         ("containsHashMapEntry", "it hn0 n0 gk2 gvb => true"),
+    ]);
+}
+
+/// The merge of #118 with main's `list_equality.rs` keeps one null-hostile
+/// mechanism: only a JDK `List.of`/`List.copyOf` list (`List12`/`ListN`)
+/// rejects a `null` lookup, while `Collections.emptyList()` and
+/// `singletonList` answer it like `AbstractList`. Expected lines: OpenJDK
+/// 25.0.5, two runs with the same output.
+#[test]
+fn only_list_of_lists_reject_a_null_lookup() {
+    check(&[
+        ("emptyListContainsNull", " => false"),
+        ("emptyListIndexOfNull", " => -1"),
+        ("singletonListContainsNull", " => false"),
+        (
+            "retainAllSingletonListWithNull",
+            "it hn0 n0 rm0 hn0 n0 hn1 n1 rm1 hn1 => true:1",
+        ),
+        ("listOfIndexOfNull", " => NPE:null"),
+        ("listCopyOfContainsNull", " => NPE:null"),
     ]);
 }

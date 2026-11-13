@@ -7,6 +7,9 @@
 //! as a missing method. The expected words below are what `java` prints for
 //! the same probe.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
@@ -44,11 +47,7 @@ public final class ConstructorProbe {
 
 #[test]
 fn source_built_probe_refuses_an_undeclared_constructor() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-reflection-constructor-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("reflection-constructor");
     let src = root.join("src/demo");
     let classes = root.join("classes");
     fs::create_dir_all(&src).unwrap();
