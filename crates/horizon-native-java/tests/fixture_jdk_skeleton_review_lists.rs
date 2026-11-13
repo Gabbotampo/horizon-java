@@ -112,26 +112,12 @@ fn review_120_runs_as_jdk_25_does() {
     ]);
 }
 
-/// **Not JVM behaviour** (Java: `true`): the honesty contract for a host gap.
-/// `AbstractList.equals` asks the host `ArrayList` for `listIterator()`,
-/// which the host does not model: the call is counted and its answer is
-/// `null`. The body stops there with its own neutral answer (`false`)
-/// instead of throwing a `NullPointerException` Java never would into the
-/// jar (`jdk_call::ABANDONED`).
+/// `AbstractList.equals` against a host `ArrayList` walks both
+/// `listIterator()`s; the host's own list iterator (#133,
+/// `host_list_iterator.rs`) answers it, so the body runs to Java's `true`
+/// with nothing counted. Before #133 the host's `listIterator()` was a counted
+/// gap and the body stopped at its neutral `false`.
 #[test]
-fn a_counted_host_list_iterator_stops_equals_without_an_npe() {
-    let fixture = javac_fixture::Fixture::build(
-        "jdk-skeleton-review-120-host",
-        &[("demo/Probe.java", PROBE)],
-    );
-    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
-    let text = fixture.text_on(&mut host, "equalsHostListStops");
-    assert_eq!(text, " => false");
-    assert_eq!(
-        host.unknown_host_calls(),
-        vec![(
-            "java/util/List#listIterator()Ljava/util/ListIterator;".to_owned(),
-            1
-        )]
-    );
+fn equals_against_a_host_list_walks_its_list_iterator() {
+    check(&[("equalsHostListStops", "g0 g1 => true")]);
 }
