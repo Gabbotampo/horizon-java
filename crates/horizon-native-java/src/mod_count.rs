@@ -220,11 +220,52 @@ fn sub_list_rule(root_class: &str, name: &str) -> Option<ModRule> {
 /// A call in flight on a tracked collection.
 pub(crate) struct ModToken {
     marker: String,
+    name: String,
     rule: Option<ModRule>,
     size: usize,
     stamp: ModStamp,
     /// `subList(from, to)`: the view to link once the host made it.
     creates: Option<(usize, usize)>,
+    /// An `ArrayDeque`'s layout to follow (`array_deque.rs`).
+    deque: DequeStep,
+    /// A stale `ArrayList.SubList` member that checks `modCount` after its
+    /// work (`equals`, `hashCode`, `indexOf`...): throw once it returned.
+    throw_after: bool,
+}
+
+/// What a call does to an `ArrayDeque`'s layout.
+enum DequeStep {
+    None,
+    /// A constructor: the layout it gives (`None`: unknown).
+    Init(Option<array_deque::DequeLayout>),
+    /// A call on a deque: its elements before, and the `Object` argument.
+    Call {
+        before: Vec<Value>,
+        needle: Option<Value>,
+    },
+}
+
+/// Where a `SubList` member calls `checkForComodification`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SubCheck {
+    /// Before its work: a stale view throws.
+    Before,
+    /// After its work over the root's range (`ArrayList.SubList`'s
+    /// `equals`/`hashCode`/`indexOf`/`lastIndexOf`/`contains`).
+    After,
+    /// Not at all (`subList`, an argument check that fails or returns
+    /// first, `equals(this)`), or not against this view
+    /// (`ArrayList.SubList.replaceAll` works on the root's range).
+    Never,
+    /// Its answer over a stale view is not modelled: counted.
+    CountIfStale,
+}
+
+/// How a call on a `subList` copy goes ahead.
+enum SubSync {
+    Ready,
+    Counted,
+    ThrowAfter,
 }
 
 impl<H: Host> Runtime<'_, H> {
@@ -275,6 +316,25 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<ModToken>, NativeError> {
+        // A sub-list read as an argument (copied, compared, printed) checks
+        // its list first, as its `toArray`/`iterator`/`toString` would.
+        self.sync_sub_list_arguments(r, op, receiver, args)?;
+        if op == 0xb7 && r.name == "<init>" && r.owner == "java/util/ArrayDeque" {
+            let Some(marker) = receiver.and_then(expect_ref).cloned() else {
+                return Ok(None);
+            };
+            let layout = self.deque_constructed(args);
+            return Ok(Some(ModToken {
+                marker,
+                name: r.name.clone(),
+                rule: None,
+                size: 0,
+                stamp: ModStamp::default(),
+                creates: None,
+                deque: DequeStep::Init(layout),
+                throw_after: false,
+            }));
+        }
         let (target, name) = match op {
             0xb8 if r.owner == "java/util/Collections" => match (r.name.as_str(), args.first()) {
                 (name @ ("sort" | "addAll"), Some(target)) => (target, name),
@@ -291,7 +351,10 @@ impl<H: Host> Runtime<'_, H> {
         };
         let creates = name == "subList" && r.descriptor == "(II)Ljava/util/List;";
         let sub_list = self.host.sub_list_link(marker).is_some();
-        if !sub_list && !creates && !may_modify(name) {
+        // A list with views: even a `set` must reach them.
+        let has_views = !self.host.sub_lists_of(marker).is_empty()
+            || !self.host.view_copies_of(marker).is_empty();
+        if !sub_list && !creates && !has_views && !may_modify(name) {
             return Ok(None);
         }
         let Some(class) = self
@@ -300,9 +363,15 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
-        if sub_list && !self.sync_sub_list(r, marker)? {
-            // Counted: the view may be stale; the host answers from its copy.
-            return Ok(None);
+        let mut throw_after = false;
+        if sub_list {
+            let point = self.sub_list_check_point(r, marker, target, args)?;
+            match self.sync_sub_list(r, marker, point)? {
+                SubSync::Ready => {}
+                // Counted: the view may be stale; the host answers from its copy.
+                SubSync::Counted => return Ok(None),
+                SubSync::ThrowAfter => throw_after = true,
+            }
         }
         let rule = if sub_list {
             let root = self.mod_count_root(marker);
@@ -322,12 +391,29 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => None,
         };
+        let deque = if class == "java/util/ArrayDeque"
+            && may_modify(name)
+            && self.host.deque_layout(marker).is_some()
+        {
+            DequeStep::Call {
+                before: self.collection_elements(target)?,
+                needle: match args {
+                    [needle] if r.descriptor == "(Ljava/lang/Object;)Z" => Some(needle.clone()),
+                    _ => None,
+                },
+            }
+        } else {
+            DequeStep::None
+        };
         Ok(Some(ModToken {
             marker: marker.clone(),
+            name: name.to_owned(),
             rule,
             size: self.element_count(target),
             stamp: self.host.mod_stamp(marker),
             creates,
+            deque,
+            throw_after,
         }))
     }
 
@@ -339,6 +425,16 @@ impl<H: Host> Runtime<'_, H> {
         token: ModToken,
         value: &Value,
     ) -> Result<(), NativeError> {
+        match &token.deque {
+            DequeStep::Init(layout) => {
+                self.host.store_deque_layout(&token.marker, *layout);
+                return Ok(());
+            }
+            DequeStep::Call { before, needle } => {
+                self.deque_stepped(&token.marker, &token.name, needle.as_ref(), before);
+            }
+            DequeStep::None => {}
+        }
         let target = Value::Ref(Some(token.marker.clone()));
         let size = self.element_count(&target);
         match token.rule {
@@ -369,13 +465,82 @@ impl<H: Host> Runtime<'_, H> {
             );
         }
         self.refresh_sub_lists_of(&token.marker);
+        // `keySet()`/`values()`/`entrySet()` kept from this map follow it
+        // (`hash_collections.rs`).
+        self.refresh_map_views(&token.marker);
+        if token.throw_after {
+            return Err(NativeError::UncaughtException {
+                class: "java/util/ConcurrentModificationException".into(),
+                message: None,
+                frame: None,
+            });
+        }
         Ok(())
     }
 
+    /// Where a `SubList` member checks `modCount`, by JDK 25's
+    /// `ArrayList.SubList` (an `ArrayList` root) or `AbstractList.SubList`
+    /// (a `LinkedList`'s or `Vector`'s): the index and argument checks that
+    /// throw or return before it, the members that check after their work,
+    /// and the ones that never do.
+    fn sub_list_check_point(
+        &self,
+        r: &MethodRef,
+        marker: &str,
+        target: &Value,
+        args: &[Value],
+    ) -> Result<SubCheck, NativeError> {
+        let root = self.mod_count_root(marker);
+        let array_list = self
+            .host_collection_class(&Value::Ref(Some(root)))
+            .as_deref()
+            == Some("java/util/ArrayList");
+        let size = self.element_count(target) as i64;
+        let empty = |value: &Value| {
+            self.host_collection_kind(value).is_some() && self.element_count(value) == 0
+        };
+        let outside = |index: &i32, limit: i64| i64::from(*index) < 0 || i64::from(*index) >= limit;
+        Ok(match (r.name.as_str(), r.descriptor.as_str(), args) {
+            ("subList", _, _) => SubCheck::Never,
+            ("equals", "(Ljava/lang/Object;)Z", [other]) if other == target => SubCheck::Never,
+            ("get" | "remove", "(I)Ljava/lang/Object;", [Value::Int(index)])
+            | ("set", "(ILjava/lang/Object;)Ljava/lang/Object;", [Value::Int(index), _])
+                if outside(index, size) =>
+            {
+                SubCheck::Never
+            }
+            ("add", "(ILjava/lang/Object;)V", [Value::Int(index), _])
+                if outside(index, size + 1) =>
+            {
+                SubCheck::Never
+            }
+            ("addAll", "(Ljava/util/Collection;)Z", [other]) if empty(other) => SubCheck::Never,
+            ("addAll", "(ILjava/util/Collection;)Z", [Value::Int(index), other])
+                if outside(index, size + 1) || empty(other) =>
+            {
+                SubCheck::Never
+            }
+            ("containsAll", _, [other]) if empty(other) => SubCheck::Never,
+            ("containsAll", _, _) if array_list => SubCheck::CountIfStale,
+            ("equals" | "hashCode" | "indexOf" | "lastIndexOf" | "contains", _, _)
+                if array_list =>
+            {
+                SubCheck::After
+            }
+            ("replaceAll", _, _) if array_list => SubCheck::CountIfStale,
+            _ => SubCheck::Before,
+        })
+    }
+
     /// `checkForComodification` for a call on a `subList` copy, up its chain
-    /// of parents, then its range re-read from the parent. `Ok(false)` when
-    /// a parent may have moved (counted).
-    fn sync_sub_list(&mut self, r: &MethodRef, marker: &str) -> Result<bool, NativeError> {
+    /// of parents, where the member checks it; then its range re-read from
+    /// the parent.
+    fn sync_sub_list(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        point: SubCheck,
+    ) -> Result<SubSync, NativeError> {
         let mut chain = Vec::new();
         let mut at = marker.to_owned();
         while let Some(link) = self.host.sub_list_link(&at) {
@@ -385,40 +550,119 @@ impl<H: Host> Runtime<'_, H> {
             chain.push((at.clone(), link.clone()));
             at = link.parent;
         }
-        for (_, link) in &chain {
-            match self.host.mod_stamp(&link.parent).verdict(link.expected) {
-                ModVerdict::Same => {}
-                ModVerdict::Changed => {
-                    return Err(NativeError::UncaughtException {
-                        class: "java/util/ConcurrentModificationException".into(),
-                        message: None,
-                        frame: None,
-                    });
-                }
-                ModVerdict::Unknown => {
-                    self.host.unknown_operand_call(r)?;
-                    return Ok(false);
+        let verdict = chain
+            .iter()
+            .map(|(_, link)| self.host.mod_stamp(&link.parent).verdict(link.expected))
+            .find(|verdict| *verdict != ModVerdict::Same)
+            .unwrap_or(ModVerdict::Same);
+        let reslice_all = |this: &mut Self| -> bool {
+            // Outermost first: each view re-reads its parent's current range.
+            for (view, link) in chain.iter().rev() {
+                if !this.reslice(view, link) {
+                    return false;
                 }
             }
+            true
+        };
+        match (verdict, point) {
+            (ModVerdict::Same, _) => {
+                reslice_all(self);
+                Ok(SubSync::Ready)
+            }
+            // A stale view a member does not check: left as it is.
+            (_, SubCheck::Never) => Ok(SubSync::Ready),
+            (ModVerdict::Changed, SubCheck::Before) => Err(NativeError::UncaughtException {
+                class: "java/util/ConcurrentModificationException".into(),
+                message: None,
+                frame: None,
+            }),
+            // The work runs over the root's current range, then throws.
+            (ModVerdict::Changed, SubCheck::After) if reslice_all(self) => Ok(SubSync::ThrowAfter),
+            _ => {
+                self.host.unknown_operand_call(r)?;
+                Ok(SubSync::Counted)
+            }
         }
-        // Outermost first: each view re-reads its parent's current range.
-        for (view, link) in chain.iter().rev() {
-            self.reslice(view, link);
+    }
+
+    /// Sub-lists passed where they are read: a `Collection`/`List`/
+    /// `Iterable` parameter (`new ArrayList<>(s)`, `addAll(s)`), a
+    /// collection's `equals(s)`, and the text and hash calls
+    /// (`String.valueOf(s)`, `StringBuilder.append(s)`, `Objects.hash`...).
+    fn sync_sub_list_arguments(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<(), NativeError> {
+        if args.is_empty() || self.host.sub_lists_of_any() == 0 {
+            return Ok(());
         }
-        Ok(true)
+        let params = descriptor_arguments(&r.descriptor);
+        let text_call = matches!(
+            r.owner.as_str(),
+            "java/lang/String"
+                | "java/lang/StringBuilder"
+                | "java/lang/StringBuffer"
+                | "java/io/PrintStream"
+                | "java/util/Objects"
+        );
+        let collection_receiver = receiver
+            .is_some_and(|receiver| op != 0xb8 && self.host_collection_kind(receiver).is_some());
+        for (index, arg) in args.iter().enumerate() {
+            let Some(marker) = expect_ref(arg).cloned() else {
+                continue;
+            };
+            if self.host.sub_list_link(&marker).is_none() || receiver == Some(arg) {
+                continue;
+            }
+            let param = params.get(index).map(String::as_str).unwrap_or("");
+            let reads = matches!(
+                param,
+                "Ljava/util/Collection;" | "Ljava/util/List;" | "Ljava/lang/Iterable;"
+            ) || (param == "Ljava/lang/Object;"
+                && (text_call || (collection_receiver && r.name == "equals")));
+            if reads {
+                self.sync_sub_list(r, &marker, SubCheck::Before)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sub-lists a string concatenation prints: `toString` iterates them.
+    pub(crate) fn sync_sub_list_operands(&mut self, values: &[Value]) -> Result<(), NativeError> {
+        if self.host.sub_lists_of_any() == 0 {
+            return Ok(());
+        }
+        let to_string = MethodRef {
+            owner: "java/util/List".into(),
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        for value in values {
+            if let Some(marker) = expect_ref(value)
+                && self.host.sub_list_link(marker).is_some()
+            {
+                self.sync_sub_list(&to_string, &marker.clone(), SubCheck::Before)?;
+            }
+        }
+        Ok(())
     }
 
     /// Re-read a view's range from its parent (a parent's `set` shows).
-    fn reslice(&mut self, view: &str, link: &SubListLink) {
+    fn reslice(&mut self, view: &str, link: &SubListLink) -> bool {
         let parent = Value::Ref(Some(link.parent.clone()));
         let Ok(elements) = self.collection_elements(&parent) else {
-            return;
+            return false;
         };
-        if link.offset + link.size <= elements.len() {
-            let range = elements[link.offset..link.offset + link.size].to_vec();
-            self.host
-                .replace_mutable_collection(&Value::Ref(Some(view.to_owned())), range);
+        if link.offset + link.size > elements.len() {
+            return false;
         }
+        let range = elements[link.offset..link.offset + link.size].to_vec();
+        self.host
+            .replace_mutable_collection(&Value::Ref(Some(view.to_owned())), range);
+        true
     }
 
     /// Write a `subList` copy into its parent's range; a structural change

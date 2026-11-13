@@ -14,6 +14,8 @@ use std::{
 };
 
 mod annotation_values;
+mod array_copy;
+mod array_deque;
 mod attachment_codec;
 mod block_item_id;
 pub mod brigadier;
@@ -44,6 +46,7 @@ mod facade_world;
 mod field_access;
 mod field_get_set;
 mod files_copy;
+mod files_move;
 mod frame_bound;
 mod game_codecs;
 mod game_hooks;
@@ -123,6 +126,7 @@ mod registry_contents;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
+mod string_code_points;
 mod string_constructors;
 mod synchronized_views;
 mod tim_sort;
@@ -2252,6 +2256,18 @@ pub trait Host {
         None
     }
 
+    /// Which view (`keySet`, `values`, `entrySet`) a copy is.
+    fn note_view_kind(&mut self, _marker: &str, _kind: &str) {}
+
+    fn view_copy_kind(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// The view copies taken from the map `source`.
+    fn view_copies_of(&self, _source: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// A collection's `modCount` (`mod_count.rs`).
     fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
         mod_count::ModStamp::default()
@@ -2270,6 +2286,35 @@ pub trait Host {
     fn sub_lists_of(&self, _parent: &str) -> Vec<(String, mod_count::SubListLink)> {
         Vec::new()
     }
+
+    /// How many `subList` copies are linked at all.
+    fn sub_lists_of_any(&self) -> usize {
+        0
+    }
+
+    /// An `ArrayDeque`'s physical layout (`array_deque.rs`).
+    fn deque_layout(&self, _marker: &str) -> Option<array_deque::DequeLayout> {
+        None
+    }
+
+    fn store_deque_layout(&mut self, _marker: &str, _layout: Option<array_deque::DequeLayout>) {}
+    /// A host iterator's cursor, its element count and the class (or encoded
+    /// kind) of the collection it iterates, when the host keeps one
+    /// (`collection_callback.rs`).
+    fn host_iterator(&self, _marker: &str) -> Option<(usize, usize, Option<String>)> {
+        None
+    }
+
+    /// `next()` on a host iterator.
+    fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
+        Err(NativeError::Metadata(format!(
+            "unknown java/util/Iterator {marker}"
+        )))
+    }
+
+    /// Move a host iterator's cursor (where a JDK iterator's
+    /// `forEachRemaining` leaves it after its action threw).
+    fn set_host_iterator_cursor(&mut self, _marker: &str, _cursor: usize) {}
 
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
@@ -2632,6 +2677,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// `Collections.emptyList()`/`emptySet()`/`emptyMap()` markers, whose
+    /// mutators JDK 25 does not all refuse (`java_immutable.rs`).
+    empty_collections: std::collections::BTreeSet<String>,
     /// UTF-8 decoders `Charset.newDecoder` made (`charset_decoder.rs`).
     charset_decoders: BTreeMap<String, charset_decoder::DecoderState>,
     /// `Collections.synchronized*` views and the collection each wraps
@@ -2651,6 +2699,8 @@ pub struct StdHost {
     probe_tables: BTreeMap<String, immutable_collections::ProbeTable>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
     view_copies: BTreeMap<String, String>,
+    /// Which view each copy is (`keySet`, `values`, `entrySet`).
+    view_kinds: BTreeMap<String, String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2669,6 +2719,11 @@ pub struct StdHost {
     mod_stamps: BTreeMap<String, mod_count::ModStamp>,
     /// `subList` copies and where they sit in their parents.
     sub_lists: BTreeMap<String, mod_count::SubListLink>,
+    /// `ArrayDeque`s' physical layouts (`array_deque.rs`).
+    deque_layouts: BTreeMap<String, array_deque::DequeLayout>,
+    /// The class (or encoded kind) of the collection each host iterator
+    /// iterates (`collection_callback.rs`).
+    iterator_sources: BTreeMap<String, String>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -2782,6 +2837,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            empty_collections: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
@@ -2790,6 +2846,7 @@ impl StdHost {
             red_black_trees: BTreeMap::new(),
             probe_tables: BTreeMap::new(),
             view_copies: BTreeMap::new(),
+            view_kinds: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -2797,6 +2854,8 @@ impl StdHost {
             iterator_guards: BTreeMap::new(),
             mod_stamps: BTreeMap::new(),
             sub_lists: BTreeMap::new(),
+            deque_layouts: BTreeMap::new(),
+            iterator_sources: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
@@ -4223,6 +4282,25 @@ impl Host for StdHost {
         self.view_copies.contains_key(marker)
     }
 
+    fn note_view_kind(&mut self, marker: &str, kind: &str) {
+        self.view_kinds.insert(marker.to_owned(), kind.to_owned());
+    }
+
+    fn view_copy_kind(&self, marker: &str) -> Option<String> {
+        self.view_kinds.get(marker).cloned()
+    }
+
+    fn view_copies_of(&self, source: &str) -> Vec<String> {
+        if self.view_copies.is_empty() {
+            return Vec::new();
+        }
+        self.view_copies
+            .iter()
+            .filter(|(_, from)| from.as_str() == source)
+            .map(|(view, _)| view.clone())
+            .collect()
+    }
+
     fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
         self.iterator_guards.get(marker).cloned()
     }
@@ -4255,7 +4333,25 @@ impl Host for StdHost {
         };
     }
 
+    fn sub_lists_of_any(&self) -> usize {
+        self.sub_lists.len()
+    }
+
+    fn deque_layout(&self, marker: &str) -> Option<array_deque::DequeLayout> {
+        self.deque_layouts.get(marker).copied()
+    }
+
+    fn store_deque_layout(&mut self, marker: &str, layout: Option<array_deque::DequeLayout>) {
+        match layout {
+            Some(layout) => self.deque_layouts.insert(marker.to_owned(), layout),
+            None => self.deque_layouts.remove(marker),
+        };
+    }
+
     fn sub_lists_of(&self, parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        if self.sub_lists.is_empty() {
+            return Vec::new();
+        }
         self.sub_lists
             .iter()
             .filter(|(_, link)| link.parent() == parent)
@@ -4265,6 +4361,38 @@ impl Host for StdHost {
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
         self.iterators.get(marker).map(|(_, index)| *index)
+    }
+
+    fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
+        let (values, index) = self.iterators.get(marker)?;
+        Some((
+            *index,
+            values.len(),
+            self.iterator_sources.get(marker).cloned(),
+        ))
+    }
+
+    fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
+        let (values, index) = self
+            .iterators
+            .get_mut(marker)
+            .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+        let value = values
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| NativeError::UncaughtException {
+                class: "java/util/NoSuchElementException".into(),
+                message: None,
+                frame: None,
+            })?;
+        *index += 1;
+        Ok(value)
+    }
+
+    fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
+        if let Some((values, index)) = self.iterators.get_mut(marker) {
+            *index = cursor.min(values.len());
+        }
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -5416,10 +5544,12 @@ impl Host for StdHost {
             ) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
                 Ok(Self::argument(r, args, 0)?.clone())
             }
+            // Moves and copies the file model can't make (`files_move.rs`)
+            // are counted: answering the target did nothing.
             ("java/nio/file/Files", "move" | "copy", descriptor)
                 if descriptor.starts_with("(Ljava/nio/file/Path;") =>
             {
-                Ok(Self::argument(r, args, 1)?.clone())
+                self.unknown_host_call(r)
             }
             (
                 "java/nio/file/Files",
@@ -7208,6 +7338,9 @@ impl Host for StdHost {
             let marker = format!("iterator/{}", self.next_iterator);
             self.next_iterator = self.next_iterator.saturating_add(1);
             self.iterators.insert(marker.clone(), (values, 0));
+            if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
+                self.iterator_sources.insert(marker.clone(), source);
+            }
             return Ok(Value::Ref(Some(marker)));
         }
         if matches!(
@@ -7247,8 +7380,14 @@ impl Host for StdHost {
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
                 ("next", "()Ljava/lang/Object;") => {
+                    // Every JDK collection iterator throws a bare
+                    // `NoSuchElementException` past its end.
                     let value = values.get(*index).cloned().ok_or_else(|| {
-                        NativeError::Metadata("java/util/Iterator exhausted".into())
+                        NativeError::UncaughtException {
+                            class: "java/util/NoSuchElementException".into(),
+                            message: None,
+                            frame: None,
+                        }
                     })?;
                     *index += 1;
                     return Ok(value);
@@ -11137,6 +11276,19 @@ fn collection_values(value: &Value) -> Result<Vec<String>, NativeError> {
         return Ok(Vec::new());
     }
     split_capture_markers(values)
+}
+
+/// The class a host collection marker was constructed as
+/// (`java/util/ArrayList#3`, `java/util/ArrayList#neutral0`), or the kind of
+/// an encoded value (`set/...` is `set`).
+fn iterated_kind(marker: &str) -> Option<String> {
+    if let Some((class, _)) = marker.split_once('#')
+        && class.starts_with("java/util/")
+    {
+        return Some(class.to_owned());
+    }
+    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
+    matches!(kind, "list" | "set").then(|| kind.to_owned())
 }
 
 fn host_collection_values(host: &StdHost, value: &Value) -> Result<Vec<String>, NativeError> {
@@ -19486,6 +19638,12 @@ impl<H: Host> Runtime<'_, H> {
         // A composition marker closes over the two callbacks it joined. Running
         // it means running both, in the order the combinator defines — not
         // answering the marker itself.
+        // `Function.identity()` / `UnaryOperator.identity()` (`string_code_points.rs`).
+        if marker == string_code_points::FUNCTION_IDENTITY
+            || marker == string_code_points::UNARY_IDENTITY
+        {
+            return Ok(Some(args.first().cloned().unwrap_or(Value::Ref(None))));
+        }
         if let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
             && let Some((left, right)) = rest.split_once('|')
         {
@@ -19578,8 +19736,12 @@ impl<H: Host> Runtime<'_, H> {
             // zero-argument `Supplier` (`HashMap::new`) has no values at all,
             // so this comes before the receiver split below.
             if callback.target.name == "<init>" {
+                // `String::new` over a `char[]`/`int[]` builds its text; any
+                // other `String::new` is counted (`string_constructors.rs`).
+                if let Some(text) = string_constructors::build(self, &callback.target, &values)? {
+                    return Ok(Some(Value::Ref(Some(text))));
+                }
                 let object = self.new_object(&callback.target.owner);
-                // `String::new` is counted (`string_constructors.rs`).
                 if string_constructors::count(self, &callback.target)?.is_none() {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
@@ -20101,6 +20263,15 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 let marker = self.new_array(class, method);
                 self.arrays.insert(marker.clone(), values);
+                // The copy is an array of the original's class (the overloads
+                // without a `Class` argument), so `System.arraycopy` and
+                // `getClass()` see its component (`array_copy.rs`).
+                if !r.descriptor.contains("Ljava/lang/Class;")
+                    && let Some(component) = expect_ref(StdHost::argument(r, args, 0)?)
+                        .and_then(|original| self.array_component(original))
+                {
+                    self.record_array_component(&marker, &component);
+                }
                 Ok(Some(Value::Ref(Some(marker))))
             }
             ("fill", descriptor) if descriptor.starts_with('[') => {
@@ -21548,6 +21719,47 @@ impl<H: Host> Runtime<'_, H> {
                         let slice = slice_utf16(text, start, length);
                         self.io_write(&marker, &slice);
                         Value::Void
+                    }
+                    // `write(char[])` and `write(char[], off, len)`: the units in
+                    // range. An index outside the array (each writer class has
+                    // its own exception text) and an unpaired surrogate, which
+                    // the model's text cannot hold, are counted.
+                    ("write", "([C)V" | "([CII)V") => {
+                        let units = args
+                            .first()
+                            .map(|array| self.array(array).cloned())
+                            .transpose()?
+                            .unwrap_or_default();
+                        let (start, length) = if r.descriptor == "([C)V" {
+                            (0, units.len() as i64)
+                        } else {
+                            (
+                                i64::from(expect_int(r, StdHost::argument(r, args, 1)?)?),
+                                i64::from(expect_int(r, StdHost::argument(r, args, 2)?)?),
+                            )
+                        };
+                        let in_range = start >= 0
+                            && length >= 0
+                            && start.saturating_add(length) <= units.len() as i64;
+                        let text = in_range
+                            .then(|| {
+                                let slice = units[start as usize..(start + length) as usize]
+                                    .iter()
+                                    .map(|unit| match unit {
+                                        Value::Int(unit) => *unit as u16,
+                                        _ => 0,
+                                    })
+                                    .collect::<Vec<_>>();
+                                String::from_utf16(&slice).ok()
+                            })
+                            .flatten();
+                        match text {
+                            Some(text) => {
+                                self.io_write(&marker, &text);
+                                Value::Void
+                            }
+                            None => self.host.unknown_operand_call(r)?,
+                        }
                     }
                     ("write", "(I)V") => {
                         let code = args
@@ -24223,6 +24435,20 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // FML's `InterModComms` (`neoforge_imc.rs`).
                         value
+                    } else if let Some(text) =
+                        invoke_or_catch!(at, string_constructors::build(self, &r, &args))
+                    {
+                        // `new String(char[]|int[], ..)` (`string_constructors.rs`):
+                        // the allocation marker becomes the text it built.
+                        if let Some(marker @ Value::Ref(Some(_))) = receiver.as_ref() {
+                            let built = Value::Ref(Some(text));
+                            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                                if slot == marker {
+                                    *slot = built.clone();
+                                }
+                            }
+                        }
+                        Value::Void
                     } else if let Some(value) =
                         invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
@@ -24322,12 +24548,27 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_reflect_array(&r, &args, class, method)?
                     {
                         value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_array_copy(&r, &args))
+                    {
+                        // `System.arraycopy` (`array_copy.rs`).
+                        value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_code_points(&r, receiver.as_ref(), &args))
+                    {
+                        // `String.codePoints().forEach` (`string_code_points.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_files_move(&r, &args))
+                    {
+                        // `Files.move`/`copy` between paths (`files_move.rs`).
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_files_copy(&r, &args))
@@ -24647,6 +24888,9 @@ impl<H: Host> Runtime<'_, H> {
                         // An object operand concatenates as its own
                         // `toString` (`jar_text.rs`), then reads as a `String`.
                         let mut captured = captured;
+                        // A `subList` operand's `toString` checks its list
+                        // (`mod_count.rs`).
+                        invoke_or_catch!(at, self.sync_sub_list_operands(&captured));
                         invoke_or_catch!(
                             at,
                             self.concat_object_texts(&mut captured, &mut arguments, class, method)

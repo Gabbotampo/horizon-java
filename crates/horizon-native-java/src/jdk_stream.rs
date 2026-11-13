@@ -372,6 +372,15 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let in_place = self
             .host_collection_class(&list)
             .is_some_and(|class| class == "java/util/ArrayList");
+        // A comparator that changes the list: the JDK sorts its array (or a
+        // copy) around the change and then checks `modCount`. Not modelled:
+        // counted, with the exception a structural change ends in.
+        let expected = self.capture_mod_count(&list);
+        let changed_under = |this: &mut Self| -> Result<Option<bool>, NativeError> {
+            let structural = this.capture_mod_count(&list) != expected;
+            let now = this.host.mutable_collection_values(&list);
+            Ok((structural || now.as_ref() != Some(&items)).then_some(structural))
+        };
         let sorted = match self.sort_in_place(&mut values, &comparator) {
             Ok(()) => values,
             Err(error) => {
@@ -381,6 +390,16 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                 return Err(error);
             }
         };
+        if let Some(structural) = changed_under(self)? {
+            self.host.unknown_operand_call(r)?;
+            if structural {
+                return Err(NativeError::UncaughtException {
+                    class: "java/util/ConcurrentModificationException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+        }
         let method = |name: &str, descriptor: &str| MethodRef {
             owner: "java/util/List".into(),
             name: name.into(),
