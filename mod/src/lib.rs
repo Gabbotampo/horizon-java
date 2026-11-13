@@ -81,12 +81,12 @@ use attachments::Lifecycle;
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
     Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, Flow, GameRuleChangedEvent,
-    Hand, Hooks, Host, HostSide, InteractionResult, ItemStack, ItemsEvent, LeftClickBlockEvent,
-    LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent,
-    LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent,
-    LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
-    PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent,
+    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow,
+    GameRuleChangedEvent, Hand, Hooks, Host, HostSide, InteractionResult, ItemStack, ItemsEvent,
+    LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef,
+    LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
+    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
+    PlayerCloneEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent,
     RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
     RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
     ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
@@ -95,6 +95,7 @@ use mod_api::{
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
     CommandSource as RuntimeSource, CommandText, MessageKind, NodeKind, Requirement,
+    SelectedEntity,
 };
 use runtime::events::{
     EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadeOriginal,
@@ -199,12 +200,52 @@ enum JavaArgument {
     Word,
     Text,
     Integer,
-    /// Brigadier's `EntityArgument.player()` or `.players()`, carried as the mod API's `player`
-    /// kind: the game resolves the selector to exactly one online player before the command
-    /// runs. `player()` is exact. `players()` is the one-player subset of what vanilla accepts:
-    /// a selector that picks two or more players is refused by the game's parser with feedback
-    /// instead of running once per player (named in `docs/mod-plan.md`, "Departures").
+    /// Brigadier's `EntityArgument.player()`, the mod API's `player` kind.
     Player,
+    /// `EntityArgument.players()`, the mod API's `players` kind (#3039).
+    Players,
+    /// `EntityArgument.entity()`, the mod API's `entity` kind (#3039).
+    Entity,
+    /// `EntityArgument.entities()`, the mod API's `entities` kind (#3039).
+    Entities,
+}
+
+/// What the bridge reads from the host to hand a selection to the runtime.
+trait Selection {
+    /// A player's name, for the input line.
+    fn name(&mut self, player: PlayerRef) -> Option<String>;
+    /// The online player an entity is; `None` for any other entity.
+    fn player_of(&mut self, entity: EntityRef) -> Option<PlayerRef>;
+    /// An entity's UUID, for the input line.
+    fn uuid(&mut self, entity: EntityRef) -> Option<u128>;
+}
+
+/// [`Selection`] over the server: the online players by entity id, read once per command.
+struct HostSelection<'a> {
+    host: &'a mut dyn ServerHost,
+    online: Vec<PlayerRef>,
+}
+
+impl<'a> HostSelection<'a> {
+    fn new(host: &'a mut dyn ServerHost) -> Self {
+        let online = host.players().server_players();
+        Self { host, online }
+    }
+}
+
+impl Selection for HostSelection<'_> {
+    fn name(&mut self, player: PlayerRef) -> Option<String> {
+        player.name(&*self.host)
+    }
+    fn player_of(&mut self, entity: EntityRef) -> Option<PlayerRef> {
+        self.online
+            .iter()
+            .find(|player| player.entity() == entity)
+            .copied()
+    }
+    fn uuid(&mut self, entity: EntityRef) -> Option<u128> {
+        entity.uuid(&mut *self.host)
+    }
 }
 
 impl JavaArgument {
@@ -214,21 +255,37 @@ impl JavaArgument {
             Self::Text => "text",
             Self::Integer => "integer",
             Self::Player => "player",
+            Self::Players => "players",
+            Self::Entity => "entity",
+            Self::Entities => "entities",
         }
     }
 
     /// The kinds the runtime's façade records that this bridge carries. Everything else is
-    /// refused by name rather than approximated.
-    ///
-    /// `EntityArgument.entity()` and `.entities()` stay refused: the mod API's only selector
-    /// kind resolves players, and narrowing "any entity" to "one player" would run the command on
-    /// a different set than the jar asked for (the fork seam is in `docs/mod-plan.md`).
+    /// refused by name rather than approximated. Each of `EntityArgument`'s four kinds is the
+    /// mod API kind of the same `single`/`playersOnly` pair, so the game parses and resolves the
+    /// selector as vanilla's `EntityArgument` would.
     fn from_kind(kind: &ArgumentKind) -> Option<Self> {
         match kind {
             ArgumentKind::Word | ArgumentKind::Quoted => Some(Self::Word),
             ArgumentKind::Greedy => Some(Self::Text),
             ArgumentKind::Integer { .. } => Some(Self::Integer),
-            ArgumentKind::Entity { players: true, .. } => Some(Self::Player),
+            ArgumentKind::Entity {
+                single: true,
+                players: true,
+            } => Some(Self::Player),
+            ArgumentKind::Entity {
+                single: false,
+                players: true,
+            } => Some(Self::Players),
+            ArgumentKind::Entity {
+                single: true,
+                players: false,
+            } => Some(Self::Entity),
+            ArgumentKind::Entity {
+                single: false,
+                players: false,
+            } => Some(Self::Entities),
             _ => None,
         }
     }
@@ -239,14 +296,6 @@ impl JavaArgument {
             ArgumentKind::Quoted => "quoted string".to_owned(),
             ArgumentKind::Greedy => "greedy string".to_owned(),
             ArgumentKind::Integer { .. } => "integer".to_owned(),
-            ArgumentKind::Entity {
-                single: true,
-                players: false,
-            } => "single-entity selector (EntityArgument.entity)".to_owned(),
-            ArgumentKind::Entity {
-                single: false,
-                players: false,
-            } => "entity selector (EntityArgument.entities)".to_owned(),
             other => format!("{other:?}"),
         }
     }
@@ -254,15 +303,17 @@ impl JavaArgument {
     /// The runtime's parsed argument for one value the game resolved, and the word
     /// `CommandContext.getInput()` shows for it. `None` when the value is not this kind.
     ///
-    /// A player is the runtime's player list of one, so `EntityArgument.getPlayer`/`getPlayers`
-    /// answer the same `game/player/<uuid>` marker the event façade already answers name, UUID
-    /// and level for. The game hands over the resolved player, not the selector text, so the
-    /// input line names the player (or, without a name, their UUID, which vanilla also accepts
-    /// as a selector) rather than repeating `@s` or `@p`.
+    /// A players-only selection is the runtime's player list and an any-entity selection its
+    /// entity list, in the game's selection order; a player among the entities is named by UUID
+    /// so the façade answers it as the same `game/player/<uuid>` an event hands out. The game
+    /// hands over the resolved selection, not the selector text, so the input word names a lone
+    /// selected player (or, without a name, the entity's UUID, which vanilla also accepts as a
+    /// selector); for several it is `@a` (players) or `@e` (entities), a stand-in, not the text
+    /// typed (named in `docs/mod-plan.md`).
     fn runtime_value(
         self,
         value: &CommandArgumentValue,
-        player_name: impl Fn(PlayerRef) -> Option<String>,
+        selection: &mut dyn Selection,
     ) -> Option<(brigadier::CommandArgument, String)> {
         Some(match (self, value) {
             (Self::Word | Self::Text, CommandArgumentValue::String(text)) => {
@@ -272,7 +323,22 @@ impl JavaArgument {
                 (brigadier::CommandArgument::Int(*value), value.to_string())
             }
             (Self::Player, CommandArgumentValue::Player(player)) => {
-                selected_player(player.uuid(), player_name(*player))
+                selected_player(player.uuid(), selection.name(*player))
+            }
+            (Self::Players, CommandArgumentValue::Players(players)) => match players.as_slice() {
+                [one] => selected_player(one.uuid(), selection.name(*one)),
+                _ => (
+                    brigadier::CommandArgument::Players(
+                        players.iter().map(|player| player.uuid()).collect(),
+                    ),
+                    "@a".to_owned(),
+                ),
+            },
+            (Self::Entity, CommandArgumentValue::Entity(entity)) => {
+                selected_entities(std::slice::from_ref(entity), selection)
+            }
+            (Self::Entities, CommandArgumentValue::Entities(entities)) => {
+                selected_entities(entities, selection)
             }
             _ => return None,
         })
@@ -286,6 +352,34 @@ fn selected_player(uuid: u128, name: Option<String>) -> (brigadier::CommandArgum
         brigadier::CommandArgument::Players(vec![uuid]),
         name.unwrap_or_else(|| hyphenated_uuid(uuid)),
     )
+}
+
+/// An any-entity selection as the runtime's entity list and its input word: the players among
+/// them by UUID, the rest by network id (`Entity.getId`, what `EntityRef::id` holds).
+fn selected_entities(
+    entities: &[EntityRef],
+    selection: &mut dyn Selection,
+) -> (brigadier::CommandArgument, String) {
+    let players: Vec<Option<PlayerRef>> = entities
+        .iter()
+        .map(|entity| selection.player_of(*entity))
+        .collect();
+    let picked: Vec<SelectedEntity> = entities
+        .iter()
+        .zip(&players)
+        .map(|(entity, player)| match player {
+            Some(player) => SelectedEntity::Player(player.uuid()),
+            None => SelectedEntity::Entity(entity.id() as i32),
+        })
+        .collect();
+    let word = match (entities, players.as_slice()) {
+        ([entity], [player]) => player
+            .and_then(|player| selection.name(player))
+            .or_else(|| selection.uuid(*entity).map(hyphenated_uuid))
+            .unwrap_or_else(|| "@e".to_owned()),
+        _ => "@e".to_owned(),
+    };
+    (brigadier::CommandArgument::Entities(picked), word)
 }
 
 /// A UUID in Java's `UUID.toString()` form (`8-4-4-4-12` lower-case hex).
@@ -527,7 +621,7 @@ impl Hooks for HorizonJava {
                 match event.command.argument(name) {
                     Some(value) => {
                         let Some((argument, word)) =
-                            kind.runtime_value(value, |player| player.name(&*host))
+                            kind.runtime_value(value, &mut HostSelection::new(&mut *host))
                         else {
                             return refuse(
                                 host,
@@ -626,12 +720,16 @@ impl Hooks for HorizonJava {
         let tick_count = event.context.tick.get().min(i32::MAX as u64) as i32;
         self.lock().tick_count = tick_count;
         let dedicated = event.context.authority == Authority::DedicatedServer;
+        let context = EventContext {
+            has_time: Some(host.server_has_time()),
+            ..EventContext::default()
+        };
         self.fire_bridged(
             Some(&mut *host),
             Lifecycle::None,
             game,
             dedicated,
-            EventContext::default(),
+            context,
             |_| true,
         );
     }
@@ -639,6 +737,7 @@ impl Hooks for HorizonJava {
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Pre`).
     fn level_tick_pre(&self, host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+        let has_time = side_has_time(&host);
         if let HostSide::Server(host) = host {
             // The level's clocks are what `level.getGameTime()`/`getDayTime()` answer, so they
             // are refreshed from the level the hook names, before the listeners run.
@@ -646,6 +745,7 @@ impl Hooks for HorizonJava {
         }
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
+            has_time: Some(has_time),
             ..EventContext::default()
         };
         self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
@@ -655,9 +755,10 @@ impl Hooks for HorizonJava {
 
     /// A server level's tick ends (Fabric's `END_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Post`).
-    fn level_tick_post(&self, _host: HostSide<'_>, event: &mut LevelTickPostEvent) {
+    fn level_tick_post(&self, host: HostSide<'_>, event: &mut LevelTickPostEvent) {
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
+            has_time: Some(side_has_time(&host)),
             ..EventContext::default()
         };
         self.fire_event(GameEvent::LevelTickEnd, self.dedicated(), context, |_| true);
@@ -1391,6 +1492,16 @@ fn one_hand<T: PartialEq>(held: Option<&T>, main: Option<&T>, off: Option<&T>) -
 }
 
 /// The dimension id of a hook's `LevelDimension`.
+/// NeoForge's `hasTime()` for a tick hook: the server's `MinecraftServer.haveTime()` as
+/// `ConfigHost::server_has_time` reads it now, and `true` on a client, where NeoForge's client
+/// level tick passes `() -> true` (the host answers the same).
+fn side_has_time(host: &HostSide<'_>) -> bool {
+    match host {
+        HostSide::Server(host) => host.server_has_time(),
+        HostSide::Client(host) => host.server_has_time(),
+    }
+}
+
 fn dimension_id(dimension: LevelDimension) -> &'static str {
     dimension.key().id()
 }
@@ -2370,34 +2481,59 @@ mod tests {
     /// and refused usages land in the row, so `calcmod`'s failed registration is a counted
     /// failure in the report, not only a log line.
     /// Brigadier's four `EntityArgument` kinds, as the runtime records them from
-    /// `EntityArgument.entity()/entities()/player()/players()` (`single`, `playersOnly`): the two
-    /// player kinds are carried as the mod API's `player` kind and spelled so in the usage the
-    /// game parses; the two entity kinds have no mod API counterpart and stay refused.
+    /// `EntityArgument.entity()/entities()/player()/players()` (`single`, `playersOnly`): each is
+    /// the mod API kind with the same pair (`entity`, `entities`, `player`, `players`, the game's
+    /// `minecraft:entity` argument with `amount` and `type`), spelled so in the usage it parses.
     #[test]
-    fn only_the_player_selector_kinds_are_carried() {
+    fn each_entity_argument_kind_is_its_mod_api_kind() {
         let kind = |single, players| ArgumentKind::Entity { single, players };
-        assert_eq!(
-            JavaArgument::from_kind(&kind(true, true)),
-            Some(JavaArgument::Player)
-        );
-        assert_eq!(
-            JavaArgument::from_kind(&kind(false, true)),
-            Some(JavaArgument::Player)
-        );
-        assert_eq!(JavaArgument::from_kind(&kind(true, false)), None);
-        assert_eq!(JavaArgument::from_kind(&kind(false, false)), None);
+        let carried = |single, players| {
+            JavaArgument::from_kind(&kind(single, players)).map(JavaArgument::usage_kind)
+        };
+        assert_eq!(carried(true, true), Some("player"));
+        assert_eq!(carried(false, true), Some("players"));
+        assert_eq!(carried(true, false), Some("entity"));
+        assert_eq!(carried(false, false), Some("entities"));
         assert_eq!(
             usage(
                 &["carryon".to_owned(), "clear".to_owned()],
-                &[("target".to_owned(), JavaArgument::Player)]
+                &[("target".to_owned(), JavaArgument::Players)]
             ),
-            "carryon clear <target:player>"
+            "carryon clear <target:players>"
         );
-        // The refusal log names the kind the jar asked for, not a Debug dump.
-        assert_eq!(
-            JavaArgument::describe(&kind(false, false)),
-            "entity selector (EntityArgument.entities)"
-        );
+    }
+
+    /// A [`Selection`] of literal facts: online players by entity id with their names, and entity
+    /// UUIDs.
+    #[derive(Default)]
+    struct Known {
+        players: Vec<(PlayerRef, Option<String>)>,
+        uuids: Vec<(EntityRef, u128)>,
+    }
+
+    impl Selection for Known {
+        fn name(&mut self, player: PlayerRef) -> Option<String> {
+            self.players
+                .iter()
+                .find(|(known, _)| *known == player)
+                .and_then(|(_, name)| name.clone())
+        }
+        fn player_of(&mut self, entity: EntityRef) -> Option<PlayerRef> {
+            self.players
+                .iter()
+                .map(|(player, _)| *player)
+                .find(|player| player.entity() == entity)
+        }
+        fn uuid(&mut self, entity: EntityRef) -> Option<u128> {
+            self.uuids
+                .iter()
+                .find(|(known, _)| *known == entity)
+                .map(|(_, uuid)| *uuid)
+        }
+    }
+
+    fn entity(id: u32) -> EntityRef {
+        EntityRef::new(mod_api::WorldEpoch::new(1), id)
     }
 
     /// The player the game selected reaches the Java command as the runtime's one-player list,
@@ -2421,16 +2557,81 @@ mod tests {
         );
         // A value of another kind is not read as a player, nor a player as text.
         let text = CommandArgumentValue::String("Alex".to_owned());
-        assert_eq!(JavaArgument::Player.runtime_value(&text, |_| None), None);
         assert_eq!(
-            JavaArgument::Word.runtime_value(&text, |_| None),
+            JavaArgument::Player.runtime_value(&text, &mut Known::default()),
+            None
+        );
+        assert_eq!(
+            JavaArgument::Word.runtime_value(&text, &mut Known::default()),
             Some((
                 brigadier::CommandArgument::Str("Alex".to_owned()),
                 "Alex".to_owned()
             ))
         );
         let number = CommandArgumentValue::Integer(3);
-        assert_eq!(JavaArgument::Player.runtime_value(&number, |_| None), None);
+        assert_eq!(
+            JavaArgument::Player.runtime_value(&number, &mut Known::default()),
+            None
+        );
+    }
+
+    /// The game's resolved selections reach the runtime in selection order: a players-only one
+    /// as the player list, an any-entity one as the entity list with the players among them by
+    /// UUID and the rest by network id. A lone selection's input word names it (a player's name,
+    /// else the entity's UUID); several get the `@a`/`@e` stand-in.
+    #[test]
+    fn entity_selections_reach_the_runtime_in_selection_order() {
+        let alex_uuid = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128;
+        let cow_uuid = 0x1111_2222_3333_4444_5555_6666_7777_8888_u128;
+        let alex = mod_api::__private::game::player_ref(entity(5), alex_uuid);
+        let bob = mod_api::__private::game::player_ref(entity(6), 9);
+        let mut known = Known {
+            players: vec![(alex, Some("Alex".to_owned())), (bob, None)],
+            uuids: vec![(entity(42), cow_uuid)],
+        };
+        let mixed = CommandArgumentValue::Entities(vec![entity(42), entity(5)]);
+        assert_eq!(
+            JavaArgument::Entities.runtime_value(&mixed, &mut known),
+            Some((
+                brigadier::CommandArgument::Entities(vec![
+                    SelectedEntity::Entity(42),
+                    SelectedEntity::Player(alex_uuid),
+                ]),
+                "@e".to_owned()
+            ))
+        );
+        let cow = CommandArgumentValue::Entity(entity(42));
+        assert_eq!(
+            JavaArgument::Entity.runtime_value(&cow, &mut known),
+            Some((
+                brigadier::CommandArgument::Entities(vec![SelectedEntity::Entity(42)]),
+                "11112222-3333-4444-5555-666677778888".to_owned()
+            ))
+        );
+        let me = CommandArgumentValue::Entity(entity(5));
+        assert_eq!(
+            JavaArgument::Entity
+                .runtime_value(&me, &mut known)
+                .map(|(_, word)| word),
+            Some("Alex".to_owned())
+        );
+        let both = CommandArgumentValue::Players(vec![bob, alex]);
+        assert_eq!(
+            JavaArgument::Players.runtime_value(&both, &mut known),
+            Some((
+                brigadier::CommandArgument::Players(vec![9, alex_uuid]),
+                "@a".to_owned()
+            ))
+        );
+        // A player selection is not read as an entity selection, nor the reverse.
+        assert_eq!(
+            JavaArgument::Entities.runtime_value(&both, &mut known),
+            None
+        );
+        assert_eq!(
+            JavaArgument::Players.runtime_value(&mixed, &mut known),
+            None
+        );
     }
 
     #[test]
