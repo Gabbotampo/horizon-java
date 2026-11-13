@@ -25,6 +25,7 @@ use zip::write::SimpleFileOptions;
 const PROBE: &str = r#"package demo;
 
 import net.neoforged.fml.config.ConfigTracker;
+import net.neoforged.fml.config.ConfigValues;
 import net.neoforged.neoforge.common.ModConfigSpec;
 
 public final class Probe {
@@ -38,6 +39,43 @@ public final class Probe {
         builder.push("general");
         return builder.path();
     }
+
+    /// A subclass of the jar's copy, whose `super` calls resolve one to the
+    /// copy's own body and one to the JDK `AbstractCollection` it extends.
+    static final class Sub extends ConfigValues {
+        @Override public String describe() {
+            return "sub>" + super.describe() + ">" + super.toString();
+        }
+    }
+
+    public static String skeleton() {
+        return new Sub().describe() + "|" + new ConfigValues().isEmpty();
+    }
+}
+"#;
+
+/// A loader-namespace copy that is also a JDK `AbstractCollection`: the jar
+/// copy (`class_precedence.rs`) and the JDK skeleton (`jdk_skeletons/`)
+/// both sit in its dispatch chain.
+const VALUES_COPY: &str = r#"package net.neoforged.fml.config;
+
+import java.util.AbstractCollection;
+import java.util.Iterator;
+
+public class ConfigValues extends AbstractCollection<String> {
+    private final String[] items = {"a", "b"};
+
+    @Override public int size() { return items.length; }
+
+    @Override public Iterator<String> iterator() {
+        return new Iterator<>() {
+            int next;
+            @Override public boolean hasNext() { return next < items.length; }
+            @Override public String next() { return items[next++]; }
+        };
+    }
+
+    public String describe() { return "copy:" + size(); }
 }
 "#;
 
@@ -119,6 +157,7 @@ impl Classes {
                 "net/neoforged/neoforge/common/ModConfigSpec.java",
                 SPEC_COPY,
             ),
+            ("net/neoforged/fml/config/ConfigValues.java", VALUES_COPY),
         ] {
             let file = root.join("src").join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -254,5 +293,22 @@ fn a_fabric_run_without_a_copy_keeps_the_host_model() {
         unknown.iter().any(|(call, _)| call
             == "net/neoforged/fml/config/ConfigTracker#registerConfig(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
         "{unknown:?}"
+    );
+}
+
+/// A `super` call on a subclass of a jar's loader-namespace copy goes where
+/// the JVM resolves it: `super.describe()` to the copy's own body (the jar
+/// copy path), `super.toString()` past the copy to `AbstractCollection`'s
+/// body (the JDK skeleton path), and the copy's constructor chains into
+/// `AbstractCollection()`. Expected text: OpenJDK 25.0.5 running the same
+/// classes (`java -cp classes demo.Probe`-style driver calling `skeleton()`).
+#[test]
+fn a_jar_copy_extending_a_jdk_skeleton_runs_each_body_where_the_jvm_resolves_it() {
+    let classes = Classes::compile("fabric-skeleton");
+    let probe = classes.jar("probe", FABRIC_META, &["demo"]);
+    let port = classes.jar("port", PORT_META, &["net"]);
+    assert_eq!(
+        run(&probe, &[&port], "skeleton"),
+        ("sub>copy:2>[a, b]|false".to_owned(), Vec::new())
     );
 }

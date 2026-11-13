@@ -21,7 +21,7 @@ use super::*;
 
 /// Field key suffix (after the array marker) holding an array's component
 /// class marker: `java/lang/String`, `int`, `[I`.
-const ARRAY_COMPONENT_FIELD: &str = "|[#component";
+pub(crate) const ARRAY_COMPONENT_FIELD: &str = "|[#component";
 
 /// `java.lang.String` and every type it extends or implements.
 const STRING_TYPES: &[&str] = &[
