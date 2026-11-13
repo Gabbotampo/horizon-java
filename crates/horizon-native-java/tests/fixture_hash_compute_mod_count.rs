@@ -137,26 +137,18 @@ fn replace_all_runs_the_function() {
 }
 
 /// A function that adds a key (JDK 25 walks on into its own table, then
-/// throws), and `replaceAll` on another map type, are counted.
+/// throws) is counted. (`TreeMap.replaceAll` is exact since #111:
+/// `fixture_tree_set_bulk.rs`.)
 #[test]
 fn replace_all_beyond_the_model_is_counted() {
     let fixture = fixture("replace-all-beyond-the-model-is-counted");
-    let cases: &[(&str, &[(&str, usize)])] = &[
-        (
-            "replaceAllPutsKey",
-            &[(
-                "java/util/Map#replaceAll(Ljava/util/function/BiFunction;)V",
-                1,
-            )],
-        ),
-        (
-            "replaceAllTree",
-            &[(
-                "java/util/Map#replaceAll(Ljava/util/function/BiFunction;)V",
-                1,
-            )],
-        ),
-    ];
+    let cases: &[(&str, &[(&str, usize)])] = &[(
+        "replaceAllPutsKey",
+        &[(
+            "java/util/Map#replaceAll(Ljava/util/function/BiFunction;)V",
+            1,
+        )],
+    )];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
         fixture.text_on(&mut host, method);
