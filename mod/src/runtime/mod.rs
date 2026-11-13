@@ -12521,7 +12521,7 @@ impl std::fmt::Display for NativeError {
                     None => write!(f, "uncaught exception {class}")?,
                 }
                 if let Some(frame) = frame {
-                    write!(f, " (at {frame})")?;
+                    write!(f, " (at {})", jar_throwables::printed_frame(frame))?;
                 }
                 Ok(())
             }
@@ -22909,6 +22909,10 @@ impl<H: Host> Runtime<'_, H> {
         }
         if method != "<clinit>" {
             self.ensure_initialized(class)?;
+        }
+        // An execution's first frame: no earlier throw can be caught in it.
+        if self.depth == 0 {
+            jar_throwables::start_execution();
         }
         self.depth += 1;
         stack_walk::enter(class, method);
