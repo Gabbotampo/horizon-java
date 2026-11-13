@@ -58,7 +58,8 @@ public final class Probe {
         out.append(is(Path.of("f"))).append(',').append(attempt(() -> kind(Path.of("f")))).append('|');
         Files.createDirectory(Path.of("g"));
         Files.move(Path.of("g"), Path.of("h"));
-        out.append(is(Path.of("g"))).append(',').append(is(Path.of("h")));
+        out.append(is(Path.of("g"))).append(',').append(is(Path.of("h"))).append('|');
+        out.append(kind(Path.of("."))).append(',').append(is(Path.of("")));
         return out.toString();
     }
 

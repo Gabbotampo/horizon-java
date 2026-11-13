@@ -26,7 +26,8 @@ fn file_kinds_and_read_attributes_answer_like_jdk_25() {
          UnsupportedOperationException:null|\
          NullPointerException:Cannot invoke \"java.nio.file.Path.getFileSystem()\" because \"path\" is null|\
          NullPointerException:Cannot invoke \"java.nio.file.Path.getFileSystem()\" because \"path\" is null|\
-         false|false/false,NoSuchFileException:f|false/false,true/false"
+         false|false/false,NoSuchFileException:f|false/false,true/false|\
+         true,false,false,false,true/false"
     );
     assert_eq!(
         host.unknown_host_call_count(),

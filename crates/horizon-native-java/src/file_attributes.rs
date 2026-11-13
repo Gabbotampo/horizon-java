@@ -15,8 +15,9 @@
 //! since this module, the directories it made (`io_dirs`: `createDirectory`,
 //! `createDirectories`, `File.mkdir`, `File.mkdirs`). A path is
 //!
-//! * a directory when the run made it, when it is the parent (at any depth) of a
-//!   file or directory the model holds, or when it is one of the folders the
+//! * a directory when the run made it, when it is the working directory
+//!   (`""`, `"."`), when it is the parent (at any depth) of a file or
+//!   directory the model holds, or when it is one of the folders the
 //!   loader hands out (`/horizon/game`, `/horizon/config`, `/horizon/mods`,
 //!   `/horizon/defaultconfigs`) or one of their parents: a game always has
 //!   those;
@@ -106,7 +107,10 @@ impl<H: Host> Runtime<'_, H> {
     /// What `path` is in the file model (see the module docs).
     pub(crate) fn file_kind(&mut self, path: &str) -> FileKind {
         let path = path.trim_end_matches('/');
-        if self.io_dirs.contains(path)
+        // The working directory (`Path.of("")`, `Path.of(".")`) always exists.
+        if path.is_empty()
+            || path == "."
+            || self.io_dirs.contains(path)
             || LOADER_DIRECTORIES
                 .iter()
                 .any(|root| *root == path || is_parent_of(path, root))
