@@ -1,23 +1,37 @@
-//! `==` on boxes and strings answers Java's object identity, or is counted.
+//! `==` on boxes, strings and the JDK's shared empty collections answers
+//! Java's object identity, or is counted.
 //!
 //! The interpreter holds a box as its value and a string as its text, so `==`
 //! used to answer "same object" for any two equal values:
 //! `Integer a = 1000, b = 1000; a == b` was `true`. Every expected string here
 //! is what the same class printed on Java 25 (OpenJDK 25.0.5, `javac
-//! --release 17`, run twice with the same output). Comparisons whose answer
-//! depends on an identity the interpreter does not keep (a box read back from
-//! a list, one producer inside a loop, two parameters) must be counted
-//! instead.
+//! --release 17`; two runs and an `-Xint` run, the same output). Comparisons
+//! whose answer depends on an identity the interpreter does not keep (a box
+//! read back from a list, a fresh string that `intern()` may have made the
+//! pool's, an array element, one producer inside a loop, two parameters) must
+//! be counted instead, whatever they answer.
 
 use horizon_native_java::{NativeJar, StdHost, Value};
-use std::{fs, io::Write, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::Command,
+    time::{Duration, Instant},
+};
 use zip::write::SimpleFileOptions;
 
+/// `MANY` becomes 4000 `if (a == b) n++;` lines (a 64 KB class, as in the
+/// review that found one analysis per comparison).
 const SOURCE: &str = r#"
+
 package demo;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 @SuppressWarnings({"removal", "deprecation"})
 public final class Identity {
@@ -89,7 +103,36 @@ public final class Identity {
     String a = "ab", b = "ab";
     String c = new StringBuilder("ab").toString();
     String d = a.substring(0, 1) + "b";
-    return "" + (a == b) + (a == "a" + "b") + (c == a) + (d == a) + (d == c) + (c.intern() == a) + (d.intern() == b);
+    return "" + (a == b) + (a == "a" + "b") + (d == c) + (c.intern() == a) + (d.intern() == b);
+  }
+
+  /** Empty builder text is the "" literal (JDK 25's toString: length() == 0 ? "" : new String). */
+  public static String emptyBuilders() {
+    StringBuilder sb = new StringBuilder();
+    String a = sb.toString(), b = sb.toString();
+    StringBuffer sf = new StringBuffer();
+    String c = sf.toString(), d = sf.toString();
+    return "" + (a == "") + (a == b) + (c == "") + (c == d) + (new StringBuilder("").toString() == "");
+  }
+
+  /** A concatenation is a new string even when empty; against a literal, unknown. */
+  public static String emptyConcat() {
+    String e = "";
+    return "" + (e + e == "") + ("" + e == e);
+  }
+
+  /** Different texts that once parsed as one box marker. */
+  public static String spelledLikeBoxes() {
+    String a = "integer:5", b = "integer:05", c = "integer:+5", d = "double:1.0", e = "double:1", f = "long:1", g = "long:01";
+    String p = "integer:";
+    return "" + (a == b) + (a == c) + (d == e) + (f == g) + ("integer:5" == (p + "05").intern());
+  }
+
+  /** The JDK's shared empty collections. */
+  public static String sharedEmpties() {
+    return "" + (List.of() == List.of()) + (Collections.emptyList() == Collections.emptyList())
+        + (Map.of() == Map.of()) + (Set.of() == Set.of()) + (List.of() == Collections.emptyList())
+        + (new ArrayList<>() == new ArrayList<>());
   }
 
   // ---- not provable: counted ----
@@ -115,6 +158,61 @@ public final class Identity {
     List<String> l = new ArrayList<>();
     l.add("ab");
     return "" + (l.get(0) == "ab");
+  }
+
+  /** intern() puts a fresh string itself in the pool (s.intern() == s). */
+  public static String internedFresh() {
+    String s = new StringBuilder("qz7").append("w1x").toString();
+    String t = s.intern();
+    return "" + (s == t) + (t == s);
+  }
+
+  public static String internedConcat() {
+    return internConcat("k3");
+  }
+
+  static String internConcat(String a) {
+    String s = a + "p9v";
+    return "" + (s.intern() == s);
+  }
+
+  public static String internedThenLiteral() {
+    String s = new StringBuilder("hh").append("q8r").toString();
+    s.intern();
+    return "" + (s == "hhq8r");
+  }
+
+  public static String freshVsLiteral() {
+    String c = new StringBuilder("ab").toString();
+    String d = "ab".substring(0, 1) + "b";
+    return "" + (c == "ab") + (d == "ab");
+  }
+
+  public static String arrayStrings() {
+    String[] ss = {"aa", new StringBuilder("a").toString() + "a"};
+    return "" + (ss[0] == ss[1]);
+  }
+
+  public static String objectStrings() {
+    List<String> l = new ArrayList<>();
+    l.add("ll");
+    l.add(new StringBuilder("l").append("l").toString());
+    Object c = l.get(0), d = l.get(1);
+    return "" + (c == d);
+  }
+
+  public static String markerShapedLiteral() {
+    return "" + ("a/B#1" == new StringBuilder("a/B#").append(1).toString());
+  }
+
+  /** 4000 comparisons of one reference in a loop: the analysis runs once. */
+  public static String manyCompares() {
+    Integer a = 1000;
+    Integer b = a;
+    int n = 0;
+    for (int i = 0; i < 2; i++) {
+MANY    }
+    return "" + n;
   }
 
   public static String params() {
@@ -144,7 +242,8 @@ fn jar(tag: &str) -> NativeJar {
     let source = root.join("src/demo/Identity.java");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();
-    fs::write(&source, SOURCE).unwrap();
+    let many = "      if (a == b) n++;\n".repeat(4000);
+    fs::write(&source, SOURCE.replace("MANY", &many)).unwrap();
     let status = Command::new(javac())
         .args(["--release", "17", "-nowarn", "-d"])
         .arg(root.join("classes"))
@@ -194,7 +293,10 @@ fn provable_identities_answer_as_java_25() {
         ("sameReference", "truetruetruefalsefalsetrue"),
         ("mixedTypes", "falsefalsefalsefalse"),
         ("acrossShapes", "truefalse15"),
-        ("strings", "truetruefalsefalsefalsetruetrue"),
+        ("strings", "truetruefalsetruetrue"),
+        ("emptyBuilders", "truetruetruetruetrue"),
+        ("spelledLikeBoxes", "falsefalsefalsefalsefalse"),
+        ("sharedEmpties", "truetruetruetruefalsefalse"),
     ] {
         let (value, unknown) = run(&jar, name);
         assert_eq!(value, text(expected), "{name}");
@@ -216,17 +318,45 @@ fn provable_identities_answer_as_java_25() {
 #[test]
 fn identities_the_interpreter_does_not_keep_are_counted() {
     let jar = jar("counted");
-    for (name, family) in [
-        ("fromList", "java/lang/Object"),
-        ("inLoop", "java/lang/Object"),
-        ("params", "java/lang/Object"),
-        ("stringFromList", "java/lang/String"),
+    // (method, Java 25's answer, the family it is counted under)
+    for (name, java, family) in [
+        ("fromList", "false", "java/lang/Object"),
+        ("inLoop", "falsefalse", "java/lang/Object"),
+        ("params", "false", "java/lang/Object"),
+        ("stringFromList", "true", "java/lang/String"),
+        ("internedFresh", "truetrue", "java/lang/String"),
+        ("internedConcat", "true", "java/lang/String"),
+        ("internedThenLiteral", "true", "java/lang/String"),
+        ("freshVsLiteral", "falsefalse", "java/lang/String"),
+        ("arrayStrings", "false", "java/lang/String"),
+        ("objectStrings", "false", "java/lang/String"),
+        ("markerShapedLiteral", "false", "java/lang/String"),
+        ("emptyConcat", "falsefalse", "java/lang/String"),
     ] {
-        let (_, unknown) = run(&jar, name);
+        let (value, unknown) = run(&jar, name);
         let counted = format!("{family}#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z");
         assert!(
             unknown.iter().any(|(call, _)| *call == counted),
-            "{name} did not count {counted}: {unknown:?}"
+            "{name} answered {value:?} (Java 25: {java}) without counting {counted}: {unknown:?}"
         );
     }
+}
+
+/// The producer analysis runs once per method, not once per comparison, and
+/// is kept across calls: 8000 comparisons in a 64 KB method answer exactly
+/// and quickly (one review measured 23 s per call before this).
+#[test]
+fn a_method_full_of_comparisons_is_analysed_once() {
+    let jar = jar("many");
+    let started = Instant::now();
+    for _ in 0..2 {
+        let (value, unknown) = run(&jar, "manyCompares");
+        assert_eq!(value, text("8000"));
+        assert_eq!(unknown, Vec::<(String, usize)>::new());
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "two calls took {elapsed:?}"
+    );
 }

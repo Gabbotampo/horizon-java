@@ -22927,6 +22927,9 @@ impl<H: Host> Runtime<'_, H> {
                 None => self.host.invoke(&r, args),
             };
         };
+        // `if_acmp`'s producer analysis, looked up once per frame
+        // (`reference_identity.rs`).
+        let mut identity = reference_identity::FrameIdentity::default();
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
         let mut local = 0;
         if !target.is_static() {
@@ -23554,6 +23557,7 @@ impl<H: Host> Runtime<'_, H> {
                     // Identity, not value equality, for boxes and strings
                     // (`reference_identity.rs`).
                     let same = self.same_reference(
+                        &mut identity,
                         file,
                         method,
                         desc,
