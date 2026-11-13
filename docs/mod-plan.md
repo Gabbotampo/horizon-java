@@ -17,7 +17,7 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 | **M0, the shell** | `Hooks::server_about_to_start` and `Hooks::client_setup` log one line each. The server start writes this mod's report, `config/horizon_java/java-runtime.json`, through the mod API's own config service (`Host::config_files`), so the game files it under `config/` beside every other mod's. With no jars it is `{"schema":1,"jars":[]}`. |
 | **M1, run jars** | Every `.jar` in `config/horizon_java/java-mods/` is read as bytes (at `server_about_to_start` until M3 moved the read to the content phase, with `std::fs`; see M3), loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `ran-partial` / `refused`, its host-call and unknown-host-call counts, and the reason a jar was refused or ran partially. |
 | **M2a, lifecycle** | Each jar's `StdHost` (heap, statics, recorded listeners) is kept for the server's life. `server_about_to_start` fires the Fabric `SERVER_STARTING` and NeoForge `ServerAboutToStartEvent` listeners, `server_starting` the NeoForge `ServerStartingEvent` ones, `server_started` the Fabric `SERVER_STARTED` and NeoForge `ServerStartedEvent` ones, and `server_stopping`/`server_stopped` their own. Each hook logs callbacks run/failed and unmodelled host calls; every row's `callbacks` object totals them; a jar's `System.out` lines reach the game log with its id. |
-| **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text`, `integer` and player-selector (`EntityArgument.player()`/`players()`, as the mod API's `player` kind) nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
+| **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text`, `integer` and entity-selector (`EntityArgument.entity()`/`entities()`/`player()`/`players()`, as the mod API's kind of the same name) nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 | **M2c, game events** | Every other modelled server event reaches its matching mod API hook, moment for moment: server and level ticks, level load/unload, player join/leave/respawn/clone/dimension change, entity join/leave, living damage before/after, item and block use, block and entity attack, and block break (whose cancel also fires Fabric's `CANCELED`). A cancellable hook carries the firing's cancel and, where the hook has one, the Fabric `InteractionResult` back as the hook's cancellation result. The full table, arguments and departures: [docs/mod-hooks.md](mod-hooks.md). |
 | **M3, content** | The jars now run at the game's **Registration** phase, before any resource or world loads and while the content root can still grow, instead of at `server_about_to_start`. Each `RegistryDeclaration::{Item, Block}` the runtime recorded becomes a native content declaration (`Hooks::blocks`/`items`, NeoForge's `RegisterEvent`): an item keeps the template and the properties the content vocabulary carries, and a block brings its block item. The game joins them under the jar's namespace, so `/give`, `setblock` and the inventory see `<jar id>:<path>`. A jar's own assets, lang and loot need the bake route in [m3-content-design.md](m3-content-design.md). |
 | **M3b, baked assets and declarations** | An install-time bake (`tools/bake.py`) runs each jar's server entrypoints through the offline runtime (`horizon-native-java --json <jar>`, the code the mod vendors), keeps the resource kinds a content package accepts, and writes one `.hmod` per namespace into `<game-dir>/horizon-mods/`, turned on in `horizon-mods.txt`. The package carries the jar's models, textures, item definitions, blockstates, lang and loot **and** its blocks/items as `data/<ns>/horizon/{block,item}/*.json` (the runtime's own mapping, `crates/horizon-native-java/src/content.rs`). It owns its namespace, so the game loads it without the native ownership fence; the mod's runtime declaration for that namespace is skipped (see the fence note below). Class files, metadata and unsafe paths never enter the package; everything left out is in `config/horizon_java/bake-report.json` with its reason. |
@@ -91,19 +91,23 @@ Named here, not just in comments:
   audience.
 - **A jar's command set is fixed at registration.** `Commands::refresh_commands` re-offers the same
   usages: no Java API here re-runs a registration callback with a different set.
-- **`EntityArgument.players()` takes one player.** The mod API's only selector kind is `player`:
-  the game resolves it to exactly one online player before the command runs. `player()` maps onto
-  it exactly. `players()` maps onto it as its one-player subset, so `/carryon clear @a` with two or
-  more players online is refused by the game's parser (with its feedback; a vanilla client already
-  flags the multi-player selector as it is typed, since the tree it gets says single player)
-  instead of running once per player as vanilla does. A selection of one player, `@s`, `@p`, a name
-  or a UUID behaves as vanilla. `EntityArgument.entity()` and `.entities()` are refused at
-  registration by name: narrowing "any entity" to "one player" would run the command on a set the
-  jar did not ask for. Both wait on the fork seam below ("Entity selectors in typed commands").
+- **Entity selectors are the game's resolution (#3039, since the `1cc882b8e0` pin).** Each of
+  `EntityArgument.entity()`/`entities()`/`player()`/`players()` is the mod API kind with the same
+  `single`/`playersOnly` pair, so the game parses, permission-checks and resolves the selector as
+  vanilla's `EntityArgument` does, and the runtime's `getEntity`/`getEntities`/
+  `getOptionalEntities`/`getPlayer`/`getPlayers`/`getOptionalPlayers` apply `EntitySelector`'s
+  checks to that selection (`argument.entity.notfound.entity`, `argument.entity.toomany`,
+  `argument.entity.notfound.player`). Departures: the fork refuses an empty `entities`/`players`
+  selection with that feedback before the jar runs, so a jar's `getOptionalEntities`/
+  `getOptionalPlayers` never sees an empty list where vanilla would run with one; and a player
+  getter on an any-entity selector is counted, not answered (`findPlayers` applies the selector's
+  limit and sort among players only, a set the game does not give). A non-player entity reaches
+  the jar as `game/entity/<id>`, whose reads are counted.
 - **`getInput()` names the selected player, not the selector typed.** The game hands the mod the
   resolved `PlayerRef`, not the text, so the input line carries the player's name (or their UUID
   when the game has no name for them, which vanilla also accepts as a selector) where the player
-  typed `@s` or `@p`.
+  typed `@s` or `@p`. A lone selected entity is named by its UUID; a selection of several reads
+  `@a` (players) or `@e` (entities), a stand-in for the text typed.
 
 ## M3 proof
 
@@ -228,10 +232,17 @@ drops", and it travels through the same bake. Without the package the item is na
   package may declare an owned namespace that differs from its id, or the join matches
   `namespaces` rather than `id`.
 
-- **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; NeoForge has
-  no counterpart (`BreakBlockEvent` is before the block goes). `break_block` fires before the block
-  is destroyed, so there is no moment to fire the Fabric listener from. Add a listen-only hook
-  after the block and its drops are gone.
+- **`block_break_after`** (#2806). Answered since the `1cc882b8e0` pin by the fork's own
+  `player_destroyed_block` hook, which fires at the `Block.destroy` call in
+  `ServerPlayerGameMode.destroyBlock`, once `Level.removeBlock` succeeded: the call Fabric API's
+  `ServerPlayerGameModeMixin.onBlockBroken` injects at to fire `PlayerBlockBreakEvents.AFTER`
+  (creative breaks included, never a canceled or level-side break). The bridge fires `AFTER` there
+  with the acting player's level (`destroyBlock`'s `this.level`), the position, the block, and the
+  `BlockEntity` as `null` when none stood there. When one did, the hook gives its saved data, not
+  a live object, so that argument is a marker whose reads are counted. The hook's `state` is what
+  the removal took out; it differs from Fabric's `adjustedState` only for a tripwire cut with
+  shears (`DISARMED` set in the level, the armed state returned), and the runtime's block state
+  names only the block, so no listener sees the difference. NeoForge has no event here.
 - **The hand on `entity_interact` (#2797).** The hook's contract says `self.hand` and it fires once
   per hand, but the game's `native_entity_interact(entity, kind, stack, claimed)` in
   `crates/horizon-client/src/game/native_hooks/base.rs` never takes a hand, so the event cannot
@@ -416,8 +427,7 @@ crates/horizon-mod-package crates/cargo-horizon-mod docs/native-mods.md docs/mod
   for it. `game_version` is `Metadata`, allowed in Setup, Reloading and World. This mod asks the host
   for it only in `server_about_to_start`, which runs in World.
 - **Commands.** `CommandArgumentValue` gained `Entity`, `Entities` and `Players` (#3039's
-  selectors). The bridge still declares only `player`. It still refuses `EntityArgument.entity()`
-  and `.entities()` at registration, as before.
+  selectors), which the bridge now declares (see "Departures").
 - **Manifest.** `Manifest::parse` still requires `api = "0.2"` and `capabilities = ["registries"]`.
   The `[native]` fields are unchanged. The fork's `MIXINS_REV` moved to
   `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, and `mixins` follows it (the launcher builds the
@@ -480,7 +490,7 @@ litematica now run (refused before, on `minecraft`'s null version).
 | #3040 the old player on `player_clone` | yes: `PlayerCloneEvent.original` and the `original_player_*` reads (uuid, position, dimension, level, inventory slot, health, experience, effects, attachments) |
 | #3273 `server_starting` after the levels load; the world folder and game rules before them | **no**: the issue is open; `ConfigServerHost::world_dir` is `None` until a world is open, and the mod's server-start facts still log `world folder unknown, 0 game rules` |
 | #3089 which fluid a container item holds | yes, client side: the `contained_fluid` hook |
-| `ServerTickEvent.hasTime`/`LevelTickEvent.hasTime` | new: `ConfigHost::server_has_time` |
+| `ServerTickEvent.hasTime`/`LevelTickEvent.hasTime` | new: `ConfigHost::server_has_time`. Wired: `server_tick` and `level_tick_pre`/`post` read it when they fire and `hasTime()` answers it (before, `true` always). **Departure:** read once per firing, where NeoForge calls its `BooleanSupplier` (`this::haveTime`, a clock comparison) on every `hasTime()` |
 
 ## Pin bump to `cf0113879e`
 
