@@ -391,6 +391,13 @@ impl<H: Host> Runtime<'_, H> {
             });
         match owner {
             Some(owner) => self.run_skeleton_body(owner, r, this, args),
+            // `Object.equals`, which a private class that no skeleton gives
+            // an `equals` inherits (`values()`'s view, the iterators): identity.
+            None if (r.name.as_str(), r.descriptor.as_str())
+                == ("equals", "(Ljava/lang/Object;)Z") =>
+            {
+                Ok(Some(boolean(args.first() == Some(this))))
+            }
             None => Ok(None),
         }
     }

@@ -810,20 +810,10 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `catch (IllegalStateException ise) { throw new
     /// ConcurrentModificationException(ise); }` around an entry access.
-    fn state_as_cme<T>(&self, result: Result<T, NativeError>) -> Result<T, NativeError> {
+    fn state_as_cme<T>(&mut self, result: Result<T, NativeError>) -> Result<T, NativeError> {
         match result {
             Err(error) if self.catches(&error, "java/lang/IllegalStateException") => {
-                let cause = match &error {
-                    NativeError::UncaughtException { class, message, .. } => {
-                        let name = class.replace('/', ".");
-                        Some(match message {
-                            Some(message) => format!("{name}: {message}"),
-                            None => name,
-                        })
-                    }
-                    _ => None,
-                };
-                Err(throw("java/util/ConcurrentModificationException", cause))
+                Err(self.throw_caused("java/util/ConcurrentModificationException", error))
             }
             other => other,
         }
