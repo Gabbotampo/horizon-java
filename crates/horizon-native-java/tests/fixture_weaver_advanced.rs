@@ -7,6 +7,9 @@
 //! then load the rewritten classes in a fresh `URLClassLoader`: only the real
 //! verifier proves the frames are right.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, ReturnMode, callback_info_class,
     callback_info_returnable_class, weave_class, weave_class_with_extras, weave_head, weave_return,
@@ -84,12 +87,8 @@ fn jdk_tool(name: &str) -> PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-advanced-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn scratch(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("advanced-{name}"));
     fs::create_dir_all(&root).unwrap();
     root
 }
@@ -113,7 +112,7 @@ fn write_callback_classes(classes: &Path) {
     fs::write(&returnable, callback_info_returnable_class().unwrap()).unwrap();
 }
 
-fn compile(name: &str) -> PathBuf {
+fn compile(name: &str) -> scratch::Scratch {
     let root = scratch(name);
     let src = root.join("src");
     let classes = root.join("classes");
@@ -147,7 +146,7 @@ fn compile(name: &str) -> PathBuf {
         "javac failed for {name}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    classes
+    root.into_path(classes)
 }
 
 fn compile_driver(root: &Path) -> PathBuf {
