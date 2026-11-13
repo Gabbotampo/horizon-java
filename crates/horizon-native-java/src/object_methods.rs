@@ -55,24 +55,14 @@ pub(crate) enum Equality {
     Host,
 }
 
-/// The box marker families (`class_of_value`) and the hash their JDK class
-/// computes from the text after the `:`.
-fn boxed_marker_hash(marker: &str) -> Option<Option<i32>> {
-    match marker {
-        "true" | "boolean:true" => return Some(Some(1231)),
-        "false" | "boolean:false" => return Some(Some(1237)),
-        _ => {}
+/// `hashCode()` of a box: `Boolean`'s 1231/1237, the value of an
+/// `Integer`/`Short`/`Byte`, the code unit of a `Character`.
+fn boxed_hash(boxed: Boxed) -> i32 {
+    match boxed {
+        Boxed::Boolean(true) => 1231,
+        Boxed::Boolean(false) => 1237,
+        other => other.int(),
     }
-    let (kind, text) = marker.split_once(':')?;
-    let hash = match kind {
-        "integer" | "short" | "byte" => text.parse::<i32>().ok(),
-        "long" => text.parse::<i64>().ok().map(long_hash),
-        "character" => text.encode_utf16().next().map(i32::from),
-        "double" => text.parse::<f64>().ok().map(double_hash),
-        "float" => text.parse::<f64>().ok().map(|v| java_float_bits(v) as i32),
-        _ => return None,
-    };
-    Some(hash)
 }
 
 /// `Long.hashCode(v)`.
@@ -83,11 +73,6 @@ pub(crate) fn long_hash(value: i64) -> i32 {
 /// `Double.hashCode(v)`: the canonical bits, folded like a `long`.
 pub(crate) fn double_hash(value: f64) -> i32 {
     long_hash(java_double_bits(value) as i64)
-}
-
-/// Whether a reference is one of the host's box markers.
-fn is_box_marker(marker: &str) -> bool {
-    boxed_marker_hash(marker).is_some()
 }
 
 /// The host's unmodifiable-collection and value markers keep `Object`'s
@@ -164,7 +149,9 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn equality_of(&self, value: &Value) -> Equality {
         let marker = match value {
             Value::Ref(None) => return Equality::Null,
-            Value::Int(_) | Value::Long(_) | Value::Float(_) => return Equality::Platform,
+            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) => {
+                return Equality::Platform;
+            }
             Value::Void => return Equality::Host,
             Value::Ref(Some(marker)) => marker,
         };
@@ -187,7 +174,7 @@ impl<H: Host> Runtime<'_, H> {
         if self.enum_constants.contains_key(marker) {
             return Equality::Identity;
         }
-        if is_box_marker(marker) || value_class::is_plain_string(marker) {
+        if value_class::is_plain_string(marker) {
             return Equality::Platform;
         }
         Equality::Host
@@ -217,10 +204,8 @@ impl<H: Host> Runtime<'_, H> {
                 Value::Int(value) => Some(*value),
                 Value::Long(value) => Some(long_hash(*value)),
                 Value::Float(_) => None,
-                Value::Ref(Some(marker)) => match boxed_marker_hash(marker) {
-                    Some(hash) => hash,
-                    None => Some(hash_map_order::java_string_hash(marker)),
-                },
+                Value::Boxed(boxed) => Some(boxed_hash(*boxed)),
+                Value::Ref(Some(marker)) => Some(hash_map_order::java_string_hash(marker)),
                 _ => None,
             }),
             Equality::Jar {
