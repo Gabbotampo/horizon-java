@@ -11744,11 +11744,51 @@ fn array_operand_error(
     }
 }
 
+/// An array creation's length. A negative one is the JVM's
+/// `NegativeArraySizeException` (its message is the length), which a jar's
+/// handler may catch; one over the runtime's bound is refused.
 fn array_length(value: i32) -> Result<usize, NativeError> {
+    if value < 0 {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NegativeArraySizeException".into(),
+            message: Some(value.to_string()),
+            frame: None,
+        });
+    }
     usize::try_from(value)
         .ok()
         .filter(|length| *length <= 1 << 20)
         .ok_or_else(|| NativeError::Metadata("array length is invalid".into()))
+}
+
+/// The null checks a method reference's adapter makes before its target runs
+/// (`LambdaMetafactory`'s generated code): a `null` receiver of an instance
+/// method, or a `null` for a primitive parameter (unboxing), throws
+/// `NullPointerException` with no message, since that code is the JDK's, not
+/// the jar's.
+fn method_ref_null_check(
+    descriptor: &str,
+    receiver: Option<&Value>,
+    args: &[Value],
+) -> Result<(), NativeError> {
+    let primitive_null =
+        descriptor_arguments(descriptor)
+            .iter()
+            .zip(args)
+            .any(|(parameter, value)| {
+                matches!(
+                    parameter.as_str(),
+                    "I" | "S" | "B" | "C" | "Z" | "J" | "F" | "D"
+                ) && *value == Value::Ref(None)
+            });
+    if receiver == Some(&Value::Ref(None)) || primitive_null {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    Ok(())
 }
 
 fn array_index(value: i32) -> Result<usize, NativeError> {
@@ -19325,6 +19365,7 @@ impl<H: Host> Runtime<'_, H> {
             values.extend_from_slice(args);
             let expected = arg_count(&callback.target.descriptor);
             if values.len() == expected && callback.target.name != "<init>" {
+                method_ref_null_check(&callback.target.descriptor, None, &values)?;
                 jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut values);
                 // A jar object argument no model can read is counted
                 // (`jar_operands.rs`), as for the direct call.
@@ -19357,6 +19398,7 @@ impl<H: Host> Runtime<'_, H> {
             // zero-argument `Supplier` (`HashMap::new`) has no values at all,
             // so this comes before the receiver split below.
             if callback.target.name == "<init>" {
+                method_ref_null_check(&callback.target.descriptor, None, &values)?;
                 let object = self.new_object(&callback.target.owner);
                 // `String::new` is counted (`string_constructors.rs`).
                 if string_constructors::count(self, &callback.target)?.is_none() {
@@ -19369,6 +19411,7 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(None);
             };
             let (receiver, mut rest) = (receiver.clone(), rest.to_vec());
+            method_ref_null_check(&callback.target.descriptor, Some(&receiver), &rest)?;
             jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut rest);
             // `Collection::size` on a jar object runs the object's own body
             // (`jvm_dispatch.rs`); a JDK body over its data is counted
@@ -19457,6 +19500,12 @@ impl<H: Host> Runtime<'_, H> {
         if !args_consumed {
             target_args.extend_from_slice(args);
         }
+        let instance = !target_is_static && callback.target.name != "<init>";
+        method_ref_null_check(
+            &callback.target.descriptor,
+            receiver.as_ref().filter(|_| instance),
+            &target_args,
+        )?;
         // An erased `Integer` argument unboxed into an `int` parameter
         // (`lambda_boxing.rs`).
         jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut target_args);
@@ -23631,7 +23680,7 @@ impl<H: Host> Runtime<'_, H> {
                     let atype = *code.get(pc).ok_or(NativeError::Truncated)?;
                     pc += 1;
                     let length = pop_int(&mut stack, class, method, at)?;
-                    let length = array_length(length)?;
+                    let length = invoke_or_catch!(at, array_length(length));
                     if !(4..=11).contains(&atype) {
                         return Err(NativeError::InvalidClass("invalid newarray type"));
                     }
@@ -23652,7 +23701,8 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
-                    let length = array_length(pop_int(&mut stack, class, method, at)?)?;
+                    let length =
+                        invoke_or_catch!(at, array_length(pop_int(&mut stack, class, method, at)?));
                     let component = class_name(&file.pool, i)?.to_owned();
                     let marker = self.new_array(class, method);
                     self.arrays
@@ -23731,13 +23781,21 @@ impl<H: Host> Runtime<'_, H> {
                             "multianewarray dimensions exceed the array descriptor",
                         ));
                     }
-                    let mut counts = Vec::with_capacity(dimensions);
+                    let mut raw = Vec::with_capacity(dimensions);
                     for _ in 0..dimensions {
-                        counts.push(array_length(pop_int(&mut stack, class, method, at)?)?);
+                        raw.push(pop_int(&mut stack, class, method, at)?);
                     }
                     // The JVM takes count1 (outermost) from the deepest slot;
-                    // pop_int read them innermost first.
-                    counts.reverse();
+                    // pop_int read them innermost first. HotSpot checks the
+                    // counts outermost first, so the first negative one names
+                    // the exception.
+                    raw.reverse();
+                    let counts = invoke_or_catch!(
+                        at,
+                        raw.iter()
+                            .map(|count| array_length(*count))
+                            .collect::<Result<Vec<_>, _>>()
+                    );
                     let marker = self.new_multidim_array(&descriptor, class, method, &counts);
                     if let Some(component) = value_class::component_of_array_class(&descriptor) {
                         self.record_array_component(&marker, &component);
