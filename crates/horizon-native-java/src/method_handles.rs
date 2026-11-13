@@ -1243,6 +1243,8 @@ impl<H: Host> Runtime<'_, H> {
                 let object = self.new_object(owner);
                 if jar_owned {
                     self.invoke(owner, "<init>", descriptor, Some(object.clone()), &values)?;
+                } else if string_constructors::count(self, &member)?.is_some() {
+                    // `String::new`: counted like `invokespecial` (`string_constructors.rs`).
                 } else {
                     self.host.invoke_instance(&member, &object, &values)?;
                 }
