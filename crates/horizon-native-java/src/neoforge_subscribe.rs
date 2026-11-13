@@ -44,7 +44,9 @@
 //!   NeoForge and the jar (another mod's class, not linked) is counted instead of judged.
 
 use crate::events::ListenerCallback;
-use crate::neoforge_bus::{BusKind, BusListener, bus_kind, bus_name, class_text, illegal_argument};
+use crate::neoforge_bus::{
+    BusKind, BusListener, bus_kind, bus_value, class_text, illegal_argument,
+};
 use crate::{
     AnnotationValue, ClassFile, Host, Method, MethodRef, NativeError, Reader, Runtime, Value,
     expect_ref, read_pool, utf8,
@@ -69,7 +71,7 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<(), NativeError> {
-        let bus = bus_name(receiver);
+        let bus = bus_value(receiver);
         let Some(target) = args.first().cloned() else {
             self.count_bus_call(r, "no target");
             return Ok(());
@@ -207,7 +209,7 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn register_method(
         &mut self,
         r: &MethodRef,
-        bus: &str,
+        bus: &Value,
         target: &Value,
         class: &str,
         method: &Method,
@@ -246,7 +248,7 @@ impl<H: Host> Runtime<'_, H> {
             )));
         };
         // The bus's class checker (`registerListener` @67–106).
-        let refused = match bus_kind(Some(&Value::Ref(Some(bus.to_owned())))) {
+        let refused = match bus_kind(Some(bus)) {
             BusKind::Mod => !facts.mod_bus,
             BusKind::Game => facts.mod_bus,
             BusKind::Unknown => false,
@@ -273,7 +275,7 @@ impl<H: Host> Runtime<'_, H> {
                 .iter()
                 .any(|(on, held)| on == bus && held == target)
         {
-            state.registered.push((bus.to_owned(), target.clone()));
+            state.registered.push((bus.clone(), target.clone()));
         }
         if !crate::neoforge_lifecycle::delivered(&event, self.bus_on_server()) {
             self.count_bus_call(r, &format!("no game event fires {event}"));
@@ -295,7 +297,7 @@ impl<H: Host> Runtime<'_, H> {
             descriptor: method.descriptor.clone(),
         };
         let listener = BusListener {
-            bus: bus.to_owned(),
+            bus: bus.clone(),
             class: event,
             priority,
             // `SubscribeEventListener#invoke` checks `receiveCanceled`; on a class that is not

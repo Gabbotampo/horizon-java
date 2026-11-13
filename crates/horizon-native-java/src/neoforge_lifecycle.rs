@@ -83,7 +83,6 @@ const LOAD_COMPLETE: &str = "net/neoforged/fml/event/lifecycle/FMLLoadCompleteEv
 const PAYLOAD_HANDLERS: &str = "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent";
 const NEOFORGE_CLIENT: &str = "net/neoforged/neoforge/client/";
 const EVENT_MARKER: &str = "neoforge-lifecycle|";
-const FUTURE_MARKER: &str = "neoforge-deferred-work/";
 
 /// One step of NeoForge's loading after the constructors, in the order it runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +226,7 @@ impl StdHost {
                     work,
                     supplier: r.descriptor.contains("Supplier"),
                 });
-                Some(Value::Ref(Some(format!("{FUTURE_MARKER}{}", tasks.len()))))
+                Some(crate::host_events::deferred_work(tasks.len()))
             }
             _ => None,
         }
@@ -305,10 +304,7 @@ impl NativeJar {
         id: &str,
         priority: Option<u8>,
     ) -> Vec<BusListener> {
-        let bus = match crate::neoforge_bus::mod_bus(Some(id)) {
-            Value::Ref(Some(bus)) => bus,
-            _ => return Vec::new(),
-        };
+        let bus = crate::neoforge_bus::mod_bus(Some(id));
         let mut listeners: Vec<BusListener> = host
             .neoforge_bus
             .listeners

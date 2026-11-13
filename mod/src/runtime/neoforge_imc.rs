@@ -56,14 +56,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::runtime::events::ListenerCallback;
+use crate::runtime::host_events::key_of;
 use crate::runtime::{
-    ExecutionBudget, Host, MethodRef, NativeError, NativeJar, Runtime, StdHost, Value, expect_ref,
+    ExecutionBudget, Host, HostKind, MethodRef, NativeError, NativeJar, Runtime, StdHost, Value,
+    expect_ref,
 };
 
 const COMMS: &str = "net/neoforged/fml/InterModComms";
-const MESSAGE: &str = "net/neoforged/fml/InterModComms$IMCMessage";
-const MESSAGE_MARKER: &str = "neoforge-imc-message/";
-const SUPPLIER_MARKER: &str = "neoforge-imc-supplier/";
 const SEND: &str = "(Ljava/lang/String;Ljava/lang/String;Ljava/util/function/Supplier;)Z";
 const SEND_AS: &str =
     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/util/function/Supplier;)Z";
@@ -165,15 +164,6 @@ pub(crate) fn set_active<H: Host + ?Sized>(host: &mut H, id: Option<&str>) -> Op
     std::mem::replace(&mut imc.active, id.map(str::to_owned))
 }
 
-/// `instanceof` for a message record and a cross-jar supplier.
-pub(crate) fn instance_of(marker: &str, wanted: &str) -> bool {
-    if marker.starts_with(MESSAGE_MARKER) {
-        return matches!(wanted, MESSAGE | "java/lang/Record" | "java/lang/Object");
-    }
-    marker.starts_with(SUPPLIER_MARKER)
-        && matches!(wanted, "java/util/function/Supplier" | "java/lang/Object")
-}
-
 fn count(unknown: &mut BTreeMap<String, usize>, call: &str, why: &str) {
     *unknown.entry(format!("{call} ({why})")).or_default() += 1;
 }
@@ -247,13 +237,13 @@ impl<H: Host> Runtime<'_, H> {
                 _ => Ok(None),
             };
         }
-        let Some(marker) = receiver.and_then(expect_ref) else {
+        let Some(receiver) = receiver else {
             return Ok(None);
         };
-        if let Some(id) = marker.strip_prefix(MESSAGE_MARKER) {
+        if let Some(id) = key_of(receiver, HostKind::ImcMessage) {
             return Ok(self.imc_message_member(r, id));
         }
-        if let Some(id) = marker.strip_prefix(SUPPLIER_MARKER)
+        if let Some(id) = key_of(receiver, HostKind::ImcSupplier)
             && r.name == "get"
             && r.descriptor == "()Ljava/lang/Object;"
         {
@@ -384,7 +374,7 @@ impl<H: Host> Runtime<'_, H> {
         drop(state);
         let values = taken
             .into_iter()
-            .map(|id| Value::Ref(Some(format!("{MESSAGE_MARKER}{id}"))))
+            .map(crate::runtime::host_events::imc_message)
             .collect();
         Ok(self.new_stream(class, method, values))
     }
@@ -405,7 +395,7 @@ impl<H: Host> Runtime<'_, H> {
                 if message.origin == own || message.supplier == Value::Ref(None) {
                     message.supplier.clone()
                 } else {
-                    Value::Ref(Some(format!("{SUPPLIER_MARKER}{id}")))
+                    crate::runtime::host_events::imc_supplier(id)
                 }
             }
             _ => return None,

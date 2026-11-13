@@ -151,6 +151,22 @@ pub enum HostKind {
     /// `java.util.OptionalDouble`: key `""` when empty, else the `double`'s
     /// `Double.doubleToLongBits` (every `NaN` one key, `-0.0` not `0.0`).
     OptionalDouble,
+    /// A NeoForge `IEventBus`: key `game`, `mod/<id>`, or `mod` (`host_events.rs`).
+    NeoForgeBus,
+    /// A Forge EventBus 7 per-event `BUS`: key the event class.
+    ForgeBus,
+    /// A Fabric `Event`: key `<owner>.<FIELD>`, or the serial `createArrayBacked` gave it.
+    FabricEvent,
+    /// A Fabric event's `invoker()`: key the event's key.
+    FabricInvoker,
+    /// A NeoForge `InterModComms.IMCMessage`: key its index on the IMC bus.
+    ImcMessage,
+    /// The supplier of an IMC message another jar sent: key the message's index.
+    ImcSupplier,
+    /// The `CompletableFuture` `ParallelDispatchEvent.enqueueWork` answers: key the task's serial.
+    DeferredWork,
+    /// An event a host caller dispatches or posts: key `<name>` or `cancelled/<name>`.
+    PostedEvent,
 }
 
 /// How a kind's Java class follows from its key.
@@ -159,8 +175,8 @@ pub(crate) enum ClassRule {
     /// Every object of the kind is this class.
     Fixed(&'static str),
     /// A family whose objects are of many classes (jar objects, collections,
-    /// game objects): the class is read from the key.
-    #[allow(dead_code)] // The first family kinds arrive in P12/P14/P16.
+    /// game objects), or a class other values than handles may also be
+    /// (`CompletableFuture`): the class is read from the key.
     FromKey(fn(&str) -> &str),
 }
 
@@ -237,13 +253,11 @@ pub(crate) fn canonical_when_empty(key: &str) -> bool {
 }
 
 /// The canonical predicate of a kind with one object per key.
-#[allow(dead_code)] // The first canonical families arrive in P1 (identifiers, enums).
 pub(crate) fn always_canonical(_key: &str) -> bool {
     true
 }
 
 /// The canonical predicate of a kind whose every object is a fresh value.
-#[allow(dead_code)]
 pub(crate) fn never_canonical(_key: &str) -> bool {
     false
 }
@@ -287,6 +301,62 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("java/util/OptionalDouble"),
         canonical: canonical_when_empty,
         methods: &crate::host_optional::OPTIONAL_DOUBLE,
+    },
+    KindInfo {
+        kind: HostKind::NeoForgeBus,
+        tag: "nfbus",
+        class: ClassRule::FromKey(crate::host_events::neoforge_bus_class),
+        canonical: crate::host_events::bus_canonical,
+        methods: &crate::host_events::NEOFORGE_BUS_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ForgeBus,
+        tag: "fgbus",
+        class: ClassRule::FromKey(crate::host_events::forge_bus_class),
+        canonical: always_canonical,
+        methods: &crate::host_events::FORGE_BUS_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricEvent,
+        tag: "fevt",
+        class: ClassRule::FromKey(crate::host_events::fabric_event_class),
+        canonical: crate::host_events::fabric_canonical,
+        methods: &crate::host_events::FABRIC_EVENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricInvoker,
+        tag: "finv",
+        class: ClassRule::FromKey(crate::host_events::object_class),
+        canonical: crate::host_events::fabric_canonical,
+        methods: &crate::host_events::UNKNOWN_CLASS_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ImcMessage,
+        tag: "imcm",
+        class: ClassRule::FromKey(crate::host_events::imc_message_class),
+        canonical: always_canonical,
+        methods: &crate::host_events::IMC_MESSAGE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ImcSupplier,
+        tag: "imcs",
+        class: ClassRule::FromKey(crate::host_events::supplier_class),
+        canonical: always_canonical,
+        methods: &crate::host_events::IMC_SUPPLIER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DeferredWork,
+        tag: "nfdw",
+        class: ClassRule::FromKey(crate::host_events::future_class),
+        canonical: always_canonical,
+        methods: &crate::host_events::DEFERRED_WORK_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::PostedEvent,
+        tag: "pev",
+        class: ClassRule::FromKey(crate::host_events::event_class),
+        canonical: never_canonical,
+        methods: &crate::host_events::POSTED_EVENT_METHODS,
     },
 ];
 

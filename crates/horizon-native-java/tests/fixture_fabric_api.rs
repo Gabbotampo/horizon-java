@@ -10,7 +10,9 @@
 #[path = "support/scratch.rs"]
 mod scratch;
 
-use horizon_native_java::{EventDispatch, HostInvocation, NativeError, NativeJar, StdHost, Value};
+use horizon_native_java::{
+    EventDispatch, HostInvocation, HostKind, NativeError, NativeJar, StdHost, Value, posted_event,
+};
 use std::{
     collections::BTreeMap,
     fs,
@@ -283,22 +285,25 @@ fn fabric_api_bootstrap_registers_both_listeners_in_declaration_order() {
     // Generic `Event<T>.register(T)` erases to `(Ljava/lang/Object;)V` at the
     // call site, which is the shape the listener record carries. Its receiver
     // is the field it was read from, so the listener keeps its event.
-    let receivers: Vec<Option<Value>> = calls_to(&host, FABRIC_EVENT, "register")
+    // Each receiver is the Fabric `Event` handle its API field names.
+    let receivers: Vec<(HostKind, String)> = calls_to(&host, FABRIC_EVENT, "register")
         .into_iter()
         .map(|register| {
             assert_eq!(register.method.descriptor, "(Ljava/lang/Object;)V");
-            register.receiver.clone()
+            match &register.receiver {
+                Some(Value::Host(event)) => (event.kind(), event.key().to_owned()),
+                other => panic!("{other:?}"),
+            }
         })
         .collect();
     assert_eq!(
         receivers,
         [
-            Some(Value::Ref(Some(format!(
-                "fabric-event/{SERVER_LIFECYCLE}.SERVER_STARTING"
-            )))),
-            Some(Value::Ref(Some(format!(
-                "fabric-event/{COMMAND_CALLBACK}.EVENT"
-            )))),
+            (
+                HostKind::FabricEvent,
+                format!("{SERVER_LIFECYCLE}.SERVER_STARTING")
+            ),
+            (HostKind::FabricEvent, format!("{COMMAND_CALLBACK}.EVENT")),
         ]
     );
 
@@ -333,7 +338,7 @@ fn fabric_api_server_starting_event_dispatches_the_registered_listener() {
     jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
         .unwrap();
 
-    let event = Value::Ref(Some("event/server-starting".into()));
+    let event = posted_event("server-starting", false);
     let dispatches = host.dispatch_event(event.clone());
     assert_eq!(dispatches.len(), 2, "both Fabric listeners are recorded");
     assert_eq!(dispatches[0].event, event);
@@ -363,7 +368,7 @@ fn fabric_api_server_starting_event_dispatches_the_registered_listener() {
 
     // A cancelled marker still selects `Event#register` listeners: the Fabric
     // path never models cancellation, so selection must not drop them silently.
-    let cancelled = host.dispatch_event(Value::Ref(Some("event/cancelled/server-starting".into())));
+    let cancelled = host.dispatch_event(posted_event("server-starting", true));
     assert_eq!(cancelled.len(), 2);
 
     // GAP: `CommandRegistrationCallback` takes three arguments (dispatcher,
