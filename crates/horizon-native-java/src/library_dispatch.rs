@@ -468,6 +468,11 @@ impl<H: Host> Runtime<'_, H> {
     /// The `instanceof` answers this module and the proxy model add to the
     /// opcode's own: unboxed boxes and proxies.
     pub(super) fn library_instance_of(&self, value: &Value, wanted: &str) -> bool {
+        // A host handle answers by its kind's row (`host_ref.rs`); an unknown
+        // answer is `instance_of_is_guess`'s to count.
+        if let Value::Host(handle) = value {
+            return handle.instance_of(wanted, self) == Some(true);
+        }
         unboxed_instance_of(value, wanted)
             || expect_ref(value).is_some_and(|marker| {
                 self.proxy_instance_of(marker, wanted)
@@ -1428,8 +1433,8 @@ pub(super) fn unboxed_instance_of(value: &Value, wanted: &str) -> bool {
         Value::Long(_) => shared || wanted == "java/lang/Long",
         Value::Int(_) => shared || wanted == "java/lang/Integer",
         Value::Boxed(boxed) => crate::jdk_model::class_instance_of(boxed.class(), wanted),
-        // A host handle answers by its kind's row (`host_ref.rs`).
-        Value::Host(handle) => handle.instance_of(wanted),
+        // A host handle is `library_instance_of`'s (it needs the hierarchy).
+        Value::Host(_) => false,
         _ => false,
     }
 }

@@ -178,6 +178,8 @@ pub(crate) const OPTIONAL: Methods = Methods {
     hash_code: optional_hash_code,
     equals: optional_equals,
     instance_of: instance_of_class,
+    // Empty, or holding a value that crosses.
+    crosses_jars: |handle, crosses| held(handle).is_none_or(|value| crosses(&value)),
 };
 
 /// The primitive optionals' text: `OptionalInt[5]`, `OptionalInt.empty`.
@@ -225,6 +227,8 @@ pub(crate) const OPTIONAL_INT: Methods = Methods {
     hash_code: |handle, _| Ok(Some(primitive_hash(handle))),
     equals: |handle, other, _| Ok(Some(primitive_equals(handle, other))),
     instance_of: instance_of_class,
+    // A number always crosses.
+    crosses_jars: |_, _| true,
 };
 
 pub(crate) const OPTIONAL_LONG: Methods = OPTIONAL_INT;

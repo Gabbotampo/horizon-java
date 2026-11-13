@@ -177,15 +177,41 @@ pub(crate) type HashCodeFn = fn(&HostRef, &mut dyn Nested) -> Result<Option<i32>
 /// `handle.equals(other)`.
 pub(crate) type EqualsFn =
     fn(&HostRef, &Value, &mut dyn Nested) -> Result<Option<bool>, NativeError>;
-/// `handle instanceof wanted` (`wanted` an internal class name).
-pub(crate) type InstanceOfFn = fn(&HostRef, &str) -> bool;
+/// `handle instanceof wanted` (`wanted` an internal class name), asking
+/// `hierarchy` about classes; `None` when the hierarchy cannot tell (the
+/// caller counts the check).
+pub(crate) type InstanceOfFn = fn(&HostRef, &str, &dyn ClassHierarchy) -> Option<bool>;
+/// Whether a handle means the same in another jar's runtime (NeoForge IMC):
+/// `crosses` answers for a held value.
+pub(crate) type CrossesFn = fn(&HostRef, &dyn Fn(&Value) -> bool) -> bool;
 
-/// A kind's `Object` methods, as the JDK class implements them.
+/// The class hierarchy a kind's `instance_of` reads: the JDK's supertypes,
+/// and in the runtime the jar's own classes (a jar object's superclasses and
+/// interfaces, a Mixin's added interface), which a family kind needs.
+pub(crate) trait ClassHierarchy {
+    /// Whether an object of class `class` is a `wanted` (internal names);
+    /// `None` when unknown (a class whose chain leaves what is held).
+    fn is_instance(&self, class: &str, wanted: &str) -> Option<bool>;
+}
+
+/// The JDK's own hierarchy, for a caller with no runtime: a JDK class never
+/// extends or implements a jar type.
+pub(crate) struct JdkHierarchy;
+
+impl ClassHierarchy for JdkHierarchy {
+    fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
+        Some(wanted == "java/lang/Object" || crate::runtime::jdk_model::class_instance_of(class, wanted))
+    }
+}
+
+/// A kind's `Object` methods, as the JDK class implements them, and the other
+/// per-kind behaviour a shared caller needs.
 pub(crate) struct Methods {
     pub(crate) to_string: ToStringFn,
     pub(crate) hash_code: HashCodeFn,
     pub(crate) equals: EqualsFn,
     pub(crate) instance_of: InstanceOfFn,
+    pub(crate) crosses_jars: CrossesFn,
 }
 
 /// One row of the kind table.
@@ -217,11 +243,14 @@ pub(crate) fn never_canonical(_key: &str) -> bool {
     false
 }
 
-/// [`InstanceOfFn`] for a kind whose class is all it is: the class, and the
-/// JDK's supertypes of it.
-pub(crate) fn instance_of_class(handle: &HostRef, wanted: &str) -> bool {
-    let class = handle.class();
-    wanted == "java/lang/Object" || crate::runtime::jdk_model::class_instance_of(class, wanted)
+/// [`InstanceOfFn`] for a kind whose class is all it is: the class and its
+/// supertypes, as `hierarchy` knows them.
+pub(crate) fn instance_of_class(
+    handle: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    hierarchy.is_instance(handle.class(), wanted)
 }
 
 /// Every kind: its tag, its class, its identity, its methods.
@@ -372,9 +401,16 @@ impl HostRef {
         (self.methods().equals)(self, other, nested)
     }
 
-    /// `this instanceof wanted`, and whether `checkcast wanted` passes.
-    pub(crate) fn instance_of(&self, wanted: &str) -> bool {
-        (self.methods().instance_of)(self, wanted)
+    /// `this instanceof wanted`, and whether `checkcast wanted` passes;
+    /// `None` when `hierarchy` cannot tell.
+    pub(crate) fn instance_of(&self, wanted: &str, hierarchy: &dyn ClassHierarchy) -> Option<bool> {
+        (self.methods().instance_of)(self, wanted, hierarchy)
+    }
+
+    /// Whether this handle means the same in another jar's runtime, with
+    /// `crosses` answering for the values it holds.
+    pub(crate) fn crosses_jars(&self, crosses: &dyn Fn(&Value) -> bool) -> bool {
+        (self.methods().crosses_jars)(self, crosses)
     }
 
     /// The handle's text form, `h<tag>:<key>`, the key as it is. A list of
@@ -413,6 +449,36 @@ mod tests {
                 assert_eq!(HostKind::of_class(class), Some(info.kind));
             }
         }
+    }
+
+    /// A kind's `instance_of` asks the hierarchy it is handed, so a family
+    /// kind (P12 jar objects) can answer from the jar's own classes, and an
+    /// unknown answer stays unknown for the caller to count.
+    #[test]
+    fn instance_of_reads_the_hierarchy_it_is_given() {
+        struct Stub;
+        impl ClassHierarchy for Stub {
+            fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
+                match (class, wanted) {
+                    ("java/util/Optional", "demo/Added") => Some(true),
+                    ("java/util/Optional", "demo/Unknown") => None,
+                    _ => Some(false),
+                }
+            }
+        }
+        let handle = HostRef::new(HostKind::Optional, "");
+        assert_eq!(handle.instance_of("demo/Added", &Stub), Some(true));
+        assert_eq!(handle.instance_of("demo/Unknown", &Stub), None);
+        assert_eq!(handle.instance_of("java/lang/Object", &Stub), Some(false));
+        // The JDK's own hierarchy: an `Optional` is an `Object` and nothing else.
+        assert_eq!(
+            handle.instance_of("java/lang/Object", &JdkHierarchy),
+            Some(true)
+        );
+        assert_eq!(
+            handle.instance_of("java/io/Serializable", &JdkHierarchy),
+            Some(false)
+        );
     }
 
     /// A small deterministic generator (xorshift): the property tests need

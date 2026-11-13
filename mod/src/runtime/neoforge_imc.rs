@@ -198,15 +198,8 @@ fn crosses_jars(value: &Value) -> bool {
             true
         }
         Value::Ref(Some(text)) => crate::runtime::value_class::is_plain_string(text),
-        // An optional crosses when what it holds does (a number always).
-        Value::Host(host) => match host.kind() {
-            crate::runtime::HostKind::Optional => {
-                crate::runtime::optional_present(value).is_none_or(|held| crosses_jars(&held))
-            }
-            crate::runtime::HostKind::OptionalInt
-            | crate::runtime::HostKind::OptionalLong
-            | crate::runtime::HostKind::OptionalDouble => true,
-        },
+        // A host handle answers by its kind's row (`host_ref.rs`).
+        Value::Host(host) => host.crosses_jars(&crosses_jars),
         Value::Void => false,
     }
 }

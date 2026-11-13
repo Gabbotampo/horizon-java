@@ -49,9 +49,16 @@ const ACC_INTERFACE: u16 = 0x0200;
 /// kind's class (those classes are final and only handles are their
 /// objects). `(passes, runtime class)`; `None` when no handle is involved, or
 /// the value's class is not known (an opaque host marker keeps its path).
-fn host_cast(value: &Value, target: &str) -> Option<(bool, String)> {
+fn host_cast(
+    hierarchy: &dyn host_ref::ClassHierarchy,
+    value: &Value,
+    target: &str,
+) -> Option<(bool, String)> {
     if let Value::Host(handle) = value {
-        return Some((handle.instance_of(target), handle.class().to_owned()));
+        return Some((
+            handle.instance_of(target, hierarchy)?,
+            handle.class().to_owned(),
+        ));
     }
     HostKind::of_class(target)?;
     let runtime_class = match value {
@@ -132,7 +139,7 @@ impl<H: Host> Runtime<'_, H> {
         // A host handle is its kind's class, and only a handle is one of a
         // handle kind's classes (`host_ref.rs`): `(String) Optional.empty()`
         // and `(Optional<?>) "text"` throw.
-        if let Some((fits, runtime_class)) = host_cast(value, target) {
+        if let Some((fits, runtime_class)) = host_cast(self, value, target) {
             if fits {
                 return Ok(());
             }
@@ -210,6 +217,8 @@ impl<H: Host> Runtime<'_, H> {
     pub(super) fn instance_of_is_guess(&self, value: &Value, target: &str) -> bool {
         let marker = match value {
             Value::Ref(Some(marker)) => marker.as_str(),
+            // A host handle whose kind cannot tell (`host_ref.rs`).
+            Value::Host(handle) => return handle.instance_of(target, self).is_none(),
             // `null` is never an instance; a box is a JDK object.
             _ => return false,
         };
@@ -262,10 +271,10 @@ impl<H: Host> Runtime<'_, H> {
         let marker = match value {
             // A host handle answers by its kind's class (`host_ref.rs`).
             Value::Host(handle) => {
-                let verdict = if handle.instance_of(target) {
-                    Verdict::Yes
-                } else {
-                    Verdict::No
+                let verdict = match handle.instance_of(target, self) {
+                    Some(true) => Verdict::Yes,
+                    Some(false) => Verdict::No,
+                    None => Verdict::Unknown,
                 };
                 return (verdict, Some(handle.class().to_owned()));
             }
@@ -400,5 +409,28 @@ impl<H: Host> Runtime<'_, H> {
                             .any(|owner| owner == class)
                     })
         })
+    }
+}
+
+/// The hierarchy a host handle's `instance_of` reads in the runtime
+/// (`host_ref.rs`): the JDK's for a JDK class, the held classes' (and
+/// Mixins') for a jar class, `None` where the chain leaves them.
+impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
+    fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
+        if wanted == "java/lang/Object" || class == wanted {
+            return Some(true);
+        }
+        if self.class(class).is_none() {
+            return host_ref::JdkHierarchy.is_instance(class, wanted);
+        }
+        let wanted_is_interface = self
+            .class(wanted)
+            .and_then(class_access)
+            .map(|access| access & ACC_INTERFACE != 0);
+        match self.hierarchy_verdict(class, wanted, wanted_is_interface) {
+            Verdict::Yes => Some(true),
+            Verdict::No => Some(false),
+            Verdict::Unknown => None,
+        }
     }
 }
