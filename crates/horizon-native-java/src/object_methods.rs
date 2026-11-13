@@ -247,6 +247,14 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(id) = marker.strip_prefix("identifier/") {
             return Ok(Some(hash_map_order::identifier_hash(id)));
         }
+        if marker.starts_with("map-entry/") {
+            // `Objects.hashCode(key) ^ Objects.hashCode(value)`.
+            let (key, entry) = map_entry_parts(value)?;
+            let (Some(key), Some(entry)) = (self.java_hash(&key)?, self.java_hash(&entry)?) else {
+                return Ok(None);
+            };
+            return Ok(Some(key ^ entry));
+        }
         let Some(kind) = self.host_collection_kind(value) else {
             return Ok(None);
         };
@@ -575,6 +583,14 @@ impl<H: Host> Runtime<'_, H> {
             };
             if keeps_identity {
                 return self.count_identity_hash().map(Some);
+            }
+            // `Map.Entry.hashCode()` is `host_value_hash`'s; an entry whose
+            // key or value has no hash the runtime can compute is counted.
+            if expect_ref(receiver).is_some_and(|marker| marker.starts_with("map-entry/")) {
+                return match self.java_hash(receiver)? {
+                    Some(hash) => Ok(Some(Value::Int(hash))),
+                    None => self.host.unknown_operand_call(r).map(Some),
+                };
             }
             // A box typed as `Object` (`Object i = 7; i.hashCode()`).
             if self.equality_of(receiver) == Equality::Platform

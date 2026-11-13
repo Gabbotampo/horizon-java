@@ -156,7 +156,13 @@ pub use weaver::{
     weave_head_cancellable, weave_invoke, weave_invoke_plan, weave_plans, weave_return,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+/// A value the interpreter holds: a primitive, a box, a reference.
+///
+/// `==` on two values is Java's `equals` for what they hold as boxes (see the
+/// `PartialEq` impl): a `double` compares its canonical bits, so a `NaN` is
+/// one key in a set or a map and `0.0` is not `-0.0`, and an `Integer` is one
+/// value however it was boxed.
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i32),
     /// An exact 64-bit Java `long`, including a boxed `Long`.
@@ -170,15 +176,35 @@ pub enum Value {
     /// One variant covers both widths: the bytecode says which one a value is,
     /// so the interpreter rounds to `f32` at the `f*` opcodes and at an `F`
     /// descriptor, and keeps the full `f64` bits everywhere else. A `float` is
-    /// therefore stored already rounded to `f32` precision. The derived
-    /// `PartialEq` is IEEE equality, so a `NaN` value never equals itself;
-    /// `Double.equals` is modelled separately through the bit comparison.
+    /// therefore stored already rounded to `f32` precision. Two of them are
+    /// `==` as `Double.equals` is: by `doubleToLongBits` (the `fcmp`/`dcmp`
+    /// opcodes compare the `f64`s themselves). As a box it is a `Double`; a
+    /// `Float` box is a `Value::Boxed`.
     Float(f64),
     Ref(Option<String>),
     /// A boxed `Boolean`/`Byte`/`Short`/`Character`/`Integer` (`boxed.rs`):
     /// never text, so no `String` can pass for one.
     Boxed(Boxed),
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (&*boxed::canonical(self), &*boxed::canonical(other)) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Long(a), Value::Long(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => java_double_bits(*a) == java_double_bits(*b),
+            // `Float.equals` compares `floatToIntBits` (one `NaN`).
+            (Value::Boxed(Boxed::Float(a)), Value::Boxed(Boxed::Float(b))) => {
+                java_float_bits(f64::from(f32::from_bits(*a)))
+                    == java_float_bits(f64::from(f32::from_bits(*b)))
+            }
+            (Value::Boxed(a), Value::Boxed(b)) => a == b,
+            (Value::Ref(a), Value::Ref(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -4572,6 +4598,11 @@ impl Host for StdHost {
                 })?;
                 Ok(Value::Boxed(Boxed::Short(value)))
             }
+            // Every `byte` is in `Byte`'s cache: one box per value.
+            ("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;") => {
+                let value = expect_int(r, Self::argument(r, args, 0)?)?;
+                Ok(Value::Boxed(Boxed::Byte(value as i8)))
+            }
             ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
                 Ok(Value::Boxed(Boxed::Integer(value)))
@@ -6264,10 +6295,21 @@ impl Host for StdHost {
                 (owner, "<init>", "(Ljava/util/Collection;)V")
                     if is_collection_owner(owner) && !is_map_owner(owner) =>
                 {
-                    let source = host_collection_values(self, Self::argument(r, args, 0)?)?
+                    let mut source = host_collection_values(self, Self::argument(r, args, 0)?)?
                         .into_iter()
                         .map(|value| parse_collection_value(&value))
                         .collect::<Result<Vec<_>, _>>()?;
+                    // A set built from a collection holds each element once
+                    // (`addAll`: `equals`, so one `NaN`).
+                    if is_set_owner(owner) {
+                        let mut unique: Vec<Value> = Vec::with_capacity(source.len());
+                        for value in source {
+                            if !unique.contains(&value) {
+                                unique.push(value);
+                            }
+                        }
+                        source = unique;
+                    }
                     self.mutable_collections.insert(marker.to_owned(), source);
                     return Ok(Value::Void);
                 }
@@ -7140,11 +7182,9 @@ impl Host for StdHost {
                     );
                     Ok(Value::Int(equal as i32))
                 }
-                ("hashCode", "()I") => Ok(Value::Int(stable_hash(&format!(
-                    "map-entry/{},{}",
-                    value_marker(&key),
-                    value_marker(&value)
-                )))),
+                // The runtime answers it (`object_methods.rs`, `host_value_hash`):
+                // a jar key's own `hashCode` is not the host's to run.
+                ("hashCode", "()I") => self.unknown_host_call(r),
                 // `key + "=" + value`, each through `String.valueOf`.
                 ("toString", "()Ljava/lang/String;") => {
                     let text = format!("{}={}", object_text(self, &key), object_text(self, &value));
@@ -7653,6 +7693,23 @@ impl Host for StdHost {
                     1237
                 },
             )),
+            // `Byte`/`Short`/`Character.equals`: the same class and value.
+            (
+                "java/lang/Byte" | "java/lang/Short" | "java/lang/Character",
+                "equals",
+                "(Ljava/lang/Object;)Z",
+            ) => {
+                let other = Self::argument(r, args, 0)?;
+                let value = |value: &Value| match value {
+                    Value::Boxed(boxed) => Some(boxed.int()),
+                    _ => None,
+                };
+                Ok(Value::Int(
+                    (same_box_class(r, other)
+                        && value(receiver).is_some()
+                        && value(receiver) == value(other)) as i32,
+                ))
+            }
             ("java/lang/Boolean", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
                 (same_box_class(r, Self::argument(r, args, 0)?)
                     && boxed_boolean(receiver).is_some()
@@ -10319,6 +10376,59 @@ fn format_java_string_call<H: Host>(
     }
 }
 
+/// What `Method.invoke` answers for a call to a method of `descriptor`: a
+/// primitive result boxed by the declared return type (`float` → `Float`,
+/// `char` → `Character`), `null` for a `void` method, a reference as it is.
+fn reflected_return<H: Host>(
+    _runtime: &mut Runtime<'_, H>,
+    descriptor: &str,
+    answer: Value,
+) -> Result<Value, NativeError> {
+    Ok(match return_desc(descriptor) {
+        "V" => Value::Ref(None),
+        returned => box_by_descriptor(returned, answer),
+    })
+}
+
+/// A primitive of `descriptor` boxed as `valueOf` boxes it: an `int`,
+/// `long` or `double` is already its `Integer`/`Long`/`Double`; a `float`,
+/// `char`, `boolean`, `short` or `byte` becomes its `Value::Boxed`. Anything
+/// else (a reference) is returned as it is.
+fn box_by_descriptor(descriptor: &str, value: Value) -> Value {
+    let Value::Int(int) = value else {
+        return match (descriptor, value) {
+            ("F", Value::Float(float)) => Value::Boxed(Boxed::float(float)),
+            (_, value) => value,
+        };
+    };
+    match descriptor {
+        "C" => Value::Boxed(Boxed::Character(int as u16)),
+        "Z" => Value::Boxed(Boxed::Boolean(int != 0)),
+        "S" => Value::Boxed(Boxed::Short(int as i16)),
+        "B" => Value::Boxed(Boxed::Byte(int as i8)),
+        "F" => Value::Boxed(Boxed::float(f64::from(int))),
+        "J" => Value::Long(i64::from(int)),
+        "D" => Value::Float(f64::from(int)),
+        _ => Value::Int(int),
+    }
+}
+
+/// The descriptor of a primitive type named as `Class.getName()` names it
+/// (`float` → `F`); `None` for a class.
+fn primitive_descriptor(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "boolean" => "Z",
+        "char" => "C",
+        "float" => "F",
+        "double" => "D",
+        "byte" => "B",
+        "short" => "S",
+        "int" => "I",
+        "long" => "J",
+        _ => return None,
+    })
+}
+
 /// `Box.equals(o)` is `o instanceof Box && ...`: an `Integer` never equals a
 /// `Long` or a `Short` of the same value, nor a `Float` a `Double`.
 fn same_box_class(r: &MethodRef, other: &Value) -> bool {
@@ -10373,12 +10483,22 @@ fn number_long_value(value: &Value) -> Option<i64> {
     }
 }
 
+/// A number narrowed to `int` the way `(short)`/`(byte)` start (JLS 5.1.3):
+/// a `float`/`double` rounds toward zero and saturates at the `int` bounds,
+/// an integral value keeps its low 32 bits.
+fn number_narrowed_int(value: &Value) -> Option<i32> {
+    match value {
+        Value::Float(_) | Value::Boxed(Boxed::Float(_)) => boxed_float(value).map(|v| v as i32),
+        _ => number_long_value(value).map(|v| v as i32),
+    }
+}
+
 fn number_short_value(value: &Value) -> Option<i32> {
-    number_long_value(value).map(|v| (v as i16) as i32)
+    number_narrowed_int(value).map(|v| (v as i16) as i32)
 }
 
 fn number_byte_value(value: &Value) -> Option<i32> {
-    number_long_value(value).map(|v| (v as i8) as i32)
+    number_narrowed_int(value).map(|v| (v as i8) as i32)
 }
 
 fn boxed_byte(value: &Value) -> Option<i8> {
@@ -20028,13 +20148,20 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("get", "(Ljava/lang/Object;I)Ljava/lang/Object;")
             | ("getInt", "(Ljava/lang/Object;I)I") => {
+                let array = StdHost::argument(r, args, 0)?;
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                self.array(StdHost::argument(r, args, 0)?)?
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?
+                let element = self.array(array)?.get(index).cloned().ok_or_else(|| {
+                    NativeError::Metadata(format!("array index {index} out of bounds"))
+                })?;
+                // `Array.get` boxes a primitive element by the array's own
+                // component type (`float[]` → `Float`, `char[]` → `Character`).
+                let primitive = expect_ref(array)
+                    .and_then(|marker| self.array_component(marker))
+                    .and_then(|component| primitive_descriptor(&component));
+                match primitive {
+                    Some(descriptor) if r.name == "get" => box_by_descriptor(descriptor, element),
+                    _ => element,
+                }
             }
             ("getBoolean", "(Ljava/lang/Object;I)Z") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
@@ -20690,7 +20817,8 @@ impl<H: Host> Runtime<'_, H> {
                         name: name.to_owned(),
                         descriptor: descriptor.to_owned(),
                     };
-                    return Ok(Some(self.host.invoke(&target, &invocation_args)?));
+                    let answer = self.host.invoke(&target, &invocation_args)?;
+                    return reflected_return(self, descriptor, answer).map(Some);
                 }
                 return Err(NativeError::MissingMethod(format!("{owner}#{name}")));
             };
@@ -20712,13 +20840,14 @@ impl<H: Host> Runtime<'_, H> {
             // `Object[]` hands boxed values to a primitive parameter, so unbox
             // against the target's own descriptor before the body reads it.
             let invocation_args = coerce_arguments(&target.descriptor, &invocation_args);
-            return Ok(Some(self.invoke(
+            let answer = self.invoke(
                 owner,
                 &target.name,
                 &target.descriptor,
                 target_receiver,
                 &invocation_args,
-            )?));
+            )?;
+            return reflected_return(self, &target.descriptor, answer).map(Some);
         }
         Ok(None)
     }
@@ -33397,10 +33526,12 @@ mandatory = true
             name: "hashCode".into(),
             descriptor: "()I".into(),
         };
-        assert_eq!(
-            host.invoke_instance(&entry_hash, &entry, &[]).unwrap(),
-            Value::Int(stable_hash("map-entry/rkey,rvalue"))
-        );
+        // `Objects.hashCode(key) ^ Objects.hashCode(value)` is the runtime's
+        // (`object_methods.rs`): it may run a jar key's `hashCode`, so the
+        // host alone counts the call.
+        let before = host.unknown_host_call_count();
+        host.invoke_instance(&entry_hash, &entry, &[]).unwrap();
+        assert_eq!(host.unknown_host_call_count(), before + 1);
         let remove_if = MethodRef {
             owner: "java/util/Collection".into(),
             name: "removeIf".into(),
