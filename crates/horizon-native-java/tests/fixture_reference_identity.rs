@@ -205,6 +205,28 @@ public final class Identity {
     return "" + ("a/B#1" == new StringBuilder("a/B#").append(1).toString());
   }
 
+    /** `"" + b` of one boolean is `String.valueOf(b)`: the shared literals. */
+  public static String unaryBooleans() {
+    boolean f = true, g = true, h = false;
+    String s1 = "" + f, s2 = "" + g;
+    char c = 'x';
+    int n = 7;
+    return "" + (s1 == s2) + (("" + h) == (h + "")) + ((s1 != s2) ? "ne" : "eq") + (("" + f) == "true")
+        + (("" + c) == ("" + c)) + (("" + n) == ("" + n));
+  }
+
+  /** One more merged local per pass over a long body: the analysis gives
+   *  up within its budget and counts. */
+  public static String longChain() {
+    Integer a0 = Integer.valueOf(1000), DECL;
+    int c = 0;
+    for (int k = 0; k < 3; k++) {
+COMPARES      a0 = Integer.valueOf(k);
+CHAIN
+    }
+    return "" + c;
+  }
+
   /** 4000 comparisons of one reference in a loop: the analysis runs once. */
   public static String manyCompares() {
     Integer a = 1000;
@@ -243,7 +265,22 @@ fn jar(tag: &str) -> NativeJar {
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();
     let many = "      if (a == b) n++;\n".repeat(4000);
-    fs::write(&source, SOURCE.replace("MANY", &many)).unwrap();
+    let declarations = (1..200)
+        .map(|i| format!("a{i} = a0"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let compares = "      if (a0 == a1) c++;\n".repeat(2900);
+    let chain = (1..200)
+        .rev()
+        .map(|i| format!("      a{i} = a{};", i - 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source_text = SOURCE
+        .replace("MANY", &many)
+        .replace("DECL", &declarations)
+        .replace("COMPARES", &compares)
+        .replace("CHAIN", &chain);
+    fs::write(&source, source_text).unwrap();
     let status = Command::new(javac())
         .args(["--release", "17", "-nowarn", "-d"])
         .arg(root.join("classes"))
@@ -297,6 +334,7 @@ fn provable_identities_answer_as_java_25() {
         ("emptyBuilders", "truetruetruetruetrue"),
         ("spelledLikeBoxes", "falsefalsefalsefalsefalse"),
         ("sharedEmpties", "truetruetruetruefalsefalse"),
+        ("unaryBooleans", "truetrueeqtruefalsefalse"),
     ] {
         let (value, unknown) = run(&jar, name);
         assert_eq!(value, text(expected), "{name}");
@@ -358,5 +396,28 @@ fn a_method_full_of_comparisons_is_analysed_once() {
     assert!(
         elapsed < Duration::from_secs(5),
         "two calls took {elapsed:?}"
+    );
+}
+
+/// A 42 KB method whose fixpoint needs one pass per local (200 `Integer`
+/// locals shifted along a chain at the end of a loop of 2900 comparisons):
+/// the pass stops at its work budget and counts, instead of running for
+/// seconds. Java 25 answers `8700`.
+#[test]
+fn a_method_past_the_budget_is_counted_quickly() {
+    let jar = jar("chain");
+    let started = Instant::now();
+    let (_, unknown) = run(&jar, "longChain");
+    let elapsed = started.elapsed();
+    assert!(
+        unknown
+            .iter()
+            .any(|(call, _)| call
+                == "java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+        "{unknown:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the first call took {elapsed:?}"
     );
 }

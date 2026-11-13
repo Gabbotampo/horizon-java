@@ -65,10 +65,19 @@ use std::{collections::BTreeMap, rc::Rc};
 /// together, before the table starts over.
 const MAX_CACHED_METHODS: usize = 1024;
 const MAX_CACHED_CODE_BYTES: usize = 16 << 20;
-/// Instructions the dataflow may step through for one method (each block is
-/// walked again whenever its entry state changes) before it gives up; a
-/// comparison in a method it gave up on is counted.
-const MAX_STEPS: usize = 4_000_000;
+/// Work the dataflow may do for one method before it gives up, in slot
+/// operations: every instruction stepped, and every local and stack slot
+/// copied or merged at a block entry or an exception handler. A method whose
+/// fixpoint costs more (one more merged local per pass over a long body) is
+/// not analysed, and its comparisons are counted. This bounds the pass to a
+/// few milliseconds per method, once per thread.
+const MAX_WORK: usize = 4_000_000;
+
+/// Charge `amount` to the method's budget; `None` once it is spent.
+fn charge(done: &mut usize, amount: usize) -> Option<()> {
+    *done += amount;
+    (*done <= MAX_WORK).then_some(())
+}
 
 /// Cached analyses: key → (the code they were computed from, the answer).
 type Cache = BTreeMap<String, (Rc<[u8]>, Option<Rc<Flow>>)>;
@@ -198,22 +207,28 @@ struct State {
 }
 
 impl State {
-    /// Merge `other` in; `None` for stack heights a verified class never has.
-    fn merge(&mut self, other: &State) -> Option<bool> {
-        if self.stack.len() != other.stack.len() {
+    /// Merge a frame's `locals` and `stack` in, in place; whether anything
+    /// changed, `None` for stack heights a verified class never has.
+    fn merge(&mut self, locals: &[Slot], stack: &[Slot]) -> Option<bool> {
+        if self.stack.len() != stack.len() {
             return None;
         }
-        let before = self.clone();
-        if self.locals.len() < other.locals.len() {
-            self.locals.resize(other.locals.len(), TOP);
+        let mut changed = false;
+        if self.locals.len() < locals.len() {
+            self.locals.resize(locals.len(), TOP);
+            changed = true;
         }
         for (index, slot) in self.locals.iter_mut().enumerate() {
-            *slot = slot.merge(other.locals.get(index).copied().unwrap_or(TOP));
+            let merged = slot.merge(locals.get(index).copied().unwrap_or(TOP));
+            changed |= merged != *slot;
+            *slot = merged;
         }
-        for (slot, other) in self.stack.iter_mut().zip(&other.stack) {
-            *slot = slot.merge(*other);
+        for (slot, other) in self.stack.iter_mut().zip(stack) {
+            let merged = slot.merge(*other);
+            changed |= merged != *slot;
+            *slot = merged;
         }
-        Some(*self != before)
+        Some(changed)
     }
 }
 
@@ -431,9 +446,15 @@ fn box_key(value: &Value) -> Option<BoxKey> {
             bits: *v,
             float: false,
         },
+        // A bare floating-point value is a `Double`; a `Float` is boxed.
         Value::Float(v) => BoxKey {
-            class: None,
+            class: Some("java/lang/Double"),
             bits: v.to_bits() as i64,
+            float: true,
+        },
+        Value::Boxed(Boxed::Float(bits)) => BoxKey {
+            class: Some("java/lang/Float"),
+            bits: i64::from(*bits),
             float: true,
         },
         Value::Boxed(boxed) => BoxKey {
@@ -628,17 +649,21 @@ fn analyse(
     queued[0] = true;
     let mut edges: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
     let mut compares = BTreeMap::new();
-    let mut steps = 0usize;
+    let mut done = 0usize;
     let merge = |entry: &mut Vec<Option<State>>,
                  work: &mut Vec<usize>,
                  queued: &mut Vec<bool>,
                  target: usize,
-                 incoming: &State|
+                 locals: &[Slot],
+                 stack: &[Slot]|
      -> Option<()> {
         let changed = match &mut entry[target] {
-            Some(existing) => existing.merge(incoming)?,
+            Some(existing) => existing.merge(locals, stack)?,
             slot @ None => {
-                *slot = Some(incoming.clone());
+                *slot = Some(State {
+                    locals: locals.to_vec(),
+                    stack: stack.to_vec(),
+                });
                 true
             }
         };
@@ -651,21 +676,23 @@ fn analyse(
     while let Some(block) = work.pop() {
         queued[block] = false;
         let mut state = entry[block].clone()?;
+        charge(&mut done, state.locals.len() + state.stack.len())?;
         let mut pc = blocks[block];
         loop {
-            steps += 1;
-            if steps > MAX_STEPS {
-                return None;
-            }
+            charge(&mut done, 1)?;
             // A handler starts with the locals of any instruction it covers.
             for handler in &handlers {
                 if (handler.start_pc as usize..handler.end_pc as usize).contains(&pc) {
                     let target = block_of[handler.handler_pc as usize];
-                    let incoming = State {
-                        locals: state.locals.clone(),
-                        stack: vec![TOP],
-                    };
-                    merge(&mut entry, &mut work, &mut queued, target, &incoming)?;
+                    charge(&mut done, state.locals.len() + 1)?;
+                    merge(
+                        &mut entry,
+                        &mut work,
+                        &mut queued,
+                        target,
+                        &state.locals,
+                        &[TOP],
+                    )?;
                     if !edges[block].contains(&target) {
                         edges[block].push(target);
                     }
@@ -686,7 +713,15 @@ fn analyse(
             }
             for target in targets {
                 let target = block_of[target];
-                merge(&mut entry, &mut work, &mut queued, target, &state)?;
+                charge(&mut done, state.locals.len() + state.stack.len())?;
+                merge(
+                    &mut entry,
+                    &mut work,
+                    &mut queued,
+                    target,
+                    &state.locals,
+                    &state.stack,
+                )?;
                 if !edges[block].contains(&target) {
                     edges[block].push(target);
                 }
@@ -798,12 +833,25 @@ fn kind(file: &ClassFile, code: &[u8], source: Source) -> Kind {
             _ => Kind::Opaque,
         },
         Some(0xbb) => Kind::Fresh,
-        Some(0xba) => match index(true).and_then(|i| file.invoke_dynamic_name(i).ok()) {
-            // JLS 15.18.1: a non-constant concatenation is a new `String`
-            // (JDK 25's `StringConcatHelper` copies even `"" + s`).
-            Some(name) if name == "makeConcatWithConstants" || name == "makeConcat" => Kind::Fresh,
-            _ => Kind::Opaque,
-        },
+        Some(0xba) => {
+            let Some(i) = index(true) else {
+                return Kind::Opaque;
+            };
+            match file.invoke_dynamic_name(i).ok().as_deref() {
+                // `"" + b` of one `boolean` and nothing else is JDK 25's
+                // `StringConcatFactory.unaryConcat` → `booleanStringifier`,
+                // i.e. `String.valueOf(boolean)`: the `"true"`/`"false"`
+                // literals.
+                Some("makeConcatWithConstants" | "makeConcat") if unary_boolean(file, i) => {
+                    Kind::Interned
+                }
+                // Every other concatenation is a new `String` (JLS 15.18.1;
+                // JDK 25's `StringConcatHelper` copies even `"" + s`, and the
+                // unary `char`/`int`/`String`/`Object` forms make one too).
+                Some("makeConcatWithConstants" | "makeConcat") => Kind::Fresh,
+                _ => Kind::Opaque,
+            }
+        }
         Some(0xb2) => match index(true).and_then(|i| file.field_ref(i).ok()) {
             Some(f)
                 if f.owner == "java/lang/Boolean" && (f.name == "TRUE" || f.name == "FALSE") =>
@@ -1108,4 +1156,31 @@ fn store(state: &mut State, kind: u8, index: usize) -> Option<()> {
         state.locals[index + 1] = TOP;
     }
     Some(())
+}
+
+/// Whether the `invokedynamic` at constant `index` concatenates exactly one
+/// `boolean` and nothing else (`makeConcat`, or `makeConcatWithConstants`
+/// whose recipe is a single argument slot).
+fn unary_boolean(file: &ClassFile, index: u16) -> bool {
+    if file.invoke_dynamic_descriptor(index).ok().as_deref() != Some("(Z)Ljava/lang/String;") {
+        return false;
+    }
+    if file.invoke_dynamic_name(index).ok().as_deref() == Some("makeConcat") {
+        return true;
+    }
+    let Some(Cp::InvokeDynamic { bootstrap, .. }) = file.pool.get(index as usize) else {
+        return false;
+    };
+    let recipe = file
+        .bootstrap_methods
+        .get(*bootstrap as usize)
+        .and_then(|method| method.arguments.first())
+        .and_then(|argument| match file.pool.get(*argument as usize) {
+            Some(Cp::String(text)) => match file.pool.get(*text as usize) {
+                Some(Cp::Utf8(text)) => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        });
+    recipe == Some("\u{1}")
 }
