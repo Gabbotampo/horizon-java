@@ -2578,7 +2578,7 @@ mod tests {
             host.game_event_call(&world_path, &server, std::slice::from_ref(&root))
                 .unwrap()
                 .unwrap(),
-            Value::Ref(Some("path:/horizon/game/world/.".into()))
+            crate::path_value("/horizon/game/world/.")
         );
         let rules = host
             .game_event_call(

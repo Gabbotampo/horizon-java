@@ -649,6 +649,8 @@ pub(crate) const MEMBER_METHODS: Methods = Methods {
     instance_of,
     // A member of one jar's classes means nothing in another jar's runtime.
     crosses_jars: |_, _| false,
+    // `Field`, `Method` and `Constructor` are not `Comparable`.
+    compare_to: None,
 };
 
 #[cfg(test)]

@@ -151,14 +151,25 @@ pub enum HostKind {
     /// `java.util.OptionalDouble`: key `""` when empty, else the `double`'s
     /// `Double.doubleToLongBits` (every `NaN` one key, `-0.0` not `0.0`).
     OptionalDouble,
-    /// `java.lang.reflect.Field`: key `<class>#<name>[:<descriptor>:<access>]
-    /// [#<copy>]` (`host_reflect.rs`).
+    /// `java.nio.file.Path`: key the path as `UnixPath` keeps it
+    /// (`host_path.rs`).
+    Path,
+    /// A NeoForge `FMLPaths` constant: key its name.
+    FmlPath,
+    /// A `StandardWatchEventKinds` constant: key its name (`host_watch.rs`).
+    WatchKind,
+    /// A `WatchService`, `WatchKey` or `WatchEvent` of the file model: key
+    /// the number the model minted for it.
+    WatchService,
+    WatchKey,
+    WatchEvent,
+    /// `java.lang.reflect.Field`: key the member's facts in the nested-key
+    /// encoding, then `#<copy>` for a copy a lookup minted (`host_reflect.rs`).
     ReflectField,
-    /// `java.lang.reflect.Method`: key `<class>#<name>[<descriptor>[:<access>
-    /// [i][:<throws>]]]` (`host_reflect.rs`).
+    /// `java.lang.reflect.Method`: key the member's facts (`host_reflect.rs`).
     ReflectMethod,
-    /// `java.lang.reflect.Constructor`: key `<class>#[<descriptor>[:<access>
-    /// [:<throws>]]]` (`host_reflect.rs`).
+    /// `java.lang.reflect.Constructor`: key the member's facts
+    /// (`host_reflect.rs`).
     ReflectConstructor,
 }
 
@@ -198,6 +209,10 @@ pub(crate) type InstanceOfFn = fn(&HostRef, &str, &dyn ClassHierarchy) -> Option
 /// Whether a handle means the same in another jar's runtime (NeoForge IMC):
 /// `crosses` answers for a held value.
 pub(crate) type CrossesFn = fn(&HostRef, &dyn Fn(&Value) -> bool) -> bool;
+/// `handle.compareTo(other)` (`Comparable`); `None` when it is unknown here
+/// (the caller counts it).
+pub(crate) type CompareToFn =
+    fn(&HostRef, &Value, &mut dyn Nested) -> Result<Option<i32>, NativeError>;
 
 /// The class hierarchy a kind's `instance_of` reads: the JDK's supertypes,
 /// and in the runtime the jar's own classes (a jar object's superclasses and
@@ -226,6 +241,11 @@ pub(crate) struct Methods {
     pub(crate) equals: EqualsFn,
     pub(crate) instance_of: InstanceOfFn,
     pub(crate) crosses_jars: CrossesFn,
+    /// Natural order, for a kind whose class is `Comparable`: every caller of
+    /// `compareTo` (a direct call, a sort, a `TreeMap`, `sorted()`) reaches
+    /// it. `None` for a kind that is not `Comparable`, or not modelled: the
+    /// caller counts the comparison.
+    pub(crate) compare_to: Option<CompareToFn>,
 }
 
 /// One row of the kind table.
@@ -297,6 +317,48 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_optional::OPTIONAL_DOUBLE,
     },
     KindInfo {
+        kind: HostKind::Path,
+        tag: "path",
+        class: ClassRule::Fixed("sun/nio/fs/UnixPath"),
+        canonical: never_canonical,
+        methods: &crate::host_path::PATH,
+    },
+    KindInfo {
+        kind: HostKind::FmlPath,
+        tag: "fmlp",
+        class: ClassRule::Fixed(crate::host_path::FML_PATHS_CLASS),
+        canonical: always_canonical,
+        methods: &crate::host_path::FML_PATHS,
+    },
+    KindInfo {
+        kind: HostKind::WatchKind,
+        tag: "wkind",
+        class: ClassRule::Fixed("java/nio/file/StandardWatchEventKinds$StdWatchEventKind"),
+        canonical: always_canonical,
+        methods: &crate::host_watch::WATCH_KIND,
+    },
+    KindInfo {
+        kind: HostKind::WatchService,
+        tag: "wsvc",
+        class: ClassRule::Fixed("sun/nio/fs/LinuxWatchService"),
+        canonical: always_canonical,
+        methods: &crate::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::WatchKey,
+        tag: "wkey",
+        class: ClassRule::Fixed("sun/nio/fs/LinuxWatchService$LinuxWatchKey"),
+        canonical: always_canonical,
+        methods: &crate::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::WatchEvent,
+        tag: "wevt",
+        class: ClassRule::Fixed("sun/nio/fs/AbstractWatchKey$Event"),
+        canonical: always_canonical,
+        methods: &crate::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
         kind: HostKind::ReflectField,
         tag: "rfld",
         class: ClassRule::Fixed(crate::host_reflect::FIELD),
@@ -332,6 +394,20 @@ impl HostKind {
             .get_or_init(|| KINDS.iter().map(|info| (info.tag, info.kind)).collect())
             .get(tag)
             .copied()
+    }
+
+    /// `class instanceof wanted` for the class name of a fixed-class kind (a
+    /// handle's `getClass()` handed to `Class.isAssignableFrom`, a class
+    /// walk): the kind's row, as for a handle of it, since a fixed class's
+    /// supertypes do not depend on the key. `None` when `class` is no kind's
+    /// fixed class; `Some(None)` when the row cannot tell.
+    pub(crate) fn class_instance_of(
+        class: &str,
+        wanted: &str,
+        hierarchy: &dyn ClassHierarchy,
+    ) -> Option<Option<bool>> {
+        let kind = Self::of_class(class)?;
+        Some(HostRef::new(kind, "").instance_of(wanted, hierarchy))
     }
 
     /// The kind of a fixed-class kind whose class is `class` (asked on every
@@ -449,6 +525,19 @@ impl HostRef {
     /// `None` when `hierarchy` cannot tell.
     pub(crate) fn instance_of(&self, wanted: &str, hierarchy: &dyn ClassHierarchy) -> Option<bool> {
         (self.methods().instance_of)(self, wanted, hierarchy)
+    }
+
+    /// `compareTo(other)`; `None` when the kind has no natural order here or
+    /// cannot compare these two.
+    pub(crate) fn compare_to(
+        &self,
+        other: &Value,
+        nested: &mut dyn Nested,
+    ) -> Result<Option<i32>, NativeError> {
+        match self.methods().compare_to {
+            Some(compare) => compare(self, other, nested),
+            None => Ok(None),
+        }
     }
 
     /// Whether this handle means the same in another jar's runtime, with

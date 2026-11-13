@@ -27,11 +27,6 @@
 //!   (`Files.exists` answers false for every other path), so JDK 25 throws
 //!   `NoSuchFileException(<path>)`.
 //!
-//! **`Path.equals`/`hashCode`** compare and hash the path text as
-//! `UnixPath` keeps it (repeated and trailing slashes dropped), byte by byte.
-//! A non-ASCII path's hash is counted: its bytes depend on the machine's
-//! `sun.jnu.encoding`.
-//!
 //! **`Path.toRealPath()`** answers an absolute path in normal form that
 //! exists with itself (the model has no links), and throws as JDK 25 does
 //! for a missing one; see [`Runtime::real_path`].
@@ -115,21 +110,6 @@ fn null_path() -> NativeError {
     )
 }
 
-/// A path as `UnixPath` keeps it: repeated slashes collapsed and a trailing
-/// slash dropped (`normalizeAndCheck`).
-fn unix_normal(path: &str) -> String {
-    let mut normal = String::with_capacity(path.len());
-    for c in path.chars() {
-        if !(c == '/' && normal.ends_with('/')) {
-            normal.push(c);
-        }
-    }
-    if normal.len() > 1 && normal.ends_with('/') {
-        normal.pop();
-    }
-    normal
-}
-
 /// Whether `ancestor` is a proper parent of `path`, by path text.
 fn is_parent_of(ancestor: &str, path: &str) -> bool {
     let ancestor = ancestor.trim_end_matches('/');
@@ -208,38 +188,16 @@ impl<H: Host> Runtime<'_, H> {
         }) {
             return self.attributes_call(r, &marker.clone());
         }
+        // `UnixPath.equals`/`hashCode` are the path kind's row (`host_path.rs`).
         if r.owner == "java/nio/file/Path"
-            && let Some(receiver @ Value::Ref(Some(marker))) = receiver
-            && marker.starts_with("path:")
+            && let Some(receiver) = receiver.filter(|value| host_path::path_key(value).is_some())
+            && (r.name.as_str(), r.descriptor.as_str())
+                == (
+                    "toRealPath",
+                    "([Ljava/nio/file/LinkOption;)Ljava/nio/file/Path;",
+                )
         {
-            return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("toRealPath", "([Ljava/nio/file/LinkOption;)Ljava/nio/file/Path;") => {
-                    self.real_path(r, Some(receiver), args.first())
-                }
-                // `UnixPath.equals`/`hashCode` over the normalized path bytes.
-                ("equals", "(Ljava/lang/Object;)Z") => {
-                    let other = match args.first() {
-                        Some(Value::Ref(Some(other))) => other.strip_prefix("path:"),
-                        _ => None,
-                    };
-                    Ok(Some(Value::Int(i32::from(other.is_some_and(|other| {
-                        unix_normal(other) == unix_normal(path_text(receiver))
-                    })))))
-                }
-                // A path's bytes are its text in `sun.jnu.encoding`, which is
-                // the machine's locale: only ASCII is the same everywhere.
-                ("hashCode", "()I") if !path_text(receiver).is_ascii() => {
-                    self.host.unknown_operand_call(r).map(Some)
-                }
-                ("hashCode", "()I") => Ok(Some(Value::Int(
-                    unix_normal(path_text(receiver))
-                        .bytes()
-                        .fold(0i32, |hash, byte| {
-                            hash.wrapping_mul(31).wrapping_add(i32::from(byte))
-                        }),
-                ))),
-                _ => Ok(None),
-            };
+            return self.real_path(r, Some(receiver), args.first());
         }
         if r.owner != FILES {
             return Ok(None);
@@ -248,8 +206,7 @@ impl<H: Host> Runtime<'_, H> {
         // `jar_root_files` answers.
         if args
             .first()
-            .and_then(expect_ref)
-            .is_some_and(|_| path_text(&args[0]).starts_with(library_dispatch::MOD_ROOT_PREFIX))
+            .is_some_and(|path| path_text(path).starts_with(library_dispatch::MOD_ROOT_PREFIX))
         {
             return Ok(None);
         }
@@ -292,10 +249,9 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         options: Option<&Value>,
     ) -> Result<Option<Value>, NativeError> {
-        let Some(receiver @ Value::Ref(Some(_))) = receiver else {
+        let Some(path) = receiver.and_then(host_path::path_key).map(str::to_owned) else {
             return Ok(None);
         };
-        let path = path_text(receiver).to_owned();
         if path.starts_with(library_dispatch::MOD_ROOT_PREFIX) {
             return Ok(None);
         }
