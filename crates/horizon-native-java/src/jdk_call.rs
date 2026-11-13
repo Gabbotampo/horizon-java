@@ -376,6 +376,37 @@ impl<H: Host> Runtime<'_, H> {
         Ok(matches!(answer, Value::Int(flag) if flag != 0))
     }
 
+    /// `throw new <class>(cause)` in a JDK body's `catch`, with `error` the
+    /// caught exception: the cause becomes an object (the very object a jar
+    /// threw, through `jar_throwables.rs`, or a new one carrying its message),
+    /// the new throwable records it through `Throwable(Throwable)` (message
+    /// `cause.toString()`), and it is thrown as the object in flight, so the
+    /// handler sees `getCause()` as the JDK chains it. Anything that is not a
+    /// Java exception passes through unchanged.
+    pub(crate) fn throw_caused(&mut self, class: &str, error: NativeError) -> NativeError {
+        let NativeError::UncaughtException {
+            class: caught,
+            message,
+            frame,
+        } = error
+        else {
+            return error;
+        };
+        let cause = self.caught_throwable(&caught, message, frame.as_deref());
+        let thrown = self.new_object(class);
+        let init = MethodRef {
+            owner: class.to_owned(),
+            name: "<init>".into(),
+            descriptor: "(Ljava/lang/Throwable;)V".into(),
+        };
+        if let Err(error) = self.host.invoke_instance(&init, &thrown, &[cause]) {
+            return error;
+        }
+        // Thrown as that object, filed under a fresh origin
+        // (`jar_throwables.rs`).
+        self.throw_object(&thrown, None)
+    }
+
     /// Run one call-site frame.
     fn run_site(
         &mut self,

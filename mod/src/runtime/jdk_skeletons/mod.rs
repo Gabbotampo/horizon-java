@@ -51,7 +51,10 @@ use crate::runtime::jdk_call::{Site, throw};
 
 mod collection;
 mod defaults;
+mod list;
 mod set_queue;
+
+pub(crate) use list::{ABSTRACT_LIST, SEQUENTIAL_LIST};
 
 /// The file whose body runs a selected JDK member.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,10 @@ enum Body {
     SetQueue,
     /// `defaults.rs`: a JDK interface default.
     Default,
+    /// `list.rs`: `AbstractList`, `AbstractSequentialList`, `List`'s defaults.
+    List,
+    /// `list.rs`: a member a private JDK class declares (`AbstractList.Itr`).
+    Internal,
 }
 
 /// Which file implements `owner.name descriptor`, if any.
@@ -73,6 +80,8 @@ fn body_for(owner: &str, name: &str, descriptor: &str) -> Option<Body> {
         Some(Body::SetQueue)
     } else if defaults::BODIES.contains(&key) {
         Some(Body::Default)
+    } else if list::BODIES.contains(&key) {
+        Some(Body::List)
     } else {
         None
     }
@@ -166,6 +175,9 @@ const SUPERTYPES: &[(&str, &[&str])] = &[
 /// for `instanceof` on a jar subclass whose chain reaches it. `None` when
 /// `class` is not a skeleton.
 pub(crate) fn skeleton_is_instance(class: &str, wanted: &str) -> Option<bool> {
+    if let Some(answer) = internal_is_instance(class, wanted) {
+        return Some(answer);
+    }
     let (_, supertypes) = SUPERTYPES.iter().find(|(skeleton, _)| *skeleton == class)?;
     Some(class == wanted || supertypes.contains(&wanted))
 }
@@ -181,7 +193,76 @@ const IMPLEMENTED_BASES: &[&str] = &[
     ABSTRACT_COLLECTION,
     ABSTRACT_SET,
     ABSTRACT_QUEUE,
+    ABSTRACT_LIST,
+    SEQUENTIAL_LIST,
 ];
+
+/// The private JDK classes the bodies construct: `(class, superclass,
+/// direct interfaces)` (JDK 25.0.5).
+const INTERNAL: &[(&str, &str, &[&str])] = &[
+    (list::ITR, "java/lang/Object", &[ITERATOR]),
+    (list::LIST_ITR, list::ITR, &["java/util/ListIterator"]),
+    (list::SUB_LIST, ABSTRACT_LIST, &[]),
+    (
+        list::RANDOM_ACCESS_SUB_LIST,
+        list::SUB_LIST,
+        &["java/util/RandomAccess"],
+    ),
+    (
+        list::SUB_LIST_ITERATOR,
+        "java/lang/Object",
+        &["java/util/ListIterator"],
+    ),
+];
+
+/// Whether `class` is a private JDK class `wanted` is a supertype of (or is),
+/// through its internal chain and then its skeleton's supertypes.
+fn internal_is_instance(class: &str, wanted: &str) -> Option<bool> {
+    let mut current = class;
+    INTERNAL
+        .iter()
+        .find(|(internal, _, _)| *internal == class)?;
+    for _ in 0..=INTERNAL.len() {
+        if current == wanted {
+            return Some(true);
+        }
+        let Some((_, superclass, interfaces)) = INTERNAL
+            .iter()
+            .find(|(internal, _, _)| *internal == current)
+        else {
+            return Some(
+                skeleton_is_instance(current, wanted).unwrap_or(false)
+                    || wanted == "java/lang/Object",
+            );
+        };
+        if interfaces.iter().any(|interface| {
+            *interface == wanted || (*interface == "java/util/ListIterator" && wanted == ITERATOR)
+        }) {
+            return Some(true);
+        }
+        current = superclass;
+    }
+    Some(false)
+}
+
+/// The class that declares the instance field `name descriptor` among the
+/// skeletons `class` is or extends: `AbstractList.modCount`, the one field a
+/// jar subclass can see. `None` for any other field.
+pub(crate) fn skeleton_field_owner(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+) -> Option<&'static str> {
+    ((name, descriptor) == ("modCount", "I")
+        && [
+            ABSTRACT_LIST,
+            SEQUENTIAL_LIST,
+            list::SUB_LIST,
+            list::RANDOM_ACCESS_SUB_LIST,
+        ]
+        .contains(&class))
+    .then_some(ABSTRACT_LIST)
+}
 
 /// A boolean result as Java's `int`.
 fn boolean(value: bool) -> Value {
@@ -226,6 +307,13 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(answer) = self.host_entry_equals(r, opcode, this, args)? {
             return Ok(Some(answer));
         }
+        if let Some(class) =
+            expect_ref(this).and_then(|marker| jvm_dispatch::constructed_object_class(marker))
+            && INTERNAL.iter().any(|(internal, _, _)| *internal == class)
+        {
+            let class = class.to_owned();
+            return self.invoke_internal(&class, r, opcode, this, args);
+        }
         let Some(base) = self.stateless_jar_object(this) else {
             return Ok(None);
         };
@@ -241,6 +329,46 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         self.run_skeleton_body(&owner, r, this, args)
+    }
+
+    /// A call on an object of a private JDK class: its own member, else what
+    /// it inherits from its skeleton superclass or its interfaces.
+    fn invoke_internal(
+        &mut self,
+        class: &str,
+        r: &MethodRef,
+        opcode: u8,
+        this: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !matches!(opcode, 0xb6 | 0xb9) || r.name.starts_with('<') {
+            return Ok(None);
+        }
+        let mut current = class;
+        let mut direct = Vec::new();
+        while let Some((_, superclass, interfaces)) = INTERNAL
+            .iter()
+            .find(|(internal, _, _)| *internal == current)
+        {
+            if list::OWN_MEMBERS.contains(&(current, r.name.as_str(), r.descriptor.as_str())) {
+                let owner = current.to_owned();
+                return self.run_body(Body::Internal, &owner, r, this, args);
+            }
+            direct.extend_from_slice(interfaces);
+            current = superclass;
+        }
+        let owner =
+            jar_operands::skeleton_declaring(current, &r.name, &r.descriptor).or_else(|| {
+                if matches!(r.name.as_str(), "equals" | "hashCode" | "toString") {
+                    return None;
+                }
+                let interfaces = jar_operands::data_interfaces_of(&direct, current);
+                jar_operands::data_default_owner(&interfaces, &r.name, &r.descriptor)
+            });
+        match owner {
+            Some(owner) => self.run_skeleton_body(owner, r, this, args),
+            None => Ok(None),
+        }
     }
 
     /// Which JDK body `r` selects on a jar object whose chain leaves the jar
@@ -308,6 +436,18 @@ impl<H: Host> Runtime<'_, H> {
         if body == Body::Default && !self.default_runs_here(owner, &r.name, this) {
             return Ok(None);
         }
+        self.run_body(body, owner, r, this, args)
+    }
+
+    /// Run `body` as the JDK frame `owner.name`.
+    fn run_body(
+        &mut self,
+        body: Body,
+        owner: &str,
+        r: &MethodRef,
+        this: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
         if !frame_bound::admits_frame(self.depth) {
             return Err(NativeError::CallDepthExceeded {
                 class: owner.to_owned(),
@@ -322,6 +462,8 @@ impl<H: Host> Runtime<'_, H> {
             Body::Collection => self.collection_body(owner, name, descriptor, this, args),
             Body::SetQueue => self.set_queue_body(owner, name, descriptor, this, args),
             Body::Default => self.interface_default_body(owner, name, descriptor, this, args),
+            Body::List => self.list_body(owner, name, descriptor, this, args),
+            Body::Internal => self.internal_body(owner, name, descriptor, this, args),
         };
         stack_walk::leave();
         self.depth -= 1;
@@ -547,5 +689,13 @@ fn data_interface(class: &str) -> Option<&'static str> {
 /// Whether `owner descriptor` is a skeleton constructor whose JDK body keeps
 /// no state (every skeleton's no-argument constructor).
 fn jdk_skeleton_constructor(owner: &str, descriptor: &str) -> bool {
-    descriptor == "()V" && [ABSTRACT_COLLECTION, ABSTRACT_SET, ABSTRACT_QUEUE].contains(&owner)
+    descriptor == "()V"
+        && [
+            ABSTRACT_COLLECTION,
+            ABSTRACT_SET,
+            ABSTRACT_QUEUE,
+            ABSTRACT_LIST,
+            SEQUENTIAL_LIST,
+        ]
+        .contains(&owner)
 }

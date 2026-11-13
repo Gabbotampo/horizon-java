@@ -19128,6 +19128,12 @@ impl<H: Host> Runtime<'_, H> {
         let mut current = field.owner.clone();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
+                // `AbstractList.modCount`, inherited from a JDK skeleton.
+                if let Some(owner) =
+                    jdk_skeletons::skeleton_field_owner(&current, &field.name, &field.descriptor)
+                {
+                    return owner.to_owned();
+                }
                 break;
             };
             if file.fields.iter().any(|declared| {
