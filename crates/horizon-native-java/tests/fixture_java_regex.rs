@@ -9,14 +9,11 @@
 //! modelled subset. Compiled with `javac --release 21` and run with `java`
 //! (OpenJDK 27), it printed the lines in `EXPECTED` verbatim.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
-use std::{
-    fs,
-    io::Write,
-    path::PathBuf,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
 
 const PROBE: &str = r##"package demo;
@@ -161,15 +158,8 @@ const EXPECTED: &[(&str, &str)] = &[
     ),
 ];
 
-fn fixture() -> (PathBuf, NativeJar) {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-regex-{}-{unique}",
-        std::process::id()
-    ));
+fn fixture() -> (scratch::Scratch, NativeJar) {
+    let root = scratch::Scratch::new("regex");
     let classes = root.join("classes");
     let source = root.join("src/demo/Probe.java");
     fs::create_dir_all(source.parent().unwrap()).unwrap();

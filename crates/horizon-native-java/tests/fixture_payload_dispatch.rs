@@ -1,6 +1,9 @@
 //! A compiled mod registers a payload receiver and the native dispatcher calls
 //! it with the received frame's bounded marker.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     NativeJar, StdHost, Value, dispatch_payload_frame, dispatch_payload_frame_with,
 };
@@ -107,15 +110,7 @@ fn build_mod(root: &Path) -> std::path::PathBuf {
 
 #[test]
 fn a_received_frame_calls_the_registered_handler() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-payload-dispatch-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("payload-dispatch");
     let jar_path = build_mod(&root);
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let entry = jar.discover_entrypoint("main").unwrap();

@@ -6,6 +6,9 @@
 //! accepts the mod, but only the mod's own classes go into the jar: the native
 //! host answers the API classes, exactly as it does for a real jar.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ExecutionBudget, NativeJar, StdHost,
     brigadier::{
@@ -225,12 +228,8 @@ public final class CmdMod {
 }
 "#;
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-brigadier-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn scratch(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("brigadier-{name}"));
     fs::create_dir_all(&root).unwrap();
     root
 }
