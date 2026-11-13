@@ -63,59 +63,6 @@ pub(super) fn package_of(class: &str) -> &str {
     class.rsplit_once('/').map_or("", |(package, _)| package)
 }
 
-/// `Class.getTypeName()` of a field descriptor.
-fn type_name(descriptor: &str) -> String {
-    if let Some(component) = descriptor.strip_prefix('[') {
-        return format!("{}[]", type_name(component));
-    }
-    match descriptor {
-        "Z" => "boolean".into(),
-        "B" => "byte".into(),
-        "C" => "char".into(),
-        "S" => "short".into(),
-        "I" => "int".into(),
-        "J" => "long".into(),
-        "F" => "float".into(),
-        "D" => "double".into(),
-        other => other
-            .strip_prefix('L')
-            .and_then(|name| name.strip_suffix(';'))
-            .unwrap_or(other)
-            .replace('/', "."),
-    }
-}
-
-/// `Field.toString()`: `Modifier.toString(mods) + " "` (when `mods != 0`),
-/// the type's and the declaring class's type names, and the field's name.
-fn field_text(declaring: &str, name: &str, descriptor: &str, access: u16) -> String {
-    // The JVM's recognized field modifiers (`getModifiers()`), printed in
-    // `Modifier.toString`'s order.
-    let modifiers = access & 0x50df;
-    let words: Vec<&str> = [
-        (0x0001, "public"),
-        (0x0004, "protected"),
-        (0x0002, "private"),
-        (0x0008, "static"),
-        (0x0010, "final"),
-        (0x0080, "transient"),
-        (0x0040, "volatile"),
-    ]
-    .into_iter()
-    .filter(|(bit, _)| modifiers & bit != 0)
-    .map(|(_, word)| word)
-    .collect();
-    let prefix = if modifiers == 0 {
-        String::new()
-    } else {
-        format!("{} ", words.join(" "))
-    };
-    format!(
-        "{prefix}{} {}.{name}",
-        type_name(descriptor),
-        declaring.replace('/', ".")
-    )
-}
-
 /// The `NestHost` class a class file names, if it has the attribute.
 fn nest_host_attribute(file: &ClassFile) -> Result<Option<String>, NativeError> {
     class_attribute_classes(file, "NestHost").map(|names| names.into_iter().next())
@@ -217,7 +164,7 @@ impl<H: Host> Runtime<'_, H> {
             if !matches!(object, Value::Ref(None)) {
                 return Err(illegal_argument(format!(
                     "non-null object for {}",
-                    field_text(declaring, name, descriptor, access)
+                    host_reflect::declared_field_text(declaring, name, descriptor, access)
                 )));
             }
             None
@@ -225,7 +172,7 @@ impl<H: Host> Runtime<'_, H> {
             if matches!(object, Value::Ref(None)) {
                 return Err(illegal_argument(format!(
                     "null object for {}",
-                    field_text(declaring, name, descriptor, access)
+                    host_reflect::declared_field_text(declaring, name, descriptor, access)
                 )));
             }
             match self.known_instance_of(object, declaring) {

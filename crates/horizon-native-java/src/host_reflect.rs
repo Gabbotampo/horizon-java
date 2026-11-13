@@ -362,6 +362,46 @@ fn field_text(field: &Member<'_>) -> Option<String> {
     ))
 }
 
+/// `Field.toString()` of a field the class file declares.
+pub(crate) fn declared_field_text(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    access: u16,
+) -> String {
+    field_text(&Member {
+        class,
+        name,
+        descriptor: Some(descriptor),
+        access: Some(access),
+        interface: false,
+        throws: "",
+    })
+    .unwrap_or_default()
+}
+
+/// `Method.toString()` of a method the class file declares.
+pub(crate) fn method_text(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    declared: &Declared,
+) -> String {
+    let throws = declared.throws.join(",");
+    executable_text(
+        &Member {
+            class,
+            name,
+            descriptor: Some(descriptor),
+            access: Some(declared.access),
+            interface: declared.interface,
+            throws: &throws,
+        },
+        false,
+    )
+    .unwrap_or_default()
+}
+
 /// `Executable.sharedToString`: the modifiers under `mask` (with `default`
 /// after the access word for an interface's default method), the header
 /// (`Method`: return type, class and name; `Constructor`: class), the
