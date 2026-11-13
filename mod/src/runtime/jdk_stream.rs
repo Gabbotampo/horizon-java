@@ -33,7 +33,7 @@
 //! is refused with a named reason rather than ordered arbitrarily.
 
 use crate::runtime::jdk_model::MAX_SPLITERATOR_ELEMENTS;
-use crate::runtime::{MethodRef, NativeError, Value, expect_ref};
+use crate::runtime::{Boxed, MethodRef, NativeError, Value, expect_ref};
 
 /// Prefix of a modelled `Comparator` marker.
 const COMPARATOR_PREFIX: &str = "@cmp:";
@@ -129,10 +129,9 @@ fn integral(value: &Value) -> Option<i64> {
     match value {
         Value::Int(value) => Some(i64::from(*value)),
         Value::Long(value) => Some(*value),
-        Value::Ref(Some(marker)) => ["integer:", "long:", "short:", "byte:"]
-            .iter()
-            .find_map(|prefix| marker.strip_prefix(prefix))
-            .and_then(|digits| digits.parse().ok()),
+        Value::Boxed(boxed @ (Boxed::Integer(_) | Boxed::Short(_) | Boxed::Byte(_))) => {
+            Some(i64::from(boxed.int()))
+        }
         _ => None,
     }
 }
@@ -140,10 +139,7 @@ fn integral(value: &Value) -> Option<i64> {
 fn floating(value: &Value) -> Option<f64> {
     match value {
         Value::Float(value) => Some(*value),
-        Value::Ref(Some(marker)) => ["double:", "float:"]
-            .iter()
-            .find_map(|prefix| marker.strip_prefix(prefix))
-            .and_then(|digits| digits.parse().ok()),
+        Value::Boxed(Boxed::Float(bits)) => Some(f64::from(f32::from_bits(*bits))),
         _ => None,
     }
 }
@@ -162,10 +158,9 @@ fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
         return Ok(a.cmp(&b) as i32);
     }
     // `Character.compareTo` is the code-unit difference, not a sign.
-    let character = |value: &Value| {
-        expect_ref(value)
-            .and_then(|marker| marker.strip_prefix("character:"))
-            .and_then(|digits| digits.parse::<i32>().ok())
+    let character = |value: &Value| match value {
+        Value::Boxed(Boxed::Character(unit)) => Some(i32::from(*unit)),
+        _ => None,
     };
     if let (Some(a), Some(b)) = (character(a), character(b)) {
         return Ok(a - b);
@@ -174,9 +169,8 @@ fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
         // `Double.compare`: -0.0 < 0.0 and NaN above everything.
         return Ok(a.total_cmp(&b) as i32);
     }
-    let boolean = |value: &Value| match expect_ref(value).map(String::as_str) {
-        Some("boolean:true") => Some(true),
-        Some("boolean:false") => Some(false),
+    let boolean = |value: &Value| match value {
+        Value::Boxed(Boxed::Boolean(flag)) => Some(*flag),
         _ => None,
     };
     if let (Some(a), Some(b)) = (boolean(a), boolean(b)) {
@@ -603,11 +597,11 @@ mod tests {
     #[test]
     fn natural_order_matches_the_jdk_compare_to() {
         assert_eq!(
-            natural_compare(&text("integer:3"), &Value::Int(7)).unwrap(),
+            natural_compare(&Value::Boxed(Boxed::Integer(3)), &Value::Int(7)).unwrap(),
             -1
         );
         assert_eq!(
-            natural_compare(&Value::Long(9), &text("long:2")).unwrap(),
+            natural_compare(&Value::Long(9), &Value::Long(2)).unwrap(),
             1
         );
         // "apple".compareTo("apricot") == 'p' - 'r'
@@ -618,7 +612,11 @@ mod tests {
         // "ab".compareTo("abcd") == 2 - 4
         assert_eq!(natural_compare(&text("ab"), &text("abcd")).unwrap(), -2);
         assert_eq!(
-            natural_compare(&text("boolean:false"), &text("boolean:true")).unwrap(),
+            natural_compare(
+                &Value::Boxed(Boxed::Boolean(false)),
+                &Value::Boxed(Boxed::Boolean(true))
+            )
+            .unwrap(),
             -1
         );
         assert!(matches!(

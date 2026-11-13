@@ -626,12 +626,16 @@ impl Hooks for HorizonJava {
         let tick_count = event.context.tick.get().min(i32::MAX as u64) as i32;
         self.lock().tick_count = tick_count;
         let dedicated = event.context.authority == Authority::DedicatedServer;
+        let context = EventContext {
+            has_time: Some(host.server_has_time()),
+            ..EventContext::default()
+        };
         self.fire_bridged(
             Some(&mut *host),
             Lifecycle::None,
             game,
             dedicated,
-            EventContext::default(),
+            context,
             |_| true,
         );
     }
@@ -639,6 +643,7 @@ impl Hooks for HorizonJava {
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Pre`).
     fn level_tick_pre(&self, host: HostSide<'_>, event: &mut LevelTickPreEvent) {
+        let has_time = side_has_time(&host);
         if let HostSide::Server(host) = host {
             // The level's clocks are what `level.getGameTime()`/`getDayTime()` answer, so they
             // are refreshed from the level the hook names, before the listeners run.
@@ -646,6 +651,7 @@ impl Hooks for HorizonJava {
         }
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
+            has_time: Some(has_time),
             ..EventContext::default()
         };
         self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
@@ -655,9 +661,10 @@ impl Hooks for HorizonJava {
 
     /// A server level's tick ends (Fabric's `END_LEVEL_TICK`, NeoForge's
     /// `LevelTickEvent.Post`).
-    fn level_tick_post(&self, _host: HostSide<'_>, event: &mut LevelTickPostEvent) {
+    fn level_tick_post(&self, host: HostSide<'_>, event: &mut LevelTickPostEvent) {
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
+            has_time: Some(side_has_time(&host)),
             ..EventContext::default()
         };
         self.fire_event(GameEvent::LevelTickEnd, self.dedicated(), context, |_| true);
@@ -1406,7 +1413,6 @@ fn one_hand<T: PartialEq>(held: Option<&T>, main: Option<&T>, off: Option<&T>) -
     }
 }
 
-/// The dimension id of a hook's `LevelDimension`.
 /// The firing context of a completed break: the block context with the acting player's level
 /// and whether the removed block had a block entity.
 ///
@@ -1426,6 +1432,17 @@ fn destroyed_block_context(
     }
 }
 
+/// NeoForge's `hasTime()` for a tick hook: the server's `MinecraftServer.haveTime()` as
+/// `ConfigHost::server_has_time` reads it now, and `true` on a client, where NeoForge's client
+/// level tick passes `() -> true` (the host answers the same).
+fn side_has_time(host: &HostSide<'_>) -> bool {
+    match host {
+        HostSide::Server(host) => host.server_has_time(),
+        HostSide::Client(host) => host.server_has_time(),
+    }
+}
+
+/// The dimension id of a hook's `LevelDimension`.
 fn dimension_id(dimension: LevelDimension) -> &'static str {
     dimension.key().id()
 }

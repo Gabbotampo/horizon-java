@@ -487,7 +487,7 @@ litematica now run (refused before, on `minecraft`'s null version).
 | #3040 the old player on `player_clone` | yes: `PlayerCloneEvent.original` and the `original_player_*` reads (uuid, position, dimension, level, inventory slot, health, experience, effects, attachments) |
 | #3273 `server_starting` after the levels load; the world folder and game rules before them | **no**: the issue is open; `ConfigServerHost::world_dir` is `None` until a world is open, and the mod's server-start facts still log `world folder unknown, 0 game rules` |
 | #3089 which fluid a container item holds | yes, client side: the `contained_fluid` hook |
-| `ServerTickEvent.hasTime`/`LevelTickEvent.hasTime` | new: `ConfigHost::server_has_time` |
+| `ServerTickEvent.hasTime`/`LevelTickEvent.hasTime` | new: `ConfigHost::server_has_time`. Wired: `server_tick` and `level_tick_pre`/`post` read it when they fire and `hasTime()` answers it (before, `true` always). **Departure:** read once per firing, where NeoForge calls its `BooleanSupplier` (`this::haveTime`, a clock comparison) on every `hasTime()` |
 
 ## Pin bump to `cf0113879e`
 
