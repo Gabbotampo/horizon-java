@@ -1,4 +1,6 @@
-//! `new String(...)` is counted, never answered with the allocation marker.
+//! `new String(...)` is counted, never answered with the allocation marker,
+//! until a model builds its text (the `char[]` and code-point constructors
+//! now do: `string_constructors.rs`).
 //!
 //! On `main` before this test, every `String` constructor left the
 //! `java/lang/String#n` marker where Java has the text, silently:
@@ -8,7 +10,13 @@
 //! `javac --release 17`) returns for it, the answer a future model must give.
 
 use horizon_native_java::{NativeJar, StdHost};
-use std::{fs, io::Write, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use zip::write::SimpleFileOptions;
 
 const SOURCE: &str = r#"
@@ -69,12 +77,29 @@ fn javac() -> PathBuf {
         .unwrap_or_else(|| "javac".into())
 }
 
+/// The build directory of one [`jar`] call, removed when it drops (also when
+/// the build panics).
+struct BuildDir(PathBuf);
+
+impl Drop for BuildDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Compile and pack the fixture. Both tests call this at once on parallel
+/// threads of one process, so each call builds in its own directory: with a
+/// name made of the process id alone, one call's cleanup deleted the other's
+/// half-built jar (a flaky `NotFound` on CI).
 fn jar() -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-string-ctors-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = BuildDir(std::env::temp_dir().join(format!(
+        "horizon-native-java-string-ctors-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    let root = &dir.0;
+    let _ = fs::remove_dir_all(root);
     let source = root.join("src/demo/Ctors.java");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();
@@ -95,9 +120,45 @@ fn jar() -> NativeJar {
         zip.write_all(&fs::read(&class).unwrap()).unwrap();
     }
     zip.finish().unwrap();
-    let jar = NativeJar::from_path(&jar_path).unwrap();
-    let _ = fs::remove_dir_all(&root);
-    jar
+    NativeJar::from_path(&jar_path).unwrap()
+}
+
+/// The `char[]` and code-point constructors are modelled
+/// (`string_constructors.rs`): they answer the Java 25 values the comments
+/// above record, with nothing counted.
+#[test]
+fn char_and_code_point_constructors_answer_java_25() {
+    let jar = jar();
+    let cases = [
+        ("chars", "ab|2|true"),
+        ("charsRange", "bc"),
+        ("codePoints", "a\u{1F600}b"),
+        ("reference", "q"),
+    ];
+    for (name, expected) in cases {
+        let mut host = StdHost::new();
+        let answer = jar
+            .invoke_method_with_args(
+                "demo.Ctors",
+                name,
+                "()Ljava/lang/String;",
+                None,
+                &[],
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(
+            answer,
+            horizon_native_java::Value::Ref(Some(expected.to_owned())),
+            "{name}"
+        );
+        assert_eq!(
+            host.unknown_host_call_count(),
+            0,
+            "{name}: {:?}",
+            host.unknown_host_calls()
+        );
+    }
 }
 
 #[test]
@@ -105,9 +166,6 @@ fn every_string_constructor_is_counted_until_it_is_modelled() {
     let jar = jar();
     // (method, the constructor descriptor it must be counted under)
     let cases = [
-        ("chars", "([C)V"),
-        ("charsRange", "([CII)V"),
-        ("codePoints", "([III)V"),
         ("bytes", "([B)V"),
         ("bytesRange", "([BII)V"),
         ("bytesCharset", "([BLjava/nio/charset/Charset;)V"),
@@ -120,7 +178,6 @@ fn every_string_constructor_is_counted_until_it_is_modelled() {
         ("copy", "(Ljava/lang/String;)V"),
         ("builder", "(Ljava/lang/StringBuilder;)V"),
         ("buffer", "(Ljava/lang/StringBuffer;)V"),
-        ("reference", "([C)V"),
         ("supplier", "()V"),
         ("handle", "(Ljava/lang/String;)V"),
     ];
