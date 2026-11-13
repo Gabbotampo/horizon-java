@@ -72,8 +72,12 @@ fn javac() -> PathBuf {
 }
 
 fn jar() -> NativeJar {
+    // One directory per build: the tests in this file run in parallel in one
+    // process, and a shared one let a test delete another's jar.
+    static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let build = BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-string-ctors-{}",
+        "horizon-native-java-string-ctors-{}-{build}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&root);

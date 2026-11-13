@@ -889,6 +889,9 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
 
 /// Whether an instance of the platform class `class` is a `wanted`.
 pub(crate) fn class_instance_of(class: &str, wanted: &str) -> bool {
+    if class == wanted {
+        return true;
+    }
     let known = match platform_supertypes(class) {
         [] => crate::java_immutable::supertypes(class),
         known => known,

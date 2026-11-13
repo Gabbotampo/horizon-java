@@ -209,6 +209,37 @@ public final class Boxes3 {
 }
 "#;
 
+/// A `String` spelled like a host optional, and optionals of optionals.
+const BOXES4: &str = r#"
+package demo;
+
+import java.util.*;
+
+public final class Boxes4 {
+  /** A String spelled like a host optional is a String, inside an Optional or not. */
+  public static String forgery() {
+    Object g = Optional.of("optional-value/i5").get();
+    Object h = Optional.of("optional-value/BF1069547520").get();
+    Object s = Optional.of("optional/x").get();
+    Object o = "optional/x";
+    Object e = "optional";
+    return g + "|" + Optional.of("optional-value/i5").equals(Optional.of(5)) + "|" + h + "|" + s + "|"
+        + (o instanceof Optional) + (e instanceof Optional) + "|" + e.getClass().getSimpleName() + "|"
+        + Optional.of("optional").isPresent() + "|" + ("" + o + e) + "|" + Optional.of("optional/x").equals(Optional.of("x"));
+  }
+
+  /** An optional of an optional is nested, not collapsed. */
+  public static String nested() {
+    Optional<Optional<Integer>> n = Optional.of(Optional.of(5));
+    Optional<Optional<String>> m = Optional.of(Optional.empty());
+    Object inner = n.get();
+    return n + "|" + n.get().get() + "|" + (inner instanceof Optional) + "|" + m + "|" + m.get().isPresent() + "|"
+        + Optional.of(Optional.of("x")).get().get() + "|" + n.equals(Optional.of(Optional.of(5))) + "|" + n.hashCode()
+        + "|" + Optional.of(5).map(Optional::of).get().get() + "|" + Optional.of(Optional.of(5)).get().getClass().getSimpleName();
+  }
+}
+"#;
+
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
         .map(|home| PathBuf::from(home).join("bin/javac"))
@@ -344,6 +375,40 @@ fn reflection_bytes_nan_keys_entry_hashes_and_narrowing_answer_as_java_25() {
         let mut host = StdHost::new();
         let value = jar.invoke_method_with_args(
             "demo.Boxes3",
+            name,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        assert_eq!(
+            value.as_ref().ok(),
+            Some(&Value::Ref(Some(expected.into()))),
+            "{name}: {value:?}, unknown calls {:?}",
+            host.unknown_host_calls()
+        );
+    }
+}
+
+/// An `Optional` is a host object (`Value::Host`), never a `String`: no jar
+/// text spells one, and an optional of an optional nests. Expected strings
+/// are `Boxes4` on Java 25 (OpenJDK 25.0.5, two runs alike).
+#[test]
+fn no_string_spells_an_optional_and_optionals_nest() {
+    let jar = jar("Boxes4", BOXES4);
+    for (name, expected) in [
+        (
+            "forgery",
+            "optional-value/i5|false|optional-value/BF1069547520|optional/x|falsefalse|String|true|optional/xoptional|false",
+        ),
+        (
+            "nested",
+            "Optional[Optional[5]]|5|true|Optional[Optional.empty]|false|x|true|5|5|Optional",
+        ),
+    ] {
+        let mut host = StdHost::new();
+        let value = jar.invoke_method_with_args(
+            "demo.Boxes4",
             name,
             "()Ljava/lang/String;",
             None,

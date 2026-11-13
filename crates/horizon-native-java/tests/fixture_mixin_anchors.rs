@@ -118,6 +118,7 @@ fn text(value: &Value) -> String {
         Value::Long(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::Boxed(boxed) => boxed.text(),
+        Value::Host(marker) => marker.clone(),
         Value::Ref(None) => "null".into(),
         Value::Void => "void".into(),
     }

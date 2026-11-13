@@ -795,6 +795,9 @@ impl<H: Host> Runtime<'_, H> {
         }
         let text = match value {
             Value::Ref(None) | Value::Void => Some("null".to_owned()),
+            // A host model's object (`Optional`): Gson reflects its private
+            // fields, which JDK 25's module system refuses; not answered.
+            Value::Host(_) => None,
             // A boxed number or boolean is a JSON number or literal; a
             // `Character` is a one-character string.
             Value::Boxed(boxed @ Boxed::Character(_)) => {

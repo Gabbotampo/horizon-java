@@ -40,8 +40,7 @@ const SEPARATOR_FREE_MARKERS: &[&str] = &[
     "guava-cache-builder",
     "mixin-environment",
     "stack-walker",
-    // The empty optionals (`EMPTY_OPTIONAL*` in lib.rs).
-    "optional",
+    // The empty primitive optionals (`EMPTY_OPTIONAL_*` in lib.rs).
     "optional-int",
     "optional-long",
     "optional-double",

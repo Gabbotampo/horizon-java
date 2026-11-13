@@ -198,6 +198,11 @@ fn crosses_jars(value: &Value) -> bool {
             true
         }
         Value::Ref(Some(text)) => crate::runtime::value_class::is_plain_string(text),
+        // An `Optional` crosses when what it holds does.
+        Value::Host(_) => {
+            crate::runtime::is_optional(value)
+                && crate::runtime::optional_present(value).is_none_or(|held| crosses_jars(&held))
+        }
         Value::Void => false,
     }
 }

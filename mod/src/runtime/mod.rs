@@ -182,9 +182,14 @@ pub enum Value {
     /// `Float` box is a `Value::Boxed`.
     Float(f64),
     Ref(Option<String>),
-    /// A boxed `Boolean`/`Byte`/`Short`/`Character`/`Integer` (`boxed.rs`):
-    /// never text, so no `String` can pass for one.
+    /// A boxed `Boolean`/`Byte`/`Short`/`Character`/`Integer`/`Float`
+    /// (`boxed.rs`): never text, so no `String` can pass for one.
     Boxed(Boxed),
+    /// An object a host model built and keeps, named by its marker: never a
+    /// `String`, whatever a `String` with the same text spells. `Optional`
+    /// is one (`optional/<payload marker>`, `optional` for the empty one);
+    /// the other host families are still `Ref` markers.
+    Host(String),
     Void,
 }
 
@@ -200,6 +205,7 @@ impl PartialEq for Value {
                     == java_float_bits(f64::from(f32::from_bits(*b)))
             }
             (Value::Boxed(a), Value::Boxed(b)) => a == b,
+            (Value::Host(a), Value::Host(b)) => a == b,
             (Value::Ref(a), Value::Ref(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -1963,7 +1969,7 @@ fn adapt_value(desc: &str, value: Value, context: &str) -> Result<Option<Value>,
         // A reference return takes a box: `Value::Boxed`, or an `Integer`,
         // `Long` or `Double` the runtime holds as its value.
         _ => match value {
-            Value::Ref(_) | Value::Boxed(_) => Ok(Some(value)),
+            Value::Ref(_) | Value::Boxed(_) | Value::Host(_) => Ok(Some(value)),
             Value::Int(_) | Value::Long(_) | Value::Float(_)
                 if desc
                     .strip_prefix('L')
@@ -7053,7 +7059,7 @@ impl Host for StdHost {
                 && r.descriptor == "()Ljava/util/Optional;"
                 && let Some(provider) = self.merged_service_providers(service).first()
             {
-                return Ok(Value::Ref(Some(format!("optional/{provider}"))));
+                return Ok(optional_wrap(Value::Ref(Some(provider.clone()))));
             }
             // No provider: `Optional.empty()`.
             if r.name == "findFirst" && r.descriptor == "()Ljava/util/Optional;" {
@@ -8075,12 +8081,7 @@ impl Host for StdHost {
                 })))
             }
             // `Objects.hashCode(value)`: a string's or a box's own hash.
-            ("java/util/Optional", "hashCode", "()I") => Ok(Value::Int(
-                optional_payload(receiver).map_or(0, |payload| match payload {
-                    Value::Ref(Some(text)) => stable_hash(&text),
-                    other => object_methods::platform_hash(&other).unwrap_or(0),
-                }),
-            )),
+            ("java/util/Optional", "hashCode", "()I") => Ok(Value::Int(optional_hash(receiver))),
             ("java/util/Optional", "equals", "(Ljava/lang/Object;)Z") => {
                 let left = optional_payload(receiver);
                 let right = optional_payload(Self::argument(r, args, 0)?);
@@ -8206,11 +8207,7 @@ impl Host for StdHost {
                     function,
                     &[value],
                 )?;
-                Ok(match applied {
-                    Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
-                    Value::Ref(None) => empty_optional(),
-                    value => optional_wrap(value),
-                })
+                Ok(optional_wrap(applied))
             }
             (
                 "java/util/Optional",
@@ -8313,13 +8310,8 @@ impl Host for StdHost {
                         &[],
                     )?;
                     Ok(match supplied {
-                        Value::Ref(Some(value))
-                            if value == EMPTY_OPTIONAL
-                                || value.starts_with("optional/")
-                                || value.starts_with(OPTIONAL_VALUE) =>
-                        {
-                            Value::Ref(Some(value))
-                        }
+                        // `or` answers the supplier's own optional.
+                        supplied if is_optional(&supplied) => supplied,
                         Value::Ref(None) => empty_optional(),
                         value => optional_wrap(value),
                     })
@@ -8555,13 +8547,13 @@ impl Host for StdHost {
                     Value::Ref(Some(id)) => id,
                     _ => return Ok(Value::Ref(None)),
                 };
-                Ok(Value::Ref(match self.mods.get(id) {
+                Ok(optional_wrap(Value::Ref(match self.mods.get(id) {
                     Some(version) => Some(format!("mod-container/{id}/{version}")),
                     // The loader and the game are present in every runtime
                     // even though no jar declares them as a dependency.
                     None if is_always_loaded_mod(id) => Some(format!("mod-container/{id}/unknown")),
                     None => None,
-                }))
+                })))
             }
             (
                 "net/fabricmc/loader/api/ModContainer",
@@ -8574,7 +8566,7 @@ impl Host for StdHost {
                 // Optional, exactly as `ModContainer.findPath` does.
                 let name = expect_string(Self::argument(r, args, 0)?);
                 Ok(self.resource(name).map_or_else(empty_optional, |_| {
-                    Value::Ref(Some(format!("optional/{name}")))
+                    optional_wrap(Value::Ref(Some(name.to_owned())))
                 }))
             }
             (
@@ -8870,7 +8862,7 @@ impl Host for StdHost {
                 let key = expect_ref(receiver)
                     .and_then(|value| value.strip_prefix("holder/"))
                     .unwrap_or("deferred-register/registry/default/entry");
-                Ok(Value::Ref(Some(format!("optional/registered/{key}"))))
+                Ok(optional_wrap(Value::Ref(Some(format!("registered/{key}")))))
             }
             (
                 "net/neoforged/neoforge/registries/DeferredHolder",
@@ -8940,12 +8932,12 @@ impl Host for StdHost {
                 "net/minecraftforge/registries/RegistryObject",
                 "getOptional",
                 "()Ljava/util/Optional;",
-            ) => Ok(Value::Ref(Some(format!(
-                "optional/registered/{}",
+            ) => Ok(optional_wrap(Value::Ref(Some(format!(
+                "registered/{}",
                 expect_ref(receiver)
                     .and_then(|value| value.strip_prefix("holder/"))
                     .unwrap_or("deferred-register/registry/default/entry")
-            )))),
+            ))))),
             (
                 "net/minecraftforge/registries/IForgeRegistryEntry",
                 "getRegistryName",
@@ -8981,7 +8973,9 @@ impl Host for StdHost {
                 let key = expect_ref(receiver)
                     .and_then(|value| value.strip_prefix("holder/"))
                     .unwrap_or("deferred-register/registry/default/entry");
-                Ok(Value::Ref(Some(format!("optional/resource-key/{key}"))))
+                Ok(optional_wrap(Value::Ref(Some(format!(
+                    "resource-key/{key}"
+                )))))
             }
             (
                 "net/neoforged/neoforge/registries/DeferredRegister"
@@ -9247,6 +9241,7 @@ fn class_of_value(value: &Value) -> Option<String> {
         // A `Float` is a `Boxed::Float`; the bare value is a `Double`.
         Value::Float(_) => Some("java/lang/Double".into()),
         Value::Boxed(boxed) => Some(boxed.class().into()),
+        Value::Host(_) => is_optional(value).then(|| "java/util/Optional".into()),
         Value::Void => None,
         Value::Ref(None) => None,
         Value::Ref(Some(marker)) => {
@@ -9255,11 +9250,6 @@ fn class_of_value(value: &Value) -> Option<String> {
             }
             let class = if marker.starts_with("string-builder/") {
                 "java/lang/StringBuilder"
-            } else if marker.starts_with("optional/")
-                || marker.starts_with(OPTIONAL_VALUE)
-                || marker == "optional"
-            {
-                "java/util/Optional"
             } else if marker.starts_with("stream/") {
                 "java/util/stream/Stream"
             } else if marker.starts_with("path:") {
@@ -9361,6 +9351,9 @@ fn builder_append_text<H: Host>(
                 crate::runtime::java_tostring::modelled_marker(host, value).unwrap_or_else(|| value.clone())
             }
             Value::Boxed(boxed) => boxed.text(),
+            Value::Host(_) => {
+                crate::runtime::java_tostring::modelled(host, value).unwrap_or_else(|| value_text(value))
+            }
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
             Value::Long(value) => value.to_string(),
@@ -9536,6 +9529,7 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         Value::Float(value) => format_java_float(*value),
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
+        Value::Host(_) => host_text(value),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => String::new(),
     }
@@ -9778,6 +9772,8 @@ fn value_marker(value: &Value) -> String {
         // An `Integer` is one key however it was boxed (`boxed::canonical`).
         Value::Boxed(Boxed::Integer(value)) => format!("i{value}"),
         Value::Boxed(boxed) => boxed.marker(),
+        // `h` and the host object's marker, escaped like a reference's.
+        Value::Host(marker) => format!("h{}", marker.replace('\\', "\\\\").replace(',', "\\,")),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
     }
@@ -10174,6 +10170,7 @@ fn capability_text(value: &Value) -> String {
         Value::Float(value) => format_java_float(*value),
         Value::Ref(Some(value)) => value.replace("\\,", ",").replace("\\\\", "\\"),
         Value::Boxed(boxed) => boxed.text(),
+        Value::Host(_) => host_text(value),
         Value::Ref(None) => "".to_owned(),
         Value::Void => "void".to_owned(),
     }
@@ -10217,12 +10214,11 @@ fn is_lazy_optional_owner(owner: &str) -> bool {
 ///
 /// `Optional.empty()` is an object in Java: `isPresent()`, `orElse` and
 /// `ifPresent` are ordinary calls on it, and only a real `null` receiver
-/// throws `NullPointerException`. Modelling the empty optional as `null`
-/// would make every one of those calls an NPE, so it carries its own
-/// non-null marker. `optional_wrap` turns any present value (a string
-/// `"optional"` included) into `optional/<value>`, so the bare marker never
-/// collides with a present optional; a nested `Optional.of(Optional.empty())`
-/// is `optional/optional` and unwraps to this marker.
+/// throws `NullPointerException`. It is the host value
+/// `Value::Host("optional")`; a present optional is
+/// `Value::Host("optional/<payload's value_marker>")`. A `Value::Host` is
+/// never a `String`, so no jar string can spell an optional, and a nested
+/// optional is its own payload.
 pub(crate) const EMPTY_OPTIONAL: &str = "optional";
 /// The empty `OptionalInt`; present ones are `optional-int/<value>`.
 pub(crate) const EMPTY_OPTIONAL_INT: &str = "optional-int";
@@ -10232,68 +10228,90 @@ pub(crate) const EMPTY_OPTIONAL_LONG: &str = "optional-long";
 pub(crate) const EMPTY_OPTIONAL_DOUBLE: &str = "optional-double";
 
 pub(crate) fn empty_optional() -> Value {
-    Value::Ref(Some(EMPTY_OPTIONAL.into()))
+    Value::Host(EMPTY_OPTIONAL.into())
+}
+
+/// Whether `value` is an `Optional` (empty or present).
+pub(crate) fn is_optional(value: &Value) -> bool {
+    matches!(value, Value::Host(marker) if marker == EMPTY_OPTIONAL || marker.starts_with("optional/"))
 }
 
 /// The empty marker for a method whose declared result is one of the JDK's
 /// optional types, so a host answer of `null` for it becomes the empty
 /// optional Java would have returned (no JDK or library API returns a
 /// `null` Optional).
-fn empty_optional_for(descriptor: &str) -> Option<&'static str> {
-    match return_desc(descriptor) {
-        "Ljava/util/Optional;" => Some(EMPTY_OPTIONAL),
-        "Ljava/util/OptionalInt;" => Some(EMPTY_OPTIONAL_INT),
-        "Ljava/util/OptionalLong;" => Some(EMPTY_OPTIONAL_LONG),
-        "Ljava/util/OptionalDouble;" => Some(EMPTY_OPTIONAL_DOUBLE),
-        _ => None,
-    }
+fn empty_optional_for(descriptor: &str) -> Option<Value> {
+    let marker = match return_desc(descriptor) {
+        "Ljava/util/Optional;" => return Some(empty_optional()),
+        "Ljava/util/OptionalInt;" => EMPTY_OPTIONAL_INT,
+        "Ljava/util/OptionalLong;" => EMPTY_OPTIONAL_LONG,
+        "Ljava/util/OptionalDouble;" => EMPTY_OPTIONAL_DOUBLE,
+        _ => return None,
+    };
+    Some(Value::Ref(Some(marker.into())))
 }
 
-/// The value a `java.util.Optional` marker holds, or `None` for an empty one.
-///
-/// A `null` is read as empty too: a host answer that predates the empty
-/// marker must not turn into a present optional.
-pub(crate) fn optional_present(value: &Value) -> Option<&str> {
-    match expect_ref(value)? {
-        marker if marker == EMPTY_OPTIONAL => None,
-        marker => Some(marker.strip_prefix("optional/").unwrap_or(marker)),
-    }
-}
-
-/// An optional whose payload is no reference (a box): `optional-value/` and
-/// the payload's [`value_marker`]. A reference payload keeps its own text
-/// after `optional/`, so the two forms never meet: `Optional.of(5)` holds an
-/// `Integer` and `Optional.of("BI5")` the string.
-pub(crate) const OPTIONAL_VALUE: &str = "optional-value/";
-
-/// The value a present optional holds, `None` when it is empty.
-pub(crate) fn optional_payload(value: &Value) -> Option<Value> {
-    let marker = expect_ref(value)?;
-    if marker == EMPTY_OPTIONAL {
+/// The value a present optional holds, `None` when it is empty or no
+/// optional at all.
+pub(crate) fn optional_present(value: &Value) -> Option<Value> {
+    let Value::Host(marker) = value else {
         return None;
-    }
-    if let Some(encoded) = marker.strip_prefix(OPTIONAL_VALUE) {
-        return parse_value_marker(encoded).ok();
-    }
-    Some(Value::Ref(Some(
-        marker
-            .strip_prefix("optional/")
-            .unwrap_or(marker)
-            .to_owned(),
-    )))
+    };
+    parse_value_marker(&unescape_marker(marker.strip_prefix("optional/")?)).ok()
 }
 
-fn optional_wrap(value: Value) -> Value {
+/// [`optional_present`].
+pub(crate) fn optional_payload(value: &Value) -> Option<Value> {
+    optional_present(value)
+}
+
+/// `Optional.ofNullable(value)`: the empty optional for `null`, otherwise an
+/// optional holding the value as it is (a `String`, a box, another
+/// optional), never read as an optional itself.
+pub(crate) fn optional_wrap(value: Value) -> Value {
     match value {
-        Value::Ref(Some(value))
-            if value.starts_with("optional/") || value.starts_with(OPTIONAL_VALUE) =>
-        {
-            Value::Ref(Some(value))
-        }
-        Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
         Value::Ref(None) | Value::Void => empty_optional(),
-        value => Value::Ref(Some(format!("{OPTIONAL_VALUE}{}", value_marker(&value)))),
+        value => Value::Host(format!("optional/{}", value_marker(&value))),
     }
+}
+
+/// `Optional.hashCode()`: `Objects.hashCode(value)` of what it holds, a
+/// string's or a box's own hash, an inner optional's in turn.
+fn optional_hash(optional: &Value) -> i32 {
+    match optional_present(optional) {
+        None => 0,
+        Some(Value::Ref(Some(text))) => stable_hash(&text),
+        Some(inner) if is_optional(&inner) => optional_hash(&inner),
+        Some(other) => object_methods::platform_hash(&other).unwrap_or(0),
+    }
+}
+
+/// `toString()` of a host object as far as its text alone says it:
+/// `Optional[<value>]`, `Optional.empty`. A model that prints a held jar
+/// object runs through the host instead (`java_tostring::modelled`).
+fn host_text(value: &Value) -> String {
+    match optional_present(value) {
+        Some(held) => format!("Optional[{}]", value_text(&held)),
+        None if is_optional(value) => "Optional.empty".to_owned(),
+        None => match value {
+            Value::Host(marker) => marker.clone(),
+            other => value_text(other),
+        },
+    }
+}
+
+/// Undo [`value_marker`]'s separator escapes (`\,`, `\\`) for a marker read
+/// back whole.
+fn unescape_marker(marker: &str) -> String {
+    let mut text = String::with_capacity(marker.len());
+    let mut chars = marker.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => text.extend(chars.next()),
+            other => text.push(other),
+        }
+    }
+    text
 }
 
 fn optional_int_value(value: &Value) -> Option<i32> {
@@ -10329,6 +10347,7 @@ fn value_text(value: &Value) -> String {
     match value {
         // A box prints its value (`Short.valueOf("1")` is `1`).
         Value::Boxed(boxed) => boxed.text(),
+        Value::Host(_) => host_text(value),
         Value::Ref(Some(value)) => {
             // A marker whose Java `toString` is its payload: string
             // concatenation goes through `String.valueOf`, not the modelled
@@ -11941,6 +11960,7 @@ fn describe_value(value: &Value) -> String {
         Value::Long(value) => format!("long {value}"),
         Value::Float(value) => format!("float {value}"),
         Value::Boxed(boxed) => format!("{} {}", boxed.class(), boxed.text()),
+        Value::Host(marker) => format!("host object {marker:?}"),
         Value::Void => "void".into(),
         Value::Ref(None) => "null".into(),
         Value::Ref(Some(marker)) if marker.chars().count() > MAX_MARKER => {
@@ -18292,6 +18312,9 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
     if let Some(boxed) = Boxed::parse_marker(marker) {
         return Ok(Value::Boxed(boxed));
     }
+    if let Some(host) = marker.strip_prefix('h') {
+        return Ok(Value::Host(host.to_owned()));
+    }
     if let Some(value) = marker.strip_prefix('i') {
         return value
             .parse::<i32>()
@@ -24632,8 +24655,16 @@ impl<H: Host> Runtime<'_, H> {
                     // No JDK or library API answers a `null` Optional: a host
                     // answer of null for one is its empty value.
                     let value = match empty_optional_for(&r.descriptor) {
-                        Some(empty) if !jar_body && value == Value::Ref(None) => {
-                            Value::Ref(Some(empty.into()))
+                        Some(empty) if !jar_body && value == Value::Ref(None) => empty,
+                        // A model that answers an `Optional` with what it
+                        // holds (a mod container, a holder) answers
+                        // `Optional.of` of it.
+                        Some(_)
+                            if !jar_body
+                                && return_desc(&r.descriptor) == "Ljava/util/Optional;"
+                                && !is_optional(&value) =>
+                        {
+                            optional_wrap(value)
                         }
                         _ => value,
                     };
@@ -30938,10 +30969,11 @@ mandatory = true
             name: "getModContainer".into(),
             descriptor: "(Ljava/lang/String;)Ljava/util/Optional;".into(),
         };
+        // `Optional<ModContainer>`.
         assert_eq!(
             host.invoke_instance(&container, &loader, &[Value::Ref(Some("demo".into()))])
                 .unwrap(),
-            Value::Ref(Some("mod-container/demo/1.2.3".into()))
+            optional_wrap(Value::Ref(Some("mod-container/demo/1.2.3".into())))
         );
     }
 
@@ -32892,7 +32924,7 @@ mandatory = true
         assert_eq!(
             host.invoke(&of, &[Value::Ref(Some("demo".into()))])
                 .unwrap(),
-            Value::Ref(Some("optional/demo".into()))
+            optional_wrap(Value::Ref(Some("demo".into())))
         );
         assert!(host.invoke(&of, &[Value::Ref(None)]).is_err());
         let of_nullable = MethodRef {
@@ -32912,7 +32944,7 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(
                 &optional_to_string,
-                &Value::Ref(Some("optional/demo".into())),
+                &optional_wrap(Value::Ref(Some("demo".into()))),
                 &[],
             )
             .unwrap(),
@@ -32926,8 +32958,8 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(
                 &optional_equals,
-                &Value::Ref(Some("optional/demo".into())),
-                &[Value::Ref(Some("optional/demo".into()))],
+                &optional_wrap(Value::Ref(Some("demo".into()))),
+                &[optional_wrap(Value::Ref(Some("demo".into())))],
             )
             .unwrap(),
             Value::Int(1)
@@ -32940,11 +32972,11 @@ mandatory = true
         let mapped = host
             .invoke_instance(
                 &map,
-                &Value::Ref(Some("optional/demo".into())),
+                &optional_wrap(Value::Ref(Some("demo".into()))),
                 &[Value::Ref(Some("@indy:identity".into()))],
             )
             .unwrap();
-        assert_eq!(mapped, Value::Ref(Some("optional/demo".into())));
+        assert_eq!(mapped, optional_wrap(Value::Ref(Some("demo".into()))));
         // Mapping an empty optional answers the empty optional, whether the
         // receiver is the empty marker or a host `null` read as empty.
         assert_eq!(
@@ -32958,8 +32990,12 @@ mandatory = true
             descriptor: "()Ljava/lang/String;".into(),
         };
         assert_eq!(
-            host.invoke_instance(&to_string, &Value::Ref(Some("optional/demo".into())), &[])
-                .unwrap(),
+            host.invoke_instance(
+                &to_string,
+                &optional_wrap(Value::Ref(Some("demo".into()))),
+                &[]
+            )
+            .unwrap(),
             Value::Ref(Some("Optional[demo]".into()))
         );
         assert_eq!(
@@ -32975,16 +33011,16 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(
                 &filter,
-                &Value::Ref(Some("optional/demo".into())),
+                &optional_wrap(Value::Ref(Some("demo".into()))),
                 &[Value::Ref(Some("@indy:predicate".into()))],
             )
             .unwrap(),
-            Value::Ref(Some("optional/demo".into()))
+            optional_wrap(Value::Ref(Some("demo".into())))
         );
         assert_eq!(
             host.invoke_instance(
                 &filter,
-                &Value::Ref(Some("optional/demo".into())),
+                &optional_wrap(Value::Ref(Some("demo".into()))),
                 &[Value::Ref(None)],
             )
             .unwrap(),
@@ -32998,11 +33034,11 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(
                 &or,
-                &Value::Ref(Some("optional/demo".into())),
+                &optional_wrap(Value::Ref(Some("demo".into()))),
                 &[Value::Ref(Some("@indy:unused-supplier".into()))],
             )
             .unwrap(),
-            Value::Ref(Some("optional/demo".into()))
+            optional_wrap(Value::Ref(Some("demo".into())))
         );
         assert_eq!(
             host.invoke_instance(
@@ -33021,7 +33057,7 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(
                 &if_present,
-                &Value::Ref(Some("optional/demo".into())),
+                &optional_wrap(Value::Ref(Some("demo".into()))),
                 &[Value::Ref(Some("@indy:consumer".into()))],
             )
             .unwrap(),
@@ -33040,7 +33076,7 @@ mandatory = true
         assert_eq!(
             host.invoke_instance(
                 &or_else_throw,
-                &Value::Ref(Some("optional/demo".into())),
+                &optional_wrap(Value::Ref(Some("demo".into()))),
                 &[],
             )
             .unwrap(),
@@ -34796,9 +34832,10 @@ mandatory = true
         let container_value = host
             .invoke_instance(&container, &loader, &[Value::Ref(Some("demo".into()))])
             .unwrap();
+        // `Optional<ModContainer>`.
         assert_eq!(
             container_value,
-            Value::Ref(Some("mod-container/demo/1.2.3".into()))
+            optional_wrap(Value::Ref(Some("mod-container/demo/1.2.3".into())))
         );
         // Fabric declares `Collection<ModContainer> getAllMods()`. A mod only
         // seeded with `with_mod` is a loaded id, not a Fabric jar with its own
@@ -34835,6 +34872,8 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
+        // The container is what the optional holds (`getModContainer(id).get()`).
+        let container_value = optional_present(&container_value).unwrap();
         let fallback = MethodRef {
             owner: "java/util/Optional".into(),
             name: "orElse".into(),
@@ -35515,8 +35554,9 @@ mandatory = true
                     &[],
                 )
                 .unwrap();
+            // `getOptional` answers an `Optional` (a host object).
             assert!(
-                matches!(value, Value::Ref(Some(_))),
+                matches!(value, Value::Ref(Some(_)) | Value::Host(_)),
                 "{name} returned {value:?}"
             );
         }
@@ -35563,9 +35603,9 @@ mandatory = true
             .unwrap();
         assert_eq!(
             holder_key,
-            Value::Ref(Some(
-                "optional/resource-key/deferred-register/registry/demo/entry".into()
-            ))
+            optional_wrap(Value::Ref(Some(
+                "resource-key/deferred-register/registry/demo/entry".into()
+            )))
         );
         let modern_id = host
             .invoke_instance(
@@ -36514,7 +36554,7 @@ mandatory = true
                     "probe",
                 )
                 .unwrap(),
-            Some(Value::Ref(Some("optional/alpha".into())))
+            Some(optional_wrap(Value::Ref(Some("alpha".into()))))
         );
         let distinct = runtime
             .invoke_stream(
@@ -37132,7 +37172,7 @@ mandatory = true
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Optional;",
                 None,
                 &[
-                    Value::Ref(Some("optional/input".into())),
+                    optional_wrap(Value::Ref(Some("input".into()))),
                     Value::Ref(Some(
                         "@indy:demo/Caller#make:0:demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;:"
                             .into(),
@@ -37141,7 +37181,7 @@ mandatory = true
                 &mut NullHost,
             )
             .unwrap(),
-            Value::Ref(Some("optional/input".into()))
+            optional_wrap(Value::Ref(Some("input".into())))
         );
     }
 

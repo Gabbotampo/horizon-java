@@ -56,6 +56,12 @@ impl<H: Host> Runtime<'_, H> {
             // A bare floating-point value is a `Double`; a `Float` is boxed.
             Value::Float(value) => return Arg::Double(*value),
             Value::Boxed(boxed) => return boxed_arg(*boxed),
+            Value::Host(_) => {
+                return match self.host.modelled_to_string(value) {
+                    Some(text) => Arg::Str(text),
+                    None => Arg::Opaque,
+                };
+            }
             Value::Void => return Arg::Opaque,
             Value::Ref(Some(marker)) => marker,
         };
