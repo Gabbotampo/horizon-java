@@ -240,7 +240,7 @@ impl<H: Host> Runtime<'_, H> {
             a.clone()
         } else {
             let length = array_size(size)?;
-            let component = self.array_component(a);
+            let component = self.skeleton_array_component(a);
             self.new_reference_array(&component, vec![Value::Ref(None); length])
         };
         let length = self.array(&r)?.len();
@@ -301,7 +301,7 @@ impl<H: Host> Runtime<'_, H> {
     fn copy_of(&mut self, r: &Value, length: usize) -> Value {
         let mut values = self.array(r).cloned().unwrap_or_default();
         values.resize(length, Value::Ref(None));
-        let component = self.array_component(r);
+        let component = self.skeleton_array_component(r);
         self.new_reference_array(&component, values)
     }
 }
