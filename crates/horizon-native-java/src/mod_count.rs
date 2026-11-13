@@ -478,3 +478,66 @@ impl SubListLink {
         &self.parent
     }
 }
+
+/// The fail-fast protocol for iterators and spliterators kept outside this
+/// module (a `ListIterator`, a stream's source spliterator), the JDK's way:
+///
+/// ```text
+/// let expected = runtime.capture_mod_count(&list);        // at creation
+/// ...
+/// if !runtime.check_mod_count(r, &list, expected)? { .. }  // in next() /
+///                                                          // at forEachRemaining's end
+/// // the iterator's own add/remove, applied to the host's row directly:
+/// let expected = runtime.own_structural_change(&list);
+/// ```
+///
+/// Calls the interpreter dispatches to the collection (`list.add(x)` in
+/// jar code, `list::add`) already move its counter; `own_structural_change`
+/// is only for a change the caller makes to the host's row itself.
+impl<H: Host> Runtime<'_, H> {
+    /// Whether `collection` is a host collection with a `modCount` (its
+    /// iterators fail fast). `ArrayDeque` and the immutable collections
+    /// have none.
+    pub(crate) fn has_mod_count(&self, collection: &Value) -> bool {
+        self.host_collection_class(collection)
+            .is_some_and(|class| tracked(&class) && class != "java/util/ArrayDeque")
+    }
+
+    /// `expectedModCount = modCount`, of the collection whose counter an
+    /// iterator over `collection` checks (a sub-list's or a view's root).
+    pub(crate) fn capture_mod_count(&self, collection: &Value) -> ModStamp {
+        let marker = expect_ref(collection).map_or("", String::as_str);
+        self.host.mod_stamp(&self.mod_count_root(marker))
+    }
+
+    /// `if (modCount != expectedModCount) throw new
+    /// ConcurrentModificationException()`: `Ok(true)` when unchanged,
+    /// `Err` when changed, `Ok(false)` when a member that may or may not
+    /// have bumped it ran (the call `r` is then counted).
+    pub(crate) fn check_mod_count(
+        &mut self,
+        r: &MethodRef,
+        collection: &Value,
+        expected: ModStamp,
+    ) -> Result<bool, NativeError> {
+        match self.capture_mod_count(collection).verdict(expected) {
+            ModVerdict::Same => Ok(true),
+            ModVerdict::Changed => Err(NativeError::UncaughtException {
+                class: "java/util/ConcurrentModificationException".into(),
+                message: None,
+                frame: None,
+            }),
+            ModVerdict::Unknown => self.host.unknown_operand_call(r).map(|_| false),
+        }
+    }
+
+    /// An iterator's own structural change (`ListIterator.add`/`remove`,
+    /// `Iterator.remove`) made to the host's row directly: `modCount++`,
+    /// and the new value for `expectedModCount = modCount`.
+    pub(crate) fn own_structural_change(&mut self, collection: &Value) -> ModStamp {
+        let marker = expect_ref(collection).map_or("", String::as_str);
+        let root = self.mod_count_root(marker);
+        self.bump_mod_count(&root, false);
+        self.host.mod_stamp(&root)
+    }
+}
