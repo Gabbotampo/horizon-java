@@ -17,13 +17,20 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
     if crate::runtime::value_class::is_plain_string(marker) {
         return None;
     }
-    // The empty optionals carry a bare marker (`EMPTY_OPTIONAL*` in lib.rs).
+    // The empty primitive optionals carry a bare marker (`EMPTY_OPTIONAL_*`
+    // in lib.rs); an `Optional` is a `Value::Host` ([`modelled`]).
     match marker {
-        crate::runtime::EMPTY_OPTIONAL => return Some("java/util/Optional".to_owned()),
         crate::runtime::EMPTY_OPTIONAL_INT => return Some("java/util/OptionalInt".to_owned()),
         crate::runtime::EMPTY_OPTIONAL_LONG => return Some("java/util/OptionalLong".to_owned()),
         crate::runtime::EMPTY_OPTIONAL_DOUBLE => return Some("java/util/OptionalDouble".to_owned()),
         _ => {}
+    }
+    // A host map entry, when the text is one (a string that merely starts
+    // like one stays a string).
+    if marker.starts_with("map-entry/")
+        && crate::runtime::map_entry_parts(&Value::Ref(Some(marker.to_owned()))).is_ok()
+    {
+        return Some("java/util/Map$Entry".to_owned());
     }
     // Prefix families the host models before any class marker.
     let prefix = [
@@ -32,15 +39,18 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("path:", "java/nio/file/Path"),
         ("duration/", "java/time/Duration"),
         ("tag-key/", "net/minecraft/tags/TagKey"),
-        ("optional/", "java/util/Optional"),
         ("optional-int/", "java/util/OptionalInt"),
         ("optional-long/", "java/util/OptionalLong"),
         ("optional-double/", "java/util/OptionalDouble"),
         ("regex-pattern/", "java/util/regex/Pattern"),
+        ("watch-kind/", "java/nio/file/WatchEvent$Kind"),
         ("charset/", "java/nio/charset/Charset"),
+        ("coding-error-action/", "java/nio/charset/CodingErrorAction"),
         ("locale/", "java/util/Locale"),
         ("mod-origin/", "net/fabricmc/loader/api/metadata/ModOrigin"),
         ("unicode-block/", "java/lang/Character$UnicodeBlock"),
+        // `key + "=" + value` (`Map.entry`, an entry from `entrySet()`).
+        ("map-entry/", "java/util/Map$Entry"),
     ];
     for (prefix, owner) in prefix {
         if marker.starts_with(prefix) {
@@ -81,6 +91,18 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
 
 /// The text `String.valueOf(value)` gives for a model object.
 pub(crate) fn modelled<H: Host>(host: &mut H, value: &Value) -> Option<String> {
+    // A host object (an `Optional`) prints through its class's model.
+    if let Value::Host(_) = value {
+        let to_string = MethodRef {
+            owner: crate::runtime::class_of_value(value)?,
+            name: "toString".into(),
+            descriptor: "()Ljava/lang/String;".into(),
+        };
+        return match host.invoke_instance(&to_string, value, &[]) {
+            Ok(Value::Ref(Some(text))) => Some(text),
+            _ => None,
+        };
+    }
     let marker = expect_ref(value)?;
     modelled_marker(host, marker)
 }

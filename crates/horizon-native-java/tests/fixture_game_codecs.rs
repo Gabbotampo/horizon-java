@@ -5,6 +5,9 @@
 //! initializer that is valid on the JVM failed on the neutral answer. The
 //! stub game classes are compiled for `javac` only.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
@@ -51,11 +54,7 @@ public final class CodecProbe {
 
 #[test]
 fn source_built_probe_sees_a_non_null_enum_codec() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-game-codecs-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("game-codecs");
     let src = root.join("src/demo");
     let stub_src = root.join("src/stubs/net/minecraft/util");
     let classes = root.join("classes");

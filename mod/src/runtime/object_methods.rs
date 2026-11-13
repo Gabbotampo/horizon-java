@@ -63,24 +63,31 @@ pub(crate) enum Equality {
     Host,
 }
 
-/// The box marker families (`class_of_value`) and the hash their JDK class
-/// computes from the text after the `:`.
-fn boxed_marker_hash(marker: &str) -> Option<Option<i32>> {
-    match marker {
-        "true" | "boolean:true" => return Some(Some(1231)),
-        "false" | "boolean:false" => return Some(Some(1237)),
-        _ => {}
+/// `hashCode()` of a box: `Boolean`'s 1231/1237, the value of an
+/// `Integer`/`Short`/`Byte`, the code unit of a `Character`, a `Float`'s
+/// `floatToIntBits`.
+fn boxed_hash(boxed: Boxed) -> i32 {
+    match boxed {
+        Boxed::Boolean(true) => 1231,
+        Boxed::Boolean(false) => 1237,
+        Boxed::Float(bits) => java_float_bits(f64::from(f32::from_bits(bits))) as i32,
+        other => other.int(),
     }
-    let (kind, text) = marker.split_once(':')?;
-    let hash = match kind {
-        "integer" | "short" | "byte" => text.parse::<i32>().ok(),
-        "long" => text.parse::<i64>().ok().map(long_hash),
-        "character" => text.encode_utf16().next().map(i32::from),
-        "double" => text.parse::<f64>().ok().map(double_hash),
-        "float" => text.parse::<f64>().ok().map(|v| java_float_bits(v) as i32),
-        _ => return None,
-    };
-    Some(hash)
+}
+
+/// `hashCode()` of a value the runtime holds as itself (a box): `None` for
+/// a reference, whose hash its own class decides.
+pub(crate) fn platform_hash(value: &Value) -> Option<i32> {
+    match value {
+        // An `Integer` (a `Boolean` stored as an int hashes 1231/1237 on a
+        // JVM: the runtime cannot tell the two apart).
+        Value::Int(value) => Some(*value),
+        Value::Long(value) => Some(long_hash(*value)),
+        // A bare floating-point value is a `Double` (a `Float` is boxed).
+        Value::Float(value) => Some(double_hash(*value)),
+        Value::Boxed(boxed) => Some(boxed_hash(*boxed)),
+        _ => None,
+    }
 }
 
 /// `Long.hashCode(v)`.
@@ -91,11 +98,6 @@ pub(crate) fn long_hash(value: i64) -> i32 {
 /// `Double.hashCode(v)`: the canonical bits, folded like a `long`.
 pub(crate) fn double_hash(value: f64) -> i32 {
     long_hash(java_double_bits(value) as i64)
-}
-
-/// Whether a reference is one of the host's box markers.
-fn is_box_marker(marker: &str) -> bool {
-    boxed_marker_hash(marker).is_some()
 }
 
 /// The host's unmodifiable-collection and value markers keep `Object`'s
@@ -172,8 +174,10 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn equality_of(&self, value: &Value) -> Equality {
         let marker = match value {
             Value::Ref(None) => return Equality::Null,
-            Value::Int(_) | Value::Long(_) | Value::Float(_) => return Equality::Platform,
-            Value::Void => return Equality::Host,
+            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) => {
+                return Equality::Platform;
+            }
+            Value::Void | Value::Host(_) => return Equality::Host,
             Value::Ref(Some(marker)) => marker,
         };
         if let Some(class) = self.interpreted_object_class(value) {
@@ -195,7 +199,7 @@ impl<H: Host> Runtime<'_, H> {
         if self.enum_constants.contains_key(marker) {
             return Equality::Identity;
         }
-        if is_box_marker(marker) || value_class::is_plain_string(marker) {
+        if value_class::is_plain_string(marker) {
             return Equality::Platform;
         }
         Equality::Host
@@ -211,7 +215,15 @@ impl<H: Host> Runtime<'_, H> {
     fn pure_equality_at(&self, value: &Value, depth: usize) -> bool {
         match self.equality_of(value) {
             Equality::Null | Equality::Platform | Equality::Identity => true,
-            Equality::Host => false,
+            Equality::Host => {
+                // An identifier compares and hashes by its text.
+                expect_ref(value).is_some_and(|marker| marker.starts_with("identifier/"))
+                    || is_map_entry(value)
+                        && map_entry_parts(value).is_ok_and(|(key, entry)| {
+                            self.pure_equality_at(&key, depth + 1)
+                                && self.pure_equality_at(&entry, depth + 1)
+                        })
+            }
             Equality::Jar { equals, hash_code } => {
                 if depth >= MAX_PURITY_DEPTH {
                     return false;
@@ -264,16 +276,8 @@ impl<H: Host> Runtime<'_, H> {
                 hash_code: None, ..
             } => Ok(None),
             Equality::Platform => Ok(match value {
-                // An `Integer` (a `Boolean` stored as an int hashes 1231/1237
-                // on a JVM: the runtime cannot tell the two apart).
-                Value::Int(value) => Some(*value),
-                Value::Long(value) => Some(long_hash(*value)),
-                Value::Float(_) => None,
-                Value::Ref(Some(marker)) => match boxed_marker_hash(marker) {
-                    Some(hash) => hash,
-                    None => Some(hash_map_order::java_string_hash(marker)),
-                },
-                _ => None,
+                Value::Ref(Some(marker)) => Some(hash_map_order::java_string_hash(marker)),
+                other => platform_hash(other),
             }),
             Equality::Jar {
                 hash_code: Some(owner),
@@ -297,11 +301,26 @@ impl<H: Host> Runtime<'_, H> {
     /// The hash of a host-modelled value: a list, set or map by the JDK's
     /// formula over its elements, an identifier by `Identifier.hashCode`.
     fn host_value_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        // `Optional.hashCode`: `Objects.hashCode(value)`.
+        if is_optional(value) {
+            return match optional_present(value) {
+                Some(held) => self.java_hash(&held),
+                None => Ok(Some(0)),
+            };
+        }
         let Some(marker) = expect_ref(value) else {
             return Ok(None);
         };
         if let Some(id) = marker.strip_prefix("identifier/") {
             return Ok(Some(hash_map_order::identifier_hash(id)));
+        }
+        if marker.starts_with("map-entry/") {
+            // `Objects.hashCode(key) ^ Objects.hashCode(value)`.
+            let (key, entry) = map_entry_parts(value)?;
+            let (Some(key), Some(entry)) = (self.java_hash(&key)?, self.java_hash(&entry)?) else {
+                return Ok(None);
+            };
+            return Ok(Some(key ^ entry));
         }
         let Some(kind) = self.host_collection_kind(value) else {
             return Ok(None);
@@ -379,7 +398,28 @@ impl<H: Host> Runtime<'_, H> {
                     ))),
                 }
             }
+            // `Optional.equals`: the other is an optional holding an equal value.
+            Equality::Host if is_optional(a) => Ok(is_optional(b)
+                && match (optional_present(a), optional_present(b)) {
+                    (Some(left), Some(right)) => match self.equality_of(&left) {
+                        Equality::Null => false,
+                        _ => self.java_equals(&left, &right)?,
+                    },
+                    (None, None) => true,
+                    _ => false,
+                }),
             Equality::Host => {
+                if is_map_entry(a) {
+                    // `Map.Entry.equals`: an entry with `Objects.equals` keys
+                    // and values.
+                    if !is_map_entry(b) {
+                        return Ok(false);
+                    }
+                    let (left_key, left_value) = map_entry_parts(a)?;
+                    let (right_key, right_value) = map_entry_parts(b)?;
+                    return Ok(self.objects_equals(&left_key, &right_key)?
+                        && self.objects_equals(&left_value, &right_value)?);
+                }
                 if self.host_collection_kind(a) == Some(CollectionKind::List)
                     && self.host_collection_kind(b) == Some(CollectionKind::List)
                 {
@@ -639,6 +679,14 @@ impl<H: Host> Runtime<'_, H> {
             if keeps_identity {
                 return self.count_identity_hash().map(Some);
             }
+            // `Map.Entry.hashCode()` is `host_value_hash`'s; an entry whose
+            // key or value has no hash the runtime can compute is counted.
+            if expect_ref(receiver).is_some_and(|marker| marker.starts_with("map-entry/")) {
+                return match self.java_hash(receiver)? {
+                    Some(hash) => Ok(Some(Value::Int(hash))),
+                    None => self.host.unknown_operand_call(r).map(Some),
+                };
+            }
             // A box typed as `Object` (`Object i = 7; i.hashCode()`).
             if self.equality_of(receiver) == Equality::Platform
                 && let Some(hash) = self.java_hash(receiver)?
@@ -646,17 +694,36 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(Some(Value::Int(hash)));
             }
         }
+        if r.name == "equals"
+            && r.descriptor == EQUALS
+            && matches!(opcode, 0xb6 | 0xb9)
+            && let (Some(receiver), [other]) = (receiver, args)
+            && is_map_entry(receiver)
+        {
+            let equal = self.java_equals(receiver, other)?;
+            return Ok(Some(Value::Int(i32::from(equal))));
+        }
         self.invoke_list_equality(r, opcode, receiver, args)
     }
+}
+
+/// Whether a value is the host's `Map.Entry` (`map-entry/k,v`).
+pub(crate) fn is_map_entry(value: &Value) -> bool {
+    expect_ref(value).is_some_and(|marker| marker.starts_with("map-entry/"))
 }
 
 /// `a.equals(b)` for a string or a box `a`: equal values of the same kind. A
 /// `Double`/`Float` compares canonical bits (`NaN` equals `NaN`, `0.0` is not
 /// `-0.0`).
 fn platform_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
+    match (&*boxed::canonical(a), &*boxed::canonical(b)) {
         (Value::Float(a), Value::Float(b)) => java_double_bits(*a) == java_double_bits(*b),
-        _ => a == b,
+        // `Float.equals` compares `floatToIntBits` (one NaN, two zeros).
+        (Value::Boxed(Boxed::Float(a)), Value::Boxed(Boxed::Float(b))) => {
+            java_float_bits(f64::from(f32::from_bits(*a)))
+                == java_float_bits(f64::from(f32::from_bits(*b)))
+        }
+        (a, b) => a == b,
     }
 }
 

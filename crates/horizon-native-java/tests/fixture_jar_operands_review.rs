@@ -152,38 +152,25 @@ fn calls(rows: &[(&str, usize)]) -> Vec<(String, usize)> {
 }
 
 /// JDK 25: `0149|1|5|x1`. The receiver's class decides which default runs,
-/// not the call site's type (`Squares s; s.forEach(...)`).
+/// not the call site's type (`Squares s; s.forEach(...)`). The list's
+/// `Iterable.forEach` and the map's `getOrDefault`/`forEach` now run as the
+/// JDK runs them; they were counted.
 #[test]
-fn defaults_reached_through_the_jar_type_are_counted() {
+fn defaults_reached_through_the_jar_type_run_as_the_jdk_does() {
     let (text, unknown) = run("typedByJarClass");
-    assert_eq!(text, "|null|null|");
-    assert_eq!(
-        unknown,
-        calls(&[
-            (
-                "java/lang/Iterable#forEach(Ljava/util/function/Consumer;)V",
-                1
-            ),
-            ("java/util/Map#forEach(Ljava/util/function/BiConsumer;)V", 1),
-            (
-                "java/util/Map#getOrDefault(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                2
-            ),
-        ])
-    );
+    assert_eq!(text, "0149|1|5|x1");
+    assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `0`. Counted under the most specific declaring interface
-/// (`List.getFirst` over `SequencedCollection.getFirst`); it used to throw
-/// the host's `NoSuchElementException` from an empty row.
+/// JDK 25: `0`. The most specific declaring interface's default
+/// (`List.getFirst` over `SequencedCollection.getFirst`) now runs as the JDK
+/// runs it; it was counted, and before that threw the host's
+/// `NoSuchElementException` from an empty row.
 #[test]
-fn get_first_through_the_jar_type_is_counted() {
+fn get_first_through_the_jar_type_runs_as_the_jdk_does() {
     let (text, unknown) = run("firstOfJarList");
-    assert_eq!(text, "null");
-    assert_eq!(
-        unknown,
-        calls(&[("java/util/List#getFirst()Ljava/lang/Object;", 1)])
-    );
+    assert_eq!(text, "0");
+    assert_eq!(unknown, Vec::new());
 }
 
 /// JDK 25: `abc-abc|abc-d`, exactly: each element is `String.valueOf`'d

@@ -87,6 +87,10 @@ struct HostList {
     /// The host's inline `list/..` value, which keeps no table of its own
     /// to mutate (the host answers its mutators).
     inline: bool,
+    /// An unmodifiable list that owns its elements (`List.of`,
+    /// `Collections.emptyList`, `singletonList`): the host refuses its
+    /// mutators.
+    unmodifiable: bool,
 }
 
 fn null_pointer() -> NativeError {
@@ -112,6 +116,7 @@ impl<H: Host> Runtime<'_, H> {
                 rules: ABSTRACT_LIST,
                 view: false,
                 inline: true,
+                unmodifiable: false,
             });
         }
         let class = self.host_collection_class(value)?;
@@ -120,13 +125,28 @@ impl<H: Host> Runtime<'_, H> {
             "java/util/LinkedList" | "java/util/Vector" | "java/util/Stack" => ABSTRACT_LIST,
             "java/util/concurrent/CopyOnWriteArrayList" => COPY_ON_WRITE,
             "java/util/ImmutableCollections$ListN" => {
-                // `List.of`/`copyOf` build a `List12` for one or two elements.
-                let size = self.host.mutable_collection_values(value)?.len();
-                if (1..=2).contains(&size) {
+                // The host reports this class for every unmodifiable list
+                // that owns its elements, but only `List.of`/`List.copyOf`
+                // build the JDK's null-hostile `List12`/`ListN`.
+                // `Collections.emptyList`/`singletonList` (and Guava's
+                // `ImmutableList`) look `null` up like `AbstractList`:
+                // `Collections.emptyList().contains(null)` is `false` on
+                // JDK 25.
+                let rules = if !self.host.is_jdk_list_of(marker) {
+                    ABSTRACT_LIST
+                } else if (1..=2).contains(&self.host.mutable_collection_values(value)?.len()) {
+                    // `List.of`/`copyOf` build a `List12` for one or two
+                    // elements.
                     LIST_12
                 } else {
                     LIST_N
-                }
+                };
+                return Some(HostList {
+                    rules,
+                    view: false,
+                    inline: false,
+                    unmodifiable: true,
+                });
             }
             "java/util/Collections$UnmodifiableRandomAccessList"
             | "java/util/Collections$UnmodifiableList" => {
@@ -134,6 +154,7 @@ impl<H: Host> Runtime<'_, H> {
                     rules: ABSTRACT_LIST,
                     view: true,
                     inline: false,
+                    unmodifiable: false,
                 });
             }
             _ => return None,
@@ -142,6 +163,7 @@ impl<H: Host> Runtime<'_, H> {
             rules,
             view: false,
             inline: false,
+            unmodifiable: false,
         })
     }
 
@@ -254,11 +276,14 @@ impl<H: Host> Runtime<'_, H> {
     /// its own rules; any other collection only while every value involved
     /// is pure, when the answer cannot depend on how the collection looks it
     /// up. `None` when this runtime cannot answer it exactly.
-    fn argument_contains(
+    pub(crate) fn argument_contains(
         &mut self,
         collection: &Value,
         element: &Value,
     ) -> Result<Option<bool>, NativeError> {
+        if self.hash_table_kind(collection).is_some() {
+            return self.hash_aware_contains(collection, element);
+        }
         if let Some(list) = self.host_list(collection) {
             let rules = if list.view {
                 self.view_source(collection)
@@ -293,7 +318,7 @@ impl<H: Host> Runtime<'_, H> {
         collection: &Value,
         elements: &[Value],
     ) -> Result<bool, NativeError> {
-        if self.host_list(collection).is_some() {
+        if self.host_list(collection).is_some() || self.hash_table_kind(collection).is_some() {
             return Ok(true);
         }
         if self.host_collection_kind(collection) != Some(CollectionKind::Set) {
@@ -341,7 +366,7 @@ impl<H: Host> Runtime<'_, H> {
         } else {
             list.rules
         };
-        let immutable = list.view || list.inline || rules.null_hostile;
+        let immutable = list.view || list.inline || list.unmodifiable;
         match (r.name.as_str(), r.descriptor.as_str(), args) {
             ("hashCode", "()I", []) => {
                 let Some(hash) = self.java_hash(receiver)? else {
