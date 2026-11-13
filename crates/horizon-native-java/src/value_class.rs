@@ -198,6 +198,8 @@ mod tests {
             // Spelled like the boxes once were; boxes are no longer text.
             "integer:5",
             "true",
+            // Spelled like a path once was (#156 P2).
+            "path:/horizon/game",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
@@ -205,7 +207,6 @@ mod tests {
             "demo/Main#3",
             "list/4",
             "registry/minecraft:item",
-            "path:/horizon/game",
             "string-builder/2",
             "@indy:demo/Main:0:demo/Main#lambda$0()V:",
             "@cmp:natural",

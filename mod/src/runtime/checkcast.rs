@@ -76,6 +76,8 @@ fn in_java_base(class: &str) -> bool {
         "java/net/",
         "java/time/",
         "java/text/",
+        // `sun.nio.fs.UnixPath`, the watch service's classes.
+        "sun/nio/",
     ];
     const ELSEWHERE: &[&str] = &[
         "java/lang/instrument/",
@@ -199,6 +201,30 @@ impl<H: Host> Runtime<'_, H> {
             Some(class) => HostCast::Throws(class),
             None => HostCast::Unknown,
         })
+    }
+
+    /// `value instanceof wanted` for a host handle, by its kind's row with
+    /// this runtime's hierarchy, for every check that is not the opcode (a
+    /// type switch label, `Class.isInstance`): an answer the row cannot give
+    /// is counted as `wanted#<instanceof>`, and the host's answer stands.
+    pub(crate) fn handle_instance_of(
+        &mut self,
+        handle: &HostRef,
+        wanted: &str,
+    ) -> Result<bool, NativeError> {
+        if let Some(answer) = handle.instance_of(wanted, self) {
+            return Ok(answer);
+        }
+        let check = MethodRef {
+            owner: wanted.to_owned(),
+            name: "<instanceof>".into(),
+            descriptor: "(Ljava/lang/Object;)Z".into(),
+        };
+        let value = Value::Host(handle.clone());
+        Ok(matches!(
+            self.host.invoke(&check, std::slice::from_ref(&value))?,
+            Value::Int(flag) if flag != 0
+        ))
     }
 
     /// The exact class of a value that is no handle, where the runtime knows
@@ -369,13 +395,11 @@ impl<H: Host> Runtime<'_, H> {
                 Some(class.to_owned()),
             );
         }
-        // A JDK value the runtime builds itself (a collection, an
-        // optional, a stream, a path): JDK classes never extend or implement a
-        // jar type.
+        // A JDK value the runtime builds itself (a collection, a stream, a
+        // builder): JDK classes never extend or implement a jar type.
         let jdk_kind = [
             "string-builder/",
             "stream/",
-            "path:",
             "list/",
             "set/",
             "map/",

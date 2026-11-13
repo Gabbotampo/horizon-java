@@ -180,6 +180,7 @@ pub(crate) const OPTIONAL: Methods = Methods {
     instance_of: instance_of_class,
     // Empty, or holding a value that crosses.
     crosses_jars: |handle, crosses| held(handle).is_none_or(|value| crosses(&value)),
+    compare_to: None,
 };
 
 /// The primitive optionals' text: `OptionalInt[5]`, `OptionalInt.empty`.
@@ -229,6 +230,7 @@ pub(crate) const OPTIONAL_INT: Methods = Methods {
     instance_of: instance_of_class,
     // A number always crosses.
     crosses_jars: |_, _| true,
+    compare_to: None,
 };
 
 pub(crate) const OPTIONAL_LONG: Methods = OPTIONAL_INT;
