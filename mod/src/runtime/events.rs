@@ -1062,6 +1062,10 @@ pub struct EventContext {
     /// What `player` holds and their game mode, read by the hook for this
     /// firing (`facade_world.rs`). `None` makes those reads refuse.
     pub held: Option<HeldItems>,
+    /// NeoForge `ServerTickEvent`/`LevelTickEvent#hasTime`: the host's
+    /// `MinecraftServer.haveTime()`, read once when the tick hook fires (NeoForge
+    /// evaluates its `BooleanSupplier` at each call). `None` refuses the read.
+    pub has_time: Option<bool>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1590,7 +1594,7 @@ impl StdHost {
                     .damage
                     .as_ref()
                     .map(|damage| marker(format!("game/damage/{damage}"))),
-                ("hasTime", "Z") => flag(true),
+                ("hasTime", "Z") => context.has_time.and_then(flag),
                 // NeoForge `PlayerEvent.Clone#isWasDeath`: `ServerPlayer.restoreFrom(old,
                 // keepEverything)` posts `new Clone(this, old, !keepEverything)` (@371-382 of the
                 // 26.3 patched server). The firing's flag is Fabric `COPY_FROM`'s `alive`, which
