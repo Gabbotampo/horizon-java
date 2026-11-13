@@ -49,17 +49,9 @@ pub(crate) enum Arg {
     Long(i64),
     /// A `Character`: one UTF-16 code unit.
     Char(u16),
-    /// A box known to be a `Double`/`Float`. Nothing builds one yet: a
-    /// `Value::Float` cannot say which (`FloatOrDouble`), and the text
-    /// markers that once could (`double:1.0`) were Strings in disguise.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A `Double` (a bare `Value::Float`) and a `Float` (`Boxed::Float`).
     Double(f64),
-    #[cfg_attr(not(test), allow(dead_code))]
     Float(f32),
-    /// The runtime keeps a boxed `Float` and a boxed `Double` as the same
-    /// value (a `float` is stored widened), so their `toString` and
-    /// `hashCode` differ while every numeric conversion agrees.
-    FloatOrDouble(f64),
     /// A non-null object the runtime cannot print or hash.
     Opaque,
 }
@@ -587,7 +579,7 @@ fn integral(arg: &Arg) -> Option<(i64, u32)> {
 /// widened first, which the runtime has already done).
 fn floating(arg: &Arg) -> Option<f64> {
     match *arg {
-        Arg::Double(value) | Arg::FloatOrDouble(value) => Some(value),
+        Arg::Double(value) => Some(value),
         Arg::Float(value) => Some(f64::from(value)),
         // `BigDecimal` and the rest are not modelled or throw.
         _ => None,
@@ -609,25 +601,8 @@ fn java_to_string(arg: &Arg) -> Option<String> {
         // [`Digits::of`]), which the runtime's `toString` does not model.
         Arg::Double(value) if !shortest_is_plain(*value, false) => return None,
         Arg::Float(value) if !shortest_is_plain(f64::from(*value), true) => return None,
-        Arg::FloatOrDouble(value)
-            if !shortest_is_plain(*value, false) || !shortest_is_plain(*value, true) =>
-        {
-            return None;
-        }
         Arg::Double(value) => super::format_java_float(*value),
         Arg::Float(value) => super::format_java_float32(f64::from(*value)),
-        Arg::FloatOrDouble(value) => {
-            // A value an `f32` cannot hold was a `Double`; otherwise the two
-            // readings must print alike.
-            let double = super::format_java_float(*value);
-            if f64::from(*value as f32).to_bits() == value.to_bits() || value.is_nan() {
-                let float = super::format_java_float32(*value);
-                if float != double {
-                    return None;
-                }
-            }
-            double
-        }
         Arg::Opaque => return None,
     })
 }
@@ -733,7 +708,7 @@ fn java_hash(arg: &Arg) -> Option<i32> {
                 value.to_bits() as i32
             }
         }
-        Arg::Null | Arg::FloatOrDouble(_) | Arg::Opaque => return None,
+        Arg::Null | Arg::Opaque => return None,
     })
 }
 
@@ -967,7 +942,10 @@ mod tests {
             ("%s", &[Bool(false)], "false"),
             ("%s", &[Double(1e7)], "1.0E7"),
             ("%s", &[Float(0.1)], "0.1"),
-            ("%s", &[FloatOrDouble(0.5)], "0.5"),
+            ("%s", &[Double(0.5)], "0.5"),
+            ("%s", &[Float(0.1)], "0.1"),
+            ("%s", &[Double(f64::from(0.1f32))], "0.10000000149011612"),
+            ("%h", &[Double(1.5)], "3ff80000"),
             ("%h", &[Str("hello".into())], "5e918d2"),
             ("%h", &[Long(-1)], "0"),
             ("%h", &[Bool(true)], "4cf"),
@@ -1034,9 +1012,6 @@ mod tests {
             ("%.1s", &[Str("\u{1F600}".into())]),
             ("%c", &[Int(0xD800)]),
             ("%s", &[Char(0xD800)]),
-            // A boxed `Float` and `Double` print differently here.
-            ("%s", &[FloatOrDouble(f64::from(0.1f32))]),
-            ("%h", &[FloatOrDouble(1.5)]),
             ("%1$<s", &[Int(1)]),
             ("%99999s", &[Int(1)]),
         ];

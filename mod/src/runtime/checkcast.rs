@@ -232,6 +232,7 @@ impl<H: Host> Runtime<'_, H> {
         let jdk_kind = [
             "string-builder/",
             "optional/",
+            "optional-value/",
             "stream/",
             "path:",
             "list/",

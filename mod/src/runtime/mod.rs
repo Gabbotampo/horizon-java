@@ -1873,11 +1873,13 @@ fn local_opcode_type(group: u8) -> &'static str {
 /// Normalize a callback's `setReturnValue` argument to the target's declared
 /// return descriptor.
 ///
-/// The interpreter represents a boxed primitive either as `Value::Int` or as
-/// the host's `integer:`/`boolean:`/`character:` reference markers, so a
-/// primitive target accepts both.  An object target accepts only a reference;
-/// handing it a primitive is a bounded diagnostic instead of a phantom
-/// coercion.  `Value::Void` clears the override (handled by the caller).
+/// The interpreter represents a box either as its value (`Value::Int`,
+/// `Value::Long`, `Value::Float` for an `Integer`, `Long`, `Double`) or as a
+/// `Value::Boxed`, so a primitive target unboxes both. An object target takes
+/// a reference, a `Value::Boxed`, or a value whose box class is that type (or
+/// one of its supertypes); anything else is a bounded diagnostic instead of a
+/// phantom coercion. `Value::Void` clears the override (handled by the
+/// caller).
 fn return_override(desc: &str, value: Value) -> Result<Option<Value>, NativeError> {
     adapt_value(desc, value, "native Mixin CallbackInfoReturnable override")
 }
@@ -1907,6 +1909,9 @@ fn adapt_value(desc: &str, value: Value, context: &str) -> Result<Option<Value>,
                 (Value::Float(float), "D") => return Ok(Some(Value::Float(*float))),
                 _ => {}
             }
+            if let (Value::Boxed(Boxed::Float(bits)), "F" | "D") = (&value, desc) {
+                return Ok(Some(Value::Float(f64::from(f32::from_bits(*bits)))));
+            }
             let integer = match &value {
                 Value::Boxed(boxed) => Some(boxed.int()),
                 _ => boxed_number(&value).map(|value| value as i32),
@@ -1923,8 +1928,21 @@ fn adapt_value(desc: &str, value: Value, context: &str) -> Result<Option<Value>,
                 _ => Value::Int(integer),
             }))
         }
+        // A reference return takes a box: `Value::Boxed`, or an `Integer`,
+        // `Long` or `Double` the runtime holds as its value.
         _ => match value {
             Value::Ref(_) | Value::Boxed(_) => Ok(Some(value)),
+            Value::Int(_) | Value::Long(_) | Value::Float(_)
+                if desc
+                    .strip_prefix('L')
+                    .and_then(|rest| rest.strip_suffix(';'))
+                    .zip(class_of_value(&value))
+                    .is_some_and(|(wanted, class)| {
+                        jdk_model::class_instance_of(&class, wanted)
+                    }) =>
+            {
+                Ok(Some(value))
+            }
             Value::Int(_) | Value::Long(_) | Value::Float(_) => {
                 Err(NativeError::Metadata(format!(
                     "{context} {} is primitive but return {desc} is a reference",
@@ -4567,12 +4585,13 @@ impl Host for StdHost {
             ("java/lang/Float", "parseFloat", "(Ljava/lang/String;)F") => {
                 Ok(float_value(parse_java_float(Self::argument(r, args, 0)?)?))
             }
-            ("java/lang/Float", "valueOf", "(Ljava/lang/String;)Ljava/lang/Float;") => {
-                Ok(float_value(parse_java_float(Self::argument(r, args, 0)?)?))
-            }
-            ("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;") => {
-                Ok(float_value(expect_float(r, Self::argument(r, args, 0)?)?))
-            }
+            ("java/lang/Float", "valueOf", "(Ljava/lang/String;)Ljava/lang/Float;") => Ok(
+                Value::Boxed(Boxed::float(parse_java_float(Self::argument(r, args, 0)?)?)),
+            ),
+            // A `Float` is its own box, never the same value as a `Double`.
+            ("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;") => Ok(Value::Boxed(
+                Boxed::float(expect_float(r, Self::argument(r, args, 0)?)?),
+            )),
             ("java/lang/Float", "compare", "(FF)I") => {
                 let left = float32(expect_float(r, Self::argument(r, args, 0)?)?);
                 let right = float32(expect_float(r, Self::argument(r, args, 1)?)?);
@@ -7045,8 +7064,11 @@ impl Host for StdHost {
                     self.entry_set_value(&key, &value, replacement)
                 }
                 ("equals", "(Ljava/lang/Object;)Z") => {
+                    let same = |a: &Value, b: &Value| boxed::canonical(a) == boxed::canonical(b);
                     let equal = map_entry_parts(Self::argument(r, args, 0)?).is_ok_and(
-                        |(other_key, other_value)| key == other_key && value == other_value,
+                        |(other_key, other_value)| {
+                            same(&key, &other_key) && same(&value, &other_value)
+                        },
                     );
                     Ok(Value::Int(equal as i32))
                 }
@@ -7055,11 +7077,11 @@ impl Host for StdHost {
                     value_marker(&key),
                     value_marker(&value)
                 )))),
-                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
-                    "{}={}",
-                    value_marker(&key),
-                    value_marker(&value)
-                )))),
+                // `key + "=" + value`, each through `String.valueOf`.
+                ("toString", "()Ljava/lang/String;") => {
+                    let text = format!("{}={}", object_text(self, &key), object_text(self, &value));
+                    Ok(Value::Ref(Some(text)))
+                }
                 _ => Err(NativeError::MissingMethod(format!(
                     "{}#{}{}",
                     r.owner, r.name, r.descriptor
@@ -7358,7 +7380,8 @@ impl Host for StdHost {
                 })?))
             }
             ("java/lang/Integer", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                (boxed_integer(receiver).is_some()
+                (same_box_class(r, Self::argument(r, args, 0)?)
+                    && boxed_integer(receiver).is_some()
                     && boxed_integer(Self::argument(r, args, 0)?)
                         .is_some_and(|other| Some(other) == boxed_integer(receiver)))
                     as i32,
@@ -7436,8 +7459,9 @@ impl Host for StdHost {
                 Ok(Value::Int(left.cmp(&right) as i32))
             }
             ("java/lang/Long", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                (boxed_long(Self::argument(r, args, 0)?)
-                    .is_some_and(|other| Some(other) == boxed_long(receiver)))
+                (same_box_class(r, Self::argument(r, args, 0)?)
+                    && boxed_long(Self::argument(r, args, 0)?)
+                        .is_some_and(|other| Some(other) == boxed_long(receiver)))
                     as i32,
             )),
             ("java/lang/Long", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
@@ -7519,7 +7543,10 @@ impl Host for StdHost {
                     "java/lang/Float" => u64::from(java_float_bits(value)),
                     _ => java_double_bits(value),
                 };
-                let other = boxed_float(Self::argument(r, args, 0)?);
+                let argument = Self::argument(r, args, 0)?;
+                let other = same_box_class(r, argument)
+                    .then(|| boxed_float(argument))
+                    .flatten();
                 Ok(Value::Int(
                     boxed_float(receiver)
                         .is_some_and(|value| other.is_some_and(|other| bits(value) == bits(other)))
@@ -7559,7 +7586,8 @@ impl Host for StdHost {
                 },
             )),
             ("java/lang/Boolean", "equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                (boxed_boolean(receiver).is_some()
+                (same_box_class(r, Self::argument(r, args, 0)?)
+                    && boxed_boolean(receiver).is_some()
                     && boxed_boolean(Self::argument(r, args, 0)?)
                         .is_some_and(|other| Some(other) == boxed_boolean(receiver)))
                     as i32,
@@ -7837,11 +7865,17 @@ impl Host for StdHost {
                 }
             }
             ("java/lang/String", "toString", "()Ljava/lang/String;")
-            | ("java/lang/Object", "toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
-                expect_ref(receiver)
-                    .cloned()
-                    .unwrap_or_else(|| "null".into()),
-            ))),
+            | ("java/lang/Object", "toString", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(match receiver {
+                    Value::Ref(Some(text)) => text.clone(),
+                    // A box's own `toString` (`Integer.toString`,
+                    // `Character.toString`...): its value's text.
+                    Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) => {
+                        value_text(receiver)
+                    }
+                    _ => "null".into(),
+                })))
+            }
             // A jar constant the runtime has no name for (`class#n`): its
             // marker's tail is not its name.
             ("java/lang/Enum", "name" | "toString", "()Ljava/lang/String;")
@@ -7910,22 +7944,27 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
             }
             ("java/util/Optional", "toString", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(match optional_present(receiver) {
-                    Some(value) => {
-                        // The payload keeps a reference's own text (`optional_wrap`).
-                        let payload = Value::Ref(Some(value.to_owned()));
-                        format!("Optional[{}]", object_text(self, &payload))
-                    }
+                Ok(Value::Ref(Some(match optional_payload(receiver) {
+                    Some(payload) => format!("Optional[{}]", object_text(self, &payload)),
                     None => "Optional.empty".to_owned(),
                 })))
             }
+            // `Objects.hashCode(value)`: a string's or a box's own hash.
             ("java/util/Optional", "hashCode", "()I") => Ok(Value::Int(
-                optional_present(receiver).map_or(0, stable_hash),
+                optional_payload(receiver).map_or(0, |payload| match payload {
+                    Value::Ref(Some(text)) => stable_hash(&text),
+                    other => object_methods::platform_hash(&other).unwrap_or(0),
+                }),
             )),
             ("java/util/Optional", "equals", "(Ljava/lang/Object;)Z") => {
-                let left = optional_present(receiver);
-                let right = optional_present(Self::argument(r, args, 0)?);
-                Ok(Value::Int((left == right) as i32))
+                let left = optional_payload(receiver);
+                let right = optional_payload(Self::argument(r, args, 0)?);
+                let canonical = |value: &Option<Value>| {
+                    value
+                        .as_ref()
+                        .map(|value| boxed::canonical(value).into_owned())
+                };
+                Ok(Value::Int((canonical(&left) == canonical(&right)) as i32))
             }
             ("java/util/Optional", "isPresent", "()Z") => {
                 Ok(Value::Int(optional_present(receiver).is_some() as i32))
@@ -8029,7 +8068,7 @@ impl Host for StdHost {
                 "map",
                 "(Ljava/util/function/Function;)Ljava/util/Optional;",
             ) => {
-                let Some(value) = optional_present(receiver) else {
+                let Some(value) = optional_payload(receiver) else {
                     return Ok(empty_optional());
                 };
                 let function = Self::argument(r, args, 0)?;
@@ -8040,12 +8079,12 @@ impl Host for StdHost {
                         descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
                     },
                     function,
-                    &[Value::Ref(Some(value.to_owned()))],
+                    &[value],
                 )?;
                 Ok(match applied {
                     Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
                     Value::Ref(None) => empty_optional(),
-                    value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
+                    value => optional_wrap(value),
                 })
             }
             (
@@ -8068,7 +8107,7 @@ impl Host for StdHost {
                 })
             }
             ("java/util/Optional", "ifPresent", "(Ljava/util/function/Consumer;)V") => {
-                if let Some(value) = optional_present(receiver) {
+                if let Some(value) = optional_payload(receiver) {
                     let consumer = Self::argument(r, args, 0)?;
                     self.invoke_instance(
                         &MethodRef {
@@ -8077,14 +8116,14 @@ impl Host for StdHost {
                             descriptor: "(Ljava/lang/Object;)V".into(),
                         },
                         consumer,
-                        &[Value::Ref(Some(value.to_owned()))],
+                        &[value],
                     )?;
                 }
                 Ok(Value::Void)
             }
             ("java/util/Optional", "get", "()Ljava/lang/Object;") => {
-                match optional_present(receiver) {
-                    Some(value) => Ok(Value::Ref(Some(value.to_owned()))),
+                match optional_payload(receiver) {
+                    Some(value) => Ok(value),
                     // `Optional.get` on an empty optional is a throw, not a null:
                     // a `catch (NoSuchElementException)` in config bootstrap code
                     // must see it.
@@ -8150,7 +8189,9 @@ impl Host for StdHost {
                     )?;
                     Ok(match supplied {
                         Value::Ref(Some(value))
-                            if value == EMPTY_OPTIONAL || value.starts_with("optional/") =>
+                            if value == EMPTY_OPTIONAL
+                                || value.starts_with("optional/")
+                                || value.starts_with(OPTIONAL_VALUE) =>
                         {
                             Value::Ref(Some(value))
                         }
@@ -9120,7 +9161,8 @@ fn class_of_value(value: &Value) -> Option<String> {
     match value {
         Value::Int(_) => Some("java/lang/Integer".into()),
         Value::Long(_) => Some("java/lang/Long".into()),
-        Value::Float(_) => Some("java/lang/Float".into()),
+        // A `Float` is a `Boxed::Float`; the bare value is a `Double`.
+        Value::Float(_) => Some("java/lang/Double".into()),
         Value::Boxed(boxed) => Some(boxed.class().into()),
         Value::Void => None,
         Value::Ref(None) => None,
@@ -9130,7 +9172,10 @@ fn class_of_value(value: &Value) -> Option<String> {
             }
             let class = if marker.starts_with("string-builder/") {
                 "java/lang/StringBuilder"
-            } else if marker.starts_with("optional/") || marker == "optional" {
+            } else if marker.starts_with("optional/")
+                || marker.starts_with(OPTIONAL_VALUE)
+                || marker == "optional"
+            {
                 "java/util/Optional"
             } else if marker.starts_with("stream/") {
                 "java/util/stream/Stream"
@@ -9647,6 +9692,8 @@ fn value_marker(value: &Value) -> String {
                 .replace('\\', "\\\\")
                 .replace(',', "\\,")
         ),
+        // An `Integer` is one key however it was boxed (`boxed::canonical`).
+        Value::Boxed(Boxed::Integer(value)) => format!("i{value}"),
         Value::Boxed(boxed) => boxed.marker(),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => "void".to_owned(),
@@ -10127,12 +10174,39 @@ pub(crate) fn optional_present(value: &Value) -> Option<&str> {
     }
 }
 
+/// An optional whose payload is no reference (a box): `optional-value/` and
+/// the payload's [`value_marker`]. A reference payload keeps its own text
+/// after `optional/`, so the two forms never meet: `Optional.of(5)` holds an
+/// `Integer` and `Optional.of("BI5")` the string.
+pub(crate) const OPTIONAL_VALUE: &str = "optional-value/";
+
+/// The value a present optional holds, `None` when it is empty.
+pub(crate) fn optional_payload(value: &Value) -> Option<Value> {
+    let marker = expect_ref(value)?;
+    if marker == EMPTY_OPTIONAL {
+        return None;
+    }
+    if let Some(encoded) = marker.strip_prefix(OPTIONAL_VALUE) {
+        return parse_value_marker(encoded).ok();
+    }
+    Some(Value::Ref(Some(
+        marker
+            .strip_prefix("optional/")
+            .unwrap_or(marker)
+            .to_owned(),
+    )))
+}
+
 fn optional_wrap(value: Value) -> Value {
     match value {
-        Value::Ref(Some(value)) if value.starts_with("optional/") => Value::Ref(Some(value)),
+        Value::Ref(Some(value))
+            if value.starts_with("optional/") || value.starts_with(OPTIONAL_VALUE) =>
+        {
+            Value::Ref(Some(value))
+        }
         Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
         Value::Ref(None) | Value::Void => empty_optional(),
-        value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
+        value => Value::Ref(Some(format!("{OPTIONAL_VALUE}{}", value_marker(&value)))),
     }
 }
 
@@ -10216,6 +10290,12 @@ fn format_java_string_call<H: Host>(
     }
 }
 
+/// `Box.equals(o)` is `o instanceof Box && ...`: an `Integer` never equals a
+/// `Long` or a `Short` of the same value, nor a `Float` a `Double`.
+fn same_box_class(r: &MethodRef, other: &Value) -> bool {
+    class_of_value(other).as_deref() == Some(r.owner.as_str())
+}
+
 fn boxed_integer(value: &Value) -> Option<i32> {
     match value {
         Value::Int(value) | Value::Boxed(Boxed::Integer(value)) => Some(*value),
@@ -10245,6 +10325,7 @@ fn boxed_number(value: &Value) -> Option<f64> {
         Value::Boxed(boxed @ (Boxed::Integer(_) | Boxed::Short(_) | Boxed::Byte(_))) => {
             Some(f64::from(boxed.int()))
         }
+        Value::Boxed(Boxed::Float(bits)) => Some(f64::from(f32::from_bits(*bits))),
         _ => None,
     }
 }
@@ -10377,6 +10458,7 @@ fn boxed_float(value: &Value) -> Option<f64> {
         Value::Int(value) => Some(f64::from(*value)),
         Value::Long(value) => Some(*value as f64),
         Value::Float(value) => Some(*value),
+        Value::Boxed(Boxed::Float(bits)) => Some(f64::from(f32::from_bits(*bits))),
         _ => None,
     }
 }
@@ -19476,7 +19558,7 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let present = optional_present(receiver);
+        let present = optional_payload(receiver);
         let callback = match r.name.as_str() {
             "map" if r.descriptor == "(Ljava/util/function/Function;)Ljava/util/Optional;" => {
                 args.first()
@@ -19526,12 +19608,10 @@ impl<H: Host> Runtime<'_, H> {
             };
         };
         if r.name == "orElseGet" {
-            return Ok(Some(Value::Ref(Some(value.to_owned()))));
+            return Ok(Some(value));
         }
         if r.name == "filter" {
-            let Some(result) =
-                self.invoke_callback(callback, &[Value::Ref(Some(value.to_owned()))])?
-            else {
+            let Some(result) = self.invoke_callback(callback, std::slice::from_ref(&value))? else {
                 return Ok(None);
             };
             return Ok(Some(match result {
@@ -19539,19 +19619,11 @@ impl<H: Host> Runtime<'_, H> {
                 _ => empty_optional(),
             }));
         }
-        let Some(result) = self.invoke_callback(callback, &[Value::Ref(Some(value.to_owned()))])?
-        else {
+        let Some(result) = self.invoke_callback(callback, &[value])? else {
             return Ok(None);
         };
         match r.name.as_str() {
-            "map" => Ok(Some(match result {
-                Value::Ref(Some(value)) if value.starts_with("optional/") => {
-                    Value::Ref(Some(value))
-                }
-                Value::Ref(Some(value)) => Value::Ref(Some(format!("optional/{value}"))),
-                Value::Ref(None) | Value::Void => empty_optional(),
-                value => Value::Ref(Some(format!("optional/{}", value_marker(&value)))),
-            })),
+            "map" => Ok(Some(optional_wrap(result))),
             "ifPresent" => Ok(Some(Value::Void)),
             "orElseGet" => Ok(Some(result)),
             _ => Ok(None),
@@ -22372,10 +22444,7 @@ impl<H: Host> Runtime<'_, H> {
             let Some(receiver) = receiver else {
                 return Ok(None);
             };
-            let values = optional_present(receiver)
-                .map(|value| Value::Ref(Some(value.to_owned())))
-                .into_iter()
-                .collect();
+            let values = optional_payload(receiver).into_iter().collect();
             return Ok(Some(self.new_stream(class, method, values)));
         }
         if r.name == "stream"
@@ -31617,7 +31686,7 @@ mandatory = true
                 &[Value::Float(0.1)],
             )
             .unwrap();
-        assert_eq!(boxed_float, Value::Float(f64::from(0.1f32)));
+        assert_eq!(boxed_float, Value::Boxed(Boxed::float(0.1)));
         assert_eq!(
             host.invoke_instance(
                 &method("java/lang/Float", "toString", "()Ljava/lang/String;"),

@@ -930,7 +930,7 @@ pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Valu
         return None;
     }
     let primitive = match value {
-        Value::Boxed(boxed) => Value::Int(boxed.int()),
+        Value::Boxed(boxed) => boxed.primitive(),
         Value::Ref(Some(_)) => match descriptor {
             "C" => super::boxed_character(value).map(Value::Int),
             "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),

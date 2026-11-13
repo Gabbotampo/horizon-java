@@ -139,6 +139,7 @@ fn integral(value: &Value) -> Option<i64> {
 fn floating(value: &Value) -> Option<f64> {
     match value {
         Value::Float(value) => Some(*value),
+        Value::Boxed(Boxed::Float(bits)) => Some(f64::from(f32::from_bits(*bits))),
         _ => None,
     }
 }

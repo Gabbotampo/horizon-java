@@ -238,9 +238,8 @@ enum Num {
     Int(i32),
     Long(i64),
     Double(f64),
-    /// A `Float`/`Double` box the runtime keeps as one `f64`: the value is
-    /// exactly representable as an `f32`, so either box could hold it.
-    Either(f64),
+    /// A `Float` (`Boxed::Float`), widened.
+    Float(f64),
     /// A `LazilyParsedNumber`'s text.
     Lazy(String),
 }
@@ -259,13 +258,7 @@ impl Num {
             Num::Int(value) => value.to_string(),
             Num::Long(value) => value.to_string(),
             Num::Double(value) => format_java_float(*value),
-            Num::Either(value) => {
-                let double = format_java_float(*value);
-                if double != format_java_float32(*value) {
-                    return None;
-                }
-                double
-            }
+            Num::Float(value) => format_java_float32(*value),
             Num::Lazy(text) => text.clone(),
         })
     }
@@ -276,7 +269,7 @@ impl Num {
         Some(match self {
             Num::Int(value) => f64::from(*value),
             Num::Long(value) => *value as f64,
-            Num::Double(value) | Num::Either(value) => *value,
+            Num::Double(value) | Num::Float(value) => *value,
             Num::Lazy(text) => {
                 json_number(text)?;
                 text.parse::<f64>().ok()?
@@ -289,7 +282,7 @@ impl Num {
         Some(match self {
             Num::Int(value) => f64::from(*value as f32),
             Num::Long(value) => f64::from(*value as f32),
-            Num::Double(value) | Num::Either(value) => f64::from(*value as f32),
+            Num::Double(value) | Num::Float(value) => f64::from(*value as f32),
             Num::Lazy(text) => {
                 json_number(text)?;
                 f64::from(text.parse::<f32>().ok()?)
@@ -304,7 +297,7 @@ impl Num {
         Ok(Some(match self {
             Num::Int(value) => i64::from(*value),
             Num::Long(value) => *value,
-            Num::Double(value) | Num::Either(value) => *value as i64,
+            Num::Double(value) | Num::Float(value) => *value as i64,
             Num::Lazy(text) => {
                 if let Some(value) = java_long(text) {
                     value
@@ -324,7 +317,7 @@ impl Num {
         Ok(Some(match self {
             Num::Int(value) => *value,
             Num::Long(value) => *value as i32,
-            Num::Double(value) | Num::Either(value) => *value as i32,
+            Num::Double(value) | Num::Float(value) => *value as i32,
             Num::Lazy(text) => {
                 if let Some(value) = java_long(text) {
                     // `parseInt` succeeds exactly when the value fits; the
@@ -865,13 +858,9 @@ impl<H: Host> Runtime<'_, H> {
         Some(match value {
             Value::Int(value) => Num::Int(*value),
             Value::Long(value) => Num::Long(*value),
-            Value::Float(value) => {
-                if value.is_nan() || float32(*value) == *value {
-                    Num::Either(*value)
-                } else {
-                    Num::Double(*value)
-                }
-            }
+            // A bare floating-point value is a `Double`; a `Float` is boxed.
+            Value::Float(value) => Num::Double(*value),
+            Value::Boxed(Boxed::Float(bits)) => Num::Float(f64::from(f32::from_bits(*bits))),
             Value::Boxed(boxed @ (Boxed::Integer(_) | Boxed::Short(_) | Boxed::Byte(_))) => {
                 Num::Int(boxed.int())
             }

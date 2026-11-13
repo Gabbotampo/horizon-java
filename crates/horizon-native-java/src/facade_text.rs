@@ -121,6 +121,12 @@ fn argument(value: &Value) -> Json {
         Value::Ref(None) => json!("null"),
         Value::Boxed(Boxed::Boolean(b)) => json!(b),
         Value::Boxed(boxed @ Boxed::Character(_)) => json!(boxed.text()),
+        Value::Boxed(Boxed::Float(bits)) => {
+            serde_json::Number::from_f64(f64::from(f32::from_bits(*bits))).map_or_else(
+                || json!(format_java_float(f64::from(f32::from_bits(*bits)))),
+                Json::Number,
+            )
+        }
         Value::Boxed(boxed) => json!(boxed.int()),
         Value::Ref(Some(text)) => json!(text),
         Value::Void => json!(""),

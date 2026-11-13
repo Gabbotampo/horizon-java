@@ -53,8 +53,8 @@ impl<H: Host> Runtime<'_, H> {
             Value::Ref(None) => return Arg::Null,
             Value::Int(value) => return Arg::Int(*value),
             Value::Long(value) => return Arg::Long(*value),
-            // A boxed `Float` and a boxed `Double` are the same value here.
-            Value::Float(value) => return Arg::FloatOrDouble(*value),
+            // A bare floating-point value is a `Double`; a `Float` is boxed.
+            Value::Float(value) => return Arg::Double(*value),
             Value::Boxed(boxed) => return boxed_arg(*boxed),
             Value::Void => return Arg::Opaque,
             Value::Ref(Some(marker)) => marker,
@@ -92,6 +92,7 @@ fn boxed_arg(boxed: Boxed) -> Arg {
         Boxed::Short(value) => Arg::Short(value),
         Boxed::Byte(value) => Arg::Byte(value),
         Boxed::Character(unit) => Arg::Char(unit),
+        Boxed::Float(bits) => Arg::Float(f32::from_bits(bits)),
     }
 }
 

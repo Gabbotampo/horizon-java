@@ -198,25 +198,30 @@ fn boxed(value: &Value, of: Prim) -> Value {
         (Prim::Char, Value::Int(v)) => Value::Boxed(Boxed::Character(*v as u16)),
         (Prim::Short, Value::Int(v)) => Value::Boxed(Boxed::Short(*v as i16)),
         (Prim::Int, Value::Int(v)) => Value::Boxed(Boxed::Integer(*v)),
+        (Prim::Float, Value::Float(v)) => Value::Boxed(Boxed::float(*v)),
         _ => value.clone(),
     }
 }
 
-/// The primitive inside a box whose class the value model keeps. `Float` and
-/// `Double` share `Value::Float` and a bare `Value::Int` may be any of the
-/// int-like boxes, so neither is read here.
+/// The primitive inside a box whose class the value model keeps. A bare
+/// `Value::Int` may be any of the int-like boxes and a bare `Value::Float` is
+/// a `Double`, so neither is read here.
 fn unbox(value: &Value) -> Option<(Prim, Value)> {
     let boxed = match value {
         Value::Long(v) => return Some((Prim::Long, Value::Long(*v))),
         Value::Boxed(boxed) => *boxed,
         _ => return None,
     };
+    if let Boxed::Float(_) = boxed {
+        return Some((Prim::Float, boxed.primitive()));
+    }
     let of = match boxed {
         Boxed::Boolean(_) => Prim::Boolean,
         Boxed::Byte(_) => Prim::Byte,
         Boxed::Short(_) => Prim::Short,
         Boxed::Character(_) => Prim::Char,
         Boxed::Integer(_) => Prim::Int,
+        Boxed::Float(_) => Prim::Float,
     };
     Some((of, Value::Int(boxed.int())))
 }

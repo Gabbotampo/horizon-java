@@ -792,6 +792,11 @@ impl<H: Host> Runtime<'_, H> {
                 (_, Value::Ref(None)) if param.starts_with('L') => Arg::Text(None),
                 // `append(Object)` of a box is `String.valueOf`: its value.
                 ("Ljava/lang/Object;", Value::Boxed(boxed)) => Arg::Text(Some(boxed.text())),
+                // An `Integer`/`Long`/`Double` the runtime holds as its value
+                // (one read back from a collection, a lambda's box).
+                ("Ljava/lang/Object;", Value::Int(_) | Value::Long(_) | Value::Float(_)) => {
+                    Arg::Text(Some(crate::runtime::value_text(value)))
+                }
                 (_, Value::Ref(Some(marker))) if param.starts_with('L') => {
                     // `insert` reads its argument after shifting the
                     // receiver, so a builder inserted into itself is not
