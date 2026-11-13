@@ -58,6 +58,9 @@ pub struct IteratorGuard {
     structure: Vec<String>,
     /// `ArrayDeque`: no `modCount`.
     deque: bool,
+    /// An `ArrayDeque` iterator whose layout is known: its `cursor` slot and
+    /// `remaining` count (`array_deque.rs`).
+    deque_cursor: Option<(usize, usize)>,
 }
 
 /// How a fail-fast collection iterates.
@@ -192,6 +195,11 @@ impl<H: Host> Runtime<'_, H> {
                 let structure = self.structure_of(&source, how)?;
                 let expected = self.capture_mod_count(&source);
                 let deque = !self.has_mod_count(&source);
+                // `DeqIterator`: `cursor = head`, `remaining = size()`.
+                let deque_cursor = (how == FailFast::Deque)
+                    .then(|| self.host.deque_layout(&source_marker))
+                    .flatten()
+                    .map(|layout| (layout.head(), structure.len()));
                 let iterator = self.host.invoke_instance(r, receiver, args)?;
                 if let Some(iterator) = expect_ref(&iterator) {
                     self.host.store_iterator_guard(
@@ -207,6 +215,7 @@ impl<H: Host> Runtime<'_, H> {
                             expected,
                             structure,
                             deque,
+                            deque_cursor,
                         },
                     );
                 }
@@ -216,6 +225,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(guard) = self.host.iterator_guard(&marker) else {
                     return Ok(None);
                 };
+                if let Some((_, remaining)) = guard.deque_cursor {
+                    return Ok(Some(Value::Int(i32::from(remaining > 0))));
+                }
                 let Some(not_equal) = guard.cursor else {
                     return Ok(None);
                 };
@@ -235,6 +247,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(guard) = self.host.iterator_guard(&marker) else {
                     return Ok(None);
                 };
+                if guard.deque_cursor.is_some() {
+                    return self.deque_next(r, &marker, guard).map(Some);
+                }
                 let source = Value::Ref(Some(guard.source.clone()));
                 let how = match guard.cursor {
                     Some(true) => FailFast::ArrayList,
@@ -266,6 +281,10 @@ impl<H: Host> Runtime<'_, H> {
                     ModVerdict::Changed if !guard.deque => Err(concurrent_modification()),
                     _ => self.host.unknown_operand_call(r).map(|_| None),
                 }
+            }
+            ("forEach", "(Ljava/util/function/Consumer;)V") if self.is_array_deque(receiver) => {
+                let action = args.first().cloned().unwrap_or(Value::Ref(None));
+                self.deque_for_each(r, receiver, &action)
             }
             ("forEach", "(Ljava/util/function/Consumer;)V") => {
                 let Some((source, how)) = self.fail_fast_source(receiver) else {
@@ -488,5 +507,183 @@ impl<H: Host> Runtime<'_, H> {
             structure = self.structure_of(source, FailFast::Cursor)?;
             removed = true;
         }
+    }
+
+    /// `DeqIterator.next()`: the live array's slot at `cursor`, a
+    /// `ConcurrentModificationException` if a removal emptied it, then the
+    /// next slot (of the array as it is now).
+    fn deque_next(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        mut guard: IteratorGuard,
+    ) -> Result<Value, NativeError> {
+        let Some((cursor, remaining)) = guard.deque_cursor else {
+            return Ok(Value::Ref(None));
+        };
+        if remaining == 0 {
+            return Err(NativeError::UncaughtException {
+                class: "java/util/NoSuchElementException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let source = Value::Ref(Some(guard.source.clone()));
+        let Some(layout) = self.host.deque_layout(&guard.source) else {
+            // The layout is no longer known: the host's snapshot, counted.
+            self.host.unknown_operand_call(r)?;
+            return self
+                .host
+                .invoke_instance(r, &Value::Ref(Some(marker.to_owned())), &[]);
+        };
+        let live = self.collection_elements(&source)?;
+        let element = layout.slot(cursor, &live);
+        if element == Value::Ref(None) {
+            return Err(concurrent_modification());
+        }
+        guard.deque_cursor = Some((layout.next_slot(cursor), remaining - 1));
+        self.host.store_iterator_guard(marker, guard);
+        Ok(element)
+    }
+
+    /// `forEachRemaining(action)` on a guarded iterator, with JDK 25's
+    /// `modCount` checks: `ArrayList.Itr`/`Vector.Itr` and
+    /// `LinkedList.ListItr` test it in the loop condition and once more
+    /// after the loop (so a change made at the last element still throws);
+    /// the `Iterator.forEachRemaining` default (hash, tree, `PriorityQueue`)
+    /// is `while (hasNext()) action.accept(next())`; `ArrayDeque`'s checks
+    /// the first slot and `tail`. `Ok(None)`: not a guarded iterator.
+    pub(crate) fn guarded_for_each_remaining(
+        &mut self,
+        r: &MethodRef,
+        iterator: &Value,
+        action: &Value,
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(marker) = expect_ref(iterator).cloned() else {
+            return Ok(None);
+        };
+        let Some(mut guard) = self.host.iterator_guard(&marker) else {
+            return Ok(None);
+        };
+        let source = Value::Ref(Some(guard.source.clone()));
+        let class = self.host_collection_class(&source).unwrap_or_default();
+        const ACCEPT: (&str, &str, &str) = (
+            "java/util/function/Consumer",
+            "accept",
+            "(Ljava/lang/Object;)V",
+        );
+        let check = |this: &mut Self, guard: &IteratorGuard| -> Result<(), NativeError> {
+            match this.mod_stamp(&guard.root).verdict(guard.expected) {
+                ModVerdict::Same => Ok(()),
+                ModVerdict::Changed => Err(concurrent_modification()),
+                ModVerdict::Unknown => this.host.unknown_operand_call(r).map(|_| ()),
+            }
+        };
+        if let Some((cursor, remaining)) = guard.deque_cursor {
+            // `DeqIterator.forEachRemaining`: `remaining = 0` first.
+            if remaining == 0 {
+                return Ok(Some(Value::Void));
+            }
+            guard.deque_cursor = Some((cursor, 0));
+            self.host.store_iterator_guard(&marker, guard.clone());
+            let Some(layout) = self.host.deque_layout(&guard.source) else {
+                return self.host.unknown_operand_call(r).map(|_| None);
+            };
+            let live = self.collection_elements(&source)?;
+            let end = layout.tail(live.len());
+            let span = (end + layout.capacity_of() - cursor) % layout.capacity_of();
+            if layout.slot(cursor, &live) == Value::Ref(None) || span != remaining {
+                return Err(concurrent_modification());
+            }
+            let mut slot = cursor;
+            for _ in 0..remaining {
+                let live = self.collection_elements(&source)?;
+                let Some(now) = self
+                    .host
+                    .deque_layout(&guard.source)
+                    .filter(|now| now.capacity_of() == layout.capacity_of())
+                else {
+                    return self.host.unknown_operand_call(r).map(|_| None);
+                };
+                self.run_functional(ACCEPT, action, &[now.slot(slot, &live)])?;
+                slot = layout.next_slot(slot);
+            }
+            let live = self.collection_elements(&source)?.len();
+            return match self.host.deque_layout(&guard.source) {
+                Some(now) if now.tail(live) != end => Err(concurrent_modification()),
+                _ => Ok(Some(Value::Void)),
+            };
+        }
+        let Some(start) = self.host.iterator_cursor(&marker) else {
+            return Ok(None);
+        };
+        match class.as_str() {
+            "java/util/ArrayList" | "java/util/Vector" | "java/util/Stack" => {
+                // `size` read once; the cursor is written after the loop.
+                let size = self.collection_elements(&source)?.len();
+                let mut index = start;
+                while index < size
+                    && self.mod_stamp(&guard.root).verdict(guard.expected) == ModVerdict::Same
+                {
+                    let element = self
+                        .collection_elements(&source)?
+                        .get(index)
+                        .cloned()
+                        .unwrap_or(Value::Ref(None));
+                    if let Err(error) = self.run_functional(ACCEPT, action, &[element]) {
+                        self.host.set_host_iterator_cursor(&marker, start);
+                        return Err(error);
+                    }
+                    index += 1;
+                }
+                self.host.set_host_iterator_cursor(&marker, index);
+                check(self, &guard)?;
+            }
+            "java/util/LinkedList" => {
+                // `nextIndex < size` reads the live size; it advances after
+                // each `accept`.
+                let mut index = start;
+                while self.mod_stamp(&guard.root).verdict(guard.expected) == ModVerdict::Same {
+                    let live = self.collection_elements(&source)?;
+                    let Some(element) = live.get(index).cloned() else {
+                        break;
+                    };
+                    self.run_functional(ACCEPT, action, &[element])?;
+                    index += 1;
+                    self.host.set_host_iterator_cursor(&marker, index);
+                }
+                check(self, &guard)?;
+            }
+            _ => {
+                // `while (hasNext()) action.accept(next())`.
+                let has_next = MethodRef {
+                    owner: "java/util/Iterator".into(),
+                    name: "hasNext".into(),
+                    descriptor: "()Z".into(),
+                };
+                let next = MethodRef {
+                    owner: "java/util/Iterator".into(),
+                    name: "next".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                };
+                loop {
+                    let more =
+                        match self.invoke_iteration_guard(&has_next, 0xb9, Some(iterator), &[])? {
+                            Some(answer) => answer,
+                            None => self.host.invoke_instance(&has_next, iterator, &[])?,
+                        };
+                    if more != Value::Int(1) {
+                        break;
+                    }
+                    let element =
+                        match self.invoke_iteration_guard(&next, 0xb9, Some(iterator), &[])? {
+                            Some(element) => element,
+                            None => self.host.host_iterator_next(&marker)?,
+                        };
+                    self.run_functional(ACCEPT, action, &[element])?;
+                }
+            }
+        }
+        Ok(Some(Value::Void))
     }
 }
