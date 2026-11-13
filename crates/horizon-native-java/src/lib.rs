@@ -44,6 +44,7 @@ mod facade_world;
 mod field_access;
 mod field_get_set;
 mod files_copy;
+mod files_move;
 mod frame_bound;
 mod game_codecs;
 mod game_hooks;
@@ -5190,10 +5191,12 @@ impl Host for StdHost {
             ) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
                 Ok(Self::argument(r, args, 0)?.clone())
             }
+            // Moves and copies the file model can't make (`files_move.rs`)
+            // are counted: answering the target did nothing.
             ("java/nio/file/Files", "move" | "copy", descriptor)
                 if descriptor.starts_with("(Ljava/nio/file/Path;") =>
             {
-                Ok(Self::argument(r, args, 1)?.clone())
+                self.unknown_host_call(r)
             }
             (
                 "java/nio/file/Files",
@@ -24040,6 +24043,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_files_move(&r, &args))
+                    {
+                        // `Files.move`/`copy` between paths (`files_move.rs`).
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_files_copy(&r, &args))
