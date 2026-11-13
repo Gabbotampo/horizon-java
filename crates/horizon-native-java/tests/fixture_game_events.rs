@@ -447,6 +447,7 @@ const NEOFORGE_STUBS: &[(&str, &str)] = &[
         "package net.neoforged.neoforge.event.tick;\n\
          public abstract class ServerTickEvent extends net.neoforged.bus.api.Event {\n\
            public net.minecraft.server.MinecraftServer getServer() { return null; }\n\
+           public boolean hasTime() { return false; }\n\
            public static class Post extends ServerTickEvent {} }",
     ),
     (
@@ -599,6 +600,85 @@ fn neoforge_listeners_run_by_event_class_and_honour_set_canceled() {
     assert_eq!(
         static_value(&host, "demo/Logins", "lastLjava/lang/String;"),
         Some(Value::Ref(Some("Alex".into())))
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+const NEOFORGE_TIME_SUBSCRIBER: &str = r#"
+package demo;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
+@EventBusSubscriber(modid = "neo_events") public final class Times {
+  public static String seen = "";
+  @SubscribeEvent public static void onTick(ServerTickEvent.Post event) {
+    seen = seen + (event.hasTime() ? "T" : "F");
+  }
+}
+"#;
+
+/// NeoForge's `ServerTickEvent#hasTime()` returns its `BooleanSupplier`'s answer
+/// (`getAsBoolean`), which `MinecraftServer.tickServer` passes as `this::haveTime`: the listener
+/// hears exactly what the firing carries (the host's `server_has_time`), false included, and a
+/// firing that does not carry it refuses the read instead of answering `true`.
+#[test]
+fn neoforge_server_tick_has_time_is_the_firings_answer() {
+    let root = scratch("neoforge-has-time");
+    let mut sources = NEOFORGE_STUBS.to_vec();
+    sources.push(("demo/NeoMod.java", NEOFORGE_MOD));
+    sources.push(("demo/Times.java", NEOFORGE_TIME_SUBSCRIBER));
+    let jar_path = build_jar(
+        &root,
+        &sources,
+        "demo",
+        (
+            "META-INF/neoforge.mods.toml",
+            "modLoader=\"javafml\"\nloaderVersion=\"[1,)\"\nlicense=\"MIT\"\n[[mods]]\nmodId=\"neo_events\"\nversion=\"1.0\"\n",
+        ),
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let mut host = StdHost::new();
+    jar.execute("demo.NeoMod", None, "neoforge", &mut host)
+        .unwrap();
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
+    let found = host.game_listeners(&jar, true);
+    let times = found
+        .listeners
+        .iter()
+        .find(|l| {
+            l.event == GameEvent::ServerTickEnd
+                && format!("{:?}", l.callback).contains("demo/Times")
+        })
+        .expect("the Times subscriber listens to ServerTickEvent.Post")
+        .clone();
+    let run = |host: &mut StdHost, has_time: Option<bool>| {
+        let mut firing = EventFiring::new(
+            GameEvent::ServerTickEnd,
+            facade(0),
+            EventContext {
+                has_time,
+                ..EventContext::default()
+            },
+        );
+        jar.run_game_listener(&times, &mut firing, host, &ExecutionBudget::UNBOUNDED)
+    };
+    run(&mut host, Some(true)).unwrap();
+    run(&mut host, Some(false)).unwrap();
+    assert_eq!(
+        static_value(&host, "demo/Times", "seenLjava/lang/String;"),
+        Some(Value::Ref(Some("TF".into())))
+    );
+    let outcome = run(&mut host, None);
+    assert!(
+        matches!(&outcome, Err(NativeError::UnknownHostCall(r)) if r.name == "hasTime"),
+        "an unknown hasTime must be refused, got {outcome:?}"
     );
     let _ = fs::remove_dir_all(root);
 }
