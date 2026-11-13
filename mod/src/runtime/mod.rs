@@ -17,6 +17,7 @@ use std::{
 };
 
 mod annotation_values;
+mod array_copy;
 mod attachment_codec;
 mod block_item_id;
 pub mod brigadier;
@@ -20001,6 +20002,15 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 let marker = self.new_array(class, method);
                 self.arrays.insert(marker.clone(), values);
+                // The copy is an array of the original's class (the overloads
+                // without a `Class` argument), so `System.arraycopy` and
+                // `getClass()` see its component (`array_copy.rs`).
+                if !r.descriptor.contains("Ljava/lang/Class;")
+                    && let Some(component) = expect_ref(StdHost::argument(r, args, 0)?)
+                        .and_then(|original| self.array_component(original))
+                {
+                    self.record_array_component(&marker, &component);
+                }
                 Ok(Some(Value::Ref(Some(marker))))
             }
             ("fill", descriptor) if descriptor.starts_with('[') => {
@@ -24239,6 +24249,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         self.invoke_reflect_array(&r, &args, class, method)?
                     {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_array_copy(&r, &args))
+                    {
+                        // `System.arraycopy` (`array_copy.rs`).
                         value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
                         value
