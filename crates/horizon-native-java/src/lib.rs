@@ -102,6 +102,7 @@ mod night_config;
 mod null_checks;
 mod object_methods;
 mod open_options;
+mod optionull;
 mod priority_queue;
 mod references;
 mod reflect_constructors;
@@ -3157,11 +3158,14 @@ impl StdHost {
     ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("load", "(Ljava/io/InputStream;)V") | ("load", "(Ljava/io/Reader;)V") => {
-                let Some(stream) = expect_ref(Self::argument(r, args, 0)?) else {
-                    return Ok(Some(Value::Void));
-                };
-                let Some((bytes, index)) = self.resource_streams.get_mut(stream) else {
-                    return Ok(Some(Value::Void));
+                // Only a host resource stream has bytes the host can parse.
+                // Any other stream (a file the jar opened, a null) would load
+                // entries the host never sees, so the call is counted rather
+                // than answered as an empty load.
+                let Some((bytes, index)) = expect_ref(Self::argument(r, args, 0)?)
+                    .and_then(|stream| self.resource_streams.get_mut(stream))
+                else {
+                    return self.unknown_host_call(r).map(Some);
                 };
                 let text = String::from_utf8_lossy(&bytes[*index..]).into_owned();
                 *index = bytes.len();
@@ -3252,7 +3256,14 @@ impl StdHost {
                 }
                 Ok(Some(marker))
             }
-            ("store", _) | ("storeToXML", _) | ("list", _) | ("save", _) => Ok(Some(Value::Void)),
+            // JDK 25's `store` writes a `#` line with `new Date().toString()`
+            // (the clock and the time zone) before the key-sorted entries,
+            // `list` walks the table in hash order, and `save` is `store` with
+            // the `IOException` swallowed. None of the text `store`,
+            // `storeToXML`, `list` or `save` writes reaches anything the host
+            // keeps, so each is counted: answering `void` would report a save
+            // that never happened.
+            ("store" | "storeToXML" | "list" | "save", _) => self.unknown_host_call(r).map(Some),
             _ => Ok(None),
         }
     }
@@ -20286,6 +20297,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_reflect_simple_name(r, receiver)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_reflect_enclosing_class(r, receiver)? {
+            return Ok(Some(value));
+        }
         // `getSuperclass` walks the jar's own hierarchy: a config scanner that
         // recurses until it reaches `Object.class` must reach it. A class the
         // runtime does not hold (a game or JDK class) answers `Object`, the one
@@ -24209,6 +24223,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_collection_callback(&r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_optionull(&r, &args))
+                    {
+                        // The game's pure `Optionull` helper (`optionull.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -34124,6 +34143,122 @@ mandatory = true
             host.invoke_instance(&size, &properties, &[]).unwrap(),
             Value::Int(default_size + 1)
         );
+    }
+
+    #[test]
+    fn properties_writes_and_unreadable_loads_are_counted() {
+        // A jar that saves its config with `props.store(out, ..)` and reads it
+        // back must see the call counted, not a silent `void` (#4 of the
+        // 2026-11-13 census: the four writers were no-ops).
+        let mut host = StdHost::new();
+        let properties = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/lang/System".into(),
+                    name: "getProperties".into(),
+                    descriptor: "()Ljava/util/Properties;".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        let out = Value::Ref(Some("jar-object/java/io/FileOutputStream/0".into()));
+        let comment = Value::Ref(Some("settings".into()));
+        let writes = [
+            ("store", "(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            ("store", "(Ljava/io/Writer;Ljava/lang/String;)V"),
+            ("storeToXML", "(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            ("save", "(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+        ];
+        for (name, descriptor) in writes {
+            let call = MethodRef {
+                owner: "java/util/Properties".into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            host.invoke_instance(&call, &properties, &[out.clone(), comment.clone()])
+                .unwrap();
+        }
+        let list = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "list".into(),
+            descriptor: "(Ljava/io/PrintStream;)V".into(),
+        };
+        host.invoke_instance(&list, &properties, std::slice::from_ref(&out))
+            .unwrap();
+        // A stream the host holds no bytes for: the entries it would load are
+        // unknown, so the load is counted too.
+        let load = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "load".into(),
+            descriptor: "(Ljava/io/InputStream;)V".into(),
+        };
+        host.invoke_instance(&load, &properties, &[out]).unwrap();
+        let counted = host.unknown_host_calls();
+        let count = |key: &str| {
+            counted
+                .iter()
+                .find(|(method, _)| method == key)
+                .map_or(0, |(_, count)| *count)
+        };
+        assert_eq!(
+            count("java/util/Properties#store(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#store(Ljava/io/Writer;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#storeToXML(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#save(Ljava/io/OutputStream;Ljava/lang/String;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#list(Ljava/io/PrintStream;)V"),
+            1
+        );
+        assert_eq!(
+            count("java/util/Properties#load(Ljava/io/InputStream;)V"),
+            1
+        );
+        assert_eq!(host.unknown_host_call_count(), 6);
+    }
+
+    #[test]
+    fn properties_load_from_a_resource_stream_still_answers() {
+        let mut host =
+            StdHost::new().with_resource_bytes("mod.properties", b"mod.version=1.2.0\n".to_vec());
+        let stream = host.resource_stream("mod.properties");
+        let properties = host
+            .invoke(
+                &MethodRef {
+                    owner: "java/lang/System".into(),
+                    name: "getProperties".into(),
+                    descriptor: "()Ljava/util/Properties;".into(),
+                },
+                &[],
+            )
+            .unwrap();
+        let load = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "load".into(),
+            descriptor: "(Ljava/io/InputStream;)V".into(),
+        };
+        host.invoke_instance(&load, &properties, &[stream]).unwrap();
+        let get = MethodRef {
+            owner: "java/util/Properties".into(),
+            name: "getProperty".into(),
+            descriptor: "(Ljava/lang/String;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            host.invoke_instance(&get, &properties, &[Value::Ref(Some("mod.version".into()))])
+                .unwrap(),
+            Value::Ref(Some("1.2.0".into()))
+        );
+        assert_eq!(host.unknown_host_call_count(), 0);
     }
 
     #[test]
