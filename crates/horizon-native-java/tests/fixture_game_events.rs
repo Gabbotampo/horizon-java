@@ -11,8 +11,8 @@ mod scratch;
 use horizon_native_java::{
     ExecutionBudget, Host, NativeError, NativeJar, StdHost, Value,
     events::{
-        EventContext, EventFacade, EventFiring, EventLoader, FacadeEntity, FacadePlayer, GameEvent,
-        GameListener,
+        EventContext, EventFacade, EventFiring, EventLoader, FacadeEntity, FacadeOriginal,
+        FacadePlayer, GameEvent, GameListener,
     },
 };
 use std::{
@@ -439,7 +439,8 @@ const NEOFORGE_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/entity/player/Player.java",
-        "package net.minecraft.world.entity.player;\npublic class Player { public String getScoreboardName() { return null; } }",
+        "package net.minecraft.world.entity.player;\npublic class Player { public String getScoreboardName() { return null; }\n\
+         public float getHealth() { return 1; } }",
     ),
     (
         "net/neoforged/neoforge/event/tick/ServerTickEvent.java",
@@ -706,7 +707,7 @@ import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 @EventBusSubscriber(modid = "neo_events") public final class Originals {
   public static String original;
   @SubscribeEvent public static void onClone(PlayerEvent.Clone event) {
-    original = event.getOriginal().getScoreboardName();
+    original = event.getOriginal().getScoreboardName() + ":" + event.getOriginal().getHealth();
   }
 }
 "#;
@@ -716,10 +717,11 @@ import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 /// `isWasDeath()` returns that field: true after a death respawn (`keepEverything` false), false
 /// after an End return. The firing carries Fabric `COPY_FROM`'s `alive` (= `keepEverything`) as
 /// its flag, so a death fires with `flag: false`. `getEntity()` is the new player.
-/// `getOriginal()` has no answer (Horizon keeps one player across the copy and the game gives no
-/// view of the old one), so that listener is refused rather than handed the new player.
+/// `getOriginal()` is the old player the game lends for the clone hook (arismoko/horizon#3040), its
+/// own marker answering the old player's facts (name, health at death); a firing without one
+/// refuses it rather than handing over the new player.
 #[test]
-fn neoforge_clone_answers_was_death_and_refuses_the_original() {
+fn neoforge_clone_answers_was_death_and_the_original_the_game_lends() {
     let root = scratch("neoforge-clone");
     let mut sources = NEOFORGE_STUBS.to_vec();
     sources.push(("demo/NeoMod.java", NEOFORGE_MOD));
@@ -759,17 +761,25 @@ fn neoforge_clone_answers_was_death_and_refuses_the_original() {
             .clone()
     };
     let (was_death, original) = (of("demo/Clones"), of("demo/Originals"));
-    let run = |host: &mut StdHost, listener: &GameListener, alive: bool| {
+    let alex = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+    let run_with = |host: &mut StdHost,
+                    listener: &GameListener,
+                    alive: bool,
+                    original: Option<FacadeOriginal>| {
         let mut firing = EventFiring::new(
             GameEvent::PlayerCopy,
             facade(0),
             EventContext {
-                player: Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
+                player: Some(alex),
                 flag: alive,
+                original,
                 ..EventContext::default()
             },
         );
         jar.run_game_listener(listener, &mut firing, host, &ExecutionBudget::UNBOUNDED)
+    };
+    let run = |host: &mut StdHost, listener: &GameListener, alive: bool| {
+        run_with(host, listener, alive, None)
     };
 
     // A death respawn, then an End return.
@@ -796,6 +806,18 @@ fn neoforge_clone_answers_was_death_and_refuses_the_original() {
     assert_eq!(
         static_value(&host, "demo/Originals", "originalLjava/lang/String;"),
         None
+    );
+    let died = FacadeOriginal {
+        uuid: alex,
+        name: Some("Alex".into()),
+        level: Some("minecraft:the_nether".into()),
+        position: Some([1.5, 64.0, -3.5]),
+        health: Some(0.0),
+    };
+    run_with(&mut host, &original, false, Some(died)).unwrap();
+    assert_eq!(
+        static_value(&host, "demo/Originals", "originalLjava/lang/String;"),
+        Some(Value::Ref(Some("Alex:0.0".into())))
     );
     let _ = fs::remove_dir_all(root);
 }
