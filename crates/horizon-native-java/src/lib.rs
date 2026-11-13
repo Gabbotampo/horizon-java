@@ -65,6 +65,7 @@ mod hash_table;
 mod heap;
 mod hook_shapes;
 mod host_entry;
+mod host_list_iterator;
 mod host_optional;
 mod host_ref;
 mod immutable_collections;
@@ -2378,6 +2379,19 @@ pub trait Host {
         Vec::new()
     }
 
+    /// Keep a new host list iterator (`host_list_iterator.rs`) and answer its
+    /// marker; `None` for a host that keeps no list iterators.
+    fn new_list_iterator(&mut self, _state: host_list_iterator::ListIter) -> Option<String> {
+        None
+    }
+
+    /// A host list iterator's state, by marker.
+    fn list_iterator(&self, _marker: &str) -> Option<host_list_iterator::ListIter> {
+        None
+    }
+
+    fn store_list_iterator(&mut self, _marker: &str, _state: host_list_iterator::ListIter) {}
+
     /// How many `subList` copies are linked at all.
     fn sub_lists_of_any(&self) -> usize {
         0
@@ -2818,6 +2832,8 @@ pub struct StdHost {
     mod_stamps: BTreeMap<String, mod_count::ModStamp>,
     /// `subList` copies and where they sit in their parents.
     sub_lists: BTreeMap<String, mod_count::SubListLink>,
+    /// `listIterator()`s over host lists (`host_list_iterator.rs`).
+    list_iterators: BTreeMap<String, host_list_iterator::ListIter>,
     /// `ArrayDeque`s' physical layouts (`array_deque.rs`).
     deque_layouts: BTreeMap<String, array_deque::DequeLayout>,
     /// The class (or encoded kind) of the collection each host iterator
@@ -2958,6 +2974,7 @@ impl StdHost {
             iterator_guards: BTreeMap::new(),
             mod_stamps: BTreeMap::new(),
             sub_lists: BTreeMap::new(),
+            list_iterators: BTreeMap::new(),
             deque_layouts: BTreeMap::new(),
             iterator_sources: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
@@ -4479,6 +4496,21 @@ impl Host for StdHost {
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
         self.iterators.get(marker).map(|(_, index)| *index)
+    }
+
+    fn new_list_iterator(&mut self, state: host_list_iterator::ListIter) -> Option<String> {
+        let marker = format!("{}{}", host_list_iterator::PREFIX, self.next_iterator);
+        self.next_iterator = self.next_iterator.saturating_add(1);
+        self.list_iterators.insert(marker.clone(), state);
+        Some(marker)
+    }
+
+    fn list_iterator(&self, marker: &str) -> Option<host_list_iterator::ListIter> {
+        self.list_iterators.get(marker).cloned()
+    }
+
+    fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
+        self.list_iterators.insert(marker.to_owned(), state);
     }
 
     fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
@@ -19088,6 +19120,12 @@ impl<H: Host> Runtime<'_, H> {
         let mut current = field.owner.clone();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
+                // `AbstractList.modCount`, inherited from a JDK skeleton.
+                if let Some(owner) =
+                    jdk_skeletons::skeleton_field_owner(&current, &field.name, &field.descriptor)
+                {
+                    return owner.to_owned();
+                }
                 break;
             };
             if file.fields.iter().any(|declared| {
@@ -24981,6 +25019,12 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_iteration_guard(&r, op, receiver.as_ref(), &args)
                     ) {
                         // Fail-fast iteration (`iteration_guard.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_list_iterator(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // `listIterator` on a host list (`host_list_iterator.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

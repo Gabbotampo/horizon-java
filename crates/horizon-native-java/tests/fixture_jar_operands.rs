@@ -177,39 +177,22 @@ fn an_interface_default_on_a_jar_iterable_runs_as_the_jdk_does() {
     assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `k=7`. The key and value are `SimpleImmutableEntry`'s state.
+/// JDK 25: `k=7`. The key and value are `SimpleImmutableEntry`'s state,
+/// now kept and read as the JDK keeps them (`jdk_skeletons/map.rs`).
 #[test]
-fn jdk_superclass_state_is_counted() {
+fn jdk_superclass_state_runs_as_the_jdk_does() {
     let (text, unknown) = run("entryState");
-    assert_eq!(text, "null=null");
-    assert_eq!(
-        unknown,
-        vec![
-            (
-                "java/util/AbstractMap$SimpleImmutableEntry#getKey()Ljava/lang/Object;".to_owned(),
-                1
-            ),
-            (
-                "java/util/AbstractMap$SimpleImmutableEntry#getValue()Ljava/lang/Object;"
-                    .to_owned(),
-                1
-            ),
-        ]
-    );
+    assert_eq!(text, "k=7");
+    assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `1|5`. `Map.getOrDefault` calls the map's own `get`.
+/// JDK 25: `1|5`. `Map.getOrDefault` calls the map's own `get`, now as the
+/// JDK does.
 #[test]
-fn a_map_default_on_a_jar_map_is_counted() {
+fn a_map_default_on_a_jar_map_runs_as_the_jdk_does() {
     let (text, unknown) = run("mapDefault");
-    assert_eq!(text, "null|null");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/util/Map#getOrDefault(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            2
-        )
-    );
+    assert_eq!(text, "1|5");
+    assert_eq!(unknown, Vec::new());
 }
 
 /// JDK 25: `2|true|[p, q]`. A subclass of a concrete JDK collection keeps
