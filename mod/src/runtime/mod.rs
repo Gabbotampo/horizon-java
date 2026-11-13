@@ -2453,6 +2453,12 @@ pub trait Host {
         None
     }
 
+    /// Whether a game object marker is an instance of `wanted`, when the host
+    /// knows that object's class chain; `None` leaves the interpreter's answer.
+    fn game_instance_of(&self, _marker: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
+
     /// Up to `limit` bytes (all that are left when `None`) of a bounded
     /// input-stream marker the host holds, consumed from the stream.
     ///
@@ -2713,6 +2719,13 @@ pub struct StdHost {
     /// `Arc` so a pack can build one table and every mod's host uses it
     /// without copying the class bytes again.
     linked_classes: Arc<LinkedClassTable>,
+    /// Each vanilla block's class chain and interfaces by simple name
+    /// (`minecraft:fire` → `FireBlock`, `BaseFireBlock`, `Block`, `ItemLike`),
+    /// which a game host seeds from its prepared `block-behaviours.json`.
+    game_block_classes: Arc<BTreeMap<String, Vec<String>>>,
+    /// The vanilla block class a block's game constructor named, for blocks
+    /// built through a `Block` subclass (`FenceBlock(Properties)`).
+    block_game_classes: BTreeMap<String, String>,
     /// Explicitly seeded Java service providers. Native execution never scans
     /// the host classpath; callers must supply the service and provider class
     /// names they want visible to `ServiceLoader`.
@@ -2872,6 +2885,10 @@ pub struct StdHost {
     heap: heap::JavaHeap,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
+    /// Game constants read as opaque typed markers (`SoundType.WOOD`): the
+    /// value is modelled only by identity and declared type, so a measurement
+    /// can still see that a jar leaned on unmodelled game state.
+    opaque_game_constants: BTreeMap<String, usize>,
     /// The threads the jar made and started (`parked_threads.rs`).
     threads: parked_threads::ThreadTable,
     strict_unknown_host_calls: bool,
@@ -2932,6 +2949,8 @@ impl StdHost {
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
             linked_classes: Arc::default(),
+            game_block_classes: Arc::default(),
+            block_game_classes: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
@@ -2997,6 +3016,7 @@ impl StdHost {
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             unknown_host_calls: BTreeMap::new(),
+            opaque_game_constants: BTreeMap::new(),
             threads: parked_threads::ThreadTable::default(),
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
@@ -3031,6 +3051,20 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// The game constants this host answered with an opaque typed marker, and
+    /// how often each was read (`owner#NAME descriptor`, like
+    /// [`Self::unknown_host_calls`]).
+    pub fn opaque_game_constant_reads(&self) -> Vec<(String, usize)> {
+        self.opaque_game_constants
+            .iter()
+            .map(|(field, count)| (field.clone(), *count))
+            .collect()
+    }
+
+    pub fn opaque_game_constant_count(&self) -> usize {
+        self.opaque_game_constants.values().sum()
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -3306,6 +3340,13 @@ impl StdHost {
         classes: impl IntoIterator<Item = ClassFile>,
     ) -> Result<usize, NativeError> {
         Arc::make_mut(&mut self.linked_classes).link_classes(id, classes)
+    }
+
+    /// Seed each vanilla block's class chain and interfaces (simple names), so
+    /// `Blocks.FIRE instanceof FireBlock` answers as in the game.
+    pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
+        self.game_block_classes = classes;
+        self
     }
 
     /// Share one linked table across many hosts (`Self::link_jar` clones it
@@ -4049,10 +4090,21 @@ impl StdHost {
             }
             "minecraft:data_component_type" => self.content_builders.component_declaration(marker),
             "minecraft:block" => {
+                // A block built through a vanilla subclass takes a vanilla block
+                // of that same class as its template, so it behaves as that
+                // class does; with none to copy it stays opaque.
+                let template = match self.block_game_classes.get(marker) {
+                    None => INFERRED_BLOCK_TEMPLATE.to_owned(),
+                    Some(class) => self
+                        .game_block_classes
+                        .iter()
+                        .find(|(_, chain)| chain.first() == Some(class))
+                        .map(|(id, _)| id.clone())?,
+                };
                 self.block_property_builders
                     .get(marker)
                     .map(|builder| RegistryDeclaration::Block {
-                        template: INFERRED_BLOCK_TEMPLATE.to_owned(),
+                        template: template.clone(),
                         properties: block_declaration_properties(builder),
                         // A block built this way has the item vanilla gives
                         // every block; a mod that registers its own block item
@@ -4263,6 +4315,33 @@ impl StdHost {
                     return Ok(Some(receiver.clone()));
                 }
                 Ok(None)
+            }
+            // A vanilla `Block` subclass's constructor (`FenceBlock(Properties)`,
+            // `StairBlock(BlockState, Properties)`): the properties carry over as
+            // for `Block`, and the class picks the template below.
+            owner
+                if r.name == "<init>"
+                    && owner != BLOCK_CLASS
+                    && owner.starts_with("net/minecraft/world/level/block/")
+                    && !self.game_block_classes.is_empty() =>
+            {
+                let Some(properties) = args
+                    .iter()
+                    .filter_map(expect_ref)
+                    .find_map(|arg| self.block_property_builders.get(arg).cloned())
+                else {
+                    return Ok(None);
+                };
+                if self.block_property_builders.contains_key(marker)
+                    || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
+                {
+                    self.block_property_builders
+                        .insert(marker.to_owned(), properties);
+                    let simple = owner.rsplit('/').next().unwrap_or(owner);
+                    self.block_game_classes
+                        .insert(marker.to_owned(), simple.to_owned());
+                }
+                Ok(Some(Value::Void))
             }
             ITEM_CLASS | BLOCK_CLASS if r.name == "<init>" => {
                 let Some(builder) = args.first().and_then(expect_ref) else {
@@ -4578,6 +4657,28 @@ impl Host for StdHost {
         Some(text)
     }
 
+    fn game_instance_of(&self, marker: &str, wanted: &str) -> Option<bool> {
+        let field = marker
+            .split_once('#')?
+            .1
+            .strip_prefix("net/minecraft/world/level/block/Blocks.")?;
+        let classes = self
+            .game_block_classes
+            .get(&format!("minecraft:{}", field.to_ascii_lowercase()))?;
+        let simple = wanted.rsplit('/').next().unwrap_or(wanted);
+        if wanted == "java/lang/Object" || classes.iter().any(|class| class == simple) {
+            return Some(true);
+        }
+        // The seeded chain runs from the block's own class up to `Block` (and
+        // its interfaces), so it can only rule out another class of the block
+        // package; anything else (`BlockBehaviour`, an outside interface)
+        // keeps the interpreter's own answer rather than a confident `false`.
+        let block_class = wanted
+            .strip_prefix("net/minecraft/world/level/block/")
+            .is_some_and(|name| !name.contains('/'));
+        block_class.then_some(false)
+    }
+
     fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
         let (bytes, index) = self.resource_streams.get_mut(marker)?;
         let start = (*index).min(bytes.len());
@@ -4810,6 +4911,24 @@ impl Host for StdHost {
                 "rarity/{}",
                 r.name.to_ascii_lowercase()
             )))),
+            // Any other game constant of a game type (`SoundType.WOOD`,
+            // `MapColor.STONE`, `Blocks.FIRE`) is one stable object of its
+            // declared type: the bounded host doesn't model its state, but
+            // identity and the declared type's `instanceof` hold, where null
+            // failed the first `Objects.requireNonNull` or `==` on it.
+            // Registries and resource keys keep their own rules above.
+            (owner, name, descriptor)
+                if owner.starts_with("net/minecraft/")
+                    && !owner.starts_with("net/minecraft/core/registries/")
+                    && game_object_type(descriptor).is_some() =>
+            {
+                let declared = game_object_type(descriptor).unwrap_or_default();
+                *self
+                    .opaque_game_constants
+                    .entry(format!("{owner}#{name}{descriptor}"))
+                    .or_default() += 1;
+                Ok(Value::Ref(Some(format!("{declared}#{owner}.{name}"))))
+            }
             _ => self.unknown_host_call(r),
         }
     }
@@ -9823,6 +9942,24 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ENCHANTMENT", "minecraft:enchantment"),
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
+
+/// The game class a field descriptor names (`Lnet/minecraft/...;`), if any.
+/// Registries and resource keys are excluded: an unknown one stays null, so a
+/// registration against it is reported rather than recorded against a guess.
+fn game_object_type(descriptor: &str) -> Option<&str> {
+    descriptor
+        .strip_prefix('L')
+        .and_then(|class| class.strip_suffix(';'))
+        .filter(|class| class.starts_with("net/minecraft/"))
+        .filter(|class| {
+            !matches!(
+                *class,
+                "net/minecraft/core/Registry"
+                    | "net/minecraft/core/WritableRegistry"
+                    | "net/minecraft/resources/ResourceKey"
+            )
+        })
+}
 
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
@@ -20413,6 +20550,9 @@ impl<H: Host> Runtime<'_, H> {
         if wanted == "java/lang/Object" {
             return true;
         }
+        if let Some(answer) = self.host.game_instance_of(marker, wanted) {
+            return answer;
+        }
         if generic_type_instance_of(marker, wanted) {
             return true;
         }
@@ -29179,6 +29319,158 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// A block built through a vanilla subclass's constructor takes a vanilla
+    /// block of that class as its template; an unknown class stays opaque.
+    #[test]
+    fn subclass_built_blocks_take_a_vanilla_template_of_their_class() {
+        let classes = BTreeMap::from([(
+            "minecraft:oak_fence".to_owned(),
+            vec![
+                "FenceBlock".into(),
+                "CrossCollisionBlock".into(),
+                "Block".into(),
+            ],
+        )]);
+        let mut host = StdHost::new().with_game_block_classes(Arc::new(classes));
+        let call = |owner: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: "<init>".into(),
+            descriptor: descriptor.into(),
+        };
+        let builder = Value::Ref(Some("props#1".into()));
+        host.invoke_instance(&call(BLOCK_PROPERTIES_CLASS, "()V"), &builder, &[])
+            .unwrap();
+        let properties = "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V";
+        let fence = Value::Ref(Some("fence#1".into()));
+        host.invoke_instance(
+            &call("net/minecraft/world/level/block/FenceBlock", properties),
+            &fence,
+            std::slice::from_ref(&builder),
+        )
+        .unwrap();
+        let odd = Value::Ref(Some("odd#1".into()));
+        host.invoke_instance(
+            &call(
+                "net/minecraft/world/level/block/NotAVanillaBlock",
+                properties,
+            ),
+            &odd,
+            std::slice::from_ref(&builder),
+        )
+        .unwrap();
+        match host.inferred_declaration("minecraft:block", &fence) {
+            Some(RegistryDeclaration::Block { template, .. }) => {
+                assert_eq!(template, "minecraft:oak_fence")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(host.inferred_declaration("minecraft:block", &odd).is_none());
+    }
+
+    /// With the game's block classes seeded, a vanilla block constant answers
+    /// `instanceof` for its real class chain and interfaces, and only those.
+    #[test]
+    fn seeded_block_classes_answer_instanceof() {
+        let classes = BTreeMap::from([(
+            "minecraft:fire".to_owned(),
+            vec![
+                "FireBlock".into(),
+                "BaseFireBlock".into(),
+                "Block".into(),
+                "ItemLike".into(),
+            ],
+        )]);
+        let mut host = StdHost::new().with_game_block_classes(Arc::new(classes));
+        let fire = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/Blocks".into(),
+                name: "FIRE".into(),
+                descriptor: "Lnet/minecraft/world/level/block/Block;".into(),
+            })
+            .unwrap();
+        let marker = expect_string(&fire).to_owned();
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/FireBlock"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/ItemLike"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/ChestBlock"),
+            Some(false)
+        );
+        // Outside the block package the chain can't rule anything out.
+        assert_eq!(
+            host.game_instance_of(
+                &marker,
+                "net/minecraft/world/level/block/state/BlockBehaviour"
+            ),
+            None
+        );
+        // An unseeded block keeps the interpreter's own answer.
+        assert_eq!(
+            host.game_instance_of(
+                "net/minecraft/world/level/block/Block#net/minecraft/world/level/block/Blocks.STONE",
+                "net/minecraft/world/level/block/FireBlock"
+            ),
+            None
+        );
+    }
+
+    /// A game constant (`SoundType.WOOD`, `Blocks.FIRE`) is a stable, typed
+    /// marker rather than null: the same field reads back the same object, so
+    /// `==` and the declared type's `instanceof` hold.
+    #[test]
+    fn game_constants_are_stable_typed_markers() {
+        let field = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let mut host = StdHost::new();
+        let wood = field(
+            "net/minecraft/world/level/block/SoundType",
+            "WOOD",
+            "Lnet/minecraft/world/level/block/SoundType;",
+        );
+        let first = host.get_static(&wood).unwrap();
+        assert_eq!(first, host.get_static(&wood).unwrap());
+        assert_eq!(
+            class_of_value(&first).as_deref(),
+            Some("net/minecraft/world/level/block/SoundType")
+        );
+        let fire = host
+            .get_static(&field(
+                "net/minecraft/world/level/block/Blocks",
+                "FIRE",
+                "Lnet/minecraft/world/level/block/Block;",
+            ))
+            .unwrap();
+        assert_eq!(
+            class_of_value(&fire).as_deref(),
+            Some("net/minecraft/world/level/block/Block")
+        );
+        assert_ne!(fire, first);
+        // Each opaque read is still recorded, so measurements stay honest.
+        assert_eq!(host.opaque_game_constant_count(), 3);
+        assert!(host.opaque_game_constant_reads().contains(&(
+            "net/minecraft/world/level/block/SoundType#WOODLnet/minecraft/world/level/block/SoundType;"
+                .to_owned(),
+            2
+        )));
+        // Registries keep their rule: an unknown one stays null.
+        let unknown_registry = host
+            .get_static(&field(
+                "net/minecraft/core/registries/Registries",
+                "NOT_A_REGISTRY",
+                "Lnet/minecraft/core/Registry;",
+            ))
+            .unwrap();
+        assert_eq!(unknown_registry, Value::Ref(None));
+    }
 
     /// A class with one static `m()V` that returns, the smallest shape the
     /// weaver accepts. Pool: 1 name, 2 Class 1, 3 `java/lang/Object`, 4 Class 3,
