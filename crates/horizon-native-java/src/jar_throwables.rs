@@ -12,24 +12,41 @@
 //!   table matches it as the JVM does, and [`throwable_is_instance`] walks the
 //!   JDK part of that chain for `instanceof`/`checkcast`.
 //! * A throw that leaves its frame is a `NativeError::UncaughtException`,
-//!   which carries the class, the message and the **origin**: the throwing
-//!   instruction (`Class#method +pc`) for an `athrow`, a fresh tag for a throw
-//!   the host makes of a jar's object (`Optional.orElseThrow(supplier)`). The
-//!   origin travels unchanged while the error unwinds. [`Runtime::throw_object`]
-//!   files the thrown object under it, and the handler that catches an error
-//!   with that origin, class and message gets the same object back
-//!   ([`Runtime::caught_object`]): identity, fields and cause survive.
+//!   which carries the class, the message and the **origin** (its `frame`):
+//!   the throwing instruction (`Class#method +pc`) for an `athrow`, `throw of
+//!   <class>` for a throw the host makes of a jar's object
+//!   (`Optional.orElseThrow(supplier)`), followed by this throw's own serial
+//!   number after [`TAG_SEPARATOR`]. The origin travels unchanged while the
+//!   error unwinds. [`Runtime::throw_object`] files the thrown object under it,
+//!   and only the handler that catches an error with that exact origin gets
+//!   the same object back ([`Runtime::caught_object`]): identity, fields and
+//!   cause survive.
 //!
-//! A throw the host raises itself (its own NPE) has no origin of this kind,
-//! so it never matches a filed object, and an object whose throw a JDK body
-//! swallowed stays filed under an origin no later throw can carry: only the
-//! same instruction throwing again reaches that key, and that throw files its
-//! own object. The table is thread-local (one execution runs on one thread)
-//! and bounded.
+//! The serial makes every throw's key unique, so no other error can ever
+//! carry it: not a host exception raised at the same pc (in an overload, or
+//! `throw null` at the `athrow` itself), not a later throw from the same
+//! instruction, not an earlier execution's uncaught throw. The error's
+//! `Display` hides the serial, so diagnostics read as before. The table is
+//! thread-local (one execution runs on one thread), bounded, and emptied
+//! when an execution starts ([`start_execution`]).
 
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+
+/// Separates an origin from its throw's serial number in an error's `frame`.
+pub(crate) const TAG_SEPARATOR: char = '\u{1f}';
+
+/// The part of an error's `frame` a diagnostic prints (without the serial).
+pub(crate) fn printed_frame(frame: &str) -> &str {
+    frame.split(TAG_SEPARATOR).next().unwrap_or(frame)
+}
+
+/// Forget every filed throw: an execution is starting on this thread, and
+/// nothing an earlier one threw can be caught in it.
+pub(crate) fn start_execution() {
+    FILED.with(|filed| filed.borrow_mut().clear());
+}
 
 /// Thrown objects kept at once; the oldest is dropped beyond this.
 const MAX_FILED: usize = 256;
@@ -42,14 +59,14 @@ thread_local! {
     static NEXT_TAG: Cell<u64> = const { Cell::new(0) };
 }
 
-/// A fresh origin for a throw made outside an `athrow` instruction.
-fn fresh_origin(class: &str) -> String {
+/// `origin` with a serial number no other throw on this thread carries.
+fn unique_origin(origin: &str) -> String {
     let tag = NEXT_TAG.with(|next| {
         let tag = next.get();
         next.set(tag.wrapping_add(1));
         tag
     });
-    format!("throw of {} #{tag}", class.replace('/', "."))
+    format!("{origin}{TAG_SEPARATOR}{tag}")
 }
 
 /// File `value` as the object thrown from `origin`; a newer throw from the
@@ -122,7 +139,9 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn throw_object(&mut self, value: &Value, origin: Option<String>) -> NativeError {
         let class = self.throwable_class(value);
         let message = self.thrown_text(value);
-        let origin = origin.unwrap_or_else(|| fresh_origin(&class));
+        let origin = unique_origin(
+            &origin.unwrap_or_else(|| format!("throw of {}", class.replace('/', "."))),
+        );
         file(&origin, &class, &message, value);
         NativeError::UncaughtException {
             class,
