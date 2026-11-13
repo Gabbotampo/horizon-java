@@ -36,9 +36,20 @@ impl State {
     /// Runs every jar once, the first time content is asked for, and keeps its runtime for the
     /// server lifecycle hooks. The game asks for blocks before items, so this guard also makes
     /// the two hooks one pass.
-    pub(crate) fn ensure_loaded(&mut self, context: &RegistrationContext) {
+    ///
+    /// `game_version` is the running game's Minecraft version as the game reports it
+    /// ([`registration_game_version`], or `ConfigHost::game_version` where a host exists). Every
+    /// jar's host is seeded with it, so `minecraft`'s mod container (Fabric's `getAllMods` and
+    /// `getModContainer`, FML's `ModList`) and `DetectedVersion`/`SharedConstants
+    /// .getCurrentVersion()` answer the game's own value. `None` leaves both unanswered (counted),
+    /// as the runtime does for a host that was not told, rather than inventing a release.
+    pub(crate) fn ensure_loaded(
+        &mut self,
+        context: &RegistrationContext,
+        game_version: Option<&str>,
+    ) {
         let owned = owned_namespaces(context);
-        self.ensure_loaded_with(read_jar_files, &owned);
+        self.ensure_loaded_with(read_jar_files, &owned, game_version);
     }
 
     /// [`State::ensure_loaded`] with the folder read injected, so a test can count how often the
@@ -47,6 +58,7 @@ impl State {
         &mut self,
         read: impl FnOnce() -> Vec<(String, Vec<u8>)>,
         owned: &[String],
+        game_version: Option<&str>,
     ) {
         if self.loaded {
             return;
@@ -100,7 +112,7 @@ impl State {
                     (file.clone(), Arc::clone(jar))
                 })
                 .collect();
-            match load_jar(file, jar, &links, &imc) {
+            match load_jar(file, jar, &links, &imc, game_version) {
                 Ok(loaded) => {
                     log::info!("{LOG}: {}", loaded.row);
                     self.jars.push(loaded);
@@ -203,6 +215,20 @@ pub(crate) fn owned_namespaces(context: &RegistrationContext) -> Vec<String> {
     }
 }
 
+/// The game's Minecraft version from a registration context (`RegistrationContext::game_version`,
+/// which the game captures before the first registration hook).
+///
+/// That accessor panics on a context made without the game's registration data (the fallback in
+/// `HorizonJava::ensure_jars` makes one at server start). The instance folder comes from the same
+/// data (`RegistrationContext::new` takes both from it), so its presence says the version may be
+/// asked; without it the caller has a host to ask instead.
+pub(crate) fn registration_game_version(context: &RegistrationContext) -> Option<&str> {
+    context
+        .instance_dir()
+        .is_ok()
+        .then(|| context.game_version())
+}
+
 /// Whether `id` (`namespace:path`) is in one of `owned`'s namespaces.
 fn owns(owned: &[String], id: &str) -> bool {
     id.split_once(':')
@@ -247,7 +273,7 @@ pub(crate) fn declare_blocks(
     context: &RegistrationContext,
     event: &mut BlocksEvent<'_>,
 ) {
-    state.ensure_loaded(context);
+    state.ensure_loaded(context, registration_game_version(context));
     let owned = owned_namespaces(context);
     let mut declared = BTreeSet::new();
     let mut count = 0;
@@ -300,7 +326,7 @@ pub(crate) fn declare_items(
     context: &RegistrationContext,
     event: &mut ItemsEvent<'_>,
 ) {
-    state.ensure_loaded(context);
+    state.ensure_loaded(context, registration_game_version(context));
     let owned = owned_namespaces(context);
     let mut declared = BTreeSet::new();
     let mut count = 0;
@@ -536,6 +562,7 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         state.ensure_loaded_with(
             || {
@@ -543,6 +570,7 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         assert_eq!(reads, 1);
         assert!(state.loaded);
@@ -560,6 +588,7 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         state.reset_server();
         state.ensure_loaded_with(
@@ -568,6 +597,7 @@ mod tests {
                 Vec::new()
             },
             &[],
+            None,
         );
         assert_eq!(reads, 1);
         assert!(state.loaded);
@@ -589,6 +619,7 @@ mod tests {
                 ]
             },
             &[],
+            None,
         );
         assert_eq!(state.jars.len(), 2);
         let sent = state.jars[0].host.take_stdout();
@@ -622,7 +653,7 @@ mod tests {
     fn the_content_pass_runs_neoforges_loading_stages() {
         let bytes = runtime::neoforge_lifecycle::tests::fixture_jar_bytes().to_vec();
         let mut state = State::default();
-        state.ensure_loaded_with(|| vec![("life.jar".to_owned(), bytes)], &[]);
+        state.ensure_loaded_with(|| vec![("life.jar".to_owned(), bytes)], &[], None);
         let jar = &mut state.jars[0];
         let printed = jar.host.take_stdout();
         for line in [

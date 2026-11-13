@@ -198,6 +198,10 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(text) = self.string_builders.get(marker) {
             return Ok(Some(Value::Ref(Some(text.clone()))));
         }
+        // A host map entry prints `key=value` (`host_entry.rs`).
+        if let Some(text) = self.host_entry_text(value, class, method)? {
+            return Ok(Some(text));
+        }
         if object_marker_class(marker).is_none() {
             return Ok(None);
         }
@@ -224,6 +228,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<String, NativeError> {
+        if let Value::Host(_) = value
+            && let Some(text) = self.host.modelled_to_string(value)
+        {
+            return Ok(text);
+        }
         if matches!(value, Value::Ref(Some(_))) {
             match self.runtime_value_of(value, class, method)? {
                 Some(Value::Ref(Some(text))) => return Ok(text),
@@ -252,13 +261,16 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
-        // A virtual `toString()` on a jar object. `invokespecial` (a
-        // `super.toString()`) keeps its symbolic owner.
+        // A virtual `toString()` on a jar object or a host map entry.
+        // `invokespecial` (a `super.toString()`) keeps its symbolic owner.
         if r.name == "toString"
             && r.descriptor == TO_STRING
             && matches!(opcode, 0xb6 | 0xb9)
             && let Some(receiver) = receiver
         {
+            if let Some(text) = self.host_entry_text(receiver, class, method)? {
+                return Ok(Some(text));
+            }
             return self.jar_to_string(receiver, class, method);
         }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
