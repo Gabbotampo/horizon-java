@@ -445,8 +445,10 @@ fn record_generated_object_methods_match_java() {
     let fixture = Fixture::build("record-java");
     assert_eq!(fixture.text("recordToString"), "Point[x=3, y=4]");
     assert_eq!(fixture.call("recordEquals", "()Z").unwrap(), Value::Int(1));
-    // `Point(3, 4)` hashes to 31 * (31 * 1 + 3) + 4 in the JVM.
-    assert_eq!(fixture.call("recordHash", "()I").unwrap(), Value::Int(1058));
+    // `ObjectMethods` folds `31 * h + hash(c)` from `0`: `Point(3, 4)` is
+    // `31 * 3 + 4` (OpenJDK 25.0.5 prints 97; this test used to pin 1058,
+    // the fold from `1`, which no JDK computes).
+    assert_eq!(fixture.call("recordHash", "()I").unwrap(), Value::Int(97));
 }
 
 #[test]
