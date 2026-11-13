@@ -51,6 +51,7 @@ mod guava_text;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
+mod host_list_iterator;
 mod jar_operands;
 mod jar_text;
 mod java_format;
@@ -2542,6 +2543,8 @@ pub struct StdHost {
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    /// `listIterator()`s over host lists (`host_list_iterator.rs`).
+    list_iterators: BTreeMap<String, host_list_iterator::ListIter>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -2659,6 +2662,7 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            list_iterators: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
@@ -6939,6 +6943,10 @@ impl Host for StdHost {
         // responsibility.
         if r.name == "isCanceled" && r.descriptor == "()Z" {
             return Ok(Value::Int(event_is_cancelled(receiver) as i32));
+        }
+        // `listIterator` on a host list, and its iterator (`host_list_iterator.rs`).
+        if let Some(result) = self.list_iterator_call(r, receiver, args) {
+            return result;
         }
         if r.name == "iterator"
             && r.descriptor.starts_with("()L")
@@ -24135,6 +24143,13 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.list_iterator_for_each(&r, receiver.as_ref(), &args)
+                    ) {
+                        // A host list iterator's `forEachRemaining` with a jar
+                        // callback (`host_list_iterator.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
