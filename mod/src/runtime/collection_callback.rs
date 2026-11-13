@@ -10,7 +10,7 @@
 //! collects the levels with `Iterable.forEach`, the list stayed empty, and the
 //! next `List.get(0)` threw — `docs/in-game-survey.md`, "Top causes" §5).
 //!
-//! These three members are answered here, in the interpreter, before the host
+//! These members are answered here, in the interpreter, before the host
 //! sees the call:
 //!
 //! * `forEach(Consumer)` on a collection: `accept` once per element, in
@@ -20,6 +20,17 @@
 //! * `removeIf(Predicate)` on a collection: `test` once per element, and the
 //!   elements it does not select stay, in their original order; the answer is
 //!   whether anything was removed (the JDK's `Collection.removeIf` contract).
+//! * `forEachRemaining(Consumer)` on a host collection's iterator: `next()`
+//!   and `accept` once per remaining element. The host's own answer drained
+//!   the iterator without running the action. When the action throws, the
+//!   iterator is left where JDK 25's class leaves it: `ArrayList.Itr` writes
+//!   its cursor only after the loop (so it resumes at the first remaining
+//!   element), `LinkedList.ListItr` advances after each `accept` returns (so
+//!   it resumes at the element that threw), `ArrayDeque`'s iterator is
+//!   exhausted before the loop, and the `Iterator.forEachRemaining` default
+//!   (`List.of`, the hash and tree sets, a map's views) has already passed
+//!   the element. An iterator whose JDK class the host does not record
+//!   (a list a collector built, an unmodifiable view) is counted then.
 //!
 //! The callback is whichever of the two shapes the value is: an indy lambda or
 //! method reference (`Runtime::invoke_callback`), or an object of a jar class
@@ -61,6 +72,14 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if matches!(
+            r.owner.as_str(),
+            "java/util/Iterator" | "java/util/ListIterator"
+        ) && r.name == "forEachRemaining"
+            && r.descriptor == "(Ljava/util/function/Consumer;)V"
+        {
+            return self.iterator_for_each_remaining(r, receiver, args);
+        }
         if !is_collection_owner(&r.owner) {
             return Ok(None);
         }
@@ -115,6 +134,62 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `forEachRemaining(action)` on a host iterator, as its JDK 25 class
+    /// runs it.
+    fn iterator_for_each_remaining(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(it) = receiver else {
+            return Ok(None);
+        };
+        let Some(marker) = crate::runtime::expect_ref(it).cloned() else {
+            return Ok(None);
+        };
+        let Some((start, len, source)) = self.host.host_iterator(&marker) else {
+            return Ok(None);
+        };
+        let action = args.first().cloned().unwrap_or(Value::Ref(None));
+        if action == Value::Ref(None) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let mut at = start;
+        while at < len {
+            let element = self.host.host_iterator_next(&marker)?;
+            at += 1;
+            let ran = match self.run_functional(ACCEPT_OBJECT, &action, &[element]) {
+                Ok(ran) => ran,
+                Err(error) => {
+                    let resume = match iteration_kind(source.as_deref()) {
+                        IterationKind::CursorAtEnd => Some(start),
+                        IterationKind::AdvanceAfterAccept => Some(at - 1),
+                        IterationKind::Exhausted => Some(len),
+                        IterationKind::Default => None,
+                        IterationKind::Unrecorded => {
+                            self.host.unknown_operand_call(r)?;
+                            None
+                        }
+                    };
+                    if let Some(resume) = resume {
+                        self.host.set_host_iterator_cursor(&marker, resume);
+                    }
+                    return Err(error);
+                }
+            };
+            if !ran {
+                // An action the runtime cannot run (a host marker).
+                self.host.unknown_operand_call(r)?;
+            }
+        }
+        Ok(Some(Value::Void))
     }
 
     /// Run one functional-interface call on `callback`, answering whether it
@@ -188,4 +263,42 @@ fn owned_values(values: &[String]) -> Result<Vec<Value>, NativeError> {
         .iter()
         .map(|value| parse_collection_value(value))
         .collect()
+}
+
+/// Where a JDK iterator's `forEachRemaining` leaves its cursor when the
+/// action throws.
+enum IterationKind {
+    /// `ArrayList.Itr`/`Vector.Itr`: cursor and `lastRet` are written once,
+    /// after the loop.
+    CursorAtEnd,
+    /// `LinkedList.ListItr`: advances after each `accept` returns.
+    AdvanceAfterAccept,
+    /// `ArrayDeque`'s iterator: `remaining = 0` before the loop.
+    Exhausted,
+    /// `Iterator.forEachRemaining`: `action.accept(next())`.
+    Default,
+    /// The host does not record which JDK class the iterator is.
+    Unrecorded,
+}
+
+/// The `forEachRemaining` of the iterator over a host collection whose class
+/// (or encoded kind) is `source`.
+fn iteration_kind(source: Option<&str>) -> IterationKind {
+    match source {
+        Some("java/util/ArrayList" | "java/util/Vector" | "java/util/Stack") => {
+            IterationKind::CursorAtEnd
+        }
+        Some("java/util/LinkedList") => IterationKind::AdvanceAfterAccept,
+        Some("java/util/ArrayDeque") => IterationKind::Exhausted,
+        // `Set.of`/`Collectors.toSet()` values and a map's key, value and
+        // entry views iterate with the default, as do these classes.
+        Some(
+            "set"
+            | "java/util/HashSet"
+            | "java/util/LinkedHashSet"
+            | "java/util/TreeSet"
+            | "java/util/PriorityQueue",
+        ) => IterationKind::Default,
+        _ => IterationKind::Unrecorded,
+    }
 }
