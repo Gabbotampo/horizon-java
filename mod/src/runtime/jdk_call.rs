@@ -412,4 +412,11 @@ impl<H: Host> Runtime<'_, H> {
             other => other,
         })
     }
+
+    /// Whether `error` is a Java exception a `catch (catch_class)` in a JDK
+    /// body would catch.
+    pub(crate) fn catches(&self, error: &NativeError, catch_class: &str) -> bool {
+        matches!(error, NativeError::UncaughtException { class, .. }
+            if exception_is_subtype(self.classes, &self.linked, class, catch_class))
+    }
 }

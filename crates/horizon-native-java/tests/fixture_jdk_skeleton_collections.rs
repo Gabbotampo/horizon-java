@@ -1,5 +1,6 @@
-//! Jar subclasses of `AbstractCollection` run the JDK's template bodies
-//! exactly (`jdk_skeletons/`).
+//! Jar subclasses of `AbstractCollection`, `AbstractSet` and `AbstractQueue`,
+//! and jar classes inheriting the `Iterable`, `Collection` and `Iterator`
+//! defaults, run the JDK's template bodies exactly (`jdk_skeletons/`).
 //!
 //! The probe's classes log every call the JDK makes into them; each expected
 //! line is OpenJDK 25.0.5's output for the same probe method
@@ -457,6 +458,89 @@ public final class Probe {
     }
 }
 "#;
+
+#[test]
+fn interface_defaults_runs_as_jdk_25_does() {
+    check(&[
+        (
+            "toArrayGenerator",
+            "size iterator hasNext0 next0 hasNext1 next1 hasNext2 => 2:ab",
+        ),
+        (
+            "removeUnsupported",
+            "iterator hasNext0 next0 hasNext1 next1 => java.lang.UnsupportedOperationException:remove",
+        ),
+        (
+            "removeIf",
+            "iterator hasNext0 next0 hasNext1 next1 remove1 hasNext1 next1 hasNext2 next2 remove2 hasNext2 iterator hasNext0 next0 hasNext1 next1 hasNext2 => true:[a, c]",
+        ),
+        ("removeIfNone", "iterator hasNext0 next0 hasNext1 => false"),
+        ("removeIfNull", " => java.lang.NullPointerException:null"),
+        (
+            "forEach",
+            "iterator hasNext0 next0 hasNext1 next1 hasNext2 => ab",
+        ),
+        ("iterableForEach", "iterator => xy"),
+        (
+            "forEachRemaining",
+            "iterator next0 hasNext1 next1 hasNext2 next2 hasNext3 => bc",
+        ),
+        (
+            "iteratorRemoveDefault",
+            "iterator next0 => java.lang.UnsupportedOperationException:remove",
+        ),
+        (
+            "stream",
+            "iterator size hasNext0 next0 hasNext1 next1 hasNext2 next2 hasNext3 => 2",
+        ),
+    ]);
+}
+
+#[test]
+fn abstract_set_runs_as_jdk_25_does() {
+    check(&[
+        (
+            "setEquals",
+            "size iterator hasNext0 next0 hasNext1 next1 iterator hasNext0 next0 size => true,false,true,false",
+        ),
+        (
+            "setHashCode",
+            "iterator hasNext0 next0 hashab hasNext1 next1 hasNext2 next2 hashc hasNext3 => 3",
+        ),
+        (
+            "setRemoveAllSmallArgument",
+            "size setRemovec iterator hasNext0 next0 hasNext1 next1 hasNext2 next2 remove2 setRemovez iterator hasNext0 next0 hasNext1 next1 hasNext2 iterator hasNext0 next0 hasNext1 next1 hasNext2 => true:[a, b]",
+        ),
+        (
+            "setRemoveAllLargeArgument",
+            "size iterator hasNext0 next0 hasNext1 next1 remove1 hasNext1 iterator hasNext0 next0 hasNext1 => true:[a]",
+        ),
+    ]);
+}
+
+#[test]
+fn abstract_queue_runs_as_jdk_25_does() {
+    check(&[
+        (
+            "queueAdd",
+            "offera offerb => java.lang.IllegalStateException:Queue full",
+        ),
+        (
+            "queueRemoveElement",
+            "offera peek poll poll => aa|java.util.NoSuchElementException:null",
+        ),
+        (
+            "queueElementEmpty",
+            "peek => java.util.NoSuchElementException:null",
+        ),
+        ("queueClearAddAll", "offera offerb poll poll poll => true:0"),
+        (
+            "queueAddAllSelf",
+            " => java.lang.IllegalArgumentException:null",
+        ),
+        ("queueAddAllNull", " => java.lang.NullPointerException:null"),
+    ]);
+}
 
 #[test]
 fn abstract_collection_runs_as_jdk_25_does() {

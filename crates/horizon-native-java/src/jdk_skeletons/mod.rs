@@ -50,20 +50,32 @@ use super::*;
 use crate::jdk_call::{Site, throw};
 
 mod collection;
+mod defaults;
+mod set_queue;
 
 /// The file whose body runs a selected JDK member.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Body {
     /// `collection.rs`: `AbstractCollection`.
     Collection,
+    /// `set_queue.rs`: `AbstractSet`, `AbstractQueue`.
+    SetQueue,
+    /// `defaults.rs`: a JDK interface default.
+    Default,
 }
 
 /// Which file implements `owner.name descriptor`, if any.
 fn body_for(owner: &str, name: &str, descriptor: &str) -> Option<Body> {
     let key = (owner, name, descriptor);
-    collection::BODIES
-        .contains(&key)
-        .then_some(Body::Collection)
+    if collection::BODIES.contains(&key) {
+        Some(Body::Collection)
+    } else if set_queue::BODIES.contains(&key) {
+        Some(Body::SetQueue)
+    } else if defaults::BODIES.contains(&key) {
+        Some(Body::Default)
+    } else {
+        None
+    }
 }
 
 /// `java.util.AbstractCollection`.
@@ -293,6 +305,9 @@ impl<H: Host> Runtime<'_, H> {
         let Some(body) = body_for(owner, &r.name, &r.descriptor) else {
             return Ok(None);
         };
+        if body == Body::Default && !self.default_runs_here(owner, &r.name, this) {
+            return Ok(None);
+        }
         if !frame_bound::admits_frame(self.depth) {
             return Err(NativeError::CallDepthExceeded {
                 class: owner.to_owned(),
@@ -305,6 +320,8 @@ impl<H: Host> Runtime<'_, H> {
         let (name, descriptor) = (r.name.as_str(), r.descriptor.as_str());
         let result = match body {
             Body::Collection => self.collection_body(owner, name, descriptor, this, args),
+            Body::SetQueue => self.set_queue_body(owner, name, descriptor, this, args),
+            Body::Default => self.interface_default_body(owner, name, descriptor, this, args),
         };
         stack_walk::leave();
         self.depth -= 1;
@@ -431,6 +448,18 @@ impl<H: Host> Runtime<'_, H> {
         Ok(truth(&answer))
     }
 
+    /// `value.hashCode()` (`invokevirtual Object.hashCode`).
+    fn virtual_hash(&mut self, value: &Value) -> Result<i32, NativeError> {
+        Ok(int_of(&self.call_virtual(
+            Site::Virtual,
+            "java/lang/Object",
+            "hashCode",
+            "()I",
+            value,
+            &[],
+        )?))
+    }
+
     /// `String.valueOf(value)`, as `StringBuilder.append(Object)` prints it.
     fn virtual_text(&mut self, value: &Value) -> Result<String, NativeError> {
         let text = self.call_static(
@@ -440,6 +469,18 @@ impl<H: Host> Runtime<'_, H> {
             std::slice::from_ref(value),
         )?;
         Ok(expect_ref(&text).cloned().unwrap_or_else(|| "null".into()))
+    }
+
+    /// One functional-interface call (`Consumer.accept`, `Predicate.test`).
+    fn call_functional(
+        &mut self,
+        interface: &str,
+        name: &str,
+        descriptor: &str,
+        callback: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        self.call_virtual(Site::Interface, interface, name, descriptor, callback, args)
     }
 
     // ---- arrays a JDK body builds ----
