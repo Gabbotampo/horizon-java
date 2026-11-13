@@ -9,8 +9,10 @@
 //! * `Counted`: Java's answer needs something no run can reproduce (an
 //!   identity hash, the order of a `Set.of`) or the runtime does not model
 //!   yet, and the run says so by counting an unknown call;
-//! * `Gap`: a named departure that is still silent, listed with its plan
-//!   (not asserted, so it cannot pass for an answer).
+//! * `Departs`: a named departure: the runtime's exact answer, which differs
+//!   from Java's in the way `why` says (asserted, uncounted);
+//! * `Gap`: a known silent difference, listed with its plan (not asserted,
+//!   so it cannot pass for an answer).
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
@@ -22,6 +24,11 @@ use javac_fixture::Fixture;
 enum Outcome {
     Exact(&'static str),
     Counted,
+    Departs {
+        native: &'static str,
+        #[allow(dead_code)]
+        why: &'static str,
+    },
     #[allow(dead_code)]
     Gap(&'static str),
 }
@@ -86,18 +93,19 @@ const CASES: &[(&str, &str, Outcome)] = &[
     (
         "Rv",
         "b5Arrays",
-        Gap("F6 (#162): a cast to a handle class passes"),
+        Exact(
+            "class java.util.Optional cannot be cast to class [Ljava.lang.String; (java.util.Optional and [Ljava.lang.String; are in module java.base of loader 'bootstrap')|class java.util.Optional cannot be cast to class [Ljava.lang.Object; (java.util.Optional and [Ljava.lang.Object; are in module java.base of loader 'bootstrap')|class java.util.Optional cannot be cast to class [I (java.util.Optional and [I are in module java.base of loader 'bootstrap')",
+        ),
     ),
     (
         "Rv",
         "b5Jar",
-        Gap("F6 (#162): a cast to a handle class passes"),
+        Departs {
+            native: "class java.util.Optional cannot be cast to class demo.Rv$Node|class demo.Rv$Node cannot be cast to class java.util.Optional|class java.util.OptionalInt cannot be cast to class demo.Rv$Rec",
+            why: "a jar class's ClassCastException leaves out the JVM's module/loader clause (the loader is not known outside a JVM), checkcast.rs",
+        },
     ),
-    (
-        "Rv",
-        "b5Others",
-        Gap("F6 (#162): a cast to a handle class passes"),
-    ),
+    ("Rv", "b5Others", Counted),
     (
         "Rv",
         "b5Boxes",
@@ -115,7 +123,9 @@ const CASES: &[(&str, &str, Outcome)] = &[
     (
         "Rv",
         "b5Null",
-        Gap("F6 (#162): a cast to a handle class passes"),
+        Exact(
+            "ok:null|false|falsefalse|truefalsefalse|trueOptional|Cannot cast java.lang.String to java.util.Optional|Cannot cast java.util.Optional to java.lang.String",
+        ),
     ),
     ("Rv", "b5Spelled", Counted),
     ("Rv", "b6IdentityMapOps", Counted),
@@ -163,18 +173,17 @@ const CASES: &[(&str, &str, Outcome)] = &[
     (
         "Rv2",
         "c1",
-        Gap("F6 (#162): a cast to a handle class passes"),
+        Exact("Cannot cast demo.Rv2$Node to java.util.Optional"),
     ),
     (
         "Rv2",
         "c2",
-        Gap("F6 (#162): a cast to a handle class passes"),
+        Departs {
+            native: "class demo.Rv2$Node cannot be cast to class java.util.Optional",
+            why: "a jar class's ClassCastException leaves out the JVM's module/loader clause (the loader is not known outside a JVM), checkcast.rs",
+        },
     ),
-    (
-        "Rv2",
-        "c3",
-        Gap("F6 (#162): a cast to a handle class passes"),
-    ),
+    ("Rv2", "c3", Counted),
     ("Rv2", "c4", Exact("falsefalse")),
     (
         "Rv2",
@@ -293,12 +302,17 @@ fn host_values_answer_as_java_25_or_count() {
                     && unknown.is_empty()
             }
             Counted => !unknown.is_empty(),
+            Departs { native, .. } => {
+                matches!(&answer, Ok(Value::Ref(Some(text))) if text == native)
+                    && unknown.is_empty()
+            }
             Gap(_) => true,
         };
         if !ok {
             let expected = match outcome {
                 Exact(text) => format!("exact {text}"),
                 Counted => "counted".to_owned(),
+                Departs { native, why } => format!("departs ({why}) {native}"),
                 Gap(_) => unreachable!(),
             };
             failures.push(format!(

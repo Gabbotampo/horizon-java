@@ -528,6 +528,26 @@ impl<H: Host> Runtime<'_, H> {
         if is_null || instance {
             return Ok(Some(value));
         }
+        // A host handle, or a cast to a handle kind's class (`checkcast.rs`):
+        // `Cannot cast <getClass().getName()> to <getName()>`, or counted.
+        match self.host_cast(&value, &wanted) {
+            Some(crate::checkcast::HostCast::Throws(class)) => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/ClassCastException".into(),
+                    message: Some(format!(
+                        "Cannot cast {} to {}",
+                        class.replace('/', "."),
+                        wanted.replace('/', ".")
+                    )),
+                    frame: None,
+                });
+            }
+            Some(crate::checkcast::HostCast::Unknown) => {
+                self.count_cast(&value, &wanted)?;
+                return Ok(Some(value));
+            }
+            Some(crate::checkcast::HostCast::Fits) | None => {}
+        }
         // Only a class the runtime can judge throws; anything else keeps the
         // value, as the opcode-level `checkcast` does.
         if self.class(&wanted).is_some() {
