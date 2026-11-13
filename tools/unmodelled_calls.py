@@ -222,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                         "kind": kind,
                         "unknown": unknown,
                         "calls": calls,
+                        "parked_threads": result.get("parked_threads") or [],
                         "deps": [dep.name for dep in deps],
                         "missing": missing,
                     }
@@ -229,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                         row["failed"] = [str(item)[:400] for item in result["failed"]]
                     rows.append(row)
                 else:
-                    rows.append({
+                    row = {
                         "jar": jar.name,
                         "verdict": "refused",
                         "kind": kind,
@@ -237,14 +238,25 @@ def main(argv: list[str] | None = None) -> int:
                         "error": str(result.get("error"))[:400],
                         "deps": [dep.name for dep in deps],
                         "missing": missing,
-                    })
+                    }
+                    # The calls the jar counted before it stopped. Kept for
+                    # reading why it was refused; the ranking and totals stay
+                    # over runs that finished, so they are not aggregated.
+                    before = result.get("unknown_host_calls")
+                    if isinstance(before, list) and before:
+                        row["counted_before_error"] = before
+                    if result.get("parked_threads"):
+                        row["parked_threads"] = result["parked_threads"]
+                    rows.append(row)
         report[name] = {"directory": str(directory), "rows": rows}
 
-    totals, ranked = aggregate({name: data["rows"] for name, data in report.items()})
-    print(json.dumps({"totals": totals, "ranked": ranked[:MAX_REPORTED],
+    rows_by_corpus = {name: data["rows"] for name, data in report.items()}
+    totals, ranked = aggregate(rows_by_corpus)
+    parked = parked_summary(rows_by_corpus)
+    print(json.dumps({"totals": totals, "ranked": ranked[:MAX_REPORTED], "parked": parked,
                       "corpora": report}, indent=2))
     if args.json:
-        args.json.write_text(json.dumps({"totals": totals, "ranked": ranked,
+        args.json.write_text(json.dumps({"totals": totals, "ranked": ranked, "parked": parked,
                                         "corpora": report}, indent=2))
     return 0
 
@@ -284,6 +296,31 @@ def aggregate(corpora: dict[str, list[dict]]) -> tuple[dict, list[dict]]:
         key=lambda entry: (-entry["sole"], -entry["jars"], -entry["calls"], entry["call"]),
     )
     return totals, ranked
+
+
+def parked_summary(corpora: dict[str, list[dict]]) -> list[dict]:
+    """What the counted `Thread.start` calls would have run, ranked by jars.
+
+    The probe names each started thread's `Runnable` (`parked_threads`): a parked
+    night-config file watcher (`FileWatcher$FsWatcher`) is not the gap an update
+    checker is, though both count as `java/lang/Thread#start()V`. A jar counts
+    once per runnable however many threads of it it started; refused jars count
+    too, since the threads they started before stopping are as real.
+    """
+    hits: dict[str, dict] = defaultdict(lambda: {"jars": set(), "threads": 0})
+    for name, rows in corpora.items():
+        for row in rows:
+            for thread in row.get("parked_threads") or []:
+                if not isinstance(thread, dict):
+                    continue
+                hit = hits[str(thread.get("runnable"))]
+                hit["jars"].add((name, row.get("jar")))
+                hit["threads"] += 1
+    return sorted(
+        ({"runnable": runnable, "jars": len(hit["jars"]), "threads": hit["threads"]}
+         for runnable, hit in hits.items()),
+        key=lambda entry: (-entry["jars"], -entry["threads"], entry["runnable"]),
+    )
 
 
 if __name__ == "__main__":

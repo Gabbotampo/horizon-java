@@ -25,8 +25,10 @@
 //! - **Registries.** `registryAccess()` (server, level or player) is one
 //!   registry-access marker; `lookupOrThrow(key)` answers a registry marker
 //!   for a registry the game listed, whose `containsKey`, `keySet` and `size`
-//!   answer from the ids it holds. A registry the game did not list refuses:
-//!   unknown to Horizon is not the same as missing in vanilla.
+//!   answer from the ids it holds; `keySet` iterates in vanilla's `HashMap`
+//!   order, rebuilt from the registration order the game gives. A registry
+//!   the game did not list refuses: unknown to Horizon is not the same as
+//!   missing in vanilla.
 //! - **Networking.** `ServerPlayNetworking.canSend(player, type)` answers
 //!   whether that player's client takes the channel ([`ServerFacts::client_channels`]).
 //!
@@ -59,16 +61,11 @@ use std::{
 };
 
 use crate::runtime::{
-    MethodRef, NativeError, Value, boolean_value, collection_value, expect_ref, identifier_parse,
-    path_join, path_value, stable_hash,
+    MethodRef, NativeError, Value, collection_value, expect_ref, identifier_parse, path_join,
+    path_value, stable_hash,
 };
 
-/// A game rule's value as the game holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GameRuleValue {
-    Bool(bool),
-    Int(i32),
-}
+pub use crate::runtime::game_rules::GameRuleValue;
 
 /// What the game knows about the running server, beyond the per-object facts
 /// each firing passes. Every fact is optional in effect: an empty map or a
@@ -82,6 +79,11 @@ pub struct ServerFacts {
     pub game_rules: BTreeMap<String, GameRuleValue>,
     /// Registries the game lists by id (`minecraft:block`) → their entry ids.
     pub registries: BTreeMap<String, Arc<BTreeSet<String>>>,
+    /// The same registries' ids in the order vanilla registers them
+    /// (`MappedRegistry.register`), which decides `keySet()`'s `HashMap`
+    /// iteration order (`hash_map_order.rs`). A listed registry with no order
+    /// here refuses `keySet()` rather than answering some other order.
+    pub registration_order: BTreeMap<String, Arc<Vec<String>>>,
     /// Per player UUID, the payload channels that player's client takes.
     /// A player with no entry takes none (a vanilla client).
     pub client_channels: BTreeMap<u128, BTreeSet<String>>,
@@ -150,14 +152,11 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
                 .find(|(field, _)| *field == r.name)
                 .map(|(_, id)| marker(format!("{LEVEL_RESOURCE}{id}")))
         }
-        GAME_RULES_CLASS
-            if r.descriptor == "Lnet/minecraft/world/level/gamerules/GameRule;"
-                && r.name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') =>
-        {
-            Some(marker(format!(
-                "{GAME_RULE}{}",
-                r.name.to_ascii_lowercase()
-            )))
+        // Only the rules the 26.3 jar declares: another name is no field of
+        // vanilla's `GameRules`, and stays counted.
+        GAME_RULES_CLASS if r.descriptor == "Lnet/minecraft/world/level/gamerules/GameRule;" => {
+            crate::runtime::game_rules::by_field(&r.name)
+                .map(|_| marker(format!("{GAME_RULE}{}", r.name.to_ascii_lowercase())))
         }
         _ => None,
     }
@@ -323,13 +322,7 @@ pub(crate) fn answer(
         _ => {}
     }
     if let Some(id) = text.strip_prefix(GAME_RULE) {
-        return match (r.name.as_str(), descriptor) {
-            ("id" | "toString", "()Ljava/lang/String;") => Ok(marker(id)),
-            ("getIdentifier", "()Lnet/minecraft/resources/Identifier;") => {
-                Ok(identifier_parse(&format!("minecraft:{id}")))
-            }
-            _ => refuse(r),
-        };
+        return crate::runtime::game_rules::rule_member(id, r, args).map_or_else(|| refuse(r), Ok);
     }
     if let Some(id) = text.strip_prefix(LEVEL_RESOURCE) {
         return match (r.name.as_str(), descriptor) {
@@ -338,29 +331,30 @@ pub(crate) fn answer(
         };
     }
     if text == RULES {
-        let rule = args
+        let id = args
             .first()
             .and_then(expect_ref)
-            .and_then(|t| t.strip_prefix(GAME_RULE))
-            .and_then(|id| facts.game_rules.get(id));
-        return match (r.name.as_str(), descriptor, rule) {
-            (
-                "get",
-                "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;",
-                Some(value),
-            ) => Ok(match value {
-                GameRuleValue::Bool(b) => boolean_value(*b),
-                GameRuleValue::Int(i) => marker(format!("integer:{i}")),
-            }),
+            .and_then(|t| t.strip_prefix(GAME_RULE));
+        let read: fn(GameRuleValue) -> Value = match (r.name.as_str(), descriptor) {
+            ("get", "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;") => {
+                GameRuleValue::boxed
+            }
+            // `gameRule.serialize(get(gameRule))`: `value.toString()`.
             (
                 "getAsString",
                 "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/String;",
-                Some(value),
-            ) => Ok(marker(match value {
-                GameRuleValue::Bool(b) => b.to_string(),
-                GameRuleValue::Int(i) => i.to_string(),
-            })),
-            _ => refuse(r),
+            ) => |value: GameRuleValue| marker(value.serialized()),
+            _ => return refuse(r),
+        };
+        // The world's value, as the game holds it now. A rule the world
+        // lacks throws as vanilla's `get` does when vanilla lacks it too (a
+        // feature-gated rule); any other absence refuses.
+        return match id.map(|id| (id, facts.game_rules.get(id))) {
+            Some((_, Some(value))) => Ok(read(*value)),
+            Some((id, None)) => Err(crate::runtime::game_rules::missing_value(id)
+                .filter(|_| !facts.game_rules.is_empty())
+                .unwrap_or_else(|| NativeError::UnknownHostCall(r.clone()))),
+            None => refuse(r),
         };
     }
     if text == LAYERED {
@@ -409,8 +403,26 @@ pub(crate) fn answer(
                     wanted.is_some_and(|wanted| entries.contains(&wanted)),
                 )))
             }
+            // `Collections.unmodifiableSet(byLocation.keySet())`: the ids in
+            // the bucket order of the `HashMap` vanilla registered them into.
             ("keySet", "()Ljava/util/Set;") => {
-                let keys: Vec<Value> = entries.iter().map(|id| identifier_parse(id)).collect();
+                let Some((order, indices)) = facts
+                    .registration_order
+                    .get(id)
+                    .filter(|order| order.len() == entries.len())
+                    .and_then(|order| {
+                        crate::runtime::hash_map_order::key_set_order(order, |id| {
+                            crate::runtime::hash_map_order::identifier_hash(id)
+                        })
+                        .map(|indices| (order, indices))
+                    })
+                else {
+                    return refuse(r);
+                };
+                let keys: Vec<Value> = indices
+                    .into_iter()
+                    .map(|index| identifier_parse(&order[index]))
+                    .collect();
                 Ok(collection_value("set", &keys))
             }
             _ => refuse(r),
@@ -664,11 +676,11 @@ mod tests {
         assert!(owns(&rules));
         assert_eq!(
             answer(&facts, &rules, &get, &[rule("KEEP_INVENTORY")]).unwrap(),
-            boolean_value(true)
+            crate::runtime::boolean_value(true)
         );
         assert_eq!(
             answer(&facts, &rules, &get, &[rule("RANDOM_TICK_SPEED")]).unwrap(),
-            marker("integer:3")
+            Value::Boxed(crate::runtime::Boxed::Integer(3))
         );
         // A rule the game does not hold, and a member the model does not
         // list, refuse rather than answer a default.
@@ -679,6 +691,41 @@ mod tests {
             "(Lnet/minecraft/world/level/gamerules/GameRule;Ljava/lang/Object;Lnet/minecraft/server/MinecraftServer;)V",
         );
         assert!(answer(&facts, &rules, &set, &[rule("KEEP_INVENTORY")]).is_err());
+        // `getAsString` is `serialize(get(rule))`, the value's `toString()`
+        // (the oracle's `after-set` row: `true`, `7`).
+        let as_string = call(
+            GAME_RULES_CLASS,
+            "getAsString",
+            "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/String;",
+        );
+        let mut changed = facts.clone();
+        changed
+            .game_rules
+            .insert("random_tick_speed".into(), GameRuleValue::Int(7));
+        assert_eq!(
+            answer(&changed, &rules, &as_string, &[rule("RANDOM_TICK_SPEED")]).unwrap(),
+            marker("7")
+        );
+        assert_eq!(
+            answer(&changed, &rules, &as_string, &[rule("KEEP_INVENTORY")]).unwrap(),
+            marker("true")
+        );
+        // A world without `minecart_improvements` has no `max_minecart_speed`:
+        // vanilla's `get` throws (game_rules.rs pins the message).
+        assert!(matches!(
+            answer(&facts, &rules, &get, &[rule("MAX_MINECART_SPEED")]),
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/IllegalArgumentException"
+        ));
+        // A `GameRules` field 26.3 does not declare is no rule marker.
+        assert_eq!(
+            static_field(&call(
+                GAME_RULES_CLASS,
+                "DO_DAYLIGHT_CYCLE",
+                "Lnet/minecraft/world/level/gamerules/GameRule;",
+            )),
+            None
+        );
     }
 
     #[test]
@@ -746,6 +793,57 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `keySet()` iterates as vanilla's `byLocation` `HashMap` does, rebuilt
+    /// from the registration order (the expected order was printed by a
+    /// `HashMap<Identifier, _>` on a JVM, 26.3 server jar); a registry the game
+    /// listed without its order refuses rather than answering another order.
+    #[test]
+    fn a_registry_key_set_is_in_vanilla_hash_map_order() {
+        let ids = [
+            "minecraft:stone",
+            "demo:t1",
+            "demo:t90",
+            "demo:t18",
+            "demo:t102",
+            "demo:t29",
+            "demo:t113",
+            "demo:t1709",
+            "demo:t124",
+            "demo:t1808",
+        ]
+        .map(str::to_owned);
+        let mut facts = facts();
+        facts.registries.insert(
+            "minecraft:item".into(),
+            Arc::new(ids.iter().cloned().collect()),
+        );
+        facts
+            .registration_order
+            .insert("minecraft:item".into(), Arc::new(ids.to_vec()));
+        let key_set = call("net/minecraft/core/Registry", "keySet", "()Ljava/util/Set;");
+        let expected: Vec<Value> = [
+            "minecraft:stone",
+            "demo:t1",
+            "demo:t18",
+            "demo:t29",
+            "demo:t1709",
+            "demo:t1808",
+            "demo:t90",
+            "demo:t102",
+            "demo:t113",
+            "demo:t124",
+        ]
+        .iter()
+        .map(|id| identifier_parse(id))
+        .collect();
+        assert_eq!(
+            answer(&facts, "game/registry/minecraft:item", &key_set, &[]).unwrap(),
+            collection_value("set", &expected)
+        );
+        // `facts()` lists blocks with no registration order.
+        assert!(answer(&facts, "game/registry/minecraft:block", &key_set, &[]).is_err());
     }
 
     #[test]

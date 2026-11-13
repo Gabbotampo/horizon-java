@@ -17,7 +17,7 @@ the mod carries a copy of the runtime (`tools/vendor.py`), because a native mod 
 | **M0, the shell** | `Hooks::server_about_to_start` and `Hooks::client_setup` log one line each. The server start writes this mod's report, `config/horizon_java/java-runtime.json`, through the mod API's own config service (`Host::config_files`), so the game files it under `config/` beside every other mod's. With no jars it is `{"schema":1,"jars":[]}`. |
 | **M1, run jars** | Every `.jar` in `config/horizon_java/java-mods/` is read as bytes (at `server_about_to_start` until M3 moved the read to the content phase, with `std::fs`; see M3), loaded by the runtime from memory (`NativeJar::from_bytes`) and run with its own `StdHost`. One log line per jar, one row in the report: the jar's id, `ran-clean` / `ran-hollow` / `ran-partial` / `refused`, its host-call and unknown-host-call counts, and the reason a jar was refused or ran partially. |
 | **M2a, lifecycle** | Each jar's `StdHost` (heap, statics, recorded listeners) is kept for the server's life. `server_about_to_start` fires the Fabric `SERVER_STARTING` and NeoForge `ServerAboutToStartEvent` listeners, `server_starting` the NeoForge `ServerStartingEvent` ones, `server_started` the Fabric `SERVER_STARTED` and NeoForge `ServerStartedEvent` ones, and `server_stopping`/`server_stopped` their own. Each hook logs callbacks run/failed and unmodelled host calls; every row's `callbacks` object totals them; a jar's `System.out` lines reach the game log with its id. |
-| **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text`, `integer` and player-selector (`EntityArgument.player()`/`players()`, as the mod API's `player` kind) nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
+| **M2b, commands** | At `register_commands`, the recorded Fabric `CommandRegistrationCallback` (and NeoForge `RegisterCommandsEvent`) listeners build their Brigadier tree on the runtime's façade, and its literal, `word`/`text`, `integer` and entity-selector (`EntityArgument.entity()`/`entities()`/`player()`/`players()`, as the mod API's kind of the same name) nodes become typed `NativeCommand` usages. `run_mod_command` maps the game's invocation back (deepest matching usage), runs the Java `Command.run`, and sends `sendSuccess`/`sendFailure`/`sendSystemMessage` replies through `Commands::feedback` (or `PlayerRef::tell` for a player the command named). Any other node — other argument kinds, redirects/forks, an unevaluable requirement — is refused by name in the log and left out. |
 | **M2c, game events** | Every other modelled server event reaches its matching mod API hook, moment for moment: server and level ticks, level load/unload, player join/leave/respawn/clone/dimension change, entity join/leave, living damage before/after, item and block use, block and entity attack, and block break (whose cancel also fires Fabric's `CANCELED`). A cancellable hook carries the firing's cancel and, where the hook has one, the Fabric `InteractionResult` back as the hook's cancellation result. The full table, arguments and departures: [docs/mod-hooks.md](mod-hooks.md). |
 | **M3, content** | The jars now run at the game's **Registration** phase, before any resource or world loads and while the content root can still grow, instead of at `server_about_to_start`. Each `RegistryDeclaration::{Item, Block}` the runtime recorded becomes a native content declaration (`Hooks::blocks`/`items`, NeoForge's `RegisterEvent`): an item keeps the template and the properties the content vocabulary carries, and a block brings its block item. The game joins them under the jar's namespace, so `/give`, `setblock` and the inventory see `<jar id>:<path>`. A jar's own assets, lang and loot need the bake route in [m3-content-design.md](m3-content-design.md). |
 | **M3b, baked assets and declarations** | An install-time bake (`tools/bake.py`) runs each jar's server entrypoints through the offline runtime (`horizon-native-java --json <jar>`, the code the mod vendors), keeps the resource kinds a content package accepts, and writes one `.hmod` per namespace into `<game-dir>/horizon-mods/`, turned on in `horizon-mods.txt`. The package carries the jar's models, textures, item definitions, blockstates, lang and loot **and** its blocks/items as `data/<ns>/horizon/{block,item}/*.json` (the runtime's own mapping, `crates/horizon-native-java/src/content.rs`). It owns its namespace, so the game loads it without the native ownership fence; the mod's runtime declaration for that namespace is skipped (see the fence note below). Class files, metadata and unsafe paths never enter the package; everything left out is in `config/horizon_java/bake-report.json` with its reason. |
@@ -91,19 +91,23 @@ Named here, not just in comments:
   audience.
 - **A jar's command set is fixed at registration.** `Commands::refresh_commands` re-offers the same
   usages: no Java API here re-runs a registration callback with a different set.
-- **`EntityArgument.players()` takes one player.** The mod API's only selector kind is `player`:
-  the game resolves it to exactly one online player before the command runs. `player()` maps onto
-  it exactly. `players()` maps onto it as its one-player subset, so `/carryon clear @a` with two or
-  more players online is refused by the game's parser (with its feedback; a vanilla client already
-  flags the multi-player selector as it is typed, since the tree it gets says single player)
-  instead of running once per player as vanilla does. A selection of one player, `@s`, `@p`, a name
-  or a UUID behaves as vanilla. `EntityArgument.entity()` and `.entities()` are refused at
-  registration by name: narrowing "any entity" to "one player" would run the command on a set the
-  jar did not ask for. Both wait on the fork seam below ("Entity selectors in typed commands").
+- **Entity selectors are the game's resolution (#3039, since the `1cc882b8e0` pin).** Each of
+  `EntityArgument.entity()`/`entities()`/`player()`/`players()` is the mod API kind with the same
+  `single`/`playersOnly` pair, so the game parses, permission-checks and resolves the selector as
+  vanilla's `EntityArgument` does, and the runtime's `getEntity`/`getEntities`/
+  `getOptionalEntities`/`getPlayer`/`getPlayers`/`getOptionalPlayers` apply `EntitySelector`'s
+  checks to that selection (`argument.entity.notfound.entity`, `argument.entity.toomany`,
+  `argument.entity.notfound.player`). Departures: the fork refuses an empty `entities`/`players`
+  selection with that feedback before the jar runs, so a jar's `getOptionalEntities`/
+  `getOptionalPlayers` never sees an empty list where vanilla would run with one; and a player
+  getter on an any-entity selector is counted, not answered (`findPlayers` applies the selector's
+  limit and sort among players only, a set the game does not give). A non-player entity reaches
+  the jar as `game/entity/<id>`, whose reads are counted.
 - **`getInput()` names the selected player, not the selector typed.** The game hands the mod the
   resolved `PlayerRef`, not the text, so the input line carries the player's name (or their UUID
   when the game has no name for them, which vanilla also accepts as a selector) where the player
-  typed `@s` or `@p`.
+  typed `@s` or `@p`. A lone selected entity is named by its UUID; a selection of several reads
+  `@a` (players) or `@e` (entities), a stand-in for the text typed.
 
 ## M3 proof
 
@@ -228,25 +232,57 @@ drops", and it travels through the same bake. Without the package the item is na
   package may declare an owned namespace that differs from its id, or the join matches
   `namespaces` rather than `id`.
 
-- **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; NeoForge has
-  no counterpart (`BreakBlockEvent` is before the block goes). `break_block` fires before the block
-  is destroyed, so there is no moment to fire the Fabric listener from. Add a listen-only hook
-  after the block and its drops are gone.
-- **The hand on `entity_interact` (#2797).** The hook's contract says `self.hand` and it fires once
-  per hand, but the game's `native_entity_interact(entity, kind, stack, claimed)` in
-  `crates/horizon-client/src/game/native_hooks/base.rs` never takes a hand, so the event cannot
-  carry one. The mod names the hand from its stack when exactly one hand holds it, and leaves it
-  unknown (a counted unknown read) when both hands agree, two empty hands included. Filed as
-  `arismoko/horizon#2797`; the fix is to pass `hand: Hand` through that call and its event.
+- **`block_break_after`** (#2806). Answered since the `1cc882b8e0` pin by the fork's own
+  `player_destroyed_block` hook, which fires at the `Block.destroy` call in
+  `ServerPlayerGameMode.destroyBlock`, once `Level.removeBlock` succeeded: the call Fabric API's
+  `ServerPlayerGameModeMixin.onBlockBroken` injects at to fire `PlayerBlockBreakEvents.AFTER`
+  (creative breaks included, never a canceled or level-side break). The bridge fires `AFTER` there
+  with the acting player's level (`destroyBlock`'s `this.level`), the position, the block, and the
+  `BlockEntity` as `null` when none stood there. When one did, the hook gives its saved data, not
+  a live object, so that argument is a marker whose reads are counted. The hook's `state` is what
+  the removal took out; it differs from Fabric's `adjustedState` only for a tripwire cut with
+  shears (`DISARMED` set in the level, the armed state returned), and the runtime's block state
+  names only the block, so no listener sees the difference. NeoForge has no event here.
+- **The hand on `entity_interact` (#2797).** Answered since the `1cc882b8e0` pin:
+  `EntityInteractEvent.hand` is the interact packet's hand, and the bridge passes it to
+  `UseEntityCallback`/`EntityInteract#getHand` as `MAIN_HAND`/`OFF_HAND`. `getItemInHand(hand)` is
+  the hook's own stack (an empty hand when it carries none) and the other hand is read from the
+  host. Before, the bridge named the hand only when exactly one hand held the hook's stack, so two
+  empty hands (the common case) gave a counted unknown hand. The firing also names the level, the
+  acting player's (#2784's read; `EntityInteract#getLevel` is `getEntity().level()`, and
+  `handleInteract` finds the target in that level), and `EntityInteract#getTarget()` answers the
+  clicked entity.
 - **A player's level (#2747).** `PlayerRef` names a player's identity, permission and messages, and
   `host.players().acting_player()` names the player a block or entity hook is about, but no read
-  gives the level that player stands in. So `CommandSourceStack.getLevel()` and the `Level`
-  argument of Fabric's `AttackBlockCallback`, `UseEntityCallback`, `PlayerBlockBreakEvents` and
-  NeoForge's `BreakBlockEvent`/`AttackEntityEvent`/`PlayerInteractEvent` cannot be filled: each call
-  that needs it is counted as an unknown host call instead of answering the overworld. Filed as
-  `arismoko/horizon#2747`; the acting player itself is already carried (M2c).
+  gives the level that player stands in. So the `Level` argument of Fabric's `AttackBlockCallback`,
+  `UseEntityCallback`, `PlayerBlockBreakEvents` and NeoForge's
+  `BreakBlockEvent`/`AttackEntityEvent`/`PlayerInteractEvent` cannot be filled: each call that needs
+  it is counted as an unknown host call instead of answering the overworld. Filed as
+  `arismoko/horizon#2747` (closed by #2784's `player_level`, after this pin); the acting player
+  itself is already carried (M2c). A player's command source does answer `getLevel()`: it is
+  `player.level()` in vanilla, and the pin reads it as the player's entity's level
+  (`EntitiesBackend::entity_level`, which the bridge already uses for the player list).
 
-- **The old player on `player_clone`.** Filed as [arismoko/horizon#3040](https://github.com/arismoko/horizon/issues/3040); the issue text, in the fork's template:
+- **The old player on `player_clone`** ([arismoko/horizon#3040](https://github.com/arismoko/horizon/issues/3040)).
+  Answered since the `1cc882b8e0` pin: `PlayerCloneEvent.original` lends the old player for the
+  hook. NeoForge's `getOriginal()` and Fabric `COPY_FROM`'s `oldPlayer` are now that player's own
+  marker (`game/original-player/<uuid>`), never the new player's:
+  - **Attachments.** The clone batch reads the old player's store (`Holder::OriginalPlayer`) before
+    the copy step, and the runtime keeps the Java objects it held for that player
+    (`neoforge_original.rs`). So `getOriginal().getData(T)` answers the object the jar last saw,
+    a non-`copyOnDeath` one included (carryon's `CarryOnData`), a saved value never decoded
+    decodes into the old player's own object, and an absent one runs the default. `setData`,
+    `removeData` and a default change only the old player's map, which is discarded with it, as
+    the old `ServerPlayer` is; nothing reaches the store (the fork refuses writes to the original).
+  - **Facts.** UUID and name (one game profile), level, `getX`/`getY`/`getZ` and `getHealth` come
+    from the `original_player_*` reads. Anything else on the old player (its inventory, entity id,
+    held items) is counted.
+  - **Departures.** The view ends with the hook, where a NeoForge listener could keep the old
+    object and read it later. The handle's store token is read through the API's
+    `__private::game::Fields` (it has no public accessor). Fabric `AFTER_RESPAWN` still passes the
+    one player twice: `player_respawned` names no old player.
+
+  The issue text, in the fork's template:
 
   > **Ask.** Let a `player_clone` listener read the player as they were before the copy: a
   > handle (say `event.original`), valid only during the hook, whose reads answer the old player's
@@ -359,6 +395,125 @@ death, which is worse than the counted refusal. So `Player#getData(Supplier)` st
 the attachment seam exists; `ServerPlayer#level()` remains separately blocked on
 `arismoko/horizon#2747`. This note does not implement either.
 
+## Pin bump to `1cc882b8e0`
+
+The fork's mod API now tells a mod which Minecraft version it runs in: `ConfigHost::game_version`
+(`#[access(Metadata)]`) and `RegistrationContext::game_version`, from the 2026-11-12 review rollup
+(`b1d4985cbf`). The pin moved from `cf0113879e` to **`1cc882b8e089a240354d142e3fd115938ce140d7`**
+(fork `main`, #3822, 2026-11-13) so the jars can be told it.
+
+**Which commit.** No fork `main` commit at or after `b1d4985cbf` has a fully green `dyna-ci` run:
+the `ignored-tests-shards` jobs (the slow `#[ignore]` tests) fail on every `main` run of 12 and 13
+November, and most runs are cancelled by the next push. `1cc882b8e0` is the newest `main` commit
+whose `verify`, `verify-static`, `lint` and `launcher` jobs passed. It is the merge of #3822, which
+fixes three of those slow-shard tests. Its own `horizon-world` slow shard still failed. The next
+commit, rollup 65 (`2d3964c330`), had no CI result yet.
+
+**Survey** (`git log cf0113879e..1cc882b8e0 -- crates/horizon-mod-api crates/horizon-mod-vocab
+crates/horizon-mod-package crates/cargo-horizon-mod docs/native-mods.md docs/modding`: 7,059 commits,
+957 files; then the diff of every hook this mod implements and every host method it calls):
+
+- **The mod compiles unchanged against the new API.** Every `mod_api` path it names still resolves.
+  The only source change the bump forced is in a test: `PlayerCloneEvent` gained a field, `original`.
+- **Hooks this mod implements whose files changed**: `blocks`, `items`, `entity_interact`,
+  `player_clone`, `right_click_block`, `right_click_item`, `level_tick_pre`/`post`, `server_tick`
+  (doc lines: `host.server_has_time()`), and doc renames from `native_*` to plain hook names in
+  `entity_leave_level`, `level_load`/`unload`, `living_damage_post`, `player_changed_dimension`,
+  `player_logged_in`/`out`, `server_about_to_start`, `server_stopping`. The rest
+  (`attack_entity`, `break_block`, `left_click_block`, `living_death*`, `entity_join_level`,
+  `register_commands`, `run_mod_command`, `server_started`/`starting`/`stopped`,
+  `player_respawned`, `game_rule_changed`, `client_setup`) are byte-identical. What changed in
+  meaning:
+  - `blocks`: **a code-declared block now gets a block item by default** (#3119:
+    `Block::default()` has `item: true`, "as in JSON"). This mod sets `block.item = false` explicitly
+    (`content.rs::block_entry`), so its declarations are unchanged.
+  - `entity_interact`: the event carries `hand` (#2797's carry), which the bridge now passes
+    through (see "Fork seams needed").
+  - `player_clone`: the event carries `original: OriginalPlayerRef`, a hook-scoped view of the old
+    player (#3040), which the bridge now lends to `getOriginal`/`COPY_FROM` (see "Fork seams needed").
+  - `right_click_block`: it now fires for spectators too, and `use_block`/`use_item` `Default` got
+    exact vanilla rules. This mod never writes either field. It only fires `UseBlock` and cancels
+    with the jar's `InteractionResult`, as before. Fabric's `UseBlockCallback` also fires for a
+    spectator: it is injected at the head of `interactBlock`, before the spectator check.
+  - `right_click_item`: `Success`, `SuccessServer` and `Consume` now all end the client's hand loop
+    (before, only `Success` did). This mod answers on the server only.
+- **Host methods.** None this mod calls was removed or changed signature. New ones include
+  `ConfigHost::{dist, game_version, horizon_version, server_has_time}`,
+  `ConfigServerHost::game_tests_enabled`, the `original_player_*` reads, `player_level`/
+  `player_dimension`, `entity_by_uuid`, `level_datapack_*` and the container `*_kind` transfers.
+  `net_send_to_player`/`net_send_to_server` were removed in favour of the payload area. This mod
+  calls neither.
+- **Access levels.** Every host method still declares one `#[access(...)]` level (`WorldOnly`,
+  `Metadata`, `ClientSetup`, `PublishedResources`). The game checks it against the load phase
+  (`world/phase.rs::access_allowed`; a native caller panics on a refusal). A mod declares nothing
+  for it. `game_version` is `Metadata`, allowed in Setup, Reloading and World. This mod asks the host
+  for it only in `server_about_to_start`, which runs in World.
+- **Commands.** `CommandArgumentValue` gained `Entity`, `Entities` and `Players` (#3039's
+  selectors), which the bridge now declares (see "Departures").
+- **Manifest.** `Manifest::parse` still requires `api = "0.2"` and `capabilities = ["registries"]`.
+  The `[native]` fields are unchanged. The fork's `MIXINS_REV` moved to
+  `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, and `mixins` follows it (the launcher builds the
+  newest `mixins` any mod names). This mod runs no mixins.
+- **Launcher staging.** The generated `main.rs` template now calls
+  `horizon_mod_host::{prepare_main_stack, exit_if_compile_child, main_with}`. The generated package
+  depends on `horizon-mod-host` (default features off). Its `MOD_ENTRIES` line is still
+  `"horizon_java" => mod_0::hooks`. The "Build" recipe below stages the same way.
+- **Dependencies.** At `1cc882b8e0`, Horizon's lock still resolves `zip 9.1.3`,
+  `serde_json 1.0.151`, `libc 0.2.190` and `log 0.4.34`, so the `=` pins in `mod/Cargo.toml` stand.
+  Staging adds exactly two packages to the lock (`horizon-java-mod`, `horizon-native-game`).
+
+**The game version reaches the jars.** `State::ensure_loaded` takes the game's version and
+`load_jar` seeds every jar's host with it (`StdHost::with_game_version`). In the content hooks the
+version comes from the `RegistrationContext`. In the `server_about_to_start` fallback it comes from
+the server's host (`ConfigHost::game_version`). `RegistrationContext::game_version` panics on a
+context without registration data. The fallback makes such a context, so the version is asked only
+of a context that carries its instance folder, which comes from the same data. With the version in
+place, `minecraft`'s mod container (Fabric's `getAllMods`/`getModContainer`, FML's `ModList`) and
+`DetectedVersion`/`SharedConstants.getCurrentVersion()` answer `26.3` instead of a counted `null`.
+
+**Build and proofs, unpatched.** The game was built from a worktree of `arismoko/horizon` at
+`1cc882b8e089a240354d142e3fd115938ce140d7`. Only the launcher's generated files were added: the
+workspace members, `crates/native-game/`, and `native-api/horizon_java` with its `horizon-mod-api`
+path rewrite. The build is the dev profile on elysium. The game's own version line is
+`Horizon 0.1.0`; this game logs no commit field, so the worktree's `HEAD` above is the build. One
+run had every fixture (`m0`, `m2a`, `m2b`, `m2c`, `m2d`, `m3`, baked), a non-jar and a client-only
+jar. It shows what the `cf0113879e` proof showed:
+
+```
+Horizon Java: broken.jar (broken) refused (0 host calls, 0 unknown host calls, reason: not a readable jar: Zip("invalid Zip archive: Could not find EOCD"))
+Horizon Java: client_only_demo.jar (client_only_demo) refused (0 host calls, 0 unknown host calls, reason: client-only entrypoint: a server never runs it)
+Horizon Java: m3_fixture.jar: content: 1 block(s), 1 item(s) in namespace m3_fixture not declared: not owned by horizon_java; run tools/bake.py
+Horizon: content from 2 mod(s) in .horizon-cache/mod-content/<stamp>
+Horizon Java 0.1.0: server about to start (dedicated=false); 8 jar(s) in config/horizon_java/java-mods: 6 ran-clean, 0 ran-hollow, 0 ran-partial, 2 refused; report in config/horizon_java/java-runtime.json
+Horizon Java: m2a_fixture: m2a: SERVER_STARTED ran
+command "javahello Viola"             {"chat":["Hello, Viola!"]}
+command "javawhere"                   {"chat":["level game/level/minecraft:overworld"]}   (#88's player-source level)
+give m3_fixture:ruby 1                Gave 1 [Ruby] to Player…; hotbar shows the ruby texture and "Ruby"
+break <ruby_block> (wooden pickaxe)   {"block_before":"m3_fixture:ruby_block","drops":{"m3_fixture:ruby":1}}
+break <stone>                         {"block":"minecraft:stone"}; m2c: kept stone / break canceled
+interact-entity <cow> (hands empty)   m2d: interact hand=null id=3, twice; use_entity: 1 callback(s) ran, 0 failed, 1 unknown host call(s)
+kill @e[type=minecraft:cow]           m2d: after death id=3
+Horizon Java: m2a_fixture: m2a: SERVER_STOPPING ran
+```
+
+An empty `java-mods/` writes `{"jars": [], "schema": 1}` (M0). The full in-game survey before and
+after the bump is in [in-game-survey.md](in-game-survey.md), "Sixth survey". Against an old-pin
+build of the same runtime, every sample row is unchanged. The one difference: servux, malilib and
+litematica now run (refused before, on `minecraft`'s null version).
+
+**Seams the fork now has** (not wired here; each is its own follow-up):
+
+| Seam | On fork `main` at `1cc882b8e0` |
+|---|---|
+| #2747 a player's level → #2784 | yes: `PlayerRef::level`/`dimension` (`player_level`/`player_dimension`); this mod already reads it since `cf0113879e` |
+| #2797 the hand on `entity_interact` | yes: `EntityInteractEvent.hand` (`12eb2e7ad3`, rollup 21) |
+| #2806 a completed player break (Fabric `PlayerBlockBreakEvents.AFTER`) | yes, as the fork's own `player_destroyed_block` hook: after `Level.removeBlock`, before `playerDestroy`'s drops, with the removed state and the block entity's saved data |
+| #3039 entity selectors in commands | yes: `CommandArgumentValue::{Entity, Entities, Players}` |
+| #3040 the old player on `player_clone` | yes: `PlayerCloneEvent.original` and the `original_player_*` reads (uuid, position, dimension, level, inventory slot, health, experience, effects, attachments) |
+| #3273 `server_starting` after the levels load; the world folder and game rules before them | **no**: the issue is open; `ConfigServerHost::world_dir` is `None` until a world is open, and the mod's server-start facts still log `world folder unknown, 0 game rules` |
+| #3089 which fluid a container item holds | yes, client side: the `contained_fluid` hook |
+| `ServerTickEvent.hasTime`/`LevelTickEvent.hasTime` | new: `ConfigHost::server_has_time`. Wired: `server_tick` and `level_tick_pre`/`post` read it when they fire and `hasTime()` answers it (before, `true` always). **Departure:** read once per firing, where NeoForge calls its `BooleanSupplier` (`this::haveTime`, a clock comparison) on every `hasTime()` |
+
 ## Pin bump to `cf0113879e`
 
 The survey the bump from `1376e3bcb6` was made from (`git log 1376e3bcb6..cf0113879e -- crates/horizon-mod-api
@@ -463,12 +618,12 @@ supplies them.
 
 ## Pinned fork commit
 
-The mod targets **`arismoko/horizon` at `cf0113879ebee600bff86070466f75b2db90b40a`** (2026-11-11),
+The mod targets **`arismoko/horizon` at `1cc882b8e089a240354d142e3fd115938ce140d7`** (2026-11-13),
 recorded in `mod/horizon-mod.toml`'s `[native] horizon` and in `mod/Cargo.toml`'s
 `horizon-mod-api` dependency. Why that commit and not `main`'s head:
 
-- it is the fork's `main` the day this was written, so a fresh clone of the shared checkout
-  reproduces the build exactly;
+- it is the newest fork `main` commit whose required CI jobs passed when the bump was made (see
+  "Pin bump to `1cc882b8e0`"), so a fresh clone of the shared checkout reproduces the build exactly;
 - the launcher downloads source archives from `arismoko/horizon`
   (`horizon_mod_package::index::native::PREBUILT_REPO`), so a commit of that repository is the only
   kind of pin it can fetch;
@@ -476,24 +631,26 @@ recorded in `mod/horizon-mod.toml`'s `[native] horizon` and in `mod/Cargo.toml`'
   `docs/modding/src/how-to/native-mods/005-native-mod-source-revisions.md`): hooks, host methods and
   their call sites are the game's source, and a later game may not build the mod unchanged.
 
-This commit replaced `1376e3bcb6` (2026-11-10), which had replaced `c4bcfcca5e` (2026-11-07). The
-earlier bumps picked up our own merged fork changes:
+This commit replaced `cf0113879e` (2026-11-11), which replaced `1376e3bcb6` (2026-11-10), which had
+replaced `c4bcfcca5e` (2026-11-07). The earlier bumps picked up our own merged fork changes:
 
 - from `c4bcfcca5e`, #2591 `level_tick_pre`/`level_tick_post` on `HostSide`/`LevelRef`, #2592 the
   `living_death_post` hook, #2626 the load-owned registry key tables;
 - from `1376e3bcb6`, the mod API's own renames (`Command`, `Authority`, `InteractionResult`,
   `BreakBlockEvent.state` as a `BlockState`, a level tick's dimension, `Text::translate` by value);
-- this one carries the vocabulary move to `horizon-mod-vocab` and the self-refusal, mod-point and
-  menu-layout changes surveyed above. None of them changes a call this mod makes.
+- from `cf0113879e`, the vocabulary move to `horizon-mod-vocab` and the self-refusal, mod-point and
+  menu-layout changes surveyed below;
+- this one carries `ConfigHost::game_version`, which the jars' hosts are now seeded with, and the
+  seams listed in its survey above.
 
-The M0–M3b proofs below were re-run on this pin, unpatched, with the game's own commit line.
+The M0–M3b proofs were re-run on this pin, unpatched, with the game's own version line.
 
 The game version is pinned beside it as `game = "26.3"`, and `mixins` at the fork's
-`MIXINS_REV` (`5a64af938ec86b00d53d16a408aabc0038fb3e57`) because the manifest requires all three.
+`MIXINS_REV` (`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`) because the manifest requires all three.
 The mod runs no mixins yet.
 
-`mod/vendor.lock` records the **horizon-java** commit the vendored runtime was copied from, with a
-SHA-256 per file. Update it with `python3 tools/vendor.py` after changing the runtime.
+The vendored runtime in `mod/src/runtime/` is the **horizon-java** runtime of the same commit:
+re-vendor it with `python3 tools/vendor.py` in every commit that changes the runtime.
 
 ## One crate, vendored
 
@@ -501,22 +658,21 @@ A native mod cannot have a path dependency, so `crates/horizon-native-java/src` 
 `mod/src/runtime/`:
 
 ```sh
-python3 tools/vendor.py             # write mod/src/runtime and mod/vendor.lock
-python3 tools/vendor.py --check-lock  # the copy is what mod/vendor.lock says (no hand edits)
-python3 tools/vendor.py --check       # ...and it matches the runtime source as it is now
+python3 tools/vendor.py          # write (or refresh) mod/src/runtime
+python3 tools/vendor.py --check  # the copy is exactly what that writes from the runtime source now
 ```
 
-- **The mod carries the runtime commit `mod/vendor.lock` records**, not whatever the runtime says on
-  every later commit. The two checks say which is which, so a runtime PR is not taxed:
-  - `--check-lock` always applies (the Python tests run it, and so CI): it fails on a hand edit to
-    `mod/src/runtime/`, never because the runtime crate changed.
-  - `--check` is required of a PR that changes `mod/**` or `tools/vendor.py`; CI runs it only for
-    those (`.github/workflows/ci.yml` diffs the PR's changed files against its base) and on `main`
-    as a non-blocking warning. **Refresh in a mod PR, and before a mod release, by re-running
-    `python3 tools/vendor.py`.**
+- **The mod carries the runtime of its own commit.** Every commit that changes
+  `crates/horizon-native-java/src` re-vendors in the same commit, and CI runs `--check` on every PR
+  and push. `--check` regenerates the copy in memory and compares it byte for byte with
+  `mod/src/runtime/`, so one check catches a hand edit to the copy, a runtime change that was not
+  re-vendored (an embedded data file included), a missing file and a stray one.
 - **Vendored files are committed.** A clean clone builds the mod with no generation step, and
-  `tests/test_vendor_mod.py` proves a one-byte edit fails `--check-lock` while a runtime-only change
-  fails only `--check`.
+  `tests/test_vendor_mod.py` proves a one-byte hand edit, an un-vendored runtime change and an
+  orphaned vendored file each fail `--check`.
+- **No lock file.** `mod/vendor.lock` (per-file SHA-256s and a source commit) used to pin the copy
+  instead. It changed in nearly every runtime PR, so any two runtime PRs conflicted on it, and it
+  guarded nothing the regenerate-and-compare check does not, so it was removed.
 - `lib.rs` becomes `runtime/mod.rs` and every `crate::` path becomes `crate::runtime::`, because the
   runtime is no longer a crate root but a module of the mod's crate.
 - `main.rs` (the command-line probe) is not vendored.

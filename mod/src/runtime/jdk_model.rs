@@ -19,7 +19,7 @@
 //!   logger configured to drop the mod's output does.
 //!
 //! The module also answers `Path.resolveSibling`, which the host's path model
-//! lacked. Paths stay virtual (`path:<text>`): no call in this file reads or
+//! lacked. Paths stay virtual (`host_path.rs`): no call in this file reads or
 //! writes the host filesystem.
 
 use crate::runtime::{MethodRef, NativeError, Value, expect_ref, expect_string};
@@ -109,12 +109,12 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             _ => None,
         },
         // A `WatchEvent.Kind` is only ever a token handed back to `register`
-        // or compared with `==` against the event a key reports. The marker
-        // keeps its enum name so `name()`/`toString` agree; the watch-service
-        // model below never produces an event, so none is ever compared.
+        // or compared with `==` against the event a key reports
+        // (`watch_service.rs`). The marker keeps its enum name so
+        // `name()`/`toString` agree.
         "java/nio/file/StandardWatchEventKinds" => match name {
             "ENTRY_CREATE" | "ENTRY_DELETE" | "ENTRY_MODIFY" | "OVERFLOW" => {
-                Some(Value::Ref(Some(format!("watch-kind/{name}"))))
+                Some(crate::runtime::host_watch::watch_kind(name))
             }
             _ => None,
         },
@@ -275,8 +275,8 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             let pattern = expect_string(args.first()?);
             Some(Ok(Value::Ref(Some(format!("regex-pattern/{pattern}")))))
         }
-        // The default filesystem. Opening a watch service over it is modelled
-        // below; no call here touches the host's disk.
+        // The default filesystem. Its watch services are `watch_service.rs`'s;
+        // no call here touches the host's disk.
         ("java/nio/file/FileSystems", "getDefault", "()Ljava/nio/file/FileSystem;") => {
             Some(Ok(Value::Ref(Some("file-system/default".into()))))
         }
@@ -359,6 +359,13 @@ pub(crate) fn instance_call(
     if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
         return resolve_sibling(r, receiver, args).map(Ok);
     }
+    if let Some(kind) = crate::runtime::host_watch::watch_key(receiver, crate::runtime::HostKind::WatchKind) {
+        return matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("name", "()Ljava/lang/String;")
+        )
+        .then(|| Ok(Value::Ref(Some(kind.to_owned()))));
+    }
     let marker = expect_ref(receiver)?;
     if let Some(canonical) = marker.strip_prefix(CHARSET_PREFIX) {
         return charset_call(r, canonical, args);
@@ -396,53 +403,11 @@ pub(crate) fn instance_call(
         };
     }
     if marker == "file-system/default" {
+        // `newWatchService` is `watch_service.rs`'s.
         return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("newWatchService", "()Ljava/nio/file/WatchService;") => {
-                Some(Ok(Value::Ref(Some("watch-service/default".into()))))
-            }
             ("getSeparator", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some("/".into())))),
             _ => None,
         };
-    }
-    if marker == "watch-service/default" {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            // The virtual filesystem has no external writer, so no event is
-            // ever pending; `poll` answering null is the JVM's "nothing
-            // happened yet", not an invented event. `take` would block the
-            // single thread for ever, so it stays unmodelled and counted.
-            ("poll", "()Ljava/nio/file/WatchKey;") => Some(Ok(Value::Ref(None))),
-            ("poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;") => {
-                Some(Ok(Value::Ref(None)))
-            }
-            ("close", "()V") => Some(Ok(Value::Void)),
-            _ => None,
-        };
-    }
-    if marker.starts_with("watch-key/") {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("pollEvents", "()Ljava/util/List;") => Some(Ok(Value::Ref(Some("list".into())))),
-            // A key with no pending events is still valid, so `reset` reports
-            // true and the mod keeps polling. `cancel` has no state to clear
-            // and `isValid` keeps answering true afterwards; a mod that
-            // cancels and then polls is outside the modelled surface.
-            ("reset" | "isValid", "()Z") => Some(Ok(Value::Int(1))),
-            ("cancel", "()V") => Some(Ok(Value::Void)),
-            _ => None,
-        };
-    }
-    if let Some(kind) = marker.strip_prefix("watch-kind/") {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("name" | "toString", "()Ljava/lang/String;") => {
-                Some(Ok(Value::Ref(Some(kind.to_owned()))))
-            }
-            _ => None,
-        };
-    }
-    // `Path.register(service, kinds...)`: the key names the watched path. The
-    // game never changes a file behind the mod's back, so the key will never
-    // report an event.
-    if r.owner == "java/nio/file/Path" && r.name == "register" {
-        return Some(Ok(Value::Ref(Some(format!("watch-key/{marker}")))));
     }
     None
 }
@@ -486,10 +451,13 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
     ) {
         return None;
     }
-    let path = expect_ref(receiver)?;
-    let path = path.strip_prefix("path:").unwrap_or(path);
-    let other = args.first().map(expect_string).unwrap_or_default();
-    let other = other.strip_prefix("path:").unwrap_or(other);
+    let path = crate::runtime::host_path::path_key(receiver)?;
+    let other = args.first().map(crate::runtime::path_text).unwrap_or_default();
+    // Text a path is made of must encode (`host_path::encodable`); left to
+    // the caller, which counts it.
+    if !crate::runtime::host_path::encodable(other) {
+        return None;
+    }
     let parent = path
         .trim_end_matches('/')
         .rsplit_once('/')
@@ -500,7 +468,7 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
         }
         _ => other.to_owned(),
     };
-    Some(Value::Ref(Some(format!("path:{resolved}"))))
+    Some(crate::runtime::path_value(&resolved))
 }
 
 /// Elements one `StreamSupport.stream` source may yield before the runtime
@@ -733,145 +701,47 @@ impl crate::runtime::StdHost {
 /// value type: java/lang/Integer") refused values the JVM accepts. Only the
 /// public types a library tests for are listed.
 fn platform_supertypes(class: &str) -> &'static [&'static str] {
-    const NUMBER: &[&str] = &[
-        "java/lang/Number",
-        "java/lang/Comparable",
-        "java/io/Serializable",
-        "java/lang/constant/Constable",
-    ];
-    const COMPARABLE_VALUE: &[&str] = &[
-        "java/lang/Comparable",
-        "java/io/Serializable",
-        "java/lang/constant/Constable",
-    ];
-    const LIST: &[&str] = &[
-        "java/util/List",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractList",
-        "java/util/AbstractCollection",
-        "java/util/RandomAccess",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const LINKED_LIST: &[&str] = &[
-        "java/util/List",
-        "java/util/Deque",
-        "java/util/Queue",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSequentialList",
-        "java/util/AbstractList",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SEQUENCED_SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/SequencedSet",
-        "java/util/SequencedCollection",
+    // The classes the platform models answer for. Their supertypes are Java 25's, generated
+    // (`jdk_closure.rs`), not written by hand: the hand rows made `WeakHashMap` a `Cloneable`,
+    // `Hashtable` an `AbstractMap` and `CopyOnWriteArrayList` an `AbstractList` (#163).
+    const CLASSES: &[&str] = &[
+        "java/lang/Integer",
+        "java/lang/Long",
+        "java/lang/Short",
+        "java/lang/Byte",
+        "java/lang/Float",
+        "java/lang/Double",
+        "java/lang/Boolean",
+        "java/lang/Character",
+        "java/util/ArrayList",
+        "java/util/Vector",
+        "java/util/Stack",
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "java/util/LinkedList",
         "java/util/HashSet",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SORTED_SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/SortedSet",
-        "java/util/NavigableSet",
-        "java/util/SequencedSet",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SEQUENCED_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/SequencedMap",
+        "java/util/concurrent/CopyOnWriteArraySet",
+        "java/util/LinkedHashSet",
+        "java/util/TreeSet",
+        "java/util/concurrent/ConcurrentSkipListSet",
         "java/util/HashMap",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
+        "java/util/IdentityHashMap",
+        "java/util/WeakHashMap",
+        "java/util/EnumMap",
+        "java/util/Hashtable",
+        "java/util/LinkedHashMap",
+        "java/util/TreeMap",
+        "java/util/concurrent/ConcurrentSkipListMap",
+        "java/util/concurrent/ConcurrentHashMap",
+        "java/util/ArrayDeque",
+        "java/util/concurrent/ConcurrentLinkedDeque",
+        "java/util/PriorityQueue",
+        "java/util/concurrent/ConcurrentLinkedQueue",
+        "java/io/File",
     ];
-    const SORTED_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/SortedMap",
-        "java/util/NavigableMap",
-        "java/util/SequencedMap",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const CONCURRENT_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/concurrent/ConcurrentMap",
-        "java/util/AbstractMap",
-        "java/io/Serializable",
-    ];
-    const DEQUE: &[&str] = &[
-        "java/util/Deque",
-        "java/util/Queue",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const QUEUE: &[&str] = &[
-        "java/util/Queue",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractQueue",
-        "java/util/AbstractCollection",
-        "java/io/Serializable",
-    ];
-    match class {
-        "java/lang/Integer" | "java/lang/Long" | "java/lang/Short" | "java/lang/Byte"
-        | "java/lang/Float" | "java/lang/Double" => NUMBER,
-        "java/lang/Boolean" | "java/lang/Character" => COMPARABLE_VALUE,
-        "java/util/ArrayList"
-        | "java/util/Vector"
-        | "java/util/Stack"
-        | "java/util/concurrent/CopyOnWriteArrayList" => LIST,
-        "java/util/LinkedList" => LINKED_LIST,
-        "java/util/HashSet" | "java/util/concurrent/CopyOnWriteArraySet" => SET,
-        "java/util/LinkedHashSet" => SEQUENCED_SET,
-        "java/util/TreeSet" | "java/util/concurrent/ConcurrentSkipListSet" => SORTED_SET,
-        "java/util/HashMap"
-        | "java/util/IdentityHashMap"
-        | "java/util/WeakHashMap"
-        | "java/util/EnumMap"
-        | "java/util/Hashtable" => MAP,
-        "java/util/LinkedHashMap" => SEQUENCED_MAP,
-        "java/util/TreeMap" | "java/util/concurrent/ConcurrentSkipListMap" => SORTED_MAP,
-        "java/util/concurrent/ConcurrentHashMap" => CONCURRENT_MAP,
-        "java/util/ArrayDeque" | "java/util/concurrent/ConcurrentLinkedDeque" => DEQUE,
-        "java/util/PriorityQueue" | "java/util/concurrent/ConcurrentLinkedQueue" => QUEUE,
-        _ => &[],
+    if CLASSES.contains(&class) {
+        crate::runtime::jdk_closure::below_object(class)
+    } else {
+        &[]
     }
 }
 
@@ -881,21 +751,17 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
     if crate::runtime::reflect_generic::annotated_type_instance_of(marker, wanted) {
         return true;
     }
-    let class = if let Some((class, _)) = marker.split_once('#') {
-        class
-    } else {
-        match marker.split_once(':').map(|(prefix, _)| prefix) {
-            Some("integer") => "java/lang/Integer",
-            Some("long") => "java/lang/Long",
-            Some("short") => "java/lang/Short",
-            Some("byte") => "java/lang/Byte",
-            Some("float") => "java/lang/Float",
-            Some("double") => "java/lang/Double",
-            Some("character") => "java/lang/Character",
-            Some("boolean") => "java/lang/Boolean",
-            _ => return false,
-        }
+    let Some((class, _)) = marker.split_once('#') else {
+        return false;
     };
+    class_instance_of(class, wanted)
+}
+
+/// Whether an instance of the platform class `class` is a `wanted`.
+pub(crate) fn class_instance_of(class: &str, wanted: &str) -> bool {
+    if class == wanted {
+        return true;
+    }
     let known = match platform_supertypes(class) {
         [] => crate::runtime::java_immutable::supertypes(class),
         known => known,
@@ -906,34 +772,60 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
     class == wanted || known.contains(&wanted)
 }
 
-/// Unbox the arguments a method reference to a JDK method receives, the way
-/// the lambda metafactory adapts `BinaryOperator<Integer>` to `Integer::sum`:
-/// a boxed marker in a primitive parameter position becomes the primitive.
-/// `args` are the target's declared parameters in order (no receiver); a value
-/// that is already primitive, or not a box, is left as it is.
+/// Adapt the arguments a method reference's target receives, the way the
+/// lambda metafactory does (JLS 5.3 invocation contexts: unboxing, then
+/// widening primitive conversion): a box in a primitive parameter position
+/// becomes its primitive (`BinaryOperator<Integer>` → `Integer::sum`), and a
+/// primitive is widened to the parameter's type (`IntFunction` →
+/// `takesLong(long)`, `Function<Integer, ?>` → `takesLong(long)`). `args` are
+/// the target's declared parameters in order (no receiver); a reference
+/// parameter, or a value that is no box, is left as it is.
 pub(crate) fn unbox_for_descriptor(descriptor: &str, args: &mut [Value]) {
     for (parameter, value) in super::descriptor_arguments(descriptor)
         .iter()
         .zip(args.iter_mut())
     {
-        if !matches!(value, Value::Ref(Some(_))) {
-            continue;
-        }
-        let unboxed = match parameter.as_str() {
-            "I" | "S" | "B" => super::boxed_integer(value)
-                .or_else(|| super::boxed_short(value).map(i32::from))
-                .or_else(|| super::boxed_byte(value).map(i32::from))
-                .map(Value::Int),
-            "C" => super::boxed_character(value).map(Value::Int),
-            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
-            "J" => super::boxed_long(value).map(Value::Long),
-            "F" | "D" => super::boxed_number(value).map(Value::Float),
-            _ => None,
-        };
-        if let Some(unboxed) = unboxed {
-            *value = unboxed;
+        if let Some(adapted) = adapt_to_primitive(value, parameter) {
+            *value = adapted;
         }
     }
+}
+
+/// `value` unboxed (when it is a box) and widened to the primitive type
+/// `descriptor` (`I`, `J`, `F`, `D`...), or `None` when `descriptor` is not a
+/// primitive or `value` is neither a primitive nor a box.
+///
+/// Widening follows JLS 5.1.2: `int`/`long` to `float` round to the nearest
+/// `float`; to `double`, `int` is exact and `long` rounds. A narrowing is never
+/// applied (the metafactory has none), so such a value is unboxed only.
+pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Value> {
+    if !matches!(descriptor, "I" | "S" | "B" | "C" | "Z" | "J" | "F" | "D") {
+        return None;
+    }
+    let primitive = match value {
+        Value::Boxed(boxed) => boxed.primitive(),
+        Value::Ref(Some(_)) => match descriptor {
+            "C" => super::boxed_character(value).map(Value::Int),
+            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
+            _ => super::boxed_integer(value)
+                .or_else(|| super::boxed_short(value).map(i32::from))
+                .or_else(|| super::boxed_byte(value).map(i32::from))
+                .or_else(|| super::boxed_character(value))
+                .map(Value::Int)
+                .or_else(|| super::boxed_long(value).map(Value::Long))
+                .or_else(|| super::boxed_number(value).map(Value::Float)),
+        }?,
+        Value::Int(_) | Value::Long(_) | Value::Float(_) => value.clone(),
+        _ => return None,
+    };
+    Some(match (primitive, descriptor) {
+        (Value::Int(int), "J") => Value::Long(i64::from(int)),
+        (Value::Int(int), "F") => Value::Float(f64::from(int as f32)),
+        (Value::Int(int), "D") => Value::Float(f64::from(int)),
+        (Value::Long(long), "F") => Value::Float(f64::from(long as f32)),
+        (Value::Long(long), "D") => Value::Float(long as f64),
+        (other, _) => other,
+    })
 }
 
 /// A parsed class's `access_flags`, read back from its bytes (the parser
@@ -946,222 +838,6 @@ pub(crate) fn class_access_flags(file: &crate::runtime::ClassFile) -> Option<u16
     reader.skip(4).ok()?;
     crate::runtime::read_pool(&mut reader).ok()?;
     reader.u2().ok()
-}
-
-/// The text `String.valueOf` gives a boxed value, for a concatenation
-/// operand typed `desc`.
-///
-/// `"" + Boolean.TRUE` is `"true"`; the runtime's box marker is
-/// `boolean:true`, and pasting the marker made Xaero's config codec reject a
-/// 12-character boolean against its 5-character bound. Only an operand typed
-/// as a box, `Number`, `Comparable`, `Serializable` or `Object` is read as a
-/// box: a `String` operand is text, whatever it spells.
-pub(crate) fn boxed_text(marker: &str, desc: &str) -> Option<String> {
-    if !matches!(
-        desc,
-        "Ljava/lang/Object;"
-            | "Ljava/lang/Number;"
-            | "Ljava/lang/Comparable;"
-            | "Ljava/io/Serializable;"
-            | "Ljava/lang/Boolean;"
-            | "Ljava/lang/Integer;"
-            | "Ljava/lang/Long;"
-            | "Ljava/lang/Short;"
-            | "Ljava/lang/Byte;"
-            | "Ljava/lang/Character;"
-            | "Ljava/lang/Float;"
-            | "Ljava/lang/Double;"
-    ) {
-        return None;
-    }
-    let (prefix, rest) = marker.split_once(':')?;
-    match prefix {
-        "boolean" => matches!(rest, "true" | "false").then(|| rest.to_owned()),
-        "integer" | "long" | "short" | "byte" => {
-            rest.parse::<i64>().ok().map(|value| value.to_string())
-        }
-        "character" => rest
-            .parse::<u32>()
-            .ok()
-            .and_then(char::from_u32)
-            .map(String::from),
-        "double" => rest.parse::<f64>().ok().map(super::format_java_float),
-        "float" => rest.parse::<f64>().ok().map(super::format_java_float32),
-        _ => None,
-    }
-}
-
-/// The `[flags][width][.precision]` part of one `String.format` specifier.
-///
-/// Only the `-` (left-justify) and `0` (zero-pad) flags are read; any other
-/// flag, an argument index (`%1$s`) or a combination the JDK rejects
-/// (`%-d` with no width, `%05s`) is refused with a named reason rather than
-/// formatted differently from the JVM.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FormatSpec {
-    left: bool,
-    zero: bool,
-    width: Option<usize>,
-    pub(crate) precision: Option<usize>,
-}
-
-impl FormatSpec {
-    /// Read the specifier starting at `at` (just past `%`), leaving `at` on
-    /// the conversion character.
-    pub(crate) fn parse(bytes: &[u8], at: &mut usize) -> Result<Self, NativeError> {
-        let mut spec = Self::default();
-        while let Some(flag) = bytes.get(*at) {
-            match flag {
-                b'-' => spec.left = true,
-                b'0' => spec.zero = true,
-                b'+' | b' ' | b',' | b'#' | b'(' => {
-                    return Err(NativeError::Metadata(format!(
-                        "unsupported String.format flag {}",
-                        *flag as char
-                    )));
-                }
-                _ => break,
-            }
-            *at += 1;
-        }
-        let digits = |at: &mut usize| {
-            let start = *at;
-            while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
-                *at += 1;
-            }
-            std::str::from_utf8(&bytes[start..*at])
-                .ok()
-                .filter(|text| !text.is_empty())
-                .and_then(|text| text.parse::<usize>().ok())
-        };
-        spec.width = digits(at);
-        if bytes.get(*at) == Some(&b'$') {
-            return Err(NativeError::Metadata(
-                "String.format argument indexes are not modelled".into(),
-            ));
-        }
-        if bytes.get(*at) == Some(&b'.') {
-            *at += 1;
-            spec.precision = Some(digits(at).ok_or_else(|| {
-                NativeError::Metadata("String.format precision has no digits".into())
-            })?);
-        }
-        Ok(spec)
-    }
-
-    /// Apply the width, flags and (for `%s`) precision to one converted
-    /// piece.
-    pub(crate) fn pad(&self, piece: String, conversion: char) -> Result<String, NativeError> {
-        if matches!(conversion, '%' | 'n') {
-            return Ok(piece);
-        }
-        let numeric = matches!(conversion, 'd' | 'x' | 'X' | 'f');
-        if (self.left || self.zero) && self.width.is_none() {
-            return Err(NativeError::Metadata(format!(
-                "String.format %{conversion} flag needs a width"
-            )));
-        }
-        if self.zero && (!numeric || self.left) {
-            return Err(NativeError::Metadata(format!(
-                "String.format %{conversion} does not take the 0 flag here"
-            )));
-        }
-        let piece = match (self.precision, conversion) {
-            (Some(precision), 's') => piece.chars().take(precision).collect(),
-            (Some(_), 'f') | (None, _) => piece,
-            (Some(_), other) => {
-                return Err(NativeError::Metadata(format!(
-                    "String.format %{other} does not take a precision"
-                )));
-            }
-        };
-        let Some(width) = self.width else {
-            return Ok(piece);
-        };
-        let length = piece.chars().count();
-        if length >= width {
-            return Ok(piece);
-        }
-        let fill = width - length;
-        Ok(if self.left {
-            format!("{piece}{}", " ".repeat(fill))
-        } else if self.zero {
-            match piece.strip_prefix('-') {
-                Some(digits) => format!("-{}{digits}", "0".repeat(fill)),
-                None => format!("{}{piece}", "0".repeat(fill)),
-            }
-        } else {
-            format!("{}{piece}", " ".repeat(fill))
-        })
-    }
-}
-
-/// `%.<precision>f` as the JDK's `Formatter` prints it.
-///
-/// The JDK rounds `RoundingMode.HALF_UP` on the double's shortest decimal
-/// digits (what `Double.toString` shows), not on its exact binary value:
-/// `String.format("%.2f", 2.675)` is `2.68` and `9.995` is `10.00`, where a
-/// correctly rounded binary value would give `2.67` and `9.99`.
-pub(crate) fn format_half_up(value: f64, precision: usize) -> String {
-    let scientific = format!("{:e}", value.abs());
-    let Some((mantissa, exponent)) = scientific.split_once('e') else {
-        return format!("{value:.precision$}");
-    };
-    let Ok(exponent) = exponent.parse::<i64>() else {
-        return format!("{value:.precision$}");
-    };
-    let significant = mantissa.replace('.', "").into_bytes();
-    // The digits as `int.frac`: `point` digits sit before the decimal point.
-    let point = exponent + 1;
-    let mut integer = Vec::new();
-    let mut fraction = Vec::new();
-    if point <= 0 {
-        integer.push(b'0');
-        fraction.extend(std::iter::repeat_n(b'0', (-point) as usize));
-        fraction.extend_from_slice(&significant);
-    } else {
-        let point = point as usize;
-        for index in 0..point.max(significant.len()) {
-            let digit = significant.get(index).copied().unwrap_or(b'0');
-            if index < point {
-                integer.push(digit);
-            } else {
-                fraction.push(digit);
-            }
-        }
-    }
-    let round_up = fraction.get(precision).is_some_and(|digit| *digit >= b'5');
-    fraction.resize(precision, b'0');
-    let mut digits = integer;
-    let split = digits.len();
-    digits.extend_from_slice(&fraction);
-    if round_up {
-        let mut index = digits.len();
-        loop {
-            if index == 0 {
-                digits.insert(0, b'1');
-                break;
-            }
-            index -= 1;
-            if digits[index] == b'9' {
-                digits[index] = b'0';
-            } else {
-                digits[index] += 1;
-                break;
-            }
-        }
-    }
-    let split = split + (digits.len() - split - precision);
-    let mut text = String::from_utf8_lossy(&digits[..split]).into_owned();
-    if precision > 0 {
-        text.push('.');
-        text.push_str(&String::from_utf8_lossy(&digits[split..]));
-    }
-    if value.is_sign_negative() {
-        format!("-{text}")
-    } else {
-        text
-    }
 }
 
 /// Whether `marker` names an object this runtime or the host built
@@ -1179,39 +855,69 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     /// host; a `StringBuilder` element reads its text, `null` reads `null`.
     /// An `Iterable`'s elements come back from the host as stored item
     /// markers, so each is parsed back to its value before it is joined.
-    pub(crate) fn invoke_string_join(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    pub(crate) fn invoke_string_join(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/lang/String" || r.name != "join" {
-            return None;
+            return Ok(None);
         }
-        let text = |runtime: &Self, value: &Value| match value {
-            Value::Ref(Some(marker)) => runtime
-                .string_builders
-                .get(marker)
-                .cloned()
-                .unwrap_or_else(|| crate::runtime::value_text(value)),
-            other => crate::runtime::value_text(other),
+        let Some(separator) = args.first() else {
+            return Ok(None);
         };
-        let separator = text(self, args.first()?);
-        let parts: Vec<String> = match r.descriptor.as_str() {
+        let elements: Vec<Value> = match r.descriptor.as_str() {
             "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
-                let array = expect_ref(args.get(1)?)?;
-                let values = self.arrays.get(array)?.clone();
-                values.iter().map(|value| text(self, value)).collect()
+                let Some(values) = args
+                    .get(1)
+                    .and_then(expect_ref)
+                    .and_then(|array| self.arrays.get(array))
+                else {
+                    return Ok(None);
+                };
+                values.clone()
             }
             "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;" => {
-                let items = self.host.mutable_collection_values(args.get(1)?)?;
+                let Some(items) = args
+                    .get(1)
+                    .and_then(|items| self.host.mutable_collection_values(items))
+                else {
+                    return Ok(None);
+                };
                 items
                     .iter()
                     .map(|item| {
                         crate::runtime::parse_collection_value(item)
-                            .map(|value| text(self, &value))
-                            .unwrap_or_else(|_| item.clone())
+                            .unwrap_or_else(|_| Value::Ref(Some(item.clone())))
                     })
                     .collect()
             }
-            _ => return None,
+            _ => return Ok(None),
         };
-        Some(Value::Ref(Some(parts.join(&separator))))
+        // `String.join` takes `String.valueOf(element)` of each element: a
+        // builder's text, a jar `CharSequence`'s own `toString()`
+        // (`jar_text.rs`, counted when it has none), else the value's text.
+        let mut parts = Vec::with_capacity(elements.len());
+        for value in std::iter::once(separator).chain(&elements) {
+            let text = match value {
+                Value::Ref(Some(marker)) if self.string_builders.contains_key(marker) => {
+                    self.string_builders[marker].clone()
+                }
+                Value::Ref(Some(marker))
+                    if crate::runtime::jar_text::object_marker_class(marker).is_some() =>
+                {
+                    match self.runtime_value_of(value, "java/lang/String", "join")? {
+                        Some(Value::Ref(Some(text))) => text,
+                        Some(_) => "null".to_owned(),
+                        None => crate::runtime::value_text(value),
+                    }
+                }
+                other => crate::runtime::value_text(other),
+            };
+            parts.push(text);
+        }
+        let separator = parts.remove(0);
+        Ok(Some(Value::Ref(Some(parts.join(&separator)))))
     }
 
     /// The JDK calls the interpreter answers itself, in one dispatch slot:
@@ -1428,13 +1134,9 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         }
         let mut values = Vec::with_capacity(found.len() + 1);
         if r.name == "walk" {
-            values.push(Value::Ref(Some(format!("path:{path}"))));
+            values.push(crate::runtime::path_value(path));
         }
-        values.extend(
-            found
-                .into_iter()
-                .map(|entry| Value::Ref(Some(format!("path:{entry}")))),
-        );
+        values.extend(found.into_iter().map(|entry| crate::runtime::path_value(&entry)));
         Ok(self.new_stream(class, method, values))
     }
 
@@ -1554,6 +1256,11 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             [key, value, merge] => (key.clone(), value.clone(), Some(merge.clone())),
             _ => return Ok(None),
         };
+        if !guava {
+            // `HashMap::new` with `putIfAbsent`/`merge` (`hash_bulk.rs`).
+            let map = self.hash_map_collect(&key_fn, &value_fn, merge_fn.as_ref(), values)?;
+            return Ok(Some(map));
+        }
         let mut entries: Vec<(Value, Value)> = Vec::new();
         for element in values {
             let key = self.apply_function(&key_fn, element)?;
@@ -1811,30 +1518,6 @@ mod tests {
     }
 
     #[test]
-    fn format_half_up_rounds_the_shortest_digits_like_the_jdk() {
-        // `String.format("%.<p>f", x)` on a JVM (java 21).
-        for (value, precision, expected) in [
-            (0.125, 2, "0.13"),
-            (-0.125, 2, "-0.13"),
-            (2.675, 2, "2.68"),
-            (9.995, 2, "10.00"),
-            (0.5, 0, "1"),
-            (1.0 / 3.0, 3, "0.333"),
-            (1.005, 2, "1.01"),
-            (0.045, 2, "0.05"),
-            (123456.785, 2, "123456.79"),
-            (1e-7, 3, "0.000"),
-            (2.5, 0, "3"),
-        ] {
-            assert_eq!(
-                format_half_up(value, precision),
-                expected,
-                "{value} {precision}"
-            );
-        }
-    }
-
-    #[test]
     fn resolve_sibling_replaces_the_last_name() {
         let sibling = method(
             "java/nio/file/Path",
@@ -1843,26 +1526,23 @@ mod tests {
         );
         let cases = [
             (
-                "path:/horizon/config",
+                "/horizon/config",
                 "defaultconfigs",
-                "path:/horizon/defaultconfigs",
+                "/horizon/defaultconfigs",
             ),
-            (
-                "path:/horizon/config/a.json",
-                "b.json",
-                "path:/horizon/config/b.json",
-            ),
-            ("path:config", "other", "path:other"),
-            ("path:/top", "x", "path:/x"),
-            ("path:/horizon/config", "/abs", "path:/abs"),
+            ("/horizon/config/a.json", "b.json", "/horizon/config/b.json"),
+            ("config", "other", "other"),
+            ("/top", "x", "/x"),
+            ("/horizon/config", "/abs", "/abs"),
         ];
         for (path, other, expected) in cases {
+            let path = crate::runtime::path_value(path);
             assert_eq!(
-                instance_call(&sibling, &text(path), &[text(other)])
+                instance_call(&sibling, &path, &[text(other)])
                     .unwrap()
                     .unwrap(),
-                text(expected),
-                "{path} sibling {other}"
+                crate::runtime::path_value(expected),
+                "{path:?} sibling {other}"
             );
         }
     }

@@ -7,6 +7,9 @@
 //! the mods' own classes go into the jars, and the native host answers the
 //! API classes exactly as it does for a real jar.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ExecutionBudget, Host, NativeJar, StdHost, Value,
     events::{
@@ -25,12 +28,8 @@ use zip::write::SimpleFileOptions;
 
 const ALEX: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-event-order-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn scratch(name: &str) -> scratch::Scratch {
+    let root = scratch::Scratch::new(&format!("event-order-{name}"));
     fs::create_dir_all(&root).unwrap();
     root
 }
@@ -451,6 +450,15 @@ fn neoforge_priorities_order_listeners_and_cancellation_skips_the_unasked() {
     let mut host = StdHost::new();
     jar.execute("demo.NeoOrder", None, "neoforge", &mut host)
         .unwrap();
+    // FML injects the `@EventBusSubscriber`s after the `@Mod` constructor.
+    assert!(
+        jar.inject_event_subscribers(
+            &mut host,
+            &horizon_native_java::ExecutionBudget::UNBOUNDED,
+            &[]
+        )
+        .is_empty()
+    );
     let found = host.game_listeners(&jar, true);
     assert_eq!(found.listeners.len(), 5);
     assert!(

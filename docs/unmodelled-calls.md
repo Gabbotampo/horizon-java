@@ -283,6 +283,137 @@ field, `EnumConfigProperty`'s `getEnumConstants`, `FabricBalmCapabilities`, and
 `CommentedProperties#save`'s `Pattern` outside the native regex subset. The game-bound
 list below is unchanged.
 
+## Re-measured (12 November 2026, Gson's JSON tree)
+
+Old is `9eb57c5` (main) and new is the same commit with Gson's JSON tree modelled from
+gson-2.14.0 (`gson_tree.rs`): `JsonObject`, `JsonArray`, `JsonPrimitive`, `JsonNull` and
+`LazilyParsedNumber`, `JsonElement.toString` and `Gson.toJson` of a tree. Reading text into a
+tree (`JsonParser`, `Gson.fromJson` into a tree class) is counted, and comes in the stacked
+parser PR. Same corpora, deps and command (release-built probes).
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 1,164 → **888** |
+| mega | 59 → **60** | 88 → 87 | 4 → 4 | 101 → 101 | 2,473 → **2,470** |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+
+Every `JsonObject` and `JsonArray` call left the ranking (the table above predates it;
+`JsonObject#addProperty(String, Boolean)` was 64 calls in 4 jars). Movers: `cupboard`
+(`326652-8890593.jar`) 78 → 2 and `structureessentials` (`832882-8896904.jar`) 198 → 2, both
+still `ran-hollow` on `Gson#fromJson(String, Class)` into `JsonObject` (Cupboard's
+`CupboardConfig#writeConfig`), now counted where the general `fromJson` path used to answer a map
+marker typed as a `JsonObject`; `modelbrowser` 3 → 0, now `ran-clean`; `takeitout` 53 → 49. No
+verdict got worse.
+
+With the parser on top (`gson_tree/parse.rs`: `JsonParser`, `Gson.fromJson` into a tree class),
+against the same `9eb57c5`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 1,164 → **896** |
+| mega | 59 → **60** | 88 → 87 | 4 → 4 | 101 → 101 | 2,473 → **2,468** |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+
+Every `JsonParser` call left the ranking too, and the counted `fromJson` into `JsonObject` is
+read. `cupboard` is 78 → 4 and `structureessentials` 198 → 9: both now get through Cupboard's
+config write and stop on `String#replaceFirst` in `CupboardConfig#splitLongDesc`, which they now
+reach (0 → 13 calls, the only call whose count rose). `PatPat` 14 → 13 and both `clientcommands`
+builds 2 → 1. Corpus-xl's total is 8 above the tree-only run because those two jars run further.
+No verdict got worse. The Gson calls still counted are `Gson` writes through an adapter or a
+custom strategy (#49's rule), `toJsonTree`, `toJson(JsonElement, JsonWriter)`,
+`TypeToken#getType` and two `GsonBuilder#setPrettyPrinting` calls, all unchanged by this model.
+
+## Re-measured (12 November 2026, honesty gaps)
+
+Four places answered without counting, against `6e3684b`:
+`Object#getClass` on a marker no model names (now counted; a plain text answers `String`, as
+`instanceof String` already did); `instanceof` against a non-JDK type the runtime cannot decide
+(now the counted call `Target#<instanceof>(Object)`, the way `checkcast` counts
+`Target#<checkcast>`); `System.load`/`loadLibrary` and `Runtime#load`/`loadLibrary` (now an
+uncatchable refusal, "loads a native library", `native-gap`); and the probe's `--json`, which
+dropped the counted table when every entrypoint threw (it now reports `unknown_host_calls` next
+to `error`, and `tools/unmodelled_calls.py` keeps it as `counted_before_error`, outside the totals).
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 896 → 896 |
+| mega | 60 → 60 | 87 → **88** | 4 → 4 | 101 → **100** | 2,468 → 2,472 |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 256 |
+
+- `voxy` refused → `ran-hollow` (4): its `Logger#objToString` read `getClass().isArray()` on a
+  string and died on the old `null`.
+- `voicechat-neoforge` 2 → 3: one `log4j core Logger#<instanceof>` on a host logger is now counted.
+- Both `e4mc` builds stay refused and move one step on: `getClass().isEnum()` on a string answered
+  `null`; now they stop at kaleido's own `IllegalArgumentException`.
+- Both `Bookshelf` builds stay refused at the same throw, and now show the counted
+  `Object#getClass` in their table (the `ServiceLoader` provider marker it is called on).
+- `krypton` is unchanged: it stops on the counted `Unpooled#directBuffer` null in
+  `NativeConstraints.<clinit>` before it reaches `System.load`.
+- 161 of 178 refused rows now carry a counted table.
+## Re-measured (12 November 2026, `ServiceLoader` providers)
+
+`ServiceLoader` now builds its providers the way JDK 27 does (`service_loader.rs`). Before,
+`Provider.get` split its marker at the first `/`, so every packaged service gave a wrong class
+name, and no provider was ever constructed. Against `6e3684b`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → 42 | 4 → 4 | 39 → 39 | 896 → 898 |
+| mega | 60 → 60 | 87 → 87 | 4 → 4 | 101 → 101 | 2,468 → 2,500 |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 255 |
+
+No verdict moved. The rises come from jars that now run further. `structure_layout_optimizer`
+(1 → 3) and `authme` (1 → 31) get past the formerly counted `ServiceLoader#forEach` into their
+next unmodelled calls (`Optionull#mapOrDefault`, `Class#getEnclosingClass`). Both `Bookshelf` builds
+get past the provider: NeoForge's now stops at `instanceof FMLModContainer`, Fabric's at
+`MapCodecs#getEnumsByName`. `moderner-beta`, `servercore`, `ItemBorders`, `Highlighter` and
+`AdvancementPlaques` stay refused, now at a later throw, because their providers' constructors
+ran.
+## Re-measured (12 November 2026, sequenced lists and `FMLModContainer`)
+
+JDK 21's `getFirst`/`getLast`/`removeFirst`/`removeLast`/`addFirst`/`addLast`/`reversed` now
+answer on lists, not only on queues (`sequenced.rs`). A `javafml` mod's container is an
+`FMLModContainer`, and its `getEventBus()` returns the mod bus. Against `6e3684b`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → 31 | 42 → **43** | 4 → 4 | 39 → **38** | 896 → 909 |
+| mega | 60 → 60 | 87 → 87 | 4 → 4 | 101 → 101 | 2,468 → 2,468 |
+| NeoForge | 21 → 21 | 25 → 25 | 0 → 0 | 39 → 39 | 255 → 257 |
+
+- `241160-8893517` (Balm's netherportalfix) goes from refused to `ran-hollow` (13).
+- `ImmediatelyFast-NeoForge` gets its two `List#getFirst` answered and runs on (2 → 4).
+- Every `collective` build, and `fullbrightnesstoggle` through it, gets past
+  `ArrayBackedEvent#rebuildInvoker` and now stops at the `String#replaceAll` null in
+  `RegisterMod`.
+
+## Re-measured (12 November 2026, `java.util.regex`)
+
+Old is `e02154f` (main, with sequenced lists and `ServiceLoader` providers) and new is the same
+commit with Java's regex engine reimplemented (`java_regex/`, `regex_calls.rs`): `String#matches`,
+`replaceAll`, `replaceFirst` and `split` answer exactly like OpenJDK 27 for any pattern in the
+modelled subset and are counted otherwise. Same corpora, deps and command (fast-built probes).
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` | unknown calls |
+|---|---:|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → **33** | 43 → 48 | 4 → 4 | 38 → **31** | 911 → 4,941 |
+| mega | 60 → 60 | 88 → 99 | 4 → 4 | 100 → **89** | 2,504 → 10,761 |
+| NeoForge | 21 → 21 | 26 → 26 | 0 → 0 | 38 → 38 | 278 → 278 |
+
+`cupboard` (4 → 0) and `structureessentials` (9 → 0) are now `ran-clean`: Cupboard's
+`splitLongDesc` `replaceFirst` (lookbehinds, a `$1` replacement) is answered. Seven maxhenkel
+rows (Simple Voice Chat ×3, Sound Physics Remastered ×2, Peek ×2, over both corpora) leave
+`refused`: `CommentedProperties#removeNewLines`' `split("\\r?\\n")` was outside the old
+literal-only split. Collective's `RegisterMod#register` (`replaceAll("\\[", "")`, which answered
+null) no longer stops twelve Serilum rows: `collective` 8.67 itself (`ran-hollow`, 474), both
+`fullbrightnesstoggle` builds and both `stackrefill` builds among them. `collective` 8.42/8.46 stop
+earlier, in `RegisterMod.<clinit>` on the `HttpClient$Builder` null, and the NeoForge build in
+`ForgeModLoaderHelper#getGameDirectory`, as on main. `litematica-printer` and `collectorsalbum`
+stay refused at a later point. The unknown totals rise because those jars now run their config
+writers: `Character$UnicodeBlock.of` and `BASIC_LATIN` (683–954 calls each per maxhenkel jar) and
+`StringBuilder#charAt` are 11,729 of the 12,287 added calls. No regex call is left in the ranking or in a
+refusal, and none of these runs reaches a `Matcher` method. No verdict got worse.
+
 ## Known limits of this census
 
 - The probe executes a jar as shipped. A jar whose entrypoint only works with its own

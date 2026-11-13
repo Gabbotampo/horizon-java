@@ -12,13 +12,25 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// A per-process build counter for fixture directories. Two tests in one test
+/// binary can build the same fixture name on different threads in the same
+/// clock tick (a CI VM's clock can be coarse), and a name made only from the
+/// pid and the time then gives both threads one directory: one writes
+/// `probe.jar` while the other reads it half-written (`Truncated`). The counter
+/// makes every build's directory its own.
+static BUILDS: AtomicU64 = AtomicU64::new(0);
 use zip::write::SimpleFileOptions;
 
 pub struct Fixture {
     root: PathBuf,
     pub jar: NativeJar,
+    /// The `lib/` classes, packed as a jar of their own by
+    /// [`Fixture::build_with_lib`], for a test to link beside `jar`.
+    pub lib: Option<NativeJar>,
 }
 
 impl Drop for Fixture {
@@ -48,12 +60,29 @@ impl Fixture {
     /// `javac --release 21` and pack the `demo/` classes as a Fabric jar with
     /// `demo.Probe` as its `main` entrypoint.
     pub fn build(test: &str, sources: &[(&str, &str)]) -> Self {
+        Self::build_jars(test, sources, &[], false)
+    }
+
+    /// [`Self::build`], with the `lib/` classes packed as a second jar
+    /// (`lib`, a library the probe jar bundles or depends on) and `extra`
+    /// `(entry, bytes)` files written into the probe jar.
+    pub fn build_with_lib(test: &str, sources: &[(&str, &str)], extra: &[(&str, &[u8])]) -> Self {
+        Self::build_jars(test, sources, extra, true)
+    }
+
+    fn build_jars(
+        test: &str,
+        sources: &[(&str, &str)],
+        extra: &[(&str, &[u8])],
+        with_lib: bool,
+    ) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let build = BUILDS.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "horizon-native-java-{test}-{}-{unique}",
+            "horizon-native-java-{test}-{}-{unique}-{build}",
             std::process::id()
         ));
         let classes = root.join("classes");
@@ -84,9 +113,30 @@ impl Fixture {
                 .unwrap();
             zip.write_all(&fs::read(class).unwrap()).unwrap();
         }
+        for (entry, bytes) in extra {
+            zip.start_file(*entry, SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
         zip.finish().unwrap();
         let jar = NativeJar::from_path(&jar_path).unwrap();
-        Self { root, jar }
+        let lib = with_lib.then(|| {
+            let lib_path = root.join("lib.jar");
+            let mut zip = zip::ZipWriter::new(fs::File::create(&lib_path).unwrap());
+            zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(br#"{"id":"probe-lib","version":"1.0"}"#)
+                .unwrap();
+            for class in files_under(&classes.join("lib")) {
+                let entry = class.strip_prefix(&classes).unwrap().to_string_lossy();
+                zip.start_file(entry.replace('\\', "/"), SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(&fs::read(class).unwrap()).unwrap();
+            }
+            zip.finish().unwrap();
+            NativeJar::from_path(&lib_path).unwrap()
+        });
+        Self { root, jar, lib }
     }
 
     /// Run the static `String demo.Probe.<method>()` on a seeded host.

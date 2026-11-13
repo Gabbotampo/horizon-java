@@ -54,6 +54,40 @@ class UnmodelledCallsTests(unittest.TestCase):
         _, ranked = TOOL.aggregate(corpora)
         self.assertEqual([row["sole"] for row in ranked], [0, 0])
 
+    def test_calls_counted_before_a_refusal_are_not_ranked(self):
+        # A refused jar keeps what it counted before it stopped, for reading;
+        # the totals and ranking stay over runs that finished.
+        corpora = {"wide": [
+            {"verdict": "refused", "counted_before_error": [["z", 3]]},
+            {"verdict": "ran-hollow", "calls": [["a", 1]], "unknown": 1},
+        ]}
+        totals, ranked = TOOL.aggregate(corpora)
+        self.assertEqual(totals["wide"]["unknown_total"], 1)
+        self.assertEqual([row["call"] for row in ranked], ["a"])
+
+    def test_parked_threads_rank_by_jars_then_threads(self):
+        watcher = "com/electronwill/nightconfig/core/file/FileWatcher$FsWatcher"
+        corpora = {
+            "mega": [
+                {"jar": "a.jar", "verdict": "ran-hollow",
+                 "parked_threads": [{"name": "w-1", "runnable": watcher},
+                                    {"name": "w-2", "runnable": watcher}]},
+                {"jar": "b.jar", "verdict": "refused",
+                 "parked_threads": [{"name": None, "runnable": "demo/Updater"}]},
+                {"jar": "c.jar", "verdict": "ran-clean"},
+            ],
+            "wide": [
+                {"jar": "a.jar", "verdict": "ran-hollow",
+                 "parked_threads": [{"name": "w-1", "runnable": watcher}]},
+            ],
+        }
+        # The same file name in two corpora is two jars; a jar starting two
+        # watchers is still one jar.
+        self.assertEqual(TOOL.parked_summary(corpora), [
+            {"runnable": watcher, "jars": 2, "threads": 3},
+            {"runnable": "demo/Updater", "jars": 1, "threads": 1},
+        ])
+
     def test_parse_corpus_splits_name_and_directory(self):
         self.assertEqual(TOOL.parse_corpus("neoforge=/tmp/x"),
                          ("neoforge", Path("/tmp/x")))
