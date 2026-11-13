@@ -124,14 +124,14 @@ What it does today:
   `word`/`text` and `integer` nodes only: anything else is refused by name and logged.
 
 A native mod is one flat crate, so the runtime is copied into `mod/src/runtime/` by
-`tools/vendor.py` (which rewrites `crate::` to `crate::runtime::` and records a SHA-256 per file in
-`mod/vendor.lock`). The copy is committed, so a clean clone builds, and it carries the runtime commit
-the lock records: `python3 tools/vendor.py --check-lock` always fails on a hand edit to it, while
-`--check` (the mod is current with the runtime source) is required of a PR that touches `mod/` and is
-run by CI only for those. A mod PR refreshes the copy with `python3 tools/vendor.py`.
+`tools/vendor.py` (which rewrites `crate::` to `crate::runtime::`). The copy is committed, so a
+clean clone builds, and every commit that changes the runtime re-vendors it in the same commit.
+`python3 tools/vendor.py --check` regenerates the copy and compares it byte for byte, so it fails on a
+hand edit to `mod/src/runtime/` and on a runtime change that was not re-vendored; CI runs it on every
+PR and push.
 
 ```sh
-python3 tools/vendor.py             # after changing crates/horizon-native-java
+python3 tools/vendor.py             # after changing crates/horizon-native-java; commit mod/src/runtime with it
 python3 tools/java_mod_fixture.py --out DIR                 # milestone 1's jar
 python3 tools/java_mod_fixture.py --kind lifecycle --out DIR # SERVER_STARTED/STOPPING lines
 python3 tools/java_mod_fixture.py --kind command --out DIR   # /javahello [name]
