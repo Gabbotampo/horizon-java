@@ -274,8 +274,7 @@ fn sub_lists_write_through_to_their_list() {
 }
 
 /// `trimToSize`, `Vector.removeElement` and `List.replaceAll` are counted
-/// by the host but still move `modCount` (`12CME`, as JDK 25). `ArrayDeque`
-/// has no `modCount`; a step after a change is counted.
+/// by the host but still move `modCount` (`12CME`, as JDK 25).
 #[test]
 fn members_the_host_counts_still_move_mod_count() {
     let fixture = fixture("members-the-host-counts-still-move-mod-c");
@@ -292,10 +291,6 @@ fn members_the_host_counts_still_move_mod_count() {
                 1,
             )],
         ),
-        (
-            "dequeLoopPollLast",
-            &[("java/util/Iterator#next()Ljava/lang/Object;", 2)],
-        ),
     ];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
@@ -308,4 +303,14 @@ fn members_the_host_counts_still_move_mod_count() {
             );
         }
     }
+}
+
+/// `ArrayDeque` has no `modCount`: its iterator throws at the slot
+/// `pollLast` emptied (`array_deque.rs`).
+#[test]
+fn array_deque_iterator_meets_the_emptied_slot() {
+    assert_exact(
+        "array-deque-iterator-meets-the-emptied-s",
+        &[("dequeLoopPollLast", "123CME")],
+    );
 }
