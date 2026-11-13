@@ -27,6 +27,7 @@ mod collection_base;
 mod collection_callback;
 mod color_collection;
 mod commons_io;
+mod concurrent_sync;
 pub mod content;
 mod declarations_content;
 pub mod dependencies;
@@ -100,6 +101,7 @@ mod nested_jars;
 mod night_config;
 mod null_checks;
 mod object_methods;
+mod open_options;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -9911,6 +9913,8 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         // SLF4J ships with the game; logging shims switch over its levels
         // (javac's `$SwitchMap` sizes its table from `values()`).
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
+        // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
+        "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
         _ => return None,
     })
 }
@@ -24057,12 +24061,24 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        open_options::invoke(self, &r, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // `Files` writers' `StandardOpenOption`s (`open_options.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_io(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, mod_origin::invoke(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        concurrent_sync::invoke(self, &r, receiver.as_ref(), &args)
+                    ) {
+                        // `CountDownLatch`, `new ThreadPoolExecutor` (`concurrent_sync.rs`).
                         value
                     } else if let Some(value) =
                         executors::invoke_thread_factory(self, &r, receiver.as_ref(), &args)
