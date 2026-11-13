@@ -2206,6 +2206,12 @@ pub trait Host {
         None
     }
 
+    /// The collection a `Collections.synchronized*` view wraps, when
+    /// `value` is one (`synchronized_views.rs`).
+    fn synchronized_wrapped(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
     /// A collection's `modCount` (`mod_count.rs`).
     fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
         mod_count::ModStamp::default()
@@ -4153,6 +4159,10 @@ impl Host for StdHost {
 
     fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
         self.iterator_guards.insert(marker.to_owned(), guard);
+    }
+
+    fn synchronized_wrapped(&self, value: &Value) -> Option<Value> {
+        self.synchronized_receiver(value)
     }
 
     fn mod_stamp(&self, marker: &str) -> mod_count::ModStamp {
@@ -24240,6 +24250,15 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    // A synchronized view runs every call on the collection it
+                    // wraps (`synchronized_views.rs`): the collection models
+                    // below answer for that collection, in its own order.
+                    let receiver = match receiver {
+                        Some(view) if op != 0xb7 => {
+                            Some(self.host.synchronized_wrapped(&view).unwrap_or(view))
+                        }
+                        receiver => receiver,
+                    };
                     // A call that may move a host collection's `modCount`
                     // (`mod_count.rs`), checked and noted around the dispatch.
                     let mod_token = if anchor_replacement.is_none() {
