@@ -10551,7 +10551,7 @@ fn is_lazy_optional_owner(owner: &str) -> bool {
 fn host_text(value: &Value) -> String {
     match value {
         Value::Host(handle) => handle
-            .to_string(&mut HostNested(None))
+            .to_string(&mut MarkerText)
             .ok()
             .flatten()
             .unwrap_or_default(),
@@ -10559,18 +10559,41 @@ fn host_text(value: &Value) -> String {
     }
 }
 
-/// [`host_ref::Nested`] for the host, which cannot run jar code: a held jar
-/// object's `hashCode` and `equals` are unknown (`None`, the caller counts
-/// them); a string, a box and a handle answer by value. With a host, a held
-/// jar object's text is counted as `Object.toString` is (`object_text`).
+/// [`host_ref::Nested`] for [`host_text`]'s callers, which can neither run
+/// jar code nor count (a facade's JSON, a diagnostic): a held value prints
+/// as [`value_text`] does, a marker as itself. Answers nothing else.
+struct MarkerText;
+
+impl host_ref::Nested for MarkerText {
+    fn hash(&mut self, _value: &Value) -> Result<Option<i32>, NativeError> {
+        Ok(None)
+    }
+
+    fn equals(&mut self, _a: &Value, _b: &Value) -> Result<Option<bool>, NativeError> {
+        Ok(None)
+    }
+
+    fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        Ok(Some(match value {
+            Value::Host(handle) => return handle.to_string(self),
+            other => value_text(other),
+        }))
+    }
+}
+
+/// [`host_ref::Nested`] for the host, which cannot run jar code. It answers
+/// only what it knows: a string, a box and a handle by value, and (with a
+/// host) the text a model prints for its own object. Any other object (a jar
+/// object, a collection, a game object) is unknown here (`None`), and the
+/// caller counts the call instead of printing or hashing its marker.
 struct HostNested<'a>(Option<&'a mut StdHost>);
 
 impl host_ref::Nested for HostNested<'_> {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
         Ok(match value {
             Value::Host(handle) => return handle.hash_code(self),
-            Value::Ref(Some(marker)) if jar_text::object_marker_class(marker).is_some() => None,
-            Value::Ref(Some(text)) => Some(stable_hash(text)),
+            Value::Ref(Some(text)) if value_class::is_plain_string(text) => Some(stable_hash(text)),
+            Value::Ref(Some(_)) | Value::Void => None,
             Value::Ref(None) => Some(0),
             other => object_methods::platform_hash(other),
         })
@@ -10579,7 +10602,9 @@ impl host_ref::Nested for HostNested<'_> {
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
         Ok(match a {
             Value::Host(handle) => return handle.equals(b, self),
-            Value::Ref(Some(marker)) if jar_text::object_marker_class(marker).is_some() => {
+            // `a == b` answers `Objects.equals` for any object; otherwise an
+            // object's own `equals` is not the host's to run.
+            Value::Ref(Some(text)) if !value_class::is_plain_string(text) => {
                 (a == b).then_some(true)
             }
             _ => Some(boxed::canonical(a) == boxed::canonical(b)),
@@ -10587,11 +10612,13 @@ impl host_ref::Nested for HostNested<'_> {
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
-        Ok(Some(match (value, self.0.as_deref_mut()) {
+        Ok(match (value, self.0.as_deref_mut()) {
             (Value::Host(handle), _) => return handle.to_string(self),
-            (other, Some(host)) => object_text(host, other),
-            (other, None) => value_text(other),
-        }))
+            (Value::Ref(Some(text)), _) if value_class::is_plain_string(text) => Some(text.clone()),
+            (Value::Ref(Some(_)), Some(host)) => host.modelled_to_string(value),
+            (Value::Ref(Some(_)), None) => None,
+            (other, _) => Some(value_text(other)),
+        })
     }
 }
 
@@ -11544,6 +11571,15 @@ fn collection_text(
 fn object_text(host: &mut StdHost, value: &Value) -> String {
     match value {
         Value::Boxed(boxed) => boxed.text(),
+        // A handle prints its kind's `toString`; one holding an object the
+        // host cannot print is counted, and keeps the old text.
+        Value::Host(handle) => match handle.to_string(&mut HostNested(Some(host))) {
+            Ok(Some(text)) => text,
+            _ => {
+                let _ = host.unknown_host_call(&jar_text::object_to_string());
+                host_text(value)
+            }
+        },
         Value::Ref(Some(marker)) => host.modelled_to_string(value).unwrap_or_else(|| {
             // An object no model prints (a jar object, an identity hash)
             // is counted; the element keeps its marker in the text.
@@ -20023,6 +20059,18 @@ impl<H: Host> Runtime<'_, H> {
                 && let Some(text) = self.host_entry_text(&receiver, "callback", "callback")?
             {
                 return Ok(Some(text));
+            }
+            // `Object::toString`/`hashCode`/`equals` on a host handle: its
+            // kind's row, as the direct call runs it (`host_ref.rs`).
+            if let Some(value) = self.invoke_host_object_method(
+                &callback.target,
+                0xb9,
+                Some(&receiver),
+                &rest,
+                "callback",
+                "callback",
+            )? {
+                return Ok(Some(value));
             }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
