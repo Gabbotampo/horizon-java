@@ -6,13 +6,15 @@
 //! The fixture first discovers the host marker for its opaque capability, then
 //! reruns with that marker seeded to a deterministic value.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 use zip::write::SimpleFileOptions;
 
@@ -27,15 +29,8 @@ fn javac() -> PathBuf {
         .unwrap_or_else(|| "javac".into())
 }
 
-fn scratch_root(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-entity-capability-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    root
+fn scratch_root(name: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("entity-capability-{name}"))
 }
 
 fn write_source(root: &Path, relative: &str, body: &str) -> PathBuf {
@@ -45,7 +40,7 @@ fn write_source(root: &Path, relative: &str, body: &str) -> PathBuf {
     path
 }
 
-fn build_jar(name: &str) -> (PathBuf, NativeJar) {
+fn build_jar(name: &str) -> (scratch::Scratch, NativeJar) {
     let root = scratch_root(name);
     let src = root.join("src");
     let classes = root.join("classes");
