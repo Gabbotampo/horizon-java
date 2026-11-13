@@ -44,6 +44,7 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("optional-long/", "java/util/OptionalLong"),
         ("optional-double/", "java/util/OptionalDouble"),
         ("regex-pattern/", "java/util/regex/Pattern"),
+        ("watch-kind/", "java/nio/file/WatchEvent$Kind"),
         ("charset/", "java/nio/charset/Charset"),
         ("coding-error-action/", "java/nio/charset/CodingErrorAction"),
         ("locale/", "java/util/Locale"),

@@ -102,6 +102,8 @@ impl<H: Host> Runtime<'_, H> {
             return self.host.unknown_operand_call(r).map(Some);
         }
         if replace_existing {
+            // `deleteIfExists(target)` first (`watch_service.rs`).
+            self.watch_deleted(&target);
             self.io_files.remove(&target);
         }
         if self.io_files.contains_key(&target) {
@@ -114,6 +116,11 @@ impl<H: Host> Runtime<'_, H> {
             return self.host.unknown_operand_call(r).map(Some);
         };
         let count = bytes.len() as i64;
+        // `newOutputStream(target, CREATE_NEW, WRITE)`, then the bytes.
+        self.watch_change(&target, watch_service::Change::Create);
+        if count > 0 {
+            self.watch_change(&target, watch_service::Change::Modify);
+        }
         self.io_files
             .insert(target, String::from_utf8_lossy(&bytes).into_owned());
         Ok(Some(Value::Long(count)))

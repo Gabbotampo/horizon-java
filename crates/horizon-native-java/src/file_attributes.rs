@@ -78,6 +78,17 @@ const LOADER_DIRECTORIES: &[&str] = &[
     "/horizon/defaultconfigs",
 ];
 
+/// What [`Runtime::delete_path`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Deletion {
+    Deleted,
+    Missing,
+    /// A directory that still holds entries: `DirectoryNotEmptyException`.
+    NotEmpty,
+    /// A loader folder or the working directory, whose contents are the game's.
+    Unknown,
+}
+
 /// What the file model knows a path to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileKind {
@@ -149,6 +160,37 @@ impl<H: Host> Runtime<'_, H> {
             return FileKind::RegularFile;
         }
         FileKind::Missing
+    }
+
+    /// Delete `path` from the model as a JDK 25 `unlink`/`rmdir` would: a
+    /// missing path and a directory that still holds entries are left alone.
+    /// A loader folder's contents are the game's, so deleting one is
+    /// [`Deletion::Unknown`].
+    pub(crate) fn delete_path(&mut self, path: &str) -> Deletion {
+        let path = path.trim_end_matches('/');
+        match self.file_kind(path) {
+            FileKind::Missing => return Deletion::Missing,
+            FileKind::Directory => {
+                if LOADER_DIRECTORIES
+                    .iter()
+                    .any(|root| *root == path || is_parent_of(path, root))
+                    || path.is_empty()
+                    || path == "."
+                {
+                    return Deletion::Unknown;
+                }
+                let holds = self.io_dirs.iter().any(|known| is_parent_of(path, known))
+                    || self.io_files.keys().any(|known| is_parent_of(path, known));
+                if holds {
+                    return Deletion::NotEmpty;
+                }
+            }
+            FileKind::RegularFile => {}
+        }
+        self.watch_deleted(path);
+        self.io_dirs.remove(path);
+        self.io_files.remove(path);
+        Deletion::Deleted
     }
 
     /// Answer `Files.readAttributes`/`isDirectory`/`isRegularFile` or a call on
