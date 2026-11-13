@@ -19,6 +19,8 @@ import java.util.*;
 public final class Probe {
     static final StringBuilder LOG = new StringBuilder();
 
+    static void log(String event) { LOG.append(event).append(' '); }
+
     static String take(Object result) {
         String text = LOG.toString().trim() + " => " + result;
         LOG.setLength(0);
@@ -131,6 +133,66 @@ public final class Probe {
         return take(it == null ? "null" : "made");
     }
 
+    static String nextOrCme(ListIterator<Integer> it) {
+        try { return String.valueOf(it.next()); } catch (ConcurrentModificationException e) { return "CME"; }
+    }
+
+    static String hasNextAfterRemove(List<Integer> l) {
+        ListIterator<Integer> it = l.listIterator();
+        it.next(); it.next(); it.next();
+        l.remove(0);
+        log(String.valueOf(it.hasNext()));
+        return take(nextOrCme(it));
+    }
+
+    public static String hasNextArrayList() { return hasNextAfterRemove(new ArrayList<>(List.of(1, 2, 3))); }
+    public static String hasNextLinkedList() { return hasNextAfterRemove(new LinkedList<>(List.of(1, 2, 3))); }
+
+    static String restoring(List<Integer> l, boolean clear) {
+        ListIterator<Integer> it = l.listIterator();
+        it.next();
+        if (clear) { l.clear(); l.addAll(List.of(1, 2, 3)); } else { l.add(9); l.remove(3); }
+        return take(l + "," + nextOrCme(it));
+    }
+
+    public static String restoreArrayList() { return restoring(new ArrayList<>(List.of(1, 2, 3)), false); }
+    public static String restoreLinkedList() { return restoring(new LinkedList<>(List.of(1, 2, 3)), false); }
+    public static String restoreClearAddAll() { return restoring(new ArrayList<>(List.of(1, 2, 3)), true); }
+
+    static String throwingEach(List<Integer> l) {
+        ListIterator<Integer> it = l.listIterator();
+        try {
+            it.forEachRemaining(x -> { log("e" + x); if (x == 2) throw new IllegalStateException(); });
+        } catch (IllegalStateException e) { log("caught"); }
+        return take(it.nextIndex() + "," + it.hasNext() + "," + it.next());
+    }
+
+    public static String throwingArrayList() { return throwingEach(new ArrayList<>(List.of(1, 2, 3))); }
+    public static String throwingLinkedList() { return throwingEach(new LinkedList<>(List.of(1, 2, 3))); }
+    public static String throwingVector() { return throwingEach(new Vector<>(List.of(1, 2, 3))); }
+
+    public static String outsideSetAndReplaceAll() {
+        List<Integer> l = new ArrayList<>(List.of(1, 2, 3));
+        ListIterator<Integer> it = l.listIterator();
+        it.next();
+        l.set(1, 9);
+        String a = nextOrCme(it);
+        return take(a);
+    }
+
+    public static String forEachRemainingOutsideAdd() {
+        List<Integer> l = new ArrayList<>(List.of(1, 2, 3));
+        ListIterator<Integer> it = l.listIterator();
+        String r;
+        try { it.forEachRemaining(x -> { log("e" + x); if (x == 1) l.add(7); }); r = "ok"; } catch (ConcurrentModificationException e) { r = "CME"; }
+        List<Integer> k = new LinkedList<>(List.of(1, 2, 3));
+        ListIterator<Integer> kt = k.listIterator();
+        String s;
+        try { kt.forEachRemaining(x -> { log("k" + x); if (x == 1) k.add(7); }); s = "ok"; } catch (ConcurrentModificationException e) { s = "CME"; }
+        return take(r + "," + it.nextIndex() + "," + s + "," + kt.nextIndex());
+    }
+
+
     public static String listIteratorForEach() {
         List<String> list = new ArrayList<>(List.of("a", "b", "c"));
         ListIterator<String> it = list.listIterator();
@@ -168,6 +230,17 @@ fn host_list_iterators_run_as_jdk_25_does() {
         ),
         ("previousThenRemove", " => [a, b],c,2,false"),
         ("listIteratorForEach", " => bc,3,false,c"),
+        ("forEachRemainingOutsideAdd", "e1 k1 => CME,1,CME,1"),
+        ("hasNextArrayList", "true => CME"),
+        ("hasNextLinkedList", "false => CME"),
+        ("outsideSetAndReplaceAll", " => 9"),
+        ("restoreArrayList", " => [1, 2, 3],CME"),
+        ("restoreClearAddAll", " => [1, 2, 3],CME"),
+        ("restoreLinkedList", " => [1, 2, 3],CME"),
+        ("throwingArrayList", "e1 e2 caught => 0,true,1"),
+        ("throwingLinkedList", "e1 e2 caught => 1,true,2"),
+        ("throwingVector", "e1 e2 caught => 0,true,1"),
+        ("nonStructuralWrite", " => z,w,[z, w]"),
     ];
     let mut failures = Vec::new();
     for (method, expected) in cases {
@@ -209,20 +282,6 @@ fn counted(method: &str) -> Vec<(String, usize)> {
         &mut host,
     );
     host.unknown_host_calls()
-}
-
-/// Not JDK behaviour, counted instead: a `set` made outside the iterator
-/// leaves the size unchanged, and without `modCount` it cannot be told from a
-/// remove and an add (which would throw), so each later `next()` is counted.
-#[test]
-fn a_same_size_change_behind_a_list_iterator_is_counted() {
-    assert_eq!(
-        counted("nonStructuralWrite"),
-        vec![(
-            "java/util/ListIterator#next()Ljava/lang/Object;".to_owned(),
-            2
-        )]
-    );
 }
 
 /// `List.of(...).listIterator()` is not modelled (the host's value does not
