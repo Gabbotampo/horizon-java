@@ -795,6 +795,12 @@ impl<H: Host> Runtime<'_, H> {
         }
         let text = match value {
             Value::Ref(None) | Value::Void => Some("null".to_owned()),
+            // A boxed number or boolean is a JSON number or literal; a
+            // `Character` is a one-character string.
+            Value::Boxed(boxed @ Boxed::Character(_)) => {
+                Some(format!("\"{}\"", style.escape(&boxed.text())))
+            }
+            Value::Boxed(boxed) => Some(boxed.text()),
             Value::Int(value) => Some(value.to_string()),
             Value::Long(value) => Some(if style.long_strings() {
                 format!("\"{value}\"")
@@ -833,14 +839,6 @@ impl<H: Host> Runtime<'_, H> {
                     .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
                 {
                     Some(format!("\"{}\"", style.escape(name)))
-                } else if let Some(text) = jdk_model::boxed_text(marker, "Ljava/lang/Object;") {
-                    // A boxed number or boolean is a JSON number or literal;
-                    // a `Character` is a one-character string.
-                    if marker.starts_with("character:") {
-                        Some(format!("\"{}\"", style.escape(&text)))
-                    } else {
-                        Some(text)
-                    }
                 } else if let Some(kind) = gson_marker_kind(self.host, value) {
                     let values = runtime_collection_values(self.host, value)?;
                     if kind == "map" {

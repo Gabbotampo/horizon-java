@@ -190,26 +190,14 @@ fn null_pointer() -> NativeError {
     }
 }
 
-/// A value that means the same in another jar's runtime: `null`, a primitive box (its marker is
-/// its value, `integer:10`) or a plain string.
+/// A value that means the same in another jar's runtime: `null`, a primitive box (it carries its
+/// value) or a plain string.
 fn crosses_jars(value: &Value) -> bool {
-    const BOXES: [&str; 8] = [
-        "java/lang/Integer",
-        "java/lang/Long",
-        "java/lang/Short",
-        "java/lang/Byte",
-        "java/lang/Character",
-        "java/lang/Float",
-        "java/lang/Double",
-        "java/lang/Boolean",
-    ];
     match value {
-        Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Ref(None) => true,
-        Value::Ref(Some(text)) => {
-            crate::runtime::value_class::is_plain_string(text)
-                || (!text.contains('#')
-                    && crate::runtime::class_of_value(value).is_some_and(|class| BOXES.contains(&&*class)))
+        Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) | Value::Ref(None) => {
+            true
         }
+        Value::Ref(Some(text)) => crate::runtime::value_class::is_plain_string(text),
         Value::Void => false,
     }
 }

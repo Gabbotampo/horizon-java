@@ -34,7 +34,7 @@ impl GameRuleValue {
     pub(crate) fn boxed(self) -> Value {
         match self {
             Self::Bool(value) => crate::runtime::boolean_value(value),
-            Self::Int(value) => Value::Ref(Some(format!("integer:{value}"))),
+            Self::Int(value) => Value::Boxed(crate::runtime::Boxed::Integer(value)),
         }
     }
 
@@ -173,7 +173,7 @@ fn argument(default: GameRuleValue, value: &Value) -> Option<GameRuleValue> {
         GameRuleValue::Int(_) => match value {
             // Only a box: an `int` on the stack is not a `GameRule<Integer>`
             // argument, `serialize` takes an `Object`.
-            Value::Ref(Some(_)) => boxed_integer(value).map(GameRuleValue::Int),
+            Value::Boxed(_) => boxed_integer(value).map(GameRuleValue::Int),
             _ => None,
         },
     }
@@ -303,11 +303,11 @@ mod tests {
             let boxed = ask("defaultValue", "()Ljava/lang/Object;", &[]).unwrap();
             let (class, value) = default.split_once(':').unwrap();
             let expected = match class {
-                "java.lang.Boolean" => format!("boolean:{value}"),
-                "java.lang.Integer" => format!("integer:{value}"),
+                "java.lang.Boolean" => crate::runtime::Boxed::Boolean(value == "true"),
+                "java.lang.Integer" => crate::runtime::Boxed::Integer(value.parse().unwrap()),
                 other => panic!("unexpected default class {other}"),
             };
-            assert_eq!(boxed, Value::Ref(Some(expected)), "{field}");
+            assert_eq!(boxed, Value::Boxed(expected), "{field}");
             assert_eq!(
                 kind,
                 match rule.default {
@@ -359,7 +359,7 @@ mod tests {
             rule_member("keep_inventory", &result, &[off]),
             Some(Value::Int(expected[2].parse().unwrap()))
         );
-        let minus_seven = Value::Ref(Some("integer:-7".into()));
+        let minus_seven = Value::Boxed(crate::runtime::Boxed::Integer(-7));
         let expected = row("serialize-int");
         assert_eq!(
             text(rule_member(

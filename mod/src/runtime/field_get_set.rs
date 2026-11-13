@@ -193,11 +193,11 @@ fn value_text(value: &Value, of: Prim) -> String {
 /// `valueOf` of a primitive, as the interpreter's own boxes look.
 fn boxed(value: &Value, of: Prim) -> Value {
     match (of, value) {
-        (Prim::Boolean, Value::Int(v)) => Value::Ref(Some(format!("boolean:{}", *v != 0))),
-        (Prim::Byte, Value::Int(v)) => Value::Ref(Some(format!("byte:{v}"))),
-        (Prim::Char, Value::Int(v)) => Value::Ref(Some(format!("character:{v}"))),
-        (Prim::Short, Value::Int(v)) => Value::Ref(Some(format!("short:{v}"))),
-        (Prim::Int, Value::Int(v)) => Value::Ref(Some(format!("integer:{v}"))),
+        (Prim::Boolean, Value::Int(v)) => Value::Boxed(Boxed::Boolean(*v != 0)),
+        (Prim::Byte, Value::Int(v)) => Value::Boxed(Boxed::Byte(*v as i8)),
+        (Prim::Char, Value::Int(v)) => Value::Boxed(Boxed::Character(*v as u16)),
+        (Prim::Short, Value::Int(v)) => Value::Boxed(Boxed::Short(*v as i16)),
+        (Prim::Int, Value::Int(v)) => Value::Boxed(Boxed::Integer(*v)),
         _ => value.clone(),
     }
 }
@@ -206,29 +206,19 @@ fn boxed(value: &Value, of: Prim) -> Value {
 /// `Double` share `Value::Float` and a bare `Value::Int` may be any of the
 /// int-like boxes, so neither is read here.
 fn unbox(value: &Value) -> Option<(Prim, Value)> {
-    if let Value::Long(v) = value {
-        return Some((Prim::Long, Value::Long(*v)));
-    }
-    let marker = expect_ref(value)?;
-    let (of, text) = [
-        ("integer:", Prim::Int),
-        ("short:", Prim::Short),
-        ("byte:", Prim::Byte),
-        ("character:", Prim::Char),
-        ("long:", Prim::Long),
-    ]
-    .into_iter()
-    .find_map(|(prefix, of)| marker.strip_prefix(prefix).map(|text| (of, text)))
-    .or_else(|| {
-        let flag = marker.strip_prefix("boolean:").unwrap_or(marker);
-        matches!(flag, "true" | "false").then_some((Prim::Boolean, flag))
-    })?;
-    let value = match of {
-        Prim::Boolean => Value::Int(i32::from(text == "true")),
-        Prim::Long => Value::Long(text.parse().ok()?),
-        _ => Value::Int(text.parse().ok()?),
+    let boxed = match value {
+        Value::Long(v) => return Some((Prim::Long, Value::Long(*v))),
+        Value::Boxed(boxed) => *boxed,
+        _ => return None,
     };
-    Some((of, value))
+    let of = match boxed {
+        Boxed::Boolean(_) => Prim::Boolean,
+        Boxed::Byte(_) => Prim::Byte,
+        Boxed::Short(_) => Prim::Short,
+        Boxed::Character(_) => Prim::Char,
+        Boxed::Integer(_) => Prim::Int,
+    };
+    Some((of, Value::Int(boxed.int())))
 }
 
 /// `Class.getName()` of a field descriptor.
