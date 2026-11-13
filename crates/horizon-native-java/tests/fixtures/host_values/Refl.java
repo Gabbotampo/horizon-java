@@ -148,8 +148,42 @@ public class Refl {
     return "" + identity.size();
   }
 
+  /**
+   * Fields paired with a sort key through a stream keep their copy: setAccessible, then get
+   * (Shulker Box Tooltip's config tree pairs each field with an ordinal the same way).
+   */
+  public static String fieldStream() throws Exception {
+    Refl holder = new Refl();
+    holder.names = new String[] {"x"};
+    holder.plain = 4;
+    return java.util.Arrays.stream(Refl.class.getDeclaredFields())
+        .filter(f -> !Modifier.isStatic(f.getModifiers()))
+        .map(f -> Map.entry(-f.getName().length(), f))
+        .sorted(Comparator.comparingInt(Map.Entry::getKey))
+        .map(Map.Entry::getValue)
+        .map(f -> { f.setAccessible(true); try { return f.getName() + "=" + f.get(holder); } catch (Exception e) { return e.toString(); } })
+        .map(s -> s.startsWith("names=") ? "names=array" : s)
+        .collect(java.util.stream.Collectors.joining(","));
+  }
+
+  /** A HashMap keyed by Method, copied and read back (DazzleConf's default-method map). */
+  public static String methodMap() throws Exception {
+    Map<Method, String> map = new HashMap<>();
+    for (Method m : new Method[] {Api.class.getMethod("name"), Api.class.getMethod("size")}) {
+      map.put(m, m.getName());
+    }
+    Map<Method, String> copy = new HashMap<>(map);
+    int seen = 0;
+    for (Map.Entry<Method, String> entry : copy.entrySet()) {
+      Objects.requireNonNull(entry.getKey(), "key");
+      seen++;
+    }
+    Map<Method, String> fixed = Collections.unmodifiableMap(copy);
+    return seen + "," + fixed.size() + "," + fixed.get(Api.class.getMethod("size")) + "," + fixed.containsKey(target());
+  }
+
   public static void main(String[] args) throws Exception {
-    for (String name : new String[] {"spelled", "text", "real", "collections", "sameHandle", "fieldCopies", "methodCopies", "constructorCopies"}) {
+    for (String name : new String[] {"spelled", "text", "real", "collections", "sameHandle", "fieldCopies", "methodCopies", "constructorCopies", "fieldStream", "methodMap"}) {
       System.out.println("== " + name);
       System.out.println(Refl.class.getMethod(name).invoke(null));
     }
