@@ -19,7 +19,7 @@
 //!   logger configured to drop the mod's output does.
 //!
 //! The module also answers `Path.resolveSibling`, which the host's path model
-//! lacked. Paths stay virtual (`path:<text>`): no call in this file reads or
+//! lacked. Paths stay virtual (`host_path.rs`): no call in this file reads or
 //! writes the host filesystem.
 
 use crate::{MethodRef, NativeError, Value, expect_ref, expect_string};
@@ -114,7 +114,7 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
         // `name()`/`toString` agree.
         "java/nio/file/StandardWatchEventKinds" => match name {
             "ENTRY_CREATE" | "ENTRY_DELETE" | "ENTRY_MODIFY" | "OVERFLOW" => {
-                Some(Value::Ref(Some(format!("watch-kind/{name}"))))
+                Some(crate::host_watch::watch_kind(name))
             }
             _ => None,
         },
@@ -359,6 +359,13 @@ pub(crate) fn instance_call(
     if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
         return resolve_sibling(r, receiver, args).map(Ok);
     }
+    if let Some(kind) = crate::host_watch::watch_key(receiver, crate::HostKind::WatchKind) {
+        return matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("name", "()Ljava/lang/String;")
+        )
+        .then(|| Ok(Value::Ref(Some(kind.to_owned()))));
+    }
     let marker = expect_ref(receiver)?;
     if let Some(canonical) = marker.strip_prefix(CHARSET_PREFIX) {
         return charset_call(r, canonical, args);
@@ -399,14 +406,6 @@ pub(crate) fn instance_call(
         // `newWatchService` is `watch_service.rs`'s.
         return match (r.name.as_str(), r.descriptor.as_str()) {
             ("getSeparator", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some("/".into())))),
-            _ => None,
-        };
-    }
-    if let Some(kind) = marker.strip_prefix("watch-kind/") {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("name" | "toString", "()Ljava/lang/String;") => {
-                Some(Ok(Value::Ref(Some(kind.to_owned()))))
-            }
             _ => None,
         };
     }
@@ -452,10 +451,8 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
     ) {
         return None;
     }
-    let path = expect_ref(receiver)?;
-    let path = path.strip_prefix("path:").unwrap_or(path);
-    let other = args.first().map(expect_string).unwrap_or_default();
-    let other = other.strip_prefix("path:").unwrap_or(other);
+    let path = crate::host_path::path_key(receiver)?;
+    let other = args.first().map(crate::path_text).unwrap_or_default();
     let parent = path
         .trim_end_matches('/')
         .rsplit_once('/')
@@ -466,7 +463,7 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
         }
         _ => other.to_owned(),
     };
-    Some(Value::Ref(Some(format!("path:{resolved}"))))
+    Some(crate::path_value(&resolved))
 }
 
 /// Elements one `StreamSupport.stream` source may yield before the runtime
@@ -837,6 +834,7 @@ fn platform_supertypes(class: &str) -> &'static [&'static str] {
         "java/util/concurrent/ConcurrentHashMap" => CONCURRENT_MAP,
         "java/util/ArrayDeque" | "java/util/concurrent/ConcurrentLinkedDeque" => DEQUE,
         "java/util/PriorityQueue" | "java/util/concurrent/ConcurrentLinkedQueue" => QUEUE,
+        "java/io/File" => &["java/io/Serializable", "java/lang/Comparable"],
         _ => &[],
     }
 }
@@ -1230,13 +1228,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         }
         let mut values = Vec::with_capacity(found.len() + 1);
         if r.name == "walk" {
-            values.push(Value::Ref(Some(format!("path:{path}"))));
+            values.push(crate::path_value(path));
         }
-        values.extend(
-            found
-                .into_iter()
-                .map(|entry| Value::Ref(Some(format!("path:{entry}")))),
-        );
+        values.extend(found.into_iter().map(|entry| crate::path_value(&entry)));
         Ok(self.new_stream(class, method, values))
     }
 
@@ -1626,26 +1620,23 @@ mod tests {
         );
         let cases = [
             (
-                "path:/horizon/config",
+                "/horizon/config",
                 "defaultconfigs",
-                "path:/horizon/defaultconfigs",
+                "/horizon/defaultconfigs",
             ),
-            (
-                "path:/horizon/config/a.json",
-                "b.json",
-                "path:/horizon/config/b.json",
-            ),
-            ("path:config", "other", "path:other"),
-            ("path:/top", "x", "path:/x"),
-            ("path:/horizon/config", "/abs", "path:/abs"),
+            ("/horizon/config/a.json", "b.json", "/horizon/config/b.json"),
+            ("config", "other", "other"),
+            ("/top", "x", "/x"),
+            ("/horizon/config", "/abs", "/abs"),
         ];
         for (path, other, expected) in cases {
+            let path = crate::path_value(path);
             assert_eq!(
-                instance_call(&sibling, &text(path), &[text(other)])
+                instance_call(&sibling, &path, &[text(other)])
                     .unwrap()
                     .unwrap(),
-                text(expected),
-                "{path} sibling {other}"
+                crate::path_value(expected),
+                "{path:?} sibling {other}"
             );
         }
     }

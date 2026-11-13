@@ -66,12 +66,14 @@
 //!   this model's are counted too.
 
 use super::*;
+use crate::host_watch::watch_key;
 use std::collections::VecDeque;
 
-const KIND_PREFIX: &str = "watch-kind/";
-const SERVICE_PREFIX: &str = "watch-service/";
-const KEY_PREFIX: &str = "watch-key/";
-const EVENT_PREFIX: &str = "watch-event/";
+/// A new handle for a watch object the model minted `key` for.
+fn handle(kind: HostKind, key: String) -> Value {
+    Value::Host(HostRef::new(kind, key))
+}
+
 /// `AbstractWatchKey`'s default `MAX_EVENT_LIST_SIZE`.
 const MAX_EVENTS: usize = 512;
 
@@ -181,9 +183,11 @@ fn directory_name(path: &str) -> String {
 }
 
 impl WatchState {
-    fn marker(&mut self, prefix: &str) -> String {
+    /// The key of a new service, key or event (`host_watch.rs`): one number
+    /// per object.
+    fn mint(&mut self) -> String {
         self.next += 1;
-        format!("{prefix}{}", self.next)
+        self.next.to_string()
     }
 
     /// `AbstractWatchKey.signalEvent`, then `signal`.
@@ -448,7 +452,7 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let Some(marker) = receiver.and_then(expect_ref).cloned() else {
+        let Some(receiver) = receiver.filter(|receiver| **receiver != Value::Ref(None)) else {
             return Ok(None);
         };
         // Every path the model names is on the default filesystem.
@@ -461,15 +465,15 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Ok(Some(Value::Ref(Some("file-system/default".into()))));
         }
-        if marker == "file-system/default"
+        if expect_ref(receiver).is_some_and(|marker| marker == "file-system/default")
             && (r.name.as_str(), r.descriptor.as_str())
                 == ("newWatchService", "()Ljava/nio/file/WatchService;")
         {
-            let service = self.watch.marker(SERVICE_PREFIX);
+            let service = self.watch.mint();
             self.watch
                 .services
                 .insert(service.clone(), Service::default());
-            return Ok(Some(Value::Ref(Some(service))));
+            return Ok(Some(handle(HostKind::WatchService, service)));
         }
         if r.name == "register"
             && matches!(
@@ -479,20 +483,26 @@ impl<H: Host> Runtime<'_, H> {
             && r.descriptor
                 .starts_with("(Ljava/nio/file/WatchService;[Ljava/nio/file/WatchEvent$Kind;")
         {
-            return self.watch_register(r, receiver.cloned().unwrap_or(Value::Ref(None)), args);
+            return self.watch_register(r, receiver.clone(), args);
         }
-        if marker.starts_with(SERVICE_PREFIX) && self.watch.services.contains_key(&marker) {
-            return self.watch_service_call(r, &marker, args);
+        if let Some(service) = watch_key(receiver, HostKind::WatchService)
+            .filter(|service| self.watch.services.contains_key(*service))
+        {
+            return self.watch_service_call(r, service, args);
         }
-        if marker.starts_with(KEY_PREFIX) && self.watch.keys.contains_key(&marker) {
-            return self.watch_key_call(r, &marker);
+        if let Some(key) =
+            watch_key(receiver, HostKind::WatchKey).filter(|key| self.watch.keys.contains_key(*key))
+        {
+            return self.watch_key_call(r, key);
         }
-        if let Some(event) = self.watch.delivered.get(&marker).cloned() {
+        if let Some(event) = watch_key(receiver, HostKind::WatchEvent)
+            .and_then(|event| self.watch.delivered.get(event))
+            .cloned()
+        {
             return Ok(match (r.name.as_str(), r.descriptor.as_str()) {
-                ("kind", "()Ljava/nio/file/WatchEvent$Kind;") => Some(Value::Ref(Some(format!(
-                    "{KIND_PREFIX}{}",
-                    event.kind.name()
-                )))),
+                ("kind", "()Ljava/nio/file/WatchEvent$Kind;") => {
+                    Some(crate::host_watch::watch_kind(event.kind.name()))
+                }
                 ("context", "()Ljava/lang/Object;") => Some(
                     event
                         .context
@@ -522,8 +532,13 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         let service = match StdHost::argument(r, args, 0)? {
             Value::Ref(None) => return Err(thrown("java/lang/NullPointerException", None)),
-            Value::Ref(Some(service)) if self.watch.services.contains_key(service) => {
-                service.clone()
+            service
+                if watch_key(service, HostKind::WatchService)
+                    .is_some_and(|service| self.watch.services.contains_key(service)) =>
+            {
+                watch_key(service, HostKind::WatchService)
+                    .unwrap_or_default()
+                    .to_owned()
             }
             // A `WatchService` of the jar's own, or one the model has no state for.
             _ => return self.host.unknown_operand_call(r).map(Some),
@@ -534,19 +549,19 @@ impl<H: Host> Runtime<'_, H> {
         };
         let mut wanted = Vec::new();
         for kind in &kinds {
-            let kind = match expect_ref(kind).map(String::as_str) {
-                None => {
-                    return Err(thrown(
-                        "java/lang/NullPointerException",
-                        Some("An element in event set is 'null'".into()),
-                    ));
-                }
-                Some("watch-kind/ENTRY_CREATE") => Kind::Create,
-                Some("watch-kind/ENTRY_DELETE") => Kind::Delete,
-                Some("watch-kind/ENTRY_MODIFY") => Kind::Modify,
-                Some("watch-kind/OVERFLOW") => continue,
+            if *kind == Value::Ref(None) {
+                return Err(thrown(
+                    "java/lang/NullPointerException",
+                    Some("An element in event set is 'null'".into()),
+                ));
+            }
+            let kind = match watch_key(kind, HostKind::WatchKind) {
+                Some("ENTRY_CREATE") => Kind::Create,
+                Some("ENTRY_DELETE") => Kind::Delete,
+                Some("ENTRY_MODIFY") => Kind::Modify,
+                Some("OVERFLOW") => continue,
                 // A `WatchEvent.Kind` of the jar's own.
-                Some(_) => return self.host.unknown_operand_call(r).map(Some),
+                _ => return self.host.unknown_operand_call(r).map(Some),
             };
             if !wanted.contains(&kind) {
                 wanted.push(kind);
@@ -584,9 +599,9 @@ impl<H: Host> Runtime<'_, H> {
             })
         {
             key.kinds = wanted;
-            return Ok(Some(Value::Ref(Some(marker.clone()))));
+            return Ok(Some(handle(HostKind::WatchKey, marker.clone())));
         }
-        let marker = self.watch.marker(KEY_PREFIX);
+        let marker = self.watch.mint();
         self.watch.keys.insert(
             marker.clone(),
             Key {
@@ -601,7 +616,7 @@ impl<H: Host> Runtime<'_, H> {
                 inexact: false,
             },
         );
-        Ok(Some(Value::Ref(Some(marker))))
+        Ok(Some(handle(HostKind::WatchKey, marker)))
     }
 
     /// `poll`, `poll(timeout, unit)`, `take` and `close`.
@@ -653,7 +668,9 @@ impl<H: Host> Runtime<'_, H> {
                 if unsettled {
                     self.host.unknown_operand_call(r)?;
                 }
-                Ok(Some(Value::Ref(next)))
+                Ok(Some(next.map_or(Value::Ref(None), |key| {
+                    handle(HostKind::WatchKey, key)
+                })))
             }
         }
     }
@@ -680,9 +697,9 @@ impl<H: Host> Runtime<'_, H> {
                     .unwrap_or_default();
                 let mut values = Vec::with_capacity(events.len());
                 for event in events {
-                    let event_marker = self.watch.marker(EVENT_PREFIX);
+                    let event_marker = self.watch.mint();
                     self.watch.delivered.insert(event_marker.clone(), event);
-                    values.push(Value::Ref(Some(event_marker)));
+                    values.push(handle(HostKind::WatchEvent, event_marker));
                 }
                 if unsettled {
                     self.host.unknown_operand_call(r)?;

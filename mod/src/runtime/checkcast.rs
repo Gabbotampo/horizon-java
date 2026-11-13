@@ -369,13 +369,11 @@ impl<H: Host> Runtime<'_, H> {
                 Some(class.to_owned()),
             );
         }
-        // A JDK value the runtime builds itself (a collection, an
-        // optional, a stream, a path): JDK classes never extend or implement a
-        // jar type.
+        // A JDK value the runtime builds itself (a collection, a stream, a
+        // builder): JDK classes never extend or implement a jar type.
         let jdk_kind = [
             "string-builder/",
             "stream/",
-            "path:",
             "list/",
             "set/",
             "map/",

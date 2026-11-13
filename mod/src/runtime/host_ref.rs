@@ -151,6 +151,18 @@ pub enum HostKind {
     /// `java.util.OptionalDouble`: key `""` when empty, else the `double`'s
     /// `Double.doubleToLongBits` (every `NaN` one key, `-0.0` not `0.0`).
     OptionalDouble,
+    /// `java.nio.file.Path`: key the path as `UnixPath` keeps it
+    /// (`host_path.rs`).
+    Path,
+    /// A NeoForge `FMLPaths` constant: key its name.
+    FmlPath,
+    /// A `StandardWatchEventKinds` constant: key its name (`host_watch.rs`).
+    WatchKind,
+    /// A `WatchService`, `WatchKey` or `WatchEvent` of the file model: key
+    /// the number the model minted for it.
+    WatchService,
+    WatchKey,
+    WatchEvent,
 }
 
 /// How a kind's Java class follows from its key.
@@ -287,6 +299,48 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("java/util/OptionalDouble"),
         canonical: canonical_when_empty,
         methods: &crate::runtime::host_optional::OPTIONAL_DOUBLE,
+    },
+    KindInfo {
+        kind: HostKind::Path,
+        tag: "path",
+        class: ClassRule::Fixed("sun/nio/fs/UnixPath"),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_path::PATH,
+    },
+    KindInfo {
+        kind: HostKind::FmlPath,
+        tag: "fmlp",
+        class: ClassRule::Fixed(crate::runtime::host_path::FML_PATHS_CLASS),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_path::FML_PATHS,
+    },
+    KindInfo {
+        kind: HostKind::WatchKind,
+        tag: "wkind",
+        class: ClassRule::Fixed("java/nio/file/StandardWatchEventKinds$StdWatchEventKind"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_KIND,
+    },
+    KindInfo {
+        kind: HostKind::WatchService,
+        tag: "wsvc",
+        class: ClassRule::Fixed("sun/nio/fs/LinuxWatchService"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::WatchKey,
+        tag: "wkey",
+        class: ClassRule::Fixed("sun/nio/fs/LinuxWatchService$LinuxWatchKey"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::WatchEvent,
+        tag: "wevt",
+        class: ClassRule::Fixed("sun/nio/fs/AbstractWatchKey$Event"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_OBJECT,
     },
 ];
 

@@ -312,6 +312,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(id) = marker.strip_prefix("identifier/") {
             return Ok(Some(hash_map_order::identifier_hash(id)));
         }
+        if let Some(path) = self.file_path(value) {
+            return Ok(Some(file_hash(path)));
+        }
         if marker.starts_with("map-entry/") {
             // `Objects.hashCode(key) ^ Objects.hashCode(value)`.
             let (key, entry) = map_entry_parts(value)?;
@@ -419,6 +422,10 @@ impl<H: Host> Runtime<'_, H> {
                     && self.host_collection_kind(b) == Some(CollectionKind::List)
                 {
                     return self.list_equals(a, b);
+                }
+                // `File.equals`: the same path text (`UnixFileSystem.compare`).
+                if let Some(path) = self.file_path(a) {
+                    return Ok(self.file_path(b) == Some(path));
                 }
                 Ok(a == b)
             }

@@ -1158,12 +1158,15 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
         }
-        let joined = parts
-            .iter()
-            .filter(|part| !part.is_empty())
-            .map(|part| part.trim_end_matches('/'))
-            .collect::<Vec<_>>()
-            .join("/");
+        // `UnixFileSystem.getPath`: `first`, then each non-empty part after
+        // a `/` (none before the first text); `path_value` normalizes.
+        let mut joined = String::new();
+        for part in parts.iter().filter(|part| !part.is_empty()) {
+            if !joined.is_empty() {
+                joined.push('/');
+            }
+            joined.push_str(part);
+        }
         Ok(Some(path_value(&joined)))
     }
 
