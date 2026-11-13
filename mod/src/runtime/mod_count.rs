@@ -352,7 +352,8 @@ impl<H: Host> Runtime<'_, H> {
         let creates = name == "subList" && r.descriptor == "(II)Ljava/util/List;";
         let sub_list = self.host.sub_list_link(marker).is_some();
         // A list with views: even a `set` must reach them.
-        let has_views = !self.host.sub_lists_of(marker).is_empty();
+        let has_views = !self.host.sub_lists_of(marker).is_empty()
+            || !self.host.view_copies_of(marker).is_empty();
         if !sub_list && !creates && !has_views && !may_modify(name) {
             return Ok(None);
         }
@@ -464,6 +465,9 @@ impl<H: Host> Runtime<'_, H> {
             );
         }
         self.refresh_sub_lists_of(&token.marker);
+        // `keySet()`/`values()`/`entrySet()` kept from this map follow it
+        // (`hash_collections.rs`).
+        self.refresh_map_views(&token.marker);
         if token.throw_after {
             return Err(NativeError::UncaughtException {
                 class: "java/util/ConcurrentModificationException".into(),

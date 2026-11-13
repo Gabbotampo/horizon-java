@@ -215,7 +215,15 @@ impl<H: Host> Runtime<'_, H> {
     fn pure_equality_at(&self, value: &Value, depth: usize) -> bool {
         match self.equality_of(value) {
             Equality::Null | Equality::Platform | Equality::Identity => true,
-            Equality::Host => false,
+            Equality::Host => {
+                // An identifier compares and hashes by its text.
+                expect_ref(value).is_some_and(|marker| marker.starts_with("identifier/"))
+                    || is_map_entry(value)
+                        && map_entry_parts(value).is_ok_and(|(key, entry)| {
+                            self.pure_equality_at(&key, depth + 1)
+                                && self.pure_equality_at(&entry, depth + 1)
+                        })
+            }
             Equality::Jar { equals, hash_code } => {
                 if depth >= MAX_PURITY_DEPTH {
                     return false;
@@ -401,6 +409,17 @@ impl<H: Host> Runtime<'_, H> {
                     _ => false,
                 }),
             Equality::Host => {
+                if is_map_entry(a) {
+                    // `Map.Entry.equals`: an entry with `Objects.equals` keys
+                    // and values.
+                    if !is_map_entry(b) {
+                        return Ok(false);
+                    }
+                    let (left_key, left_value) = map_entry_parts(a)?;
+                    let (right_key, right_value) = map_entry_parts(b)?;
+                    return Ok(self.objects_equals(&left_key, &right_key)?
+                        && self.objects_equals(&left_value, &right_value)?);
+                }
                 if self.host_collection_kind(a) == Some(CollectionKind::List)
                     && self.host_collection_kind(b) == Some(CollectionKind::List)
                 {
@@ -675,8 +694,22 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(Some(Value::Int(hash)));
             }
         }
+        if r.name == "equals"
+            && r.descriptor == EQUALS
+            && matches!(opcode, 0xb6 | 0xb9)
+            && let (Some(receiver), [other]) = (receiver, args)
+            && is_map_entry(receiver)
+        {
+            let equal = self.java_equals(receiver, other)?;
+            return Ok(Some(Value::Int(i32::from(equal))));
+        }
         self.invoke_list_equality(r, opcode, receiver, args)
     }
+}
+
+/// Whether a value is the host's `Map.Entry` (`map-entry/k,v`).
+pub(crate) fn is_map_entry(value: &Value) -> bool {
+    expect_ref(value).is_some_and(|marker| marker.starts_with("map-entry/"))
 }
 
 /// `a.equals(b)` for a string or a box `a`: equal values of the same kind. A
