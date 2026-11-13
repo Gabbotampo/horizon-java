@@ -495,7 +495,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The component class an array was created with (`Object` when the
     /// runtime did not record one).
-    fn array_component(&self, array: &Value) -> String {
+    fn skeleton_array_component(&self, array: &Value) -> String {
         expect_ref(array)
             .and_then(|marker| {
                 self.fields
