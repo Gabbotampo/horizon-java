@@ -47,6 +47,15 @@ const CASES: &[(&str, Outcome)] = &[
     ("pathSameHandle", Exact("truefalse12")),
     ("pathTwo", Counted),
     ("pathIdMap", Counted),
+    // A handle's class reaches its kind's row from `Class.isInstance`,
+    // `isAssignableFrom` and a type switch's guarded pattern (#164 B1).
+    (
+        "classSurface",
+        Exact("truetruetruefalse|truetruetruetruefalsetrue|truefalse|CW"),
+    ),
+    // Java 25: `java.lang.Object|1`; the row knows UnixPath's supertypes,
+    // not which one is the direct superclass or interface.
+    ("classDirect", Counted),
     // Java 25 threw `InvalidPathException` under the POSIX locale and
     // printed `6214` under `C.UTF-8`.
     ("pathNonAscii", Counted),

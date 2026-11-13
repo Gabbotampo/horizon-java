@@ -157,6 +157,24 @@ public final class P2 {
     } catch (Throwable e) { return ex(e); }
   }
 
+  /** A handle's class reaches its kind's row from every class check (#164 B1). */
+  public static String classSurface() {
+    Object p = Path.of("/x");
+    Object k = StandardWatchEventKinds.ENTRY_CREATE;
+    Class<?> c = p.getClass();
+    String sw = switch (p) { case Comparable<?> x when x instanceof Watchable -> "CW"; default -> "D"; };
+    return "" + Path.class.isInstance(p) + Comparable.class.isInstance(p) + Iterable.class.isInstance(p) + String.class.isInstance(p)
+        + "|" + Path.class.isAssignableFrom(c) + Watchable.class.isAssignableFrom(c) + Iterable.class.isAssignableFrom(c)
+        + Comparable.class.isAssignableFrom(c) + String.class.isAssignableFrom(c) + Object.class.isAssignableFrom(c)
+        + "|" + WatchEvent.Kind.class.isAssignableFrom(k.getClass()) + Path.class.isAssignableFrom(k.getClass()) + "|" + sw;
+  }
+
+  /** A kind's class knows its supertypes, not which are direct: counted. */
+  public static String classDirect() {
+    Class<?> c = Path.of("/x").getClass();
+    return c.getSuperclass().getName() + "|" + c.getInterfaces().length;
+  }
+
   /** A non-ASCII path's bytes are the machine's `sun.jnu.encoding`. */
   public static String pathNonAscii() { return "" + Path.of("\u00e9").hashCode(); }
 

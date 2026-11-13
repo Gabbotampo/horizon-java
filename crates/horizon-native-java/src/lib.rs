@@ -20507,6 +20507,10 @@ impl<H: Host> Runtime<'_, H> {
                 return true;
             }
             let Some(file) = self.class(&current) else {
+                // A host kind's class answers by its row (`host_ref.rs`).
+                if let Some(answer) = HostKind::class_instance_of(&current, wanted, self) {
+                    return answer == Some(true);
+                }
                 // A JDK skeleton superclass's own supertypes (`jdk_skeletons/`),
                 // else a JDK throwable superclass and its JDK ancestors.
                 return jdk_skeletons::skeleton_is_instance(&current, wanted)
@@ -20563,6 +20567,11 @@ impl<H: Host> Runtime<'_, H> {
         let name = receiver
             .and_then(expect_ref)
             .map(|marker| marker.replace('.', "/"))?;
+        // A host kind's class: its row knows its supertypes, not which are
+        // declared directly. Left to the host, which counts it.
+        if HostKind::of_class(&name).is_some() {
+            return None;
+        }
         let interfaces = self
             .class(&name)
             .map(ClassFile::interface_names)
@@ -20964,6 +20973,13 @@ impl<H: Host> Runtime<'_, H> {
         {
             let target = reflection_class_name(receiver, r)?.replace('.', "/");
             let source = reflection_class_name(args.first(), r)?.replace('.', "/");
+            // A host kind's class (`getClass()` of a handle): its row.
+            if let Some(answer) = HostKind::class_instance_of(&source, &target, self) {
+                return match answer {
+                    Some(answer) => Ok(Some(Value::Int(i32::from(answer)))),
+                    None => self.host.unknown_operand_call(r).map(Some),
+                };
+            }
             let assignable = target == source
                 || target == "java/lang/Object"
                 || (!class_is_primitive(&Value::Ref(Some(source.clone())))
@@ -20997,6 +21013,11 @@ impl<H: Host> Runtime<'_, H> {
             let class = reflection_class_name(receiver, r)?.replace('.', "/");
             if class == "java/lang/Object" || class_is_primitive(&Value::Ref(Some(class.clone()))) {
                 return Ok(Some(Value::Ref(None)));
+            }
+            // A host kind's class: its row knows its supertypes, not which
+            // one is the direct superclass. Counted.
+            if HostKind::of_class(&class).is_some() {
+                return self.host.unknown_operand_call(r).map(Some);
             }
             let parent = self
                 .class(&class)
@@ -25442,7 +25463,9 @@ impl<H: Host> Runtime<'_, H> {
                     if let Some(labels) = file.type_switch_labels(index)
                         && let [value, Value::Int(restart)] = captured.as_slice()
                     {
-                        stack.push(Value::Int(self.type_switch_index(&labels, value, *restart)));
+                        let index =
+                            invoke_or_catch!(at, self.type_switch_index(&labels, value, *restart));
+                        stack.push(Value::Int(index));
                         continue;
                     }
                     // A string-concat site joins its captured values into the

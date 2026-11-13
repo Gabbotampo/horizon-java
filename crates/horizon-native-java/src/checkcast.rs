@@ -201,6 +201,30 @@ impl<H: Host> Runtime<'_, H> {
         })
     }
 
+    /// `value instanceof wanted` for a host handle, by its kind's row with
+    /// this runtime's hierarchy, for every check that is not the opcode (a
+    /// type switch label, `Class.isInstance`): an answer the row cannot give
+    /// is counted as `wanted#<instanceof>`, and the host's answer stands.
+    pub(crate) fn handle_instance_of(
+        &mut self,
+        handle: &HostRef,
+        wanted: &str,
+    ) -> Result<bool, NativeError> {
+        if let Some(answer) = handle.instance_of(wanted, self) {
+            return Ok(answer);
+        }
+        let check = MethodRef {
+            owner: wanted.to_owned(),
+            name: "<instanceof>".into(),
+            descriptor: "(Ljava/lang/Object;)Z".into(),
+        };
+        let value = Value::Host(handle.clone());
+        Ok(matches!(
+            self.host.invoke(&check, std::slice::from_ref(&value))?,
+            Value::Int(flag) if flag != 0
+        ))
+    }
+
     /// The exact class of a value that is no handle, where the runtime knows
     /// it: a string, a box, an array whose component was recorded, a jar
     /// object, a JDK object a jar constructed

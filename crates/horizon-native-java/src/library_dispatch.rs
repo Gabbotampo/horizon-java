@@ -518,10 +518,16 @@ impl<H: Host> Runtime<'_, H> {
         let value = args.first().cloned().unwrap_or(Value::Ref(None));
         let is_null = matches!(value, Value::Ref(None));
         // A primitive class has no instances; `int.class.isInstance(1)` is
-        // false on the JVM too.
-        let instance = !is_null
-            && !PRIMITIVE_CLASSES.contains(&wanted.as_str())
-            && self.value_instance_of(&value, &wanted);
+        // false on the JVM too. A host handle answers by its kind's row, an
+        // unknown answer counted (`checkcast.rs`).
+        let instance = match &value {
+            Value::Host(handle) => self.handle_instance_of(handle, &wanted)?,
+            _ => {
+                !is_null
+                    && !PRIMITIVE_CLASSES.contains(&wanted.as_str())
+                    && self.value_instance_of(&value, &wanted)
+            }
+        };
         if r.name == "isInstance" {
             return Ok(Some(Value::Int(i32::from(instance))));
         }

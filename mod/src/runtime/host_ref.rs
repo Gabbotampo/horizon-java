@@ -359,6 +359,20 @@ impl HostKind {
             .copied()
     }
 
+    /// `class instanceof wanted` for the class name of a fixed-class kind (a
+    /// handle's `getClass()` handed to `Class.isAssignableFrom`, a class
+    /// walk): the kind's row, as for a handle of it, since a fixed class's
+    /// supertypes do not depend on the key. `None` when `class` is no kind's
+    /// fixed class; `Some(None)` when the row cannot tell.
+    pub(crate) fn class_instance_of(
+        class: &str,
+        wanted: &str,
+        hierarchy: &dyn ClassHierarchy,
+    ) -> Option<Option<bool>> {
+        let kind = Self::of_class(class)?;
+        Some(HostRef::new(kind, "").instance_of(wanted, hierarchy))
+    }
+
     /// The kind of a fixed-class kind whose class is `class` (asked on every
     /// `checkcast`, so a map, not a scan).
     pub(crate) fn of_class(class: &str) -> Option<Self> {
