@@ -19,7 +19,11 @@
 //! Answered here: the constructors, `put`/`putIfAbsent`/`get`/`containsKey`/
 //! `getOrDefault`/`remove`/`replace`/`containsValue`/`putAll`/`clear`, a
 //! set's `add`/`contains`/`remove`/`addAll`, `first*`/`last*`/`poll*`, the
-//! `floor`/`ceiling`/`higher`/`lower` lookups and `comparator()`. The
+//! `floor`/`ceiling`/`higher`/`lower` lookups and `comparator()`, matched by
+//! exact name; `computeIfAbsent`/`computeIfPresent`/`compute`/`merge` and
+//! `forEach`, which run their callbacks with the tree put back and throw a
+//! `ConcurrentModificationException` when a callback changed its structure
+//! (`RedBlackTree::mod_count`). The
 //! navigable views (`headMap`, `subSet`, `descendingMap`...) are counted. A
 //! key another path added is placed by the next call while the order of its
 //! comparisons cannot show (pure keys, natural order); otherwise the tree's
@@ -45,6 +49,10 @@ pub struct RedBlackTree {
     root: Option<usize>,
     /// A key was added by a path that could not place it.
     pub(crate) tainted: bool,
+    /// `modCount`: bumped by every insertion and deletion (a value replaced
+    /// in place is not structural), so a callback that changed the tree
+    /// shows as a different count.
+    mod_count: u64,
 }
 
 impl RedBlackTree {
@@ -80,6 +88,7 @@ impl RedBlackTree {
     }
 
     fn new_node(&mut self, key: Value, parent: Option<usize>) -> usize {
+        self.mod_count += 1;
         self.nodes.push(Some(Node {
             key,
             left: None,
@@ -242,6 +251,7 @@ impl RedBlackTree {
 
     /// `deleteEntry(p)`.
     fn delete_entry(&mut self, p: usize) {
+        self.mod_count += 1;
         let mut p = p;
         if self.node(p).left.is_some() && self.node(p).right.is_some() {
             let s = self
@@ -652,6 +662,9 @@ impl<H: Host> Runtime<'_, H> {
         if navigable_view(&r.name) {
             return self.host.unknown_operand_call(r).map(|_| None);
         }
+        if let Some(callback) = TreeCallback::of(map, r) {
+            return self.tree_callback_member(r, receiver, &marker, map, callback, args);
+        }
         let entries = self.collection_elements(receiver)?;
         let comparator = self.host.collection_comparator(&marker);
         let mut tree = self.take_tree(&marker, &entries, map);
@@ -790,13 +803,16 @@ impl<H: Host> Runtime<'_, H> {
                 Value::Int(i32::from(found))
             }
             (_, "clear", []) => {
-                *tree = RedBlackTree::default();
+                *tree = RedBlackTree {
+                    mod_count: tree.mod_count + 1,
+                    ..RedBlackTree::default()
+                };
                 values.clear();
                 Value::Void
             }
             (_, "comparator", []) => comparator.clone().unwrap_or(Value::Ref(None)),
-            (_, "firstKey" | "lastKey" | "first" | "last", []) => {
-                let node = if name.starts_with("first") {
+            (true, "firstKey" | "lastKey", []) | (false, "first" | "last", []) => {
+                let node = if matches!(name, "firstKey" | "first") {
                     tree.first()
                 } else {
                     tree.last()
@@ -806,13 +822,10 @@ impl<H: Host> Runtime<'_, H> {
                     None => return Err(thrown("java/util/NoSuchElementException")),
                 }
             }
-            (
-                _,
-                "firstEntry" | "lastEntry" | "pollFirstEntry" | "pollLastEntry" | "pollFirst"
-                | "pollLast",
-                [],
-            ) => {
-                let node = if name.contains("First") {
+            (true, "firstEntry" | "lastEntry" | "pollFirstEntry" | "pollLastEntry", [])
+            | (false, "pollFirst" | "pollLast", []) => {
+                // Exact names: `firstEntry` has a lowercase `f`.
+                let node = if matches!(name, "firstEntry" | "pollFirstEntry" | "pollFirst") {
                     tree.first()
                 } else {
                     tree.last()
@@ -822,37 +835,41 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let key = tree.node(node).key.clone();
                 let value = value_of(&values, &key);
-                if name.starts_with("poll") {
+                if matches!(
+                    name,
+                    "pollFirstEntry" | "pollLastEntry" | "pollFirst" | "pollLast"
+                ) {
                     values.remove(&collection_item_marker(&key));
                     tree.delete_entry(node);
                 }
-                if name.ends_with("Entry") {
+                if map {
                     map_entry_value(&key, &value)
                 } else {
                     key
                 }
             }
             (
-                _,
-                "ceilingKey" | "floorKey" | "higherKey" | "lowerKey" | "ceiling" | "floor"
-                | "higher" | "lower" | "ceilingEntry" | "floorEntry" | "higherEntry" | "lowerEntry",
+                true,
+                "ceilingKey" | "floorKey" | "higherKey" | "lowerKey" | "ceilingEntry"
+                | "floorEntry" | "higherEntry" | "lowerEntry",
                 [key],
-            ) => {
-                let nearest = if name.starts_with("ceiling") {
-                    Nearest::Ceiling
-                } else if name.starts_with("floor") {
-                    Nearest::Floor
-                } else if name.starts_with("higher") {
-                    Nearest::Higher
-                } else {
-                    Nearest::Lower
+            )
+            | (false, "ceiling" | "floor" | "higher" | "lower", [key]) => {
+                let nearest = match name {
+                    "ceilingKey" | "ceilingEntry" | "ceiling" => Nearest::Ceiling,
+                    "floorKey" | "floorEntry" | "floor" => Nearest::Floor,
+                    "higherKey" | "higherEntry" | "higher" => Nearest::Higher,
+                    _ => Nearest::Lower,
                 };
                 if comparator.is_none() && *key == Value::Ref(None) {
                     return Err(thrown("java/lang/NullPointerException"));
                 }
                 let node = self.tree_nearest(tree, comparator, key, nearest)?;
                 let found = key_of(tree, node);
-                if name.ends_with("Entry") {
+                if matches!(
+                    name,
+                    "ceilingEntry" | "floorEntry" | "higherEntry" | "lowerEntry"
+                ) {
                     match node {
                         Some(_) => map_entry_value(&found, &value_of(&values, &found)),
                         None => Value::Ref(None),
@@ -991,5 +1008,326 @@ impl<H: Host> Runtime<'_, H> {
         };
         self.invoke_tree_collection(&copy, 0xb6, Some(receiver), std::slice::from_ref(&source))?;
         Ok(Some(Value::Void))
+    }
+}
+
+/// The members that call back into the jar while the tree is live: the
+/// `compute` family, `merge` and `forEach`.
+#[derive(Clone, Copy, PartialEq)]
+enum TreeCallback {
+    ComputeIfAbsent,
+    ComputeIfPresent,
+    Compute,
+    Merge,
+    /// `TreeMap.forEach(BiConsumer)`.
+    MapForEach,
+    /// `TreeSet.forEach(Consumer)`, which is `Iterable.forEach`.
+    SetForEach,
+}
+
+impl TreeCallback {
+    /// The member `r` names on a tree map (`map`) or set, by exact name and
+    /// descriptor.
+    fn of(map: bool, r: &MethodRef) -> Option<Self> {
+        const FUNCTION: &str =
+            "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;";
+        const BI_FUNCTION: &str =
+            "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;";
+        const MERGE: &str = "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;";
+        Some(match (map, r.name.as_str(), r.descriptor.as_str()) {
+            (true, "computeIfAbsent", FUNCTION) => Self::ComputeIfAbsent,
+            (true, "computeIfPresent", BI_FUNCTION) => Self::ComputeIfPresent,
+            (true, "compute", BI_FUNCTION) => Self::Compute,
+            (true, "merge", MERGE) => Self::Merge,
+            (true, "forEach", "(Ljava/util/function/BiConsumer;)V") => Self::MapForEach,
+            (false, "forEach", "(Ljava/util/function/Consumer;)V") => Self::SetForEach,
+            _ => return None,
+        })
+    }
+}
+
+/// The value the host keeps for `key` in a map's flat `k, v` list.
+fn stored_value(entries: &[Value], key: &Value) -> Value {
+    let marker = collection_item_marker(key);
+    entries
+        .chunks(2)
+        .find(|pair| collection_item_marker(&pair[0]) == marker)
+        .and_then(|pair| pair.get(1).cloned())
+        .unwrap_or(Value::Ref(None))
+}
+
+fn concurrent_modification() -> NativeError {
+    thrown("java/util/ConcurrentModificationException")
+}
+
+impl<H: Host> Runtime<'_, H> {
+    /// The tree of `receiver`, reconciled with the host's list, and that
+    /// list. On an error the tree is put back first.
+    fn load_tree(
+        &mut self,
+        receiver: &Value,
+        marker: &str,
+        comparator: &Option<Value>,
+        map: bool,
+    ) -> Result<(RedBlackTree, Vec<Value>), NativeError> {
+        let entries = self.collection_elements(receiver)?;
+        let mut tree = self.take_tree(marker, &entries, map);
+        if let Err(error) = self.resync_tree(&mut tree, comparator, &entries, map) {
+            self.host.store_red_black_tree(marker, tree);
+            return Err(error);
+        }
+        Ok((tree, entries))
+    }
+
+    /// Run `function` on `args` with the tree put back (the jar may call
+    /// the map), then take it again: `Ok(None)` when the call changed the
+    /// map's structure, which the JDK's `modCount` check turns into a
+    /// `ConcurrentModificationException`.
+    #[allow(clippy::type_complexity)]
+    fn tree_callback(
+        &mut self,
+        receiver: &Value,
+        marker: &str,
+        comparator: &Option<Value>,
+        map: bool,
+        tree: RedBlackTree,
+        call: impl FnOnce(&mut Self) -> Result<Value, NativeError>,
+    ) -> Result<(Value, Option<(RedBlackTree, Vec<Value>)>), NativeError> {
+        let expected = tree.mod_count;
+        self.host.store_red_black_tree(marker, tree);
+        let answer = call(self)?;
+        let (tree, entries) = self.load_tree(receiver, marker, comparator, map)?;
+        if tree.mod_count != expected || tree.tainted {
+            self.host.store_red_black_tree(marker, tree);
+            return Ok((answer, None));
+        }
+        Ok((answer, Some((tree, entries))))
+    }
+
+    /// `computeIfAbsent`/`computeIfPresent`/`compute`/`merge` and
+    /// `forEach`, as JDK 25's `TreeMap` runs them: the `put` walk (or
+    /// `getEntry` for `computeIfPresent`) before the function, the function
+    /// checked by `callMappingFunctionWithCheck`/`callRemappingFunction-
+    /// WithCheck`, then `addEntry` (`addEntryToEmptyMap`, which compares
+    /// the key with itself, for an empty map), `deleteEntry` for a `null`
+    /// result, or the value replaced in place. `TreeMap.forEach` throws
+    /// right after the action that changed the map; `TreeSet.forEach` is a
+    /// loop, which throws at the next step unless the change came at the
+    /// last element.
+    fn tree_callback_member(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        marker: &str,
+        map: bool,
+        callback: TreeCallback,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let null = Value::Ref(None);
+        let function = match (callback, args) {
+            (TreeCallback::Merge, [_, _, function]) | (_, [_, function]) | (_, [function]) => {
+                function.clone()
+            }
+            _ => return Ok(None),
+        };
+        if function == null {
+            return Err(thrown("java/lang/NullPointerException"));
+        }
+        if callback == TreeCallback::Merge && args[1] == null {
+            return Err(thrown("java/lang/NullPointerException"));
+        }
+        let comparator = self.host.collection_comparator(marker);
+        let (tree, entries) = self.load_tree(receiver, marker, &comparator, map)?;
+        if tree.tainted {
+            // Keys this tree could not place: the host answers, counted.
+            self.host.store_red_black_tree(marker, tree);
+            return self.host.unknown_operand_call(r).map(|_| None);
+        }
+        match callback {
+            TreeCallback::MapForEach | TreeCallback::SetForEach => self
+                .tree_for_each(
+                    receiver,
+                    marker,
+                    map,
+                    callback,
+                    &comparator,
+                    tree,
+                    &function,
+                )
+                .map(Some),
+            _ => self
+                .tree_compute(
+                    receiver,
+                    marker,
+                    callback,
+                    &comparator,
+                    tree,
+                    entries,
+                    args,
+                    &function,
+                )
+                .map(Some),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tree_compute(
+        &mut self,
+        receiver: &Value,
+        marker: &str,
+        callback: TreeCallback,
+        comparator: &Option<Value>,
+        tree: RedBlackTree,
+        entries: Vec<Value>,
+        args: &[Value],
+        function: &Value,
+    ) -> Result<Value, NativeError> {
+        let null = Value::Ref(None);
+        let key = args[0].clone();
+        // The walk: `Err(node)` for the key's entry, `Ok(place)` for where a
+        // new key goes (`None`: the empty map).
+        let searched = if callback == TreeCallback::ComputeIfPresent {
+            self.tree_get(&tree, comparator, &key)
+                .map(|found| found.map_or(Ok(None), Err))
+        } else {
+            self.tree_search(&tree, comparator, &key)
+        };
+        let found = match searched {
+            Ok(found) => found,
+            Err(error) => {
+                self.host.store_red_black_tree(marker, tree);
+                return Err(error);
+            }
+        };
+        let old = match found {
+            Err(node) => stored_value(&entries, &tree.node(node).key.clone()),
+            Ok(_) => null.clone(),
+        };
+        // The function's arguments, or the answer without calling it.
+        let call: Option<Vec<Value>> = match (callback, &found) {
+            (TreeCallback::ComputeIfAbsent, Err(_)) if old != null => {
+                self.host.store_red_black_tree(marker, tree);
+                return Ok(old);
+            }
+            (TreeCallback::ComputeIfAbsent, _) => Some(vec![key.clone()]),
+            (TreeCallback::ComputeIfPresent, Err(_)) if old != null => {
+                Some(vec![key.clone(), old.clone()])
+            }
+            (TreeCallback::ComputeIfPresent, _) => {
+                self.host.store_red_black_tree(marker, tree);
+                return Ok(null);
+            }
+            (TreeCallback::Compute, _) => Some(vec![key.clone(), old.clone()]),
+            // `merge`: the function only for an entry with a value.
+            (_, Err(_)) if old != null => Some(vec![old.clone(), args[1].clone()]),
+            _ => None,
+        };
+        let (value, mut tree, entries) = match call {
+            Some(call) => {
+                let function = function.clone();
+                let (value, live) =
+                    self.tree_callback(receiver, marker, comparator, true, tree, |this| {
+                        this.apply_callback(&function, &call)
+                    })?;
+                let Some((tree, entries)) = live else {
+                    return Err(concurrent_modification());
+                };
+                (value, tree, entries)
+            }
+            None => (args[1].clone(), tree, entries),
+        };
+        let mut values: BTreeMap<String, Value> = entries
+            .chunks(2)
+            .map(|pair| (collection_item_marker(&pair[0]), pair[1].clone()))
+            .collect();
+        match found {
+            // `computeIfAbsent` keeps a `null` result on an existing entry.
+            Err(node) if value == null && callback != TreeCallback::ComputeIfAbsent => {
+                values.remove(&collection_item_marker(&tree.node(node).key.clone()));
+                tree.delete_entry(node);
+            }
+            Err(node) => {
+                values.insert(
+                    collection_item_marker(&tree.node(node).key.clone()),
+                    value.clone(),
+                );
+            }
+            Ok(_) if value == null => {}
+            Ok(None) => {
+                // `addEntryToEmptyMap`: `compare(key, key)` first.
+                if let Err(error) = self.tree_compare(comparator, &key, &key) {
+                    self.host.store_red_black_tree(marker, tree);
+                    return Err(error);
+                }
+                tree.root = Some(tree.new_node(key.clone(), None));
+                values.insert(collection_item_marker(&key), value.clone());
+            }
+            Ok(Some((parent, left))) => {
+                tree.add_entry(key.clone(), parent, left);
+                values.insert(collection_item_marker(&key), value.clone());
+            }
+        }
+        self.write_tree(receiver, &tree, true, &values);
+        self.host.store_red_black_tree(marker, tree);
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tree_for_each(
+        &mut self,
+        receiver: &Value,
+        marker: &str,
+        map: bool,
+        callback: TreeCallback,
+        comparator: &Option<Value>,
+        mut tree: RedBlackTree,
+        action: &Value,
+    ) -> Result<Value, NativeError> {
+        let mut at = tree.first();
+        let mut entries = self.collection_elements(receiver)?;
+        while let Some(node) = at {
+            let key = tree.node(node).key.clone();
+            // The iterator's `next` is taken before the action runs.
+            let next = tree.successor(node);
+            let (target, call): ((&str, &str, &str), Vec<Value>) = if map {
+                let value = stored_value(&entries, &key);
+                (
+                    (
+                        "java/util/function/BiConsumer",
+                        "accept",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                    ),
+                    vec![key, value],
+                )
+            } else {
+                (
+                    (
+                        "java/util/function/Consumer",
+                        "accept",
+                        "(Ljava/lang/Object;)V",
+                    ),
+                    vec![key],
+                )
+            };
+            let action = action.clone();
+            let (_, live) =
+                self.tree_callback(receiver, marker, comparator, map, tree, |this| {
+                    this.run_functional(target, &action, &call)?;
+                    Ok(Value::Void)
+                })?;
+            let Some((live, live_entries)) = live else {
+                // `TreeMap.forEach` checks after every action; the loop of
+                // `TreeSet.forEach` only on its next step.
+                if callback == TreeCallback::MapForEach || next.is_some() {
+                    return Err(concurrent_modification());
+                }
+                return Ok(Value::Void);
+            };
+            tree = live;
+            entries = live_entries;
+            at = next;
+        }
+        self.host.store_red_black_tree(marker, tree);
+        Ok(Value::Void)
     }
 }

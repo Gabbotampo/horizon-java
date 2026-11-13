@@ -364,6 +364,40 @@ impl<H: Host> Runtime<'_, H> {
             // `hash_bulk.rs`.
             return self.hash_compute(r, receiver, &marker, kind, args);
         }
+        match (r.name.as_str(), r.descriptor.as_str(), &*args) {
+            ("removeIf", "(Ljava/util/function/Predicate;)Z", [predicate]) if !kind.map => {
+                let predicate = predicate.clone();
+                if !self
+                    .host
+                    .take_hash_table(&marker)
+                    .map(|table| {
+                        let known = !table.order_unknown() && !table.lookups_unknown();
+                        self.host.store_hash_table(&marker, table);
+                        known
+                    })
+                    .unwrap_or(false)
+                {
+                    return self.count_and_continue(r);
+                }
+                return self
+                    .hash_remove_if(receiver, &marker, kind, &predicate)
+                    .map(Some);
+            }
+            ("forEach", "(Ljava/util/function/Consumer;)V", [callback])
+            | ("forEach", "(Ljava/util/function/BiConsumer;)V", [callback]) => {
+                let callback = callback.clone();
+                let unknown = self.host.take_hash_table(&marker).map(|table| {
+                    let unknown = table.order_unknown();
+                    self.host.store_hash_table(&marker, table);
+                    unknown
+                });
+                if unknown == Some(true) {
+                    return self.count_and_continue(r);
+                }
+                return self.hash_for_each(r, receiver, kind, &callback).map(Some);
+            }
+            _ => {}
+        }
         let mut table = self.take_table(&marker, kind);
         if tainted_argument && matches!(r.name.as_str(), "putAll" | "addAll") {
             table.tainted = true;
@@ -397,6 +431,24 @@ impl<H: Host> Runtime<'_, H> {
         if self.host.is_view_copy(&marker) && java_immutable::is_mutator(&r.name) {
             return self.count_and_continue(r).map(Some);
         }
+        // `equals` of a copy holding jar keys: the host compares markers.
+        if self.host.is_view_copy(&marker)
+            && r.name == "equals"
+            && r.descriptor == "(Ljava/lang/Object;)Z"
+        {
+            let mut values = self.collection_elements(receiver)?;
+            values.extend(
+                args.first()
+                    .and_then(|other| self.collection_elements(other).ok())
+                    .unwrap_or_default(),
+            );
+            if values
+                .iter()
+                .any(|value| matches!(self.equality_of(value), Equality::Jar { .. }))
+            {
+                return self.count_and_continue(r).map(Some);
+            }
+        }
         if !matches!(r.name.as_str(), "keySet" | "values" | "entrySet")
             || !args.is_empty()
             || !is_map_owner(&r.owner)
@@ -415,7 +467,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         let copy = self.host.invoke_instance(r, receiver, args)?;
         if let Some(copy) = expect_ref(&copy) {
-            self.host.note_view_copy(copy);
+            self.host.note_view_copy(copy, &marker);
         }
         Ok(Some(Some(copy)))
     }
@@ -892,5 +944,144 @@ impl<H: Host> Runtime<'_, H> {
         let old = std::mem::replace(&mut entries[index * 2 + 1], value);
         self.host.replace_mutable_collection(receiver, entries);
         Ok(old)
+    }
+}
+
+impl<H: Host> Runtime<'_, H> {
+    /// The keys of a hash collection, sorted: what a structural change moves.
+    fn key_signature(&self, value: &Value, kind: TableKind) -> Result<Vec<String>, NativeError> {
+        let step = if kind.map { 2 } else { 1 };
+        let mut keys: Vec<String> = runtime_collection_values(self.host, value)?
+            .into_iter()
+            .step_by(step)
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// `Collection.removeIf` on a `HashSet`/`LinkedHashSet` (neither
+    /// overrides it): the iterator walks the set, and `it.remove()` runs
+    /// `removeNode(hash, key)`, which searches the bin again, calling
+    /// `key.equals(k)` on every earlier node of equal hash. A predicate that
+    /// changes the set makes the next `next()` (or `remove()`) throw
+    /// `ConcurrentModificationException`.
+    fn hash_remove_if(
+        &mut self,
+        receiver: &Value,
+        marker: &str,
+        kind: TableKind,
+        predicate: &Value,
+    ) -> Result<Value, NativeError> {
+        if *predicate == Value::Ref(None) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let elements = self.collection_elements(receiver)?;
+        let mut expected = self.key_signature(receiver, kind)?;
+        let mut removed = false;
+        for (index, element) in elements.iter().enumerate() {
+            // `each.next()` (after the first) checks `modCount`.
+            if index > 0 && self.key_signature(receiver, kind)? != expected {
+                return Err(concurrent_modification());
+            }
+            if !self.predicate_holds(predicate, element)? {
+                continue;
+            }
+            // `each.remove()`: the check, then the re-walk.
+            self.resync_hash_table(receiver)?;
+            if self.key_signature(receiver, kind)? != expected {
+                return Err(concurrent_modification());
+            }
+            let mut table = self.take_table(marker, kind);
+            let item = collection_item_marker(element);
+            let walked = match table.stored_hash(&item) {
+                Some(stored) => {
+                    self.table_lookup(&table, element, Some(hash_table::spread(stored)))
+                }
+                None => Ok(Lookup::Found(element.clone())),
+            };
+            let node = match walked {
+                Ok(Lookup::Found(node)) => collection_item_marker(&node),
+                Ok(_) => item.clone(),
+                Err(error) => {
+                    self.host.store_hash_table(marker, table);
+                    return Err(error);
+                }
+            };
+            table.remove(&node);
+            self.host.store_hash_table(marker, table);
+            let kept: Vec<Value> = self
+                .collection_elements(receiver)?
+                .into_iter()
+                .filter(|value| collection_item_marker(value) != node)
+                .collect();
+            self.host.replace_mutable_collection(receiver, kept);
+            expected = self.key_signature(receiver, kind)?;
+            removed = true;
+        }
+        Ok(Value::Int(i32::from(removed)))
+    }
+
+    /// `HashMap.forEach`/`HashSet.forEach` (and the linked ones): every
+    /// entry in order, then `ConcurrentModificationException` if a callback
+    /// changed the collection. The JDK keeps walking the live table after a
+    /// change, which this does not model: a change is counted.
+    fn hash_for_each(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        kind: TableKind,
+        callback: &Value,
+    ) -> Result<Value, NativeError> {
+        let entries = self.collection_elements(receiver)?;
+        let before = self.key_signature(receiver, kind)?;
+        let step = if kind.map { 2 } else { 1 };
+        let mut counted = false;
+        for chunk in entries.chunks(step) {
+            if kind.map {
+                let [key, value] = chunk else { continue };
+                self.run_functional(
+                    (
+                        "java/util/function/BiConsumer",
+                        "accept",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                    ),
+                    callback,
+                    &[key.clone(), value.clone()],
+                )?;
+            } else {
+                self.run_functional(
+                    (
+                        "java/util/function/Consumer",
+                        "accept",
+                        "(Ljava/lang/Object;)V",
+                    ),
+                    callback,
+                    &[chunk[0].clone()],
+                )?;
+            }
+            // The JDK walks the live table (or linked list) after a change,
+            // even after the last entry (a key added behind it is visited):
+            // not modelled, so any change is counted.
+            if !counted && self.key_signature(receiver, kind)? != before {
+                self.host.unknown_operand_call(r)?;
+                counted = true;
+            }
+        }
+        if self.key_signature(receiver, kind)? != before {
+            return Err(concurrent_modification());
+        }
+        Ok(Value::Void)
+    }
+}
+
+fn concurrent_modification() -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/util/ConcurrentModificationException".into(),
+        message: None,
+        frame: None,
     }
 }
