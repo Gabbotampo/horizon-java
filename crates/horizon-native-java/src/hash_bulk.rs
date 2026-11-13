@@ -394,7 +394,11 @@ impl<H: Host> Runtime<'_, H> {
                 self.host_collection_kind(receiver) == Some(object_methods::CollectionKind::Map)
                     && self
                         .host_collection_class(receiver)
-                        .is_some_and(|class| !class.starts_with("java/util/ImmutableCollections"))
+                        // `tree_map.rs` runs `TreeMap.replaceAll`.
+                        .is_some_and(|class| {
+                            !class.starts_with("java/util/ImmutableCollections")
+                                && class != "java/util/TreeMap"
+                        })
             })
     }
 
