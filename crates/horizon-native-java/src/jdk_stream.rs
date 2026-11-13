@@ -33,7 +33,7 @@
 //! is refused with a named reason rather than ordered arbitrarily.
 
 use crate::jdk_model::MAX_SPLITERATOR_ELEMENTS;
-use crate::{MethodRef, NativeError, Value, expect_ref};
+use crate::{Boxed, MethodRef, NativeError, Value, expect_ref};
 
 /// Prefix of a modelled `Comparator` marker.
 const COMPARATOR_PREFIX: &str = "@cmp:";
@@ -129,10 +129,9 @@ fn integral(value: &Value) -> Option<i64> {
     match value {
         Value::Int(value) => Some(i64::from(*value)),
         Value::Long(value) => Some(*value),
-        Value::Ref(Some(marker)) => ["integer:", "long:", "short:", "byte:"]
-            .iter()
-            .find_map(|prefix| marker.strip_prefix(prefix))
-            .and_then(|digits| digits.parse().ok()),
+        Value::Boxed(boxed @ (Boxed::Integer(_) | Boxed::Short(_) | Boxed::Byte(_))) => {
+            Some(i64::from(boxed.int()))
+        }
         _ => None,
     }
 }
@@ -140,17 +139,14 @@ fn integral(value: &Value) -> Option<i64> {
 fn floating(value: &Value) -> Option<f64> {
     match value {
         Value::Float(value) => Some(*value),
-        Value::Ref(Some(marker)) => ["double:", "float:"]
-            .iter()
-            .find_map(|prefix| marker.strip_prefix(prefix))
-            .and_then(|digits| digits.parse().ok()),
+        Value::Boxed(Boxed::Float(bits)) => Some(f64::from(f32::from_bits(*bits))),
         _ => None,
     }
 }
 
 /// `Comparable.compareTo` for the values whose natural order the JDK defines
 /// and the runtime can read.
-fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
+pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
     if matches!(a, Value::Ref(None)) || matches!(b, Value::Ref(None)) {
         return Err(NativeError::UncaughtException {
             class: "java/lang/NullPointerException".into(),
@@ -162,10 +158,9 @@ fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
         return Ok(a.cmp(&b) as i32);
     }
     // `Character.compareTo` is the code-unit difference, not a sign.
-    let character = |value: &Value| {
-        expect_ref(value)
-            .and_then(|marker| marker.strip_prefix("character:"))
-            .and_then(|digits| digits.parse::<i32>().ok())
+    let character = |value: &Value| match value {
+        Value::Boxed(Boxed::Character(unit)) => Some(i32::from(*unit)),
+        _ => None,
     };
     if let (Some(a), Some(b)) = (character(a), character(b)) {
         return Ok(a - b);
@@ -174,9 +169,8 @@ fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
         // `Double.compare`: -0.0 < 0.0 and NaN above everything.
         return Ok(a.total_cmp(&b) as i32);
     }
-    let boolean = |value: &Value| match expect_ref(value).map(String::as_str) {
-        Some("boolean:true") => Some(true),
-        Some("boolean:false") => Some(false),
+    let boolean = |value: &Value| match value {
+        Value::Boxed(Boxed::Boolean(flag)) => Some(*flag),
         _ => None,
     };
     if let (Some(a), Some(b)) = (boolean(a), boolean(b)) {
@@ -221,7 +215,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
     ) -> Result<i32, NativeError> {
         // `sorted(null)` and `List.sort(null)` mean natural order.
         let Some(marker) = expect_ref(comparator).cloned() else {
-            return natural_compare(a, b);
+            return self.natural_order(a, b);
         };
         let Some(body) = marker.strip_prefix(COMPARATOR_PREFIX) else {
             let result = self.apply_callback(comparator, &[a.clone(), b.clone()])?;
@@ -234,7 +228,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         };
         let (kind, rest) = body.split_once(':').unwrap_or((body, ""));
         match kind {
-            "natural" => natural_compare(a, b),
+            "natural" => self.natural_order(a, b),
             "reverse" => {
                 let inner = operands(rest)?
                     .into_iter()
@@ -249,7 +243,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                     .unwrap_or(Value::Ref(None));
                 let left = self.apply_callback(&key, std::slice::from_ref(a))?;
                 let right = self.apply_callback(&key, std::slice::from_ref(b))?;
-                natural_compare(&left, &right)
+                self.natural_order(&left, &right)
             }
             "keycmp" => {
                 let parts = operands(rest)?;
@@ -274,9 +268,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                 let (ka, va) = super::map_entry_parts(a)?;
                 let (kb, vb) = super::map_entry_parts(b)?;
                 if kind == "entry-key" {
-                    natural_compare(&ka, &kb)
+                    self.natural_order(&ka, &kb)
                 } else {
-                    natural_compare(&va, &vb)
+                    self.natural_order(&va, &vb)
                 }
             }
             _ => Err(NativeError::Metadata(format!(
@@ -362,11 +356,44 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let Some(items) = self.host.mutable_collection_values(&list) else {
             return Ok(None);
         };
-        let values = items
+        let mut values = items
             .iter()
             .map(|item| super::parse_collection_value(item))
             .collect::<Result<Vec<_>, _>>()?;
-        let sorted = self.sort_values(values, &comparator)?;
+        // `ArrayList.sort` sorts its own array, which a comparator that
+        // throws leaves part-merged; `List.sort`'s default sorts a copy and
+        // writes nothing back then.
+        let in_place = self
+            .host_collection_class(&list)
+            .is_some_and(|class| class == "java/util/ArrayList");
+        // A comparator that changes the list: the JDK sorts its array (or a
+        // copy) around the change and then checks `modCount`. Not modelled:
+        // counted, with the exception a structural change ends in.
+        let expected = self.capture_mod_count(&list);
+        let changed_under = |this: &mut Self| -> Result<Option<bool>, NativeError> {
+            let structural = this.capture_mod_count(&list) != expected;
+            let now = this.host.mutable_collection_values(&list);
+            Ok((structural || now.as_ref() != Some(&items)).then_some(structural))
+        };
+        let sorted = match self.sort_in_place(&mut values, &comparator) {
+            Ok(()) => values,
+            Err(error) => {
+                if in_place {
+                    self.host.replace_mutable_collection(&list, values);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(structural) = changed_under(self)? {
+            self.host.unknown_operand_call(r)?;
+            if structural {
+                return Err(NativeError::UncaughtException {
+                    class: "java/util/ConcurrentModificationException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+        }
         let method = |name: &str, descriptor: &str| MethodRef {
             owner: "java/util/List".into(),
             name: name.into(),
@@ -381,32 +408,27 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         Ok(Some(Value::Void))
     }
 
-    /// A stable merge sort under `comparator`, as `List.sort` and
-    /// `Stream.sorted` are (TimSort keeps equal elements in order).
+    /// `Arrays.sort(values, comparator)`: TimSort (`tim_sort.rs`), which makes
+    /// the JDK's comparisons in the JDK's order. `null` is natural order.
     pub(crate) fn sort_values(
         &mut self,
         values: Vec<Value>,
         comparator: &Value,
     ) -> Result<Vec<Value>, NativeError> {
-        if values.len() <= 1 {
-            return Ok(values);
-        }
         let mut values = values;
-        let right = values.split_off(values.len() / 2);
-        let left = self.sort_values(values, comparator)?;
-        let right = self.sort_values(right, comparator)?;
-        let mut merged = Vec::with_capacity(left.len() + right.len());
-        let (mut left, mut right) = (left.into_iter().peekable(), right.into_iter().peekable());
-        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
-            if self.compare_with(comparator, a, b)? <= 0 {
-                merged.extend(left.next());
-            } else {
-                merged.extend(right.next());
-            }
-        }
-        merged.extend(left);
-        merged.extend(right);
-        Ok(merged)
+        self.sort_in_place(&mut values, comparator)?;
+        Ok(values)
+    }
+
+    /// TimSort `values` in place; a comparison that throws leaves them as
+    /// the JDK's array is left.
+    pub(crate) fn sort_in_place(
+        &mut self,
+        values: &mut [Value],
+        comparator: &Value,
+    ) -> Result<(), NativeError> {
+        let comparator = comparator.clone();
+        crate::tim_sort::sort(values, &mut |a, b| self.compare_with(&comparator, a, b))
     }
 
     /// `IntStream`/`LongStream` sources: `range`, `rangeClosed` and `of`.
@@ -509,12 +531,12 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                         }
                     });
                 }
-                best.map_or(Value::Ref(None), super::optional_wrap)
+                best.map_or_else(super::empty_optional, super::optional_wrap)
             }
             ("findFirst" | "findAny", "()Ljava/util/Optional;") => values
                 .first()
                 .cloned()
-                .map_or(Value::Ref(None), super::optional_wrap),
+                .map_or_else(super::empty_optional, super::optional_wrap),
             ("reduce", "(Ljava/util/function/BinaryOperator;)Ljava/util/Optional;") => {
                 let operator = argument();
                 let mut acc: Option<Value> = None;
@@ -526,7 +548,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                         }
                     });
                 }
-                acc.map_or(Value::Ref(None), super::optional_wrap)
+                acc.map_or_else(super::empty_optional, super::optional_wrap)
             }
             (
                 "reduce",
@@ -603,11 +625,11 @@ mod tests {
     #[test]
     fn natural_order_matches_the_jdk_compare_to() {
         assert_eq!(
-            natural_compare(&text("integer:3"), &Value::Int(7)).unwrap(),
+            natural_compare(&Value::Boxed(Boxed::Integer(3)), &Value::Int(7)).unwrap(),
             -1
         );
         assert_eq!(
-            natural_compare(&Value::Long(9), &text("long:2")).unwrap(),
+            natural_compare(&Value::Long(9), &Value::Long(2)).unwrap(),
             1
         );
         // "apple".compareTo("apricot") == 'p' - 'r'
@@ -618,7 +640,11 @@ mod tests {
         // "ab".compareTo("abcd") == 2 - 4
         assert_eq!(natural_compare(&text("ab"), &text("abcd")).unwrap(), -2);
         assert_eq!(
-            natural_compare(&text("boolean:false"), &text("boolean:true")).unwrap(),
+            natural_compare(
+                &Value::Boxed(Boxed::Boolean(false)),
+                &Value::Boxed(Boxed::Boolean(true))
+            )
+            .unwrap(),
             -1
         );
         assert!(matches!(

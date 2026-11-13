@@ -181,18 +181,14 @@ fn erased(descriptor: &str) -> Value {
     Value::Ref(Some(erased_field_type(descriptor)))
 }
 
-/// The `(class, name, descriptor)` a `reflect-method/` marker names, when it
-/// carries its descriptor.
+/// The `(class, name, descriptor)` a `Method` handle names, when it carries
+/// its descriptor.
 fn method_marker(value: Option<&Value>) -> Option<(String, String, String)> {
-    let marker = value
-        .and_then(expect_ref)?
-        .strip_prefix("reflect-method/")?;
-    let (class, member) = marker.split_once('#')?;
-    let at = member.find('(')?;
+    let method = host_reflect::method_of(value?)?;
     Some((
-        class.to_owned(),
-        member[..at].to_owned(),
-        member[at..].to_owned(),
+        method.class.to_owned(),
+        method.name.to_owned(),
+        method.descriptor?.to_owned(),
     ))
 }
 
@@ -298,7 +294,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `Class.getDeclaredMethods()` (`declared`) or `Class.getMethods()` as
-    /// `Method` markers.
+    /// `Method` handles.
     ///
     /// `getDeclaredMethods` is every method the class declares except its
     /// constructors and static initializer. `getMethods` is the public ones,
@@ -311,10 +307,15 @@ impl<H: Host> Runtime<'_, H> {
     /// it.
     pub(super) fn reflected_methods(&self, class: &str, declared: bool) -> Vec<Value> {
         let marker = |owner: &str, method: &Method| {
-            Value::Ref(Some(format!(
-                "reflect-method/{owner}#{}{}",
-                method.name, method.descriptor
-            )))
+            let declared = self.class(owner).and_then(|file| {
+                host_reflect::Declared::of(file, &method.name, &method.descriptor)
+            });
+            host_reflect::method(
+                owner,
+                &method.name,
+                Some(&method.descriptor),
+                declared.as_ref(),
+            )
         };
         let Some(file) = self.class(class) else {
             return Vec::new();

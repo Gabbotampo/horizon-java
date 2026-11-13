@@ -253,7 +253,7 @@ public final class FacadeMod {
 fn facade() -> Arc<EventFacade> {
     Arc::new(EventFacade {
         dedicated: true,
-        max_players: 20,
+        max_players: Some(20),
         players: vec![FacadePlayer {
             uuid: ALEX,
             name: "Alex".into(),

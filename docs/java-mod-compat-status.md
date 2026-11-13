@@ -33,6 +33,42 @@ it is not `ran-clean` either. Phase 2 starts from phase 1's zero-refusal baselin
 carrying: game-class mixins, event callbacks and the client surface. The design and tier model are
 [java-mod-compat.md](java-mod-compat.md#native-first-strategy-and-tiers).
 
+### Entrypoint census, re-measured (11 November 2026)
+
+The ledgers above run each jar on a real dedicated server; the entrypoint census
+([unmodelled-calls.md](unmodelled-calls.md)) runs the native probe over the same corpora, entrypoints only,
+with every server stage the loader runs (`main`, then `server`) and the game's own verdict. Re-measured at
+`1894d35` plus the interpreter-honesty PRs (#37: a call on `null` throws `NullPointerException`, empty optionals
+are objects; #38: bodiless and unmodelled instance calls are counted, no 64-key cap; #41: casts to jar classes,
+`Enum.valueOf` and `Thread.start` are checked or counted), old → new:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
+|---|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 52 → **31** | 52 → 34 | 0 → 8 | 12 → 43 |
+| mega | 86 → **59** | 136 → 67 | 0 → 10 | 30 → 116 |
+| NeoForge 26.3 | 36 → **22** | 21 → 20 | 0 → 0 | 28 → 43 |
+
+The numbers going down is the correct outcome: 62 jars had read `ran-clean` only because the interpreter carried
+on through a call on `null`, answered a bodiless or unmodelled instance call without counting it, or never ran the
+jar's second stage. The newly refused rows stop on a `NullPointerException` on a `null` an unmodelled call answered:
+the runtime stopping where Java would on that `null`, not proof the jar is broken.
+
+The unmodelled-answer batch (#49 Gson's fluent builder/`FormattingStyle`/writer, #50 Fabric `ModOrigin`,
+#51 Guava `MapMaker`, #52 executors, #53 host method references) then moves those rows forward, measured the same
+way at `b45a717`:
+
+| Corpus | `ran-clean` | `ran-hollow` | `ran-partial` | `refused` |
+|---|---:|---:|---:|---:|
+| wide (`corpus-xl`) | 31 → **31** | 34 → 41 | 8 → 4 | 43 → 40 |
+| mega | 59 → **59** | 67 → 84 | 10 → 4 | 116 → 105 |
+| NeoForge 26.3 | 22 → **21** | 20 → 22 | 0 → 0 | 43 → 42 |
+| **total** | **112 → 111** | 121 → 147 | 18 → 8 | 202 → 187 |
+
+Fifteen jars leave `refused` and ten `ran-partial` rows become `ran-hollow` (their second stage used to fail on
+one of those invented `null`s and now runs). Two `ran-clean` rows leave: their `Gson` registers a type adapter or
+a custom naming strategy, and #49 now counts that write instead of emitting text that ignored the option. The next stops are named in
+[unmodelled-calls.md](unmodelled-calls.md#re-measured-11-november-2026-after-the-unmodelled-answer-batch).
+
 ### Coverage of the two gates (8 November 2026, commit `8a3c8dc59`)
 
 The committed ledgers predate the per-run unmodelled-host-call count, so every row that ran reads `ran-hollow` with
@@ -438,6 +474,11 @@ counting a refusal:
 - `native-gap`: native execution refuses it yet; [Known gaps](#known-gaps) and the row's reason say where.
 - `missing-dependency` (`--with-deps` only): the jar's declared closure needs a mod id no corpus jar provides, so no
   loader would start it either; the ledger does not run it.
+
+The in-game mod's report adds `ran-partial`: at least one entrypoint stage ran and at least one failed, so the
+listeners from the running stages stay active and the row's reason names the failed stages. It is never counted as
+`ran-clean` or `ran-hollow`. The ledger above does not emit it, because it runs one stage per invocation; the
+entrypoint census ([unmodelled-calls.md](unmodelled-calls.md)) runs every server stage and uses the same verdict.
 
 The default ledger starts one server per jar, so a jar that declares a dependency (archers on `spell_engine`, zoomify
 on YACL) runs without it, which a real loader never does. `--with-deps` runs each jar with its declared closure
@@ -985,7 +1026,7 @@ than rows; the cache held 86 entries in 436 KiB.
    fell from 22 still failing to 4: static Mixin accessors run their generated contract, reflection answers the
    class file (superclass, assignability, enums, constructors, nested simple names, annotations with defaults,
    `Modifier`), JDK method references keep their arguments, concrete virtual calls reach overrides, pattern-matching
-   `switch` sites answer, `String.matches` has a bounded regex, `StackWalker` sees jar frames, and game codecs,
+   `switch` sites answer, `String`'s regex methods match like `java.util.regex`, `StackWalker` sees jar frames, and game codecs,
    builders, registry keys, `BlockItemId`/`ColorCollection` ids and mod registries are never null. The four left:
    archers and wizards read `spell_engine`'s config classes, which a lone jar does not have (both reach `Done` with
    `spell_engine` and `structure_pool_api` beside them; a real loader would refuse them alone for the missing
