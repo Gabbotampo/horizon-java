@@ -1594,6 +1594,11 @@ impl StdHost {
                     .as_ref()
                     .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}"))),
                 ("getHand", _) => Some(hand_marker(context.off_hand)),
+                // `PlayerInteractEvent.EntityInteract#getTarget`: the clicked entity.
+                ("getTarget", _) if event == GameEvent::UseEntity => context
+                    .entity
+                    .as_ref()
+                    .map(|entity| marker(format!("game/entity/{}", entity.id))),
                 ("getState", _) => context.block.as_deref().map(block_state_marker),
                 ("getEntity" | "getPlayer" | "player" | "entity", _) => context_subject(&context),
                 ("getSource" | "source", _) => context
@@ -2933,6 +2938,55 @@ mod tests {
             marker("enum/net/minecraft/world/InteractionHand/OFF_HAND".into())
         );
         assert_eq!(args[3], marker("game/entity/42".into()));
+    }
+
+    /// NeoForge's `EntityInteract#getTarget()` is the clicked entity and `getLevel()` the
+    /// player's level: the same entity and level a Fabric `UseEntityCallback` is handed.
+    #[test]
+    fn an_entity_interaction_answers_its_target_and_level() {
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::UseEntity,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(7),
+                level: Some("minecraft:the_nether".into()),
+                entity: Some(FacadeEntity {
+                    id: 42,
+                    kind: "minecraft:cow".into(),
+                    level: Some("minecraft:the_nether".into()),
+                }),
+                off_hand: Some(false),
+                ..EventContext::default()
+            },
+        )));
+        let event = event_marker(GameEvent::UseEntity);
+        let call = |host: &mut StdHost, name: &str, returns: &str| {
+            host.game_event_call(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$EntityInteract"
+                        .into(),
+                    name: name.into(),
+                    descriptor: format!("(){returns}"),
+                },
+                &event,
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(
+            call(
+                &mut host,
+                "getTarget",
+                "Lnet/minecraft/world/entity/Entity;"
+            ),
+            marker("game/entity/42".into())
+        );
+        assert_eq!(
+            call(&mut host, "getLevel", "Lnet/minecraft/world/level/Level;"),
+            level_marker("minecraft:the_nether")
+        );
     }
 
     /// A firing that does not know which hand acted passes a hand marker no read answers:
