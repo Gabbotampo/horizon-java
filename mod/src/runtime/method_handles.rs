@@ -1150,7 +1150,7 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     // The handler takes the throw, then a prefix of the
                     // target's arguments.
-                    let thrown = self.caught_throwable(&class, message);
+                    let thrown = self.caught_throwable(&class, message, frame.as_deref());
                     let takes = arg_count(&handler.descriptor()?).saturating_sub(1);
                     let mut values = vec![thrown];
                     values.extend(args.iter().take(takes).cloned());
