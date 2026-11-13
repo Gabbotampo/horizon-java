@@ -51,11 +51,14 @@ fn logger_value(name: &str) -> Value {
 /// The canonical name `Charset.forName` resolves `name` to, matching the
 /// JDK's case-insensitive lookup over the standard charsets and their common
 /// aliases.
-fn canonical_charset(name: &str) -> Option<&'static str> {
+pub(crate) fn canonical_charset(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
     Some(match lower.as_str() {
         "utf-8" | "utf8" | "unicode-1-1-utf-8" => "UTF-8",
-        "us-ascii" | "ascii" | "iso646-us" | "us" | "default" | "ascii7" | "646" => "US-ASCII",
+        // Not `default`: JDK 25's `Charset.forName("default")` throws
+        // `UnsupportedCharsetException`, as `new String(bytes, "default")`
+        // throws `UnsupportedEncodingException`.
+        "us-ascii" | "ascii" | "iso646-us" | "us" | "ascii7" | "646" => "US-ASCII",
         "iso-8859-1" | "iso8859_1" | "iso8859-1" | "latin1" | "l1" | "iso_8859-1" | "cp819" => {
             "ISO-8859-1"
         }
@@ -1394,11 +1397,17 @@ mod tests {
             instance_call(&name, &latin, &[]).unwrap().unwrap(),
             text("ISO-8859-1")
         );
-        assert!(matches!(
-            static_call(&for_name, &[text("KOI8-R")]),
-            Some(Err(NativeError::UncaughtException { class, .. }))
-                if class == "java/nio/charset/UnsupportedCharsetException"
-        ));
+        // `KOI8-R` is not modelled; `default` is not a name JDK 25 knows.
+        for unknown in ["KOI8-R", "default"] {
+            assert!(
+                matches!(
+                    static_call(&for_name, &[text(unknown)]),
+                    Some(Err(NativeError::UncaughtException { class, .. }))
+                        if class == "java/nio/charset/UnsupportedCharsetException"
+                ),
+                "{unknown}"
+            );
+        }
     }
 
     #[test]
