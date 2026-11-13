@@ -50,6 +50,7 @@ mod game_rules;
 mod gson_model;
 mod gson_tree;
 mod guava_model;
+mod guava_text;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
@@ -98,6 +99,7 @@ mod nested_jars;
 mod night_config;
 mod null_checks;
 mod open_options;
+mod optionull;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -109,6 +111,7 @@ mod registry_contents;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
+mod string_constructors;
 mod type_switch;
 mod value_class;
 mod vanilla_registries;
@@ -4297,6 +4300,10 @@ impl Host for StdHost {
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
+        // Guava's `Splitter`/`Joiner` and `Lists.newArrayList` (`guava_text.rs`).
+        if let Some(value) = self.guava_text(r, None, args) {
+            return value;
+        }
         if let Some(value) = self.neoforge_loader_call(r, args) {
             return Ok(value);
         }
@@ -5409,6 +5416,9 @@ impl Host for StdHost {
         self.record(r, Some(receiver), args);
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
+        }
+        if let Some(value) = self.guava_text(r, Some(receiver), args) {
+            return value;
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
@@ -19382,8 +19392,11 @@ impl<H: Host> Runtime<'_, H> {
             // so this comes before the receiver split below.
             if callback.target.name == "<init>" {
                 let object = self.new_object(&callback.target.owner);
-                self.host
-                    .invoke_instance(&callback.target, &object, &values)?;
+                // `String::new` is counted (`string_constructors.rs`).
+                if string_constructors::count(self, &callback.target)?.is_none() {
+                    self.host
+                        .invoke_instance(&callback.target, &object, &values)?;
+                }
                 return Ok(Some(object));
             }
             let Some((receiver, rest)) = values.split_first() else {
@@ -20201,6 +20214,9 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(value));
         }
         if let Some(value) = self.invoke_reflect_simple_name(r, receiver)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_reflect_enclosing_class(r, receiver)? {
             return Ok(Some(value));
         }
         // `getSuperclass` walks the jar's own hierarchy: a config scanner that
@@ -24064,6 +24080,11 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // FML's `InterModComms` (`neoforge_imc.rs`).
                         value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, string_constructors::count(self, &r))
+                    {
+                        // `new String(...)` builds no text yet: counted.
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
@@ -24196,6 +24217,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_collection_callback(&r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_optionull(&r, &args))
+                    {
+                        // The game's pure `Optionull` helper (`optionull.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
