@@ -42,6 +42,7 @@
 
 use super::*;
 use hash_table::HashTable;
+use mod_count::{ModStamp, ModVerdict};
 use object_methods::Equality;
 
 /// What a hash collection is.
@@ -332,6 +333,10 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         let Some(kind) = receiver_kind else {
+            if self.other_map_replace_all(r, opcode, receiver) {
+                // `hash_bulk.rs`: no other map's `replaceAll` is modelled.
+                return self.count_and_continue(r);
+            }
             if tainted_argument && self.shows_argument_order(r) {
                 return self.count_and_continue(r);
             }
@@ -376,6 +381,21 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 return self
                     .hash_remove_if(receiver, &marker, kind, &predicate)
+                    .map(Some);
+            }
+            ("replaceAll", "(Ljava/util/function/BiFunction;)V", [function]) if kind.map => {
+                let function = function.clone();
+                let unknown = self.host.take_hash_table(&marker).map(|table| {
+                    let unknown = table.order_unknown();
+                    self.host.store_hash_table(&marker, table);
+                    unknown
+                });
+                if unknown == Some(true) {
+                    return self.count_and_continue(r);
+                }
+                // `hash_bulk.rs`.
+                return self
+                    .hash_replace_all(r, receiver, &marker, &function)
                     .map(Some);
             }
             ("forEach", "(Ljava/util/function/Consumer;)V", [callback])
@@ -954,6 +974,23 @@ impl<H: Host> Runtime<'_, H> {
         Ok(keys)
     }
 
+    /// `modCount != expectedModCount` for a hash collection (`mod_count.rs`);
+    /// a key set that moved without it (a path the counter does not see)
+    /// is a change too.
+    fn hash_verdict(
+        &self,
+        receiver: &Value,
+        marker: &str,
+        kind: TableKind,
+        expected: (ModStamp, &[String]),
+    ) -> Result<ModVerdict, NativeError> {
+        let verdict = self.mod_stamp(marker).verdict(expected.0);
+        if verdict == ModVerdict::Same && self.key_signature(receiver, kind)? != expected.1 {
+            return Ok(ModVerdict::Changed);
+        }
+        Ok(verdict)
+    }
+
     /// `Collection.removeIf` on a `HashSet`/`LinkedHashSet` (neither
     /// overrides it): the iterator walks the set, and `it.remove()` runs
     /// `removeNode(hash, key)`, which searches the bin again, calling
@@ -975,20 +1012,38 @@ impl<H: Host> Runtime<'_, H> {
             });
         }
         let elements = self.collection_elements(receiver)?;
-        let mut expected = self.key_signature(receiver, kind)?;
+        let mut expected = self.mod_stamp(marker);
+        let mut signature = self.key_signature(receiver, kind)?;
         let mut removed = false;
+        let counted = MethodRef {
+            owner: "java/util/Collection".into(),
+            name: "removeIf".into(),
+            descriptor: "(Ljava/util/function/Predicate;)Z".into(),
+        };
         for (index, element) in elements.iter().enumerate() {
             // `each.next()` (after the first) checks `modCount`.
-            if index > 0 && self.key_signature(receiver, kind)? != expected {
-                return Err(concurrent_modification());
+            if index > 0 {
+                match self.hash_verdict(receiver, marker, kind, (expected, &signature))? {
+                    ModVerdict::Same => {}
+                    ModVerdict::Changed => return Err(concurrent_modification()),
+                    ModVerdict::Unknown => {
+                        self.host.unknown_operand_call(&counted)?;
+                        return Ok(Value::Int(i32::from(removed)));
+                    }
+                }
             }
             if !self.predicate_holds(predicate, element)? {
                 continue;
             }
             // `each.remove()`: the check, then the re-walk.
             self.resync_hash_table(receiver)?;
-            if self.key_signature(receiver, kind)? != expected {
-                return Err(concurrent_modification());
+            match self.hash_verdict(receiver, marker, kind, (expected, &signature))? {
+                ModVerdict::Same => {}
+                ModVerdict::Changed => return Err(concurrent_modification()),
+                ModVerdict::Unknown => {
+                    self.host.unknown_operand_call(&counted)?;
+                    return Ok(Value::Int(i32::from(removed)));
+                }
             }
             let mut table = self.take_table(marker, kind);
             let item = collection_item_marker(element);
@@ -1014,7 +1069,10 @@ impl<H: Host> Runtime<'_, H> {
                 .filter(|value| collection_item_marker(value) != node)
                 .collect();
             self.host.replace_mutable_collection(receiver, kept);
-            expected = self.key_signature(receiver, kind)?;
+            // `removeNode` bumps `modCount`; the iterator takes it.
+            self.bump_mod_count(marker, false);
+            expected = self.mod_stamp(marker);
+            signature = self.key_signature(receiver, kind)?;
             removed = true;
         }
         Ok(Value::Int(i32::from(removed)))
@@ -1032,7 +1090,8 @@ impl<H: Host> Runtime<'_, H> {
         callback: &Value,
     ) -> Result<Value, NativeError> {
         let entries = self.collection_elements(receiver)?;
-        let before = self.key_signature(receiver, kind)?;
+        let marker = expect_ref(receiver).cloned().unwrap_or_default();
+        let before = (self.mod_stamp(&marker), self.key_signature(receiver, kind)?);
         let step = if kind.map { 2 } else { 1 };
         let mut counted = false;
         for chunk in entries.chunks(step) {
@@ -1061,15 +1120,20 @@ impl<H: Host> Runtime<'_, H> {
             // The JDK walks the live table (or linked list) after a change,
             // even after the last entry (a key added behind it is visited):
             // not modelled, so any change is counted.
-            if !counted && self.key_signature(receiver, kind)? != before {
+            if !counted
+                && self.hash_verdict(receiver, &marker, kind, (before.0, &before.1))?
+                    != ModVerdict::Same
+            {
                 self.host.unknown_operand_call(r)?;
                 counted = true;
             }
         }
-        if self.key_signature(receiver, kind)? != before {
-            return Err(concurrent_modification());
+        match self.hash_verdict(receiver, &marker, kind, (before.0, &before.1))? {
+            ModVerdict::Same => Ok(Value::Void),
+            ModVerdict::Changed => Err(concurrent_modification()),
+            // Counted above.
+            ModVerdict::Unknown => Ok(Value::Void),
         }
-        Ok(Value::Void)
     }
 }
 

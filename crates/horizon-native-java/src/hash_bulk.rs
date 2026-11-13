@@ -291,11 +291,17 @@ impl<H: Host> Runtime<'_, H> {
         let value = match call {
             Some(call) => {
                 let keys = table.order();
+                // `int mc = modCount;`, then `if (mc != modCount) throw`.
+                let mc = self.mod_stamp(marker);
                 self.host.store_hash_table(marker, table);
                 let value = self.apply_callback(function, &call)?;
                 self.resync_hash_table(receiver)?;
                 table = self.take_table(marker, kind);
-                if table.order() != keys {
+                let verdict = self.mod_stamp(marker).verdict(mc);
+                if verdict == mod_count::ModVerdict::Unknown {
+                    self.host.unknown_operand_call(r)?;
+                }
+                if verdict == mod_count::ModVerdict::Changed || table.order() != keys {
                     self.host.store_hash_table(marker, table);
                     return Err(NativeError::UncaughtException {
                         class: "java/util/ConcurrentModificationException".into(),
@@ -311,6 +317,85 @@ impl<H: Host> Runtime<'_, H> {
             self.finish_compute(receiver, kind, &mut table, key, hash, stored, &value, name);
         self.host.store_hash_table(marker, table);
         result.map(|()| Some(value))
+    }
+
+    /// `HashMap.replaceAll`/`LinkedHashMap.replaceAll`: `e.value =
+    /// function.apply(e.key, e.value)` for every entry in iteration order,
+    /// each reading the value as it is then, and a
+    /// `ConcurrentModificationException` at the end if the function changed
+    /// the map's structure. The JDK keeps walking its table after such a
+    /// change, which is not modelled: counted.
+    pub(crate) fn hash_replace_all(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        marker: &str,
+        function: &Value,
+    ) -> Result<Value, NativeError> {
+        if *function == Value::Ref(None) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let keys: Vec<Value> = self
+            .collection_elements(receiver)?
+            .into_iter()
+            .step_by(2)
+            .collect();
+        let mc = self.mod_stamp(marker);
+        let mut counted = false;
+        for key in keys {
+            if !counted && self.mod_stamp(marker) != mc {
+                self.host.unknown_operand_call(r)?;
+                counted = true;
+            }
+            let entries = self.collection_elements(receiver)?;
+            let item = collection_item_marker(&key);
+            if !entries
+                .chunks(2)
+                .any(|pair| collection_item_marker(&pair[0]) == item)
+            {
+                continue;
+            }
+            let value = Self::stored_value(&entries, &key);
+            let replaced = self.apply_callback(function, &[key.clone(), value])?;
+            self.set_stored_value(receiver, &key, replaced)?;
+        }
+        match self.mod_stamp(marker).verdict(mc) {
+            mod_count::ModVerdict::Same => Ok(Value::Void),
+            mod_count::ModVerdict::Changed => Err(NativeError::UncaughtException {
+                class: "java/util/ConcurrentModificationException".into(),
+                message: None,
+                frame: None,
+            }),
+            mod_count::ModVerdict::Unknown => {
+                if !counted {
+                    self.host.unknown_operand_call(r)?;
+                }
+                Ok(Value::Void)
+            }
+        }
+    }
+
+    /// `replaceAll` with a function on a host map this runtime does not
+    /// model (the host's answer skips a jar function): counted.
+    pub(crate) fn other_map_replace_all(
+        &self,
+        r: &MethodRef,
+        opcode: u8,
+        receiver: Option<&Value>,
+    ) -> bool {
+        r.name == "replaceAll"
+            && r.descriptor == "(Ljava/util/function/BiFunction;)V"
+            && matches!(opcode, 0xb6 | 0xb9)
+            && receiver.is_some_and(|receiver| {
+                self.host_collection_kind(receiver) == Some(object_methods::CollectionKind::Map)
+                    && self
+                        .host_collection_class(receiver)
+                        .is_some_and(|class| !class.starts_with("java/util/ImmutableCollections"))
+            })
     }
 
     /// The end of a compute: store `value` under the found key, remove it
