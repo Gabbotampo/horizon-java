@@ -390,6 +390,27 @@ fn close_data_interface(interface: &str, out: &mut Vec<&'static str>) {
     }
 }
 
+/// Every data interface an object of a private JDK class implements: its
+/// `direct` interfaces and its skeleton superclass `skeleton`'s, closed over
+/// their superinterfaces (`jdk_skeletons/`).
+pub(crate) fn data_interfaces_of(direct: &[&str], skeleton: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for interface in direct {
+        close_data_interface(interface, &mut out);
+    }
+    let mut current = Some(skeleton);
+    while let Some(class) = current {
+        if let Some((_, interface)) = SKELETON_INTERFACES.iter().find(|(s, _)| *s == class) {
+            close_data_interface(interface, &mut out);
+        }
+        current = jvm_dispatch::JDK_SKELETONS
+            .iter()
+            .find(|(s, _, _)| *s == class)
+            .map(|(_, superclass, _)| *superclass);
+    }
+    out
+}
+
 /// `Object`'s members that never depend on the object's data.
 const IDENTITY_MEMBERS: &[&str] = &["getClass", "notify", "notifyAll", "wait"];
 

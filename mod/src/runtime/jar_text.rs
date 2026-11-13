@@ -96,6 +96,10 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // A private JDK collection the skeletons built (a sublist).
+        if let Some(text) = self.invoke_jdk_skeleton(&object_to_string(), 0xb6, Some(value), &[])? {
+            return Ok(Some(text));
+        }
         let Some(receiver_class) = self.jar_object_class(value) else {
             return Ok(None);
         };

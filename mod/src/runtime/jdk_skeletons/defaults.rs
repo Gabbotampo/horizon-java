@@ -35,31 +35,21 @@ const ACCEPT: (&str, &str, &str) = (
 );
 
 impl<H: Host> Runtime<'_, H> {
-    /// Whether the default `owner.name` runs here for `this`: a stream of a
-    /// `RandomAccess` list reads it by index (`List.spliterator`), which this
-    /// file does not run; nor does it run a class's own `spliterator()`.
+    /// Whether the default `owner.name` runs here for `this`: not a stream of
+    /// a class with its own `spliterator()`.
     pub(super) fn default_runs_here(&mut self, owner: &str, name: &str, this: &Value) -> bool {
-        // A list's stream of a `RandomAccess` list reads it by index
-        // (`List.spliterator`), which this file does not run; nor does it run
-        // a class's own `spliterator()` override.
+        // A class's own `spliterator()` override is not run here.
         if owner == COLLECTION && name.ends_with("tream") {
             let spliterator = MethodRef {
                 owner: COLLECTION.into(),
                 name: "spliterator".into(),
                 descriptor: "()Ljava/util/Spliterator;".into(),
             };
-            let overridden = self
+            return self
                 .jvm_selected_jar_body(&spliterator, 0xb9, Some(this))
                 .ok()
                 .flatten()
-                .is_some();
-            let random_access = expect_ref(this)
-                .and_then(|marker| jvm_dispatch::constructed_object_class(marker))
-                .is_some_and(|class| {
-                    self.class_is_instance(class, "java/util/List")
-                        && self.class_is_instance(class, "java/util/RandomAccess")
-                });
-            return !overridden && !random_access;
+                .is_none();
         }
         true
     }
@@ -121,6 +111,18 @@ impl<H: Host> Runtime<'_, H> {
                 )
             }
             (COLLECTION, "stream" | "parallelStream") => {
+                // A `RandomAccess` list's `List.spliterator` reads it by
+                // index (`list.rs`).
+                let random_access = expect_ref(this)
+                    .and_then(|marker| jvm_dispatch::constructed_object_class(marker))
+                    .is_some_and(|class| {
+                        self.class_is_instance(class, "java/util/List")
+                            && self.class_is_instance(class, "java/util/RandomAccess")
+                    });
+                if random_access {
+                    let values = self.random_access_values(this)?;
+                    return Ok(self.new_stream("java/util/List", name, values));
+                }
                 // `StreamSupport.stream(spliterator(), false)`: the
                 // collection's `IteratorSpliterator` asks for `iterator()`
                 // and `size()` when the terminal operation starts, then
