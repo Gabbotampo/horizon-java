@@ -401,7 +401,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         let copy = self.host.invoke_instance(r, receiver, args)?;
         if let Some(copy) = expect_ref(&copy) {
-            self.host.note_view_copy(copy);
+            self.host.note_view_copy(copy, &marker);
         }
         Ok(Some(Some(copy)))
     }

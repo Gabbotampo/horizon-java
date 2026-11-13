@@ -322,6 +322,9 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
+        if self.host_collection_class(receiver).as_deref() == Some("java/util/ArrayDeque") {
+            return self.array_deque_equality(r, receiver, args);
+        }
         let Some(list) = self.host_list(receiver) else {
             return Ok(None);
         };
@@ -456,5 +459,49 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `ArrayDeque`'s `contains`/`remove(Object)`/`removeFirstOccurrence`
+    /// (head to tail) and `removeLastOccurrence` (tail to head): `o.equals(e)`,
+    /// and `null` is never there. The host compared by marker.
+    fn array_deque_equality(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let (name, [needle]) = (r.name.as_str(), args) else {
+            return Ok(None);
+        };
+        if r.descriptor != "(Ljava/lang/Object;)Z"
+            || !matches!(
+                name,
+                "contains" | "remove" | "removeFirstOccurrence" | "removeLastOccurrence"
+            )
+        {
+            return Ok(None);
+        }
+        if *needle == Value::Ref(None) {
+            return Ok(Some(Value::Int(0)));
+        }
+        if !self.jar_equals(needle) {
+            return Ok(None);
+        }
+        let mut elements = self.collection_elements(receiver)?;
+        let order: Vec<usize> = if name == "removeLastOccurrence" {
+            (0..elements.len()).rev().collect()
+        } else {
+            (0..elements.len()).collect()
+        };
+        for index in order {
+            if self.java_equals(needle, &elements[index])? {
+                if name != "contains" {
+                    elements.remove(index);
+                    self.host.replace_mutable_collection(receiver, elements);
+                }
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        Ok(Some(Value::Int(0)))
     }
 }
