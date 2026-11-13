@@ -24,6 +24,7 @@ mod collection_base;
 mod collection_callback;
 mod color_collection;
 mod commons_io;
+mod commons_pair;
 mod concurrent_sync;
 pub mod content;
 mod declarations_content;
@@ -24183,6 +24184,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_mod_config_spec(&r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_commons_pair(&r, receiver.as_ref(), &args))
+                    {
+                        // commons-lang3 `Pair` (`commons_pair.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
