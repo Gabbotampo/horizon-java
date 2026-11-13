@@ -109,9 +109,9 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             _ => None,
         },
         // A `WatchEvent.Kind` is only ever a token handed back to `register`
-        // or compared with `==` against the event a key reports. The marker
-        // keeps its enum name so `name()`/`toString` agree; the watch-service
-        // model below never produces an event, so none is ever compared.
+        // or compared with `==` against the event a key reports
+        // (`watch_service.rs`). The marker keeps its enum name so
+        // `name()`/`toString` agree.
         "java/nio/file/StandardWatchEventKinds" => match name {
             "ENTRY_CREATE" | "ENTRY_DELETE" | "ENTRY_MODIFY" | "OVERFLOW" => {
                 Some(Value::Ref(Some(format!("watch-kind/{name}"))))
@@ -275,8 +275,8 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             let pattern = expect_string(args.first()?);
             Some(Ok(Value::Ref(Some(format!("regex-pattern/{pattern}")))))
         }
-        // The default filesystem. Opening a watch service over it is modelled
-        // below; no call here touches the host's disk.
+        // The default filesystem. Its watch services are `watch_service.rs`'s;
+        // no call here touches the host's disk.
         ("java/nio/file/FileSystems", "getDefault", "()Ljava/nio/file/FileSystem;") => {
             Some(Ok(Value::Ref(Some("file-system/default".into()))))
         }
@@ -396,37 +396,9 @@ pub(crate) fn instance_call(
         };
     }
     if marker == "file-system/default" {
+        // `newWatchService` is `watch_service.rs`'s.
         return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("newWatchService", "()Ljava/nio/file/WatchService;") => {
-                Some(Ok(Value::Ref(Some("watch-service/default".into()))))
-            }
             ("getSeparator", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some("/".into())))),
-            _ => None,
-        };
-    }
-    if marker == "watch-service/default" {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            // The virtual filesystem has no external writer, so no event is
-            // ever pending; `poll` answering null is the JVM's "nothing
-            // happened yet", not an invented event. `take` would block the
-            // single thread for ever, so it stays unmodelled and counted.
-            ("poll", "()Ljava/nio/file/WatchKey;") => Some(Ok(Value::Ref(None))),
-            ("poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;") => {
-                Some(Ok(Value::Ref(None)))
-            }
-            ("close", "()V") => Some(Ok(Value::Void)),
-            _ => None,
-        };
-    }
-    if marker.starts_with("watch-key/") {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("pollEvents", "()Ljava/util/List;") => Some(Ok(Value::Ref(Some("list".into())))),
-            // A key with no pending events is still valid, so `reset` reports
-            // true and the mod keeps polling. `cancel` has no state to clear
-            // and `isValid` keeps answering true afterwards; a mod that
-            // cancels and then polls is outside the modelled surface.
-            ("reset" | "isValid", "()Z") => Some(Ok(Value::Int(1))),
-            ("cancel", "()V") => Some(Ok(Value::Void)),
             _ => None,
         };
     }
@@ -437,12 +409,6 @@ pub(crate) fn instance_call(
             }
             _ => None,
         };
-    }
-    // `Path.register(service, kinds...)`: the key names the watched path. The
-    // game never changes a file behind the mod's back, so the key will never
-    // report an event.
-    if r.owner == "java/nio/file/Path" && r.name == "register" {
-        return Some(Ok(Value::Ref(Some(format!("watch-key/{marker}")))));
     }
     None
 }
