@@ -19629,14 +19629,39 @@ impl<H: Host> Runtime<'_, H> {
     /// sibling jars the host linked. This keeps reflection useful for
     /// bootstrap code without permitting arbitrary classpath or filesystem
     /// loading: a class neither source declares still answers `null`.
-    fn class_for_name(&self, args: &[Value]) -> Result<Value, NativeError> {
-        let binary = expect_string(
+    /// `Class.forName`, as JDK 25 runs it: `forName(String)` loads and
+    /// **initializes** the class (`forName0(name, true, ..)`), so its static
+    /// initializer runs here, at the call, and a failure in it surfaces as the
+    /// `ExceptionInInitializerError` it is. `forName(String, boolean,
+    /// ClassLoader)` initializes only when asked; `forName(Module, String)`
+    /// never does, and takes the name as its second argument. night-config's
+    /// `FormatDetector.<clinit>` relies on the first: it `forName`s
+    /// `TomlFormat`, whose own `<clinit>` registers the `toml` extension.
+    fn class_for_name(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        let module_overload = r.descriptor.starts_with("(Ljava/lang/Module;");
+        let name = if module_overload {
+            args.get(1)
+        } else {
             args.first()
-                .ok_or_else(|| NativeError::Metadata("Class.forName needs a class name".into()))?,
+        };
+        let binary = expect_string(
+            name.ok_or_else(|| NativeError::Metadata("Class.forName needs a class name".into()))?,
         );
         let internal = binary.replace('.', "/");
-        if self.has_class(&internal)
-            || library_dispatch::jdk_class_exists(&internal)
+        if self.has_class(&internal) {
+            let initialize = match r.descriptor.as_str() {
+                "(Ljava/lang/String;)Ljava/lang/Class;" => true,
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;" => {
+                    !matches!(args.get(1), Some(Value::Int(0)))
+                }
+                _ => false,
+            };
+            if initialize {
+                self.ensure_initialized(&internal)?;
+            }
+            return Ok(Value::Ref(Some(internal)));
+        }
+        if library_dispatch::jdk_class_exists(&internal)
             || self.host.platform_class_present(&internal)
         {
             return Ok(Value::Ref(Some(internal)));
@@ -24113,7 +24138,7 @@ impl<H: Host> Runtime<'_, H> {
                         && r.name == "forName"
                         && r.descriptor.ends_with(")Ljava/lang/Class;")
                     {
-                        invoke_or_catch!(at, self.class_for_name(&args))
+                        invoke_or_catch!(at, self.class_for_name(&r, &args))
                     } else if let Some(value) = self.invoke_class_interfaces(&r, receiver.as_ref())
                     {
                         value
@@ -36471,14 +36496,28 @@ mandatory = true
         );
         assert_eq!(
             runtime
-                .class_for_name(&[Value::Ref(Some("demo.Reflective".into()))])
+                .class_for_name(
+                    &MethodRef {
+                        owner: "java/lang/Class".into(),
+                        name: "forName".into(),
+                        descriptor: "(Ljava/lang/String;)Ljava/lang/Class;".into(),
+                    },
+                    &[Value::Ref(Some("demo.Reflective".into()))]
+                )
                 .unwrap(),
             Value::Ref(Some("demo/Reflective".into()))
         );
         // The JVM throws for an absent class; a platform probe catches the
         // exception and tries its next loader.
         let missing = runtime
-            .class_for_name(&[Value::Ref(Some("demo.Missing".into()))])
+            .class_for_name(
+                &MethodRef {
+                    owner: "java/lang/Class".into(),
+                    name: "forName".into(),
+                    descriptor: "(Ljava/lang/String;)Ljava/lang/Class;".into(),
+                },
+                &[Value::Ref(Some("demo.Missing".into()))],
+            )
             .unwrap_err();
         assert!(matches!(
             missing,
