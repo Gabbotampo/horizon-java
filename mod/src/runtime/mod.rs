@@ -19710,6 +19710,9 @@ impl<H: Host> Runtime<'_, H> {
                 "java/lang/Iterable",
             ],
             "map" => &["java/util/Map"],
+            // A host map entry (`HashMap`/`TreeMap` node, `Map.entry`): every
+            // one implements only `Map.Entry`.
+            "map-entry" => &["java/util/Map$Entry"],
             _ => &[],
         };
         if collection_kinds.contains(&wanted) {
