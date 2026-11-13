@@ -85,6 +85,7 @@ mod java_format;
 mod java_format_args;
 mod java_identifier;
 mod java_immutable;
+mod java_math;
 mod java_nbt;
 mod java_numbers;
 mod java_regex;
@@ -4848,6 +4849,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = java_numbers::static_call(r, args) {
+            return value;
+        }
+        if let Some(value) = java_math::static_call(r, args) {
             return value;
         }
         if let Some(value) = java_identifier::invoke_static(self, r, args) {
