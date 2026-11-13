@@ -14,6 +14,7 @@ use std::{
 };
 
 mod annotation_values;
+mod array_copy;
 mod attachment_codec;
 mod block_item_id;
 pub mod brigadier;
@@ -57,6 +58,7 @@ mod guava_text;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
+mod host_entry;
 mod jar_operands;
 mod jar_text;
 mod java_format;
@@ -7118,10 +7120,13 @@ impl Host for StdHost {
                     value_marker(&key),
                     value_marker(&value)
                 )))),
+                // JDK 25: `key + "=" + value`, each `String.valueOf`'d (a box
+                // as Java prints it; a jar object, which the host cannot run,
+                // counted as in any collection's text).
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
                     "{}={}",
-                    value_marker(&key),
-                    value_marker(&value)
+                    object_text(self, &key),
+                    object_text(self, &value)
                 )))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "{}#{}{}",
@@ -10651,7 +10656,7 @@ fn map_entry_value(key: &Value, value: &Value) -> Value {
     )))
 }
 
-fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
+pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
     let marker = expect_ref(value)
         .and_then(|marker| marker.strip_prefix("map-entry/"))
         .ok_or_else(|| NativeError::Metadata("expected a native map entry marker".into()))?;
@@ -19481,6 +19486,14 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return Ok(Some(value));
             }
+            // `Object::toString` on a host entry: its text, as the direct call
+            // prints it (`host_entry.rs`).
+            if callback.target.name == "toString"
+                && callback.target.descriptor == "()Ljava/lang/String;"
+                && let Some(text) = self.host_entry_text(&receiver, "callback", "callback")?
+            {
+                return Ok(Some(text));
+            }
             if callback.target.name == "stream"
                 && callback.target.descriptor == "()Ljava/util/stream/Stream;"
                 && is_collection_owner(&callback.target.owner)
@@ -19958,6 +19971,15 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 let marker = self.new_array(class, method);
                 self.arrays.insert(marker.clone(), values);
+                // The copy is an array of the original's class (the overloads
+                // without a `Class` argument), so `System.arraycopy` and
+                // `getClass()` see its component (`array_copy.rs`).
+                if !r.descriptor.contains("Ljava/lang/Class;")
+                    && let Some(component) = expect_ref(StdHost::argument(r, args, 0)?)
+                        .and_then(|original| self.array_component(original))
+                {
+                    self.record_array_component(&marker, &component);
+                }
                 Ok(Some(Value::Ref(Some(marker))))
             }
             ("fill", descriptor) if descriptor.starts_with('[') => {
@@ -24197,6 +24219,11 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         self.invoke_reflect_array(&r, &args, class, method)?
                     {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_array_copy(&r, &args))
+                    {
+                        // `System.arraycopy` (`array_copy.rs`).
                         value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
                         value

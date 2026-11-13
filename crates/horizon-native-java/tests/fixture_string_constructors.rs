@@ -10,7 +10,13 @@
 //! `javac --release 17`) returns for it, the answer a future model must give.
 
 use horizon_native_java::{NativeJar, StdHost};
-use std::{fs, io::Write, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use zip::write::SimpleFileOptions;
 
 const SOURCE: &str = r#"
@@ -71,12 +77,29 @@ fn javac() -> PathBuf {
         .unwrap_or_else(|| "javac".into())
 }
 
+/// The build directory of one [`jar`] call, removed when it drops (also when
+/// the build panics).
+struct BuildDir(PathBuf);
+
+impl Drop for BuildDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Compile and pack the fixture. Both tests call this at once on parallel
+/// threads of one process, so each call builds in its own directory: with a
+/// name made of the process id alone, one call's cleanup deleted the other's
+/// half-built jar (a flaky `NotFound` on CI).
 fn jar() -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-string-ctors-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = BuildDir(std::env::temp_dir().join(format!(
+        "horizon-native-java-string-ctors-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    let root = &dir.0;
+    let _ = fs::remove_dir_all(root);
     let source = root.join("src/demo/Ctors.java");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();
@@ -97,9 +120,7 @@ fn jar() -> NativeJar {
         zip.write_all(&fs::read(&class).unwrap()).unwrap();
     }
     zip.finish().unwrap();
-    let jar = NativeJar::from_path(&jar_path).unwrap();
-    let _ = fs::remove_dir_all(&root);
-    jar
+    NativeJar::from_path(&jar_path).unwrap()
 }
 
 /// The `char[]` and code-point constructors are modelled
