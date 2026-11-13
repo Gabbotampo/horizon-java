@@ -5,6 +5,9 @@
 //! classes go into the jar; the config library and the game are stubs for
 //! `javac`, so the host answers them, as for a real jar run alone.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ExecutionBudget, NativeJar, StdHost, Value,
     client_surface::{
@@ -184,11 +187,7 @@ public final class TooltipMod {
 /// lines, which it gets in order with the name first.
 #[test]
 fn a_tooltip_callback_appends_its_line_to_the_games_lines() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-client-tooltip-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("client-tooltip");
     let mut sources = STUBS.to_vec();
     sources.extend_from_slice(TOOLTIP_STUBS);
     sources.push(("demo/TooltipMod.java", TOOLTIP_MOD));
@@ -288,11 +287,7 @@ public final class HudMod {
 
 #[test]
 fn a_config_gated_hud_element_draws_the_held_stack_and_its_durability() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-client-hud-items-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("client-hud-items");
     let mut sources = STUBS.to_vec();
     sources.push(("demo/Config.java", CONFIG));
     sources.push(("demo/HudMod.java", MOD));

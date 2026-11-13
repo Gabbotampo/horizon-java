@@ -7,6 +7,9 @@
 //! host boundary where `StdHost` records order, and the returnable methods
 //! resolve against the runtime's own table.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{MethodRef, NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
@@ -31,15 +34,8 @@ fn files_under(root: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-fn build_jar(
-    name: &str,
-    sources: BTreeMap<&str, &str>,
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-mixin-return-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_jar(name: &str, sources: BTreeMap<&str, &str>) -> (scratch::Scratch, std::path::PathBuf) {
+    let root = scratch::Scratch::new(&format!("mixin-return-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();
@@ -262,7 +258,7 @@ public abstract class TailMixin {
     sources
 }
 
-fn fixture(name: &str) -> (std::path::PathBuf, NativeJar) {
+fn fixture(name: &str) -> (scratch::Scratch, NativeJar) {
     let (root, jar_path) = build_jar(name, fixture_sources());
     let jar = NativeJar::from_path(&jar_path).unwrap();
     (root, jar)
