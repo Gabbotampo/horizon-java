@@ -7,6 +7,9 @@
 //! checks the parts are addressable rather than reporting that misleading
 //! error.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -44,12 +47,8 @@ public final class Probe {
 }
 "#;
 
-fn build_fixture() -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-string-split-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_fixture() -> scratch::Scratch {
+    let root = scratch::Scratch::new("string-split");
     let source_path = root.join("src/demo/SplitEntrypoint.java");
     let probe_path = root.join("src/demo/Probe.java");
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -84,7 +83,7 @@ fn build_fixture() -> PathBuf {
     jar.write_all(&fs::read(root.join("classes/demo/SplitEntrypoint.class")).unwrap())
         .unwrap();
     jar.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 #[test]

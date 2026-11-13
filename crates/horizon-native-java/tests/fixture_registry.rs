@@ -1,3 +1,6 @@
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     Host, MethodRef, NativeJar, RegistryEntry, StdHost, TypedRegistrySink, Value,
 };
@@ -29,11 +32,7 @@ impl TypedRegistrySink for Recording {
 
 #[test]
 fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-fixture-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("fixture");
     fs::create_dir_all(&root).unwrap();
     let jar_path = root.join("fixture-registry.jar");
     let file = fs::File::create(&jar_path).unwrap();
@@ -168,11 +167,7 @@ fn fabric_fixture_runs_entrypoint_and_carries_resource_and_registry_declaration(
 
 #[test]
 fn fabric_fixture_rejects_unknown_typed_declaration_kind() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-invalid-fixture-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("invalid-fixture");
     fs::create_dir_all(&root).unwrap();
     let jar_path = root.join("fixture-invalid.jar");
     let file = fs::File::create(&jar_path).unwrap();
