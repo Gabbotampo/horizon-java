@@ -223,6 +223,11 @@ fn p8_host_objects_answer_as_java_25_or_count() {
             Exact("truefalsefalse"),
         ),
         ("supplierRunnable", vec![imc_supplier(0)], Counted),
+        // The declared `Supplier` is not its class: `isAssignableFrom(getClass())` counts the
+        // `getClass()` (Java: `true`), and a type switch counts `case Runnable` and picks Java's
+        // `case Supplier`.
+        ("supplierAssignable", vec![imc_supplier(0)], Counted),
+        ("supplierSwitch", vec![imc_supplier(0)], CountedAs("S")),
         // A final class is ruled out only when its whole hierarchy is known: one that is a
         // `Supplier` through an absent jar's interface, or a jar class over a JDK superclass (another
         // jar's Mixin may add an interface), is counted (Java: `false` for this lambda).

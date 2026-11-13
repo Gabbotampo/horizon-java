@@ -255,6 +255,8 @@ const fn methods(instance_of: fn(&HostRef, &str, &dyn ClassHierarchy) -> Option<
         equals: identity_equals,
         instance_of,
         crosses_jars: stays_in_its_jar,
+        // None of these classes is `Comparable`: a `compareTo` on one is counted.
+        compare_to: None,
     }
 }
 

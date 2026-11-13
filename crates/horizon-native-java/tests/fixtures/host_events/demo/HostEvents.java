@@ -168,6 +168,20 @@ public final class HostEvents {
     return "" + (supplier instanceof Runnable);
   }
 
+  /** Its class's own supertypes need its class: not the declared {@code Supplier} as a class. */
+  public static String supplierAssignable(Object supplier) {
+    return "" + Supplier.class.isAssignableFrom(supplier.getClass());
+  }
+
+  /** A type switch: a {@code Runnable} needs the class, a {@code Supplier} it surely is. */
+  public static String supplierSwitch(Object supplier) {
+    return switch (supplier) {
+      case Runnable r -> "R";
+      case Supplier<?> s -> "S";
+      default -> "d";
+    };
+  }
+
   /** A final class that is a {@code Supplier} through an interface of a jar that is not loaded. */
   static final class FinalViaMissing implements rvx.MissingIface {
     public Object get() {

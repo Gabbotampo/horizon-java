@@ -154,11 +154,25 @@ pub enum HostKind {
     /// `java.util.OptionalDouble`: key `""` when empty, else the `double`'s
     /// `Double.doubleToLongBits` (every `NaN` one key, `-0.0` not `0.0`).
     OptionalDouble,
-    /// A NeoForge `IEventBus`: key `game`, `mod/<id>`, or `mod` (`host_events.rs`).
+    /// `java.nio.file.Path`: key the path as `UnixPath` keeps it
+    /// (`host_path.rs`).
+    Path,
+    /// A NeoForge `FMLPaths` constant: key its name.
+    FmlPath,
+    /// A `StandardWatchEventKinds` constant: key its name (`host_watch.rs`).
+    WatchKind,
+    /// A `WatchService`, `WatchKey` or `WatchEvent` of the file model: key
+    /// the number the model minted for it.
+    WatchService,
+    WatchKey,
+    WatchEvent,
+    /// A NeoForge `IEventBus`: key `game`, or `mod` with its id when known
+    /// (`host_events.rs`; every key below holds its parts escaped).
     NeoForgeBus,
     /// A Forge EventBus 7 per-event `BUS`: key the event class.
     ForgeBus,
-    /// A Fabric `Event`: key `<owner>.<FIELD>`, or the serial `createArrayBacked` gave it.
+    /// A Fabric `Event`: key an API field's owner and name, a
+    /// `createArrayBacked` serial, or a registry's text.
     FabricEvent,
     /// A Fabric event's `invoker()`: key the event's key.
     FabricInvoker,
@@ -168,7 +182,8 @@ pub enum HostKind {
     ImcSupplier,
     /// The `CompletableFuture` `ParallelDispatchEvent.enqueueWork` answers: key the task's serial.
     DeferredWork,
-    /// An event a host caller dispatches or posts: key `<name>` or `cancelled/<name>`.
+    /// An event a host caller dispatches or posts: key its cancelled flag and
+    /// name.
     PostedEvent,
 }
 
@@ -355,6 +370,13 @@ fn jdk_closed(class: &str) -> Option<(bool, &'static [&'static str])> {
         .map(|(_, is_final, closure)| (*is_final, *closure))
 }
 
+/// Whether an object whose exact class is `class` is provably not a
+/// `wanted`: `wanted` is a `final` [`JDK_CLOSED`] class other than `class`,
+/// whose only instances are of that very class.
+pub(crate) fn exact_class_rules_out(class: &str, wanted: &str) -> bool {
+    class != wanted && jdk_closed(wanted).is_some_and(|(is_final, _)| is_final)
+}
+
 /// Whether no object can be both a `class` and a `declared`, proved: `class`
 /// is `final` and its whole supertype closure is known without `declared`.
 /// Only the JDK classes of [`JDK_CLOSED`] qualify. A jar class never does:
@@ -389,6 +411,10 @@ pub(crate) type InstanceOfFn = fn(&HostRef, &str, &dyn ClassHierarchy) -> Option
 /// Whether a handle means the same in another jar's runtime (NeoForge IMC):
 /// `crosses` answers for a held value.
 pub(crate) type CrossesFn = fn(&HostRef, &dyn Fn(&Value) -> bool) -> bool;
+/// `handle.compareTo(other)` (`Comparable`); `None` when it is unknown here
+/// (the caller counts it).
+pub(crate) type CompareToFn =
+    fn(&HostRef, &Value, &mut dyn Nested) -> Result<Option<i32>, NativeError>;
 
 /// The class hierarchy a kind's `instance_of` reads: the JDK's supertypes,
 /// and in the runtime the jar's own classes (a jar object's superclasses and
@@ -418,6 +444,9 @@ impl ClassHierarchy for JdkHierarchy {
         if let Some((_, closure)) = jdk_closed(class) {
             return Some(closure.contains(&wanted));
         }
+        if exact_class_rules_out(class, wanted) {
+            return Some(false);
+        }
         let jdk = |name: &str| {
             ["java/", "javax/", "jdk/"]
                 .iter()
@@ -435,6 +464,11 @@ pub(crate) struct Methods {
     pub(crate) equals: EqualsFn,
     pub(crate) instance_of: InstanceOfFn,
     pub(crate) crosses_jars: CrossesFn,
+    /// Natural order, for a kind whose class is `Comparable`: every caller of
+    /// `compareTo` (a direct call, a sort, a `TreeMap`, `sorted()`) reaches
+    /// it. `None` for a kind that is not `Comparable`, or not modelled: the
+    /// caller counts the comparison.
+    pub(crate) compare_to: Option<CompareToFn>,
 }
 
 /// One row of the kind table.
@@ -524,6 +558,48 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_optional::OPTIONAL_DOUBLE,
     },
     KindInfo {
+        kind: HostKind::Path,
+        tag: "path",
+        class: ClassRule::Fixed("sun/nio/fs/UnixPath"),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_path::PATH,
+    },
+    KindInfo {
+        kind: HostKind::FmlPath,
+        tag: "fmlp",
+        class: ClassRule::Fixed(crate::runtime::host_path::FML_PATHS_CLASS),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_path::FML_PATHS,
+    },
+    KindInfo {
+        kind: HostKind::WatchKind,
+        tag: "wkind",
+        class: ClassRule::Fixed("java/nio/file/StandardWatchEventKinds$StdWatchEventKind"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_KIND,
+    },
+    KindInfo {
+        kind: HostKind::WatchService,
+        tag: "wsvc",
+        class: ClassRule::Fixed("sun/nio/fs/LinuxWatchService"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::WatchKey,
+        tag: "wkey",
+        class: ClassRule::Fixed("sun/nio/fs/LinuxWatchService$LinuxWatchKey"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::WatchEvent,
+        tag: "wevt",
+        class: ClassRule::Fixed("sun/nio/fs/AbstractWatchKey$Event"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
         kind: HostKind::NeoForgeBus,
         tag: "nfbus",
         class: ClassRule::FromKey(crate::runtime::host_events::neoforge_bus_class),
@@ -603,6 +679,20 @@ impl HostKind {
             .get_or_init(|| KINDS.iter().map(|info| (info.tag, info.kind)).collect())
             .get(tag)
             .copied()
+    }
+
+    /// `class instanceof wanted` for the class name of a fixed-class kind (a
+    /// handle's `getClass()` handed to `Class.isAssignableFrom`, a class
+    /// walk): the kind's row, as for a handle of it, since a fixed class's
+    /// supertypes do not depend on the key. `None` when `class` is no kind's
+    /// fixed class; `Some(None)` when the row cannot tell.
+    pub(crate) fn class_instance_of(
+        class: &str,
+        wanted: &str,
+        hierarchy: &dyn ClassHierarchy,
+    ) -> Option<Option<bool>> {
+        let kind = Self::of_class(class)?;
+        Some(HostRef::new(kind, "").instance_of(wanted, hierarchy))
     }
 
     /// The kind of a fixed-class kind whose class is `class` (asked on every
@@ -725,6 +815,19 @@ impl HostRef {
         (self.methods().instance_of)(self, wanted, hierarchy)
     }
 
+    /// `compareTo(other)`; `None` when the kind has no natural order here or
+    /// cannot compare these two.
+    pub(crate) fn compare_to(
+        &self,
+        other: &Value,
+        nested: &mut dyn Nested,
+    ) -> Result<Option<i32>, NativeError> {
+        match self.methods().compare_to {
+            Some(compare) => compare(self, other, nested),
+            None => Ok(None),
+        }
+    }
+
     /// Whether this handle means the same in another jar's runtime, with
     /// `crosses` answering for the values it holds.
     pub(crate) fn crosses_jars(&self, crosses: &dyn Fn(&Value) -> bool) -> bool {
@@ -769,6 +872,40 @@ mod tests {
             if let ClassRule::Fixed(class) = info.class {
                 assert_eq!(HostKind::of_class(class), Some(info.kind));
             }
+        }
+    }
+
+    /// A kind whose runtime class is unknown is never found through a type it
+    /// declares: `Supplier` is not an IMC supplier's class, so a class check
+    /// on `Supplier` (`Class.isAssignableFrom`, a class walk) is not answered
+    /// as that kind's.
+    #[test]
+    fn unknown_class_kinds_are_not_found_by_their_declared_types() {
+        for info in KINDS {
+            let ClassRule::Unknown { declared } = info.class else {
+                continue;
+            };
+            let handle = HostRef::new(info.kind, "");
+            assert_eq!(handle.class(), None, "{:?}", info.kind);
+            for key in ["", "i1,rx", "i0,rx"] {
+                for class in declared(key) {
+                    assert_ne!(HostKind::of_class(class), Some(info.kind), "{class}");
+                }
+            }
+        }
+        for class in [
+            "java/util/function/Supplier",
+            "net/neoforged/bus/api/Event",
+            "net/neoforged/bus/api/ICancellableEvent",
+            "net/minecraftforge/eventbus/api/bus/EventBus",
+            "java/lang/Object",
+        ] {
+            assert_eq!(HostKind::of_class(class), None, "{class}");
+            assert_eq!(
+                HostKind::class_instance_of(class, "java/lang/Object", &JdkHierarchy),
+                None,
+                "{class}"
+            );
         }
     }
 

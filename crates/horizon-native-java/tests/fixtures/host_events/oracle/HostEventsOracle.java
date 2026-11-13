@@ -47,6 +47,8 @@ public final class HostEventsOracle {
     print("supplierClass", HostEvents.supplierClass(supplier));
     print("supplierTypes", HostEvents.supplierTypes(supplier));
     print("supplierRunnable", HostEvents.supplierRunnable(supplier));
+    print("supplierAssignable", HostEvents.supplierAssignable(supplier));
+    print("supplierSwitch", HostEvents.supplierSwitch(supplier));
     print("supplierFinalViaMissing", HostEvents.supplierFinalViaMissing(supplier));
     print("supplierFinalList", HostEvents.supplierFinalList(supplier));
     print("jarViaMissing", HostEvents.jarViaMissing());

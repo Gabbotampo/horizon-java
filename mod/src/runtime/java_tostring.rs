@@ -30,11 +30,9 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
     let prefix = [
         ("identifier/", "net/minecraft/resources/Identifier"),
         ("uuid/", "java/util/UUID"),
-        ("path:", "java/nio/file/Path"),
         ("duration/", "java/time/Duration"),
         ("tag-key/", "net/minecraft/tags/TagKey"),
         ("regex-pattern/", "java/util/regex/Pattern"),
-        ("watch-kind/", "java/nio/file/WatchEvent$Kind"),
         ("charset/", "java/nio/charset/Charset"),
         ("coding-error-action/", "java/nio/charset/CodingErrorAction"),
         ("locale/", "java/util/Locale"),

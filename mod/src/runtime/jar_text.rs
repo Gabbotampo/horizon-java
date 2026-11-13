@@ -213,6 +213,10 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(text) = self.host_entry_text(value, class, method)? {
             return Ok(Some(text));
         }
+        // `File.toString()` is its path.
+        if let Some(path) = self.file_path(value) {
+            return Ok(Some(Value::Ref(Some(path.to_owned()))));
+        }
         if object_marker_class(marker).is_none() {
             return Ok(None);
         }

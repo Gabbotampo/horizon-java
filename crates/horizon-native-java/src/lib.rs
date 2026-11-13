@@ -68,7 +68,9 @@ mod host_entry;
 mod host_events;
 mod host_list_iterator;
 mod host_optional;
+mod host_path;
 mod host_ref;
+mod host_watch;
 mod immutable_collections;
 mod iteration_guard;
 mod jar_compare;
@@ -176,6 +178,7 @@ pub(crate) use host_optional::{
     optional_int, optional_int_value, optional_long, optional_long_value, optional_payload,
     optional_present, optional_wrap,
 };
+pub(crate) use host_path::{path_text, path_value, unix_normal};
 pub use host_ref::{HostKind, HostRef};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
 pub use mixin_extras::{GameHookShape, MixinExtrasKind, MixinExtrasPlan};
@@ -5651,7 +5654,11 @@ impl Host for StdHost {
                 "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
             )
             | ("java/nio/file/Path", "of", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
-                Ok(path_value(expect_string(Self::argument(r, args, 0)?)))
+                let text = expect_string(Self::argument(r, args, 0)?);
+                if !host_path::encodable(text) {
+                    self.unknown_host_call(r)?;
+                }
+                Ok(path_value(text))
             }
             // The virtual filesystem keeps no files of its own: a path is
             // readable only when the caller seeded the same resource name.
@@ -5931,6 +5938,18 @@ impl Host for StdHost {
         self.record(r, Some(receiver), args);
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
+        }
+        // A handle's `toString`/`hashCode`/`equals` are its kind's row
+        // (`host_ref.rs`), before any model that answers by the call's owner.
+        if matches!(receiver, Value::Host(_))
+            && (matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("toString", "()Ljava/lang/String;")
+                    | ("hashCode", "()I")
+                    | ("equals", "(Ljava/lang/Object;)Z")
+            ) || r.name == "compareTo" && object_methods::is_compare_to(&r.descriptor))
+        {
+            return self.host_object_method(r, receiver, args);
         }
         if let Some(value) = self.guava_text(r, Some(receiver), args) {
             return value;
@@ -7618,9 +7637,6 @@ impl Host for StdHost {
             };
         }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
-            ("java/nio/file/Path", "toString", "()Ljava/lang/String;") => {
-                Ok(Value::Ref(Some(path_text(receiver).to_owned())))
-            }
             // A Unix path is absolute when it starts at the root.
             ("java/nio/file/Path", "isAbsolute", "()Z") => {
                 Ok(Value::Int(i32::from(path_text(receiver).starts_with('/'))))
@@ -7631,6 +7647,9 @@ impl Host for StdHost {
             }
             ("java/nio/file/Path", "resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 let child = expect_string(Self::argument(r, args, 0)?);
+                if !host_path::encodable(child) {
+                    self.unknown_host_call(r)?;
+                }
                 Ok(path_value(&path_join(path_text(receiver), child)))
             }
             ("java/nio/file/Path", "resolve", "(Ljava/nio/file/Path;)Ljava/nio/file/Path;") => {
@@ -8964,13 +8983,13 @@ impl Host for StdHost {
                 Ok(collection_value("list", &values))
             }
             ("net/fabricmc/loader/api/FabricLoader", "getGameDir", "()Ljava/nio/file/Path;") => {
-                Ok(Value::Ref(Some("path:/horizon/game".into())))
+                Ok(path_value("/horizon/game"))
             }
             ("net/fabricmc/loader/api/FabricLoader", "getConfigDir", "()Ljava/nio/file/Path;") => {
-                Ok(Value::Ref(Some("path:/horizon/config".into())))
+                Ok(path_value("/horizon/config"))
             }
             ("net/fabricmc/loader/api/FabricLoader", "getModsDir", "()Ljava/nio/file/Path;") => {
-                Ok(Value::Ref(Some("path:/horizon/mods".into())))
+                Ok(path_value("/horizon/mods"))
             }
             (
                 "net/fabricmc/loader/api/FabricLoader",
@@ -9537,14 +9556,9 @@ fn expect_string(value: &Value) -> &str {
     expect_ref(value).map_or("", String::as_str)
 }
 
-fn path_text(value: &Value) -> &str {
-    expect_string(value)
-        .strip_prefix("path:")
-        .unwrap_or_else(|| expect_string(value))
-}
-
-fn path_value(value: &str) -> Value {
-    Value::Ref(Some(format!("path:{value}")))
+/// `java.io.File.hashCode` on Linux: `path.hashCode() ^ 1234321`.
+fn file_hash(path: &str) -> i32 {
+    stable_hash(path) ^ 1234321
 }
 
 fn path_join(base: &str, child: &str) -> String {
@@ -9627,8 +9641,6 @@ fn class_of_value(value: &Value) -> Option<String> {
                 "java/lang/StringBuilder"
             } else if marker.starts_with("stream/") {
                 "java/util/stream/Stream"
-            } else if marker.starts_with("path:") {
-                "java/nio/file/Path"
             } else if marker == "list" || marker.starts_with("list/") {
                 "java/util/ArrayList"
             } else if marker == "set" || marker.starts_with("set/") {
@@ -10689,6 +10701,12 @@ impl StdHost {
             "hashCode" => handle
                 .hash_code(&mut HostNested(Some(self)))?
                 .map(Value::Int),
+            "compareTo" => {
+                let other = Self::argument(r, args, 0)?;
+                handle
+                    .compare_to(other, &mut HostNested(Some(self)))?
+                    .map(Value::Int)
+            }
             _ => {
                 let other = Self::argument(r, args, 0)?;
                 handle
@@ -10717,9 +10735,6 @@ fn value_text(value: &Value) -> String {
             // concatenation goes through `String.valueOf`, not the modelled
             // instance method.
             if let Some(value) = value.strip_prefix("regex-pattern/") {
-                return value.to_owned();
-            }
-            if let Some(value) = value.strip_prefix("watch-kind/") {
                 return value.to_owned();
             }
             value.clone()
@@ -12171,7 +12186,7 @@ fn class_marker_like(
     {
         return true;
     }
-    const NON_CLASS_PREFIXES: [&str; 13] = [
+    const NON_CLASS_PREFIXES: [&str; 12] = [
         "@",
         "array/",
         "capability/",
@@ -12181,7 +12196,6 @@ fn class_marker_like(
         "list",
         "map",
         "number-format/",
-        "path:",
         "reflect-",
         "resource-",
         "type/",
@@ -20499,6 +20513,10 @@ impl<H: Host> Runtime<'_, H> {
                 return true;
             }
             let Some(file) = self.class(&current) else {
+                // A host kind's class answers by its row (`host_ref.rs`).
+                if let Some(answer) = HostKind::class_instance_of(&current, wanted, self) {
+                    return answer == Some(true);
+                }
                 // A JDK skeleton superclass's own supertypes (`jdk_skeletons/`),
                 // else a JDK throwable superclass and its JDK ancestors.
                 return jdk_skeletons::skeleton_is_instance(&current, wanted)
@@ -20555,6 +20573,11 @@ impl<H: Host> Runtime<'_, H> {
         let name = receiver
             .and_then(expect_ref)
             .map(|marker| marker.replace('.', "/"))?;
+        // A host kind's class: its row knows its supertypes, not which are
+        // declared directly. Left to the host, which counts it.
+        if HostKind::of_class(&name).is_some() {
+            return None;
+        }
         let interfaces = self
             .class(&name)
             .map(ClassFile::interface_names)
@@ -20956,6 +20979,13 @@ impl<H: Host> Runtime<'_, H> {
         {
             let target = reflection_class_name(receiver, r)?.replace('.', "/");
             let source = reflection_class_name(args.first(), r)?.replace('.', "/");
+            // A host kind's class (`getClass()` of a handle): its row.
+            if let Some(answer) = HostKind::class_instance_of(&source, &target, self) {
+                return match answer {
+                    Some(answer) => Ok(Some(Value::Int(i32::from(answer)))),
+                    None => self.host.unknown_operand_call(r).map(Some),
+                };
+            }
             let assignable = target == source
                 || target == "java/lang/Object"
                 || (!class_is_primitive(&Value::Ref(Some(source.clone())))
@@ -20989,6 +21019,11 @@ impl<H: Host> Runtime<'_, H> {
             let class = reflection_class_name(receiver, r)?.replace('.', "/");
             if class == "java/lang/Object" || class_is_primitive(&Value::Ref(Some(class.clone()))) {
                 return Ok(Some(Value::Ref(None)));
+            }
+            // A host kind's class: its row knows its supertypes, not which
+            // one is the direct superclass. Counted.
+            if HostKind::of_class(&class).is_some() {
+                return self.host.unknown_operand_call(r).map(Some);
             }
             let parent = self
                 .class(&class)
@@ -21601,20 +21636,29 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// The path text a `File`, `Path`, string or stream marker names.
+    /// The path text a `File`, `Path`, string or stream names.
     ///
     /// A `File`/`FileInputStream`/`FileWriter` marker resolves through
-    /// [`Runtime::io_paths`]; a `Path` marker carries its text after
-    /// `path:`; anything else is a plain string path.
+    /// [`Runtime::io_paths`]; a `Path` is its handle's text; anything else is
+    /// a plain string path.
     fn io_path_of(&self, value: &Value) -> Option<String> {
+        if let Some(path) = host_path::path_key(value) {
+            return Some(path.to_owned());
+        }
         let text = expect_ref(value)?;
         if let Some(path) = self.io_paths.get(text) {
             return Some(path.clone());
         }
-        if let Some(path) = text.strip_prefix("path:") {
-            return Some(path.to_owned());
-        }
         Some(text.to_owned())
+    }
+
+    /// The path of a `java.io.File` object, as `UnixFileSystem.normalize`
+    /// kept it.
+    pub(crate) fn file_path(&self, value: &Value) -> Option<&str> {
+        let marker = expect_ref(value)?;
+        (jar_text::object_marker_class(marker) == Some("java/io/File"))
+            .then(|| self.io_paths.get(marker).map(String::as_str))
+            .flatten()
     }
 
     /// The sink a modelled writer marker appends into.
@@ -21745,24 +21789,36 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 if r.name == "<init>" {
+                    // `UnixFileSystem.normalize`, and `resolve` against a
+                    // parent (an empty one is `/`), as JDK 25's constructors.
+                    let normal = |value: Option<&Value>| expect_ref(value?).map(|t| unix_normal(t));
                     let path = match r.descriptor.as_str() {
-                        "(Ljava/lang/String;)V" => args
-                            .first()
-                            .and_then(expect_ref)
-                            .map(|text| text.to_owned()),
-                        "(Ljava/lang/String;Ljava/lang/String;)V" => {
-                            let parent = args.first().and_then(expect_ref).cloned();
-                            let child = args.get(1).and_then(expect_ref).cloned();
-                            parent
-                                .zip(child)
-                                .map(|(parent, child)| path_join(&parent, &child))
-                        }
-                        "(Ljava/io/File;Ljava/lang/String;)V" => {
-                            let parent = args.first().and_then(|value| self.io_path_of(value));
-                            let child = args.get(1).and_then(expect_ref).cloned();
-                            parent
-                                .zip(child)
-                                .map(|(parent, child)| path_join(&parent, &child))
+                        "(Ljava/lang/String;)V" => normal(args.first()),
+                        "(Ljava/lang/String;Ljava/lang/String;)V"
+                        | "(Ljava/io/File;Ljava/lang/String;)V" => {
+                            let parent = match args.first() {
+                                Some(Value::Ref(Some(text)))
+                                    if r.descriptor.starts_with("(Ljava/lang/String;") =>
+                                {
+                                    Some(unix_normal(text))
+                                }
+                                Some(value) => self.file_path(value).map(str::to_owned),
+                                None => None,
+                            };
+                            normal(args.get(1)).map(|child| {
+                                let Some(parent) = parent.as_deref() else {
+                                    return child;
+                                };
+                                let parent = if parent.is_empty() { "/" } else { parent };
+                                match (parent, child.as_str()) {
+                                    (parent, "") => parent.to_owned(),
+                                    ("/", child) => format!("/{}", child.trim_start_matches('/')),
+                                    (parent, child) if child.starts_with('/') => {
+                                        format!("{parent}{child}")
+                                    }
+                                    (parent, child) => format!("{parent}/{child}"),
+                                }
+                            })
                         }
                         _ => return Ok(None),
                     };
@@ -21806,7 +21862,12 @@ impl<H: Host> Runtime<'_, H> {
                             _ => Value::Ref(None),
                         }
                     }
-                    ("toPath", "()Ljava/nio/file/Path;") => path_value(&path),
+                    ("toPath", "()Ljava/nio/file/Path;") => {
+                        if !host_path::encodable(&path) {
+                            self.host.unknown_operand_call(r)?;
+                        }
+                        path_value(&path)
+                    }
                     ("mkdir", "()Z") | ("mkdirs", "()Z") | ("createNewFile", "()Z") => {
                         if r.name == "mkdirs" {
                             self.watch_directories_created(&path);
@@ -21833,6 +21894,11 @@ impl<H: Host> Runtime<'_, H> {
                         "getPath" | "getAbsolutePath" | "getCanonicalPath" | "toString",
                         "()Ljava/lang/String;",
                     ) => Value::Ref(Some(path)),
+                    // `UnixFileSystem.hashCode`/`compare`: the path's text.
+                    ("hashCode", "()I") => Value::Int(file_hash(&path)),
+                    ("equals", "(Ljava/lang/Object;)Z") => Value::Int(i32::from(
+                        args.first().and_then(|other| self.file_path(other)) == Some(&path),
+                    )),
                     _ => return Ok(None),
                 }))
             }
@@ -25407,7 +25473,8 @@ impl<H: Host> Runtime<'_, H> {
                     if let Some(labels) = file.type_switch_labels(index)
                         && let [value, Value::Int(restart)] = captured.as_slice()
                     {
-                        let index = self.type_switch_index(&labels, value, *restart)?;
+                        let index =
+                            invoke_or_catch!(at, self.type_switch_index(&labels, value, *restart));
                         stack.push(Value::Int(index));
                         continue;
                     }
@@ -35648,7 +35715,7 @@ mandatory = true
                     descriptor: "(Ljava/lang/Object;)Z".into(),
                 },
                 &roots,
-                &[Value::Ref(Some("path:/horizon/mods/demo".into()))],
+                &[path_value("/horizon/mods/demo")],
             )
             .unwrap(),
             Value::Int(1)
@@ -35795,7 +35862,7 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&game_dir, &loader, &[]).unwrap(),
-            Value::Ref(Some("path:/horizon/game".into()))
+            path_value("/horizon/game")
         );
         let resolve = MethodRef {
             owner: "java/nio/file/Path".into(),
@@ -35805,11 +35872,11 @@ mandatory = true
         let config = host
             .invoke_instance(
                 &resolve,
-                &Value::Ref(Some("path:/horizon/game".into())),
+                &path_value("/horizon/game"),
                 &[Value::Ref(Some("config".into()))],
             )
             .unwrap();
-        assert_eq!(config, Value::Ref(Some("path:/horizon/game/config".into())));
+        assert_eq!(config, path_value("/horizon/game/config"));
         let to_string = MethodRef {
             owner: "java/nio/file/Path".into(),
             name: "toString".into(),
