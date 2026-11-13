@@ -7,6 +7,9 @@
 //! not packaged, so every builder call crosses the interpreter's boundary as in
 //! a real install.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{ATTACHMENT_REGISTRY, NativeJar, RegistryDeclaration, StdHost};
 use std::{
     collections::BTreeMap,
@@ -14,7 +17,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 use zip::write::SimpleFileOptions;
 
@@ -47,15 +49,8 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn scratch_root(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-content-decl-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    root
+fn scratch_root(name: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("content-decl-{name}"))
 }
 
 fn write_sources(root: &Path, tree: &BTreeMap<&str, &str>) -> Vec<PathBuf> {
@@ -88,7 +83,7 @@ fn build_jar(
     sources: &BTreeMap<&str, &str>,
     metadata: &[u8],
     data: &[(&str, &[u8])],
-) -> (PathBuf, PathBuf) {
+) -> (scratch::Scratch, PathBuf) {
     let root = scratch_root(name);
     let stub_classes = root.join("stub-classes");
     let classes = root.join("classes");

@@ -51,6 +51,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(text) = args.get(1).and_then(expect_ref) else {
                     return Ok(None);
                 };
+                // commons-io may make parent folders and opens its own stream:
+                // not events the model can name (`watch_service.rs`).
+                self.watch_change(&path, crate::runtime::watch_service::Change::Unmodelled);
                 self.io_files.insert(path, text.clone());
                 Ok(Some(Value::Void))
             }

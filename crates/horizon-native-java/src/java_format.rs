@@ -43,21 +43,15 @@ pub(crate) enum Arg {
     /// (a `StringBuilder`, a modelled library object).
     Str(String),
     Bool(bool),
-    /// The runtime's bare `true`/`false`: a boxed `Boolean` or a `String` of
-    /// that text, which only `%s` prints alike.
-    BoolOrString(bool),
     Byte(i8),
     Short(i16),
     Int(i32),
     Long(i64),
     /// A `Character`: one UTF-16 code unit.
     Char(u16),
+    /// A `Double` (a bare `Value::Float`) and a `Float` (`Boxed::Float`).
     Double(f64),
     Float(f32),
-    /// The runtime keeps a boxed `Float` and a boxed `Double` as the same
-    /// value (a `float` is stored widened), so their `toString` and
-    /// `hashCode` differ while every numeric conversion agrees.
-    FloatOrDouble(f64),
     /// A non-null object the runtime cannot print or hash.
     Opaque,
 }
@@ -313,10 +307,9 @@ impl Spec {
         match self.conversion {
             'b' => self.print_string(
                 match arg {
-                    Arg::Null | Arg::Bool(false) => "false",
                     // `Boolean.FALSE` prints `false`, the string `"false"`
                     // prints `true`.
-                    Arg::BoolOrString(false) => return None,
+                    Arg::Null | Arg::Bool(false) => "false",
                     _ => "true",
                 }
                 .to_owned(),
@@ -586,7 +579,7 @@ fn integral(arg: &Arg) -> Option<(i64, u32)> {
 /// widened first, which the runtime has already done).
 fn floating(arg: &Arg) -> Option<f64> {
     match *arg {
-        Arg::Double(value) | Arg::FloatOrDouble(value) => Some(value),
+        Arg::Double(value) => Some(value),
         Arg::Float(value) => Some(f64::from(value)),
         // `BigDecimal` and the rest are not modelled or throw.
         _ => None,
@@ -598,7 +591,7 @@ fn java_to_string(arg: &Arg) -> Option<String> {
     Some(match arg {
         Arg::Null => "null".to_owned(),
         Arg::Str(text) => text.clone(),
-        Arg::Bool(value) | Arg::BoolOrString(value) => value.to_string(),
+        Arg::Bool(value) => value.to_string(),
         Arg::Byte(value) => value.to_string(),
         Arg::Short(value) => value.to_string(),
         Arg::Int(value) => value.to_string(),
@@ -608,25 +601,8 @@ fn java_to_string(arg: &Arg) -> Option<String> {
         // [`Digits::of`]), which the runtime's `toString` does not model.
         Arg::Double(value) if !shortest_is_plain(*value, false) => return None,
         Arg::Float(value) if !shortest_is_plain(f64::from(*value), true) => return None,
-        Arg::FloatOrDouble(value)
-            if !shortest_is_plain(*value, false) || !shortest_is_plain(*value, true) =>
-        {
-            return None;
-        }
         Arg::Double(value) => super::format_java_float(*value),
         Arg::Float(value) => super::format_java_float32(f64::from(*value)),
-        Arg::FloatOrDouble(value) => {
-            // A value an `f32` cannot hold was a `Double`; otherwise the two
-            // readings must print alike.
-            let double = super::format_java_float(*value);
-            if f64::from(*value as f32).to_bits() == value.to_bits() || value.is_nan() {
-                let float = super::format_java_float32(*value);
-                if float != double {
-                    return None;
-                }
-            }
-            double
-        }
         Arg::Opaque => return None,
     })
 }
@@ -732,7 +708,7 @@ fn java_hash(arg: &Arg) -> Option<i32> {
                 value.to_bits() as i32
             }
         }
-        Arg::Null | Arg::BoolOrString(_) | Arg::FloatOrDouble(_) | Arg::Opaque => return None,
+        Arg::Null | Arg::Opaque => return None,
     })
 }
 
@@ -876,8 +852,8 @@ mod tests {
             ("%b", &[Null], "false"),
             ("%b", &[Str("false".into())], "true"),
             ("%b", &[Int(0)], "true"),
-            ("%b", &[BoolOrString(true)], "true"),
-            ("%s", &[BoolOrString(false)], "false"),
+            ("%s", &[Bool(false)], "false"),
+            ("%s", &[Str("false".into())], "false"),
             ("%.2b", &[Bool(false)], "fa"),
             ("%-7B|", &[Bool(true)], "TRUE   |"),
             ("%f", &[Double(5e-7)], "0.000001"),
@@ -966,7 +942,10 @@ mod tests {
             ("%s", &[Bool(false)], "false"),
             ("%s", &[Double(1e7)], "1.0E7"),
             ("%s", &[Float(0.1)], "0.1"),
-            ("%s", &[FloatOrDouble(0.5)], "0.5"),
+            ("%s", &[Double(0.5)], "0.5"),
+            ("%s", &[Float(0.1)], "0.1"),
+            ("%s", &[Double(f64::from(0.1f32))], "0.10000000149011612"),
+            ("%h", &[Double(1.5)], "3ff80000"),
             ("%h", &[Str("hello".into())], "5e918d2"),
             ("%h", &[Long(-1)], "0"),
             ("%h", &[Bool(true)], "4cf"),
@@ -1033,12 +1012,6 @@ mod tests {
             ("%.1s", &[Str("\u{1F600}".into())]),
             ("%c", &[Int(0xD800)]),
             ("%s", &[Char(0xD800)]),
-            // A boxed `Float` and `Double` print differently here.
-            ("%s", &[FloatOrDouble(f64::from(0.1f32))]),
-            ("%h", &[FloatOrDouble(1.5)]),
-            // `Boolean.FALSE` and the string `"false"` differ here.
-            ("%b", &[BoolOrString(false)]),
-            ("%h", &[BoolOrString(true)]),
             ("%1$<s", &[Int(1)]),
             ("%99999s", &[Int(1)]),
         ];

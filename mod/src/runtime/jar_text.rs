@@ -128,6 +128,10 @@ impl<H: Host> Runtime<'_, H> {
                 .invoke(&owner, "toString", TO_STRING, Some(value.clone()), &[])
                 .map(Some);
         }
+        // `Throwable.toString()` on a jar exception (`jar_throwables.rs`).
+        if let Some(text) = self.invoke_jar_throwable(&object_to_string(), 0xb6, Some(value))? {
+            return Ok(Some(text));
+        }
         // `Enum.toString()` is `name()`: the name its constructor received.
         if owner == "java/lang/Enum"
             && let Some((name, _)) = expect_ref(value).and_then(|m| self.enum_constants.get(m))
@@ -216,6 +220,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<String, NativeError> {
+        if let Value::Host(_) = value
+            && let Some(text) = self.host.modelled_to_string(value)
+        {
+            return Ok(text);
+        }
         if matches!(value, Value::Ref(Some(_))) {
             match self.runtime_value_of(value, class, method)? {
                 Some(Value::Ref(Some(text))) => return Ok(text),
