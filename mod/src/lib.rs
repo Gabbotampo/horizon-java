@@ -98,8 +98,8 @@ use runtime::brigadier::{
     SelectedEntity,
 };
 use runtime::events::{
-    EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadePlayer, GameEvent,
-    GameListener, HeldItems, PhaseOrdering, ServerFacts, dispatch_order,
+    EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadeOriginal,
+    FacadePlayer, GameEvent, GameListener, HeldItems, PhaseOrdering, ServerFacts, dispatch_order,
 };
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
@@ -884,10 +884,21 @@ impl Hooks for HorizonJava {
     /// A player's data was copied to their new player (Fabric's `COPY_FROM`, NeoForge's
     /// `PlayerEvent.Clone`); `was_death` says a death caused it.
     fn player_clone(&self, host: &mut dyn ServerHost, event: &mut PlayerCloneEvent<'_>) {
-        let context = player_clone_context(event);
+        let original = event.original;
+        // The old and the new `ServerPlayer` share one game profile, so one UUID and name.
+        let lent = FacadeOriginal {
+            uuid: original.uuid(&*host).unwrap_or(event.player),
+            name: Some(event.name.to_owned()),
+            level: original
+                .level(&*host)
+                .map(|level| level.dimension_id().to_owned()),
+            position: original.position(&*host),
+            health: original.health(&*host),
+        };
+        let context = player_clone_context(event, lent);
         self.fire_bridged(
             Some(&mut *host),
-            Lifecycle::Cloned(event.player, event.was_death),
+            Lifecycle::Cloned(event.player, event.was_death, original),
             GameEvent::PlayerCopy,
             self.dedicated(),
             context,
@@ -1550,10 +1561,11 @@ fn copy_from_alive(was_death: bool) -> bool {
 }
 
 /// The `COPY_FROM`/`AFTER_RESPAWN` firing context for one player clone.
-fn player_clone_context(event: &PlayerCloneEvent<'_>) -> EventContext {
+fn player_clone_context(event: &PlayerCloneEvent<'_>, original: FacadeOriginal) -> EventContext {
     EventContext {
         player: Some(event.player),
         flag: copy_from_alive(event.was_death),
+        original: Some(original),
         ..EventContext::default()
     }
 }
@@ -3029,15 +3041,22 @@ mod tests {
             name: "Alex",
             was_death: true,
             // The hook-scoped view of the old player (fork pin `1cc882b8e0`); the context
-            // reads only the flag and the UUID, so any token does.
+            // takes the facts read from it, so any token does.
             original: mod_api::__private::game::original_player_ref(1),
         };
-        assert!(!player_clone_context(&event).flag);
+        let died = FacadeOriginal {
+            uuid: 7,
+            level: Some("minecraft:the_nether".to_owned()),
+            ..FacadeOriginal::default()
+        };
+        let context = player_clone_context(&event, died.clone());
+        assert!(!context.flag);
+        assert_eq!(context.original, Some(died.clone()));
         let event = PlayerCloneEvent {
             was_death: false,
             ..event
         };
-        assert!(player_clone_context(&event).flag);
+        assert!(player_clone_context(&event, died).flag);
     }
 
     /// Fabric's `afterDamage` gets `hurtServer`'s `originalDamage` and `damage` at `TAIL`, and

@@ -333,10 +333,14 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         let Some(kind) = receiver_kind else {
+            if self.other_map_replace_all(r, opcode, receiver) {
+                // `hash_bulk.rs`: no other map's `replaceAll` is modelled.
+                return self.count_and_continue(r);
+            }
             if tainted_argument && self.shows_argument_order(r) {
                 return self.count_and_continue(r);
             }
-            return Ok(None);
+            return self.snapshot_set_contains(r, opcode, receiver, args);
         };
         let Some(receiver) = receiver else {
             return Ok(None);
@@ -351,6 +355,15 @@ impl<H: Host> Runtime<'_, H> {
             return self.construct_hash_collection(r, receiver, &marker, kind, args);
         }
         self.resync_hash_table(receiver)?;
+        if kind.map
+            && matches!(
+                r.name.as_str(),
+                "computeIfAbsent" | "computeIfPresent" | "compute" | "merge"
+            )
+        {
+            // `hash_bulk.rs`.
+            return self.hash_compute(r, receiver, &marker, kind, args);
+        }
         match (r.name.as_str(), r.descriptor.as_str(), &*args) {
             ("removeIf", "(Ljava/util/function/Predicate;)Z", [predicate]) if !kind.map => {
                 let predicate = predicate.clone();
@@ -370,6 +383,21 @@ impl<H: Host> Runtime<'_, H> {
                     .hash_remove_if(receiver, &marker, kind, &predicate)
                     .map(Some);
             }
+            ("replaceAll", "(Ljava/util/function/BiFunction;)V", [function]) if kind.map => {
+                let function = function.clone();
+                let unknown = self.host.take_hash_table(&marker).map(|table| {
+                    let unknown = table.order_unknown();
+                    self.host.store_hash_table(&marker, table);
+                    unknown
+                });
+                if unknown == Some(true) {
+                    return self.count_and_continue(r);
+                }
+                // `hash_bulk.rs`.
+                return self
+                    .hash_replace_all(r, receiver, &marker, &function)
+                    .map(Some);
+            }
             ("forEach", "(Ljava/util/function/Consumer;)V", [callback])
             | ("forEach", "(Ljava/util/function/BiConsumer;)V", [callback]) => {
                 let callback = callback.clone();
@@ -382,20 +410,6 @@ impl<H: Host> Runtime<'_, H> {
                     return self.count_and_continue(r);
                 }
                 return self.hash_for_each(r, receiver, kind, &callback).map(Some);
-            }
-            ("equals", "(Ljava/lang/Object;)Z", [other]) => {
-                // `AbstractMap`/`AbstractSet.equals` look the other's keys up
-                // with `hashCode`/`equals`; with a jar key the host's marker
-                // comparison is not Java's.
-                let other = other.clone();
-                let mut values = self.collection_elements(receiver)?;
-                values.extend(self.collection_elements(&other).unwrap_or_default());
-                if values
-                    .iter()
-                    .any(|value| matches!(self.equality_of(value), Equality::Jar { .. }))
-                {
-                    return self.count_and_continue(r);
-                }
             }
             _ => {}
         }
@@ -1078,7 +1092,8 @@ impl<H: Host> Runtime<'_, H> {
                     None => self.count_and_continue(r),
                 }
             }
-            _ => Ok(None),
+            // `containsAll`/`removeAll`/`retainAll`/`equals` (`hash_bulk.rs`).
+            _ => self.hash_bulk_member(r, receiver, kind, table, args),
         }
     }
 

@@ -58,6 +58,7 @@ mod gson_model;
 mod gson_tree;
 mod guava_model;
 mod guava_text;
+mod hash_bulk;
 mod hash_collections;
 mod hash_map_order;
 mod hash_table;
@@ -2726,6 +2727,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// `Collections.emptyList()`/`emptySet()`/`emptyMap()` markers, whose
+    /// mutators JDK 25 does not all refuse (`java_immutable.rs`).
+    empty_collections: std::collections::BTreeSet<String>,
     /// UTF-8 decoders `Charset.newDecoder` made (`charset_decoder.rs`).
     charset_decoders: BTreeMap<String, charset_decoder::DecoderState>,
     /// `Collections.synchronized*` views and the collection each wraps
@@ -2881,6 +2885,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            empty_collections: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
@@ -5097,12 +5102,15 @@ impl Host for StdHost {
             ("java/util/stream/Collectors", "toList", "()Ljava/util/stream/Collector;") => {
                 Ok(Value::Ref(Some("collector/list".into())))
             }
-            ("java/util/stream/Collectors", "toSet", "()Ljava/util/stream/Collector;")
-            | (
+            ("java/util/stream/Collectors", "toSet", "()Ljava/util/stream/Collector;") => {
+                Ok(Value::Ref(Some("collector/set".into())))
+            }
+            // Not a `HashSet`: `Set.of` of the collected elements.
+            (
                 "java/util/stream/Collectors",
                 "toUnmodifiableSet",
                 "()Ljava/util/stream/Collector;",
-            ) => Ok(Value::Ref(Some("collector/set".into()))),
+            ) => Ok(Value::Ref(Some("collector/ordered-set".into()))),
             (
                 "java/util/stream/Collectors",
                 "toUnmodifiableList",
@@ -5118,7 +5126,7 @@ impl Host for StdHost {
                 "com/google/common/collect/ImmutableSet",
                 "toImmutableSet",
                 "()Ljava/util/stream/Collector;",
-            ) => Ok(Value::Ref(Some("collector/set".into()))),
+            ) => Ok(Value::Ref(Some("collector/ordered-set".into()))),
             ("com/google/common/collect/ImmutableList", "of", descriptor)
                 if descriptor.ends_with("Ljava/util/List;")
                     || descriptor.ends_with("Lcom/google/common/collect/ImmutableList;") =>
@@ -23221,12 +23229,8 @@ impl<H: Host> Runtime<'_, H> {
                 self.new_stream(class, method, flattened)
             }
             ("distinct", "()Ljava/util/stream/Stream;") => {
-                let mut distinct = Vec::with_capacity(values.len());
-                for value in values {
-                    if !distinct.contains(&value) {
-                        distinct.push(value);
-                    }
-                }
+                // `DistinctOps`' `HashSet` (`hash_bulk.rs`).
+                let distinct = self.hash_distinct(values)?;
                 self.new_stream(class, method, distinct)
             }
             // Both take a `long` (`ldc2_w 2L`), not an `int`.
@@ -23342,7 +23346,9 @@ impl<H: Host> Runtime<'_, H> {
                 })?;
                 match collector.as_str() {
                     "collector/list" => collection_value("list", &values),
-                    "collector/set" => collection_value("set", &values),
+                    // `HashSet::new` (`hash_bulk.rs`).
+                    "collector/set" => self.hash_set_collect(&values)?,
+                    "collector/ordered-set" => collection_value("set", &values),
                     collector if collector.starts_with("collector/joining/") => {
                         let payload = collector
                             .strip_prefix("collector/joining/")

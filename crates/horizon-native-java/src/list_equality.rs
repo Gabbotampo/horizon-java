@@ -265,11 +265,14 @@ impl<H: Host> Runtime<'_, H> {
     /// its own rules; any other collection only while every value involved
     /// is pure, when the answer cannot depend on how the collection looks it
     /// up. `None` when this runtime cannot answer it exactly.
-    fn argument_contains(
+    pub(crate) fn argument_contains(
         &mut self,
         collection: &Value,
         element: &Value,
     ) -> Result<Option<bool>, NativeError> {
+        if self.hash_table_kind(collection).is_some() {
+            return self.hash_aware_contains(collection, element);
+        }
         if let Some(list) = self.host_list(collection) {
             let rules = if list.view {
                 self.view_source(collection)
@@ -304,7 +307,7 @@ impl<H: Host> Runtime<'_, H> {
         collection: &Value,
         elements: &[Value],
     ) -> Result<bool, NativeError> {
-        if self.host_list(collection).is_some() {
+        if self.host_list(collection).is_some() || self.hash_table_kind(collection).is_some() {
             return Ok(true);
         }
         if self.host_collection_kind(collection) != Some(CollectionKind::Set) {

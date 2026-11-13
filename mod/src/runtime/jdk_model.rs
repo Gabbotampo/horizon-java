@@ -1356,6 +1356,11 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             [key, value, merge] => (key.clone(), value.clone(), Some(merge.clone())),
             _ => return Ok(None),
         };
+        if !guava {
+            // `HashMap::new` with `putIfAbsent`/`merge` (`hash_bulk.rs`).
+            let map = self.hash_map_collect(&key_fn, &value_fn, merge_fn.as_ref(), values)?;
+            return Ok(Some(map));
+        }
         let mut entries: Vec<(Value, Value)> = Vec::new();
         for element in values {
             let key = self.apply_function(&key_fn, element)?;
