@@ -123,6 +123,7 @@ mod type_switch;
 mod value_class;
 mod vanilla_registries;
 pub mod verdict;
+mod watch_service;
 pub mod weaver;
 
 pub use facade_server::{GameRuleValue, ServerFacts};
@@ -7133,6 +7134,10 @@ impl Host for StdHost {
             ("java/nio/file/Path", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(path_text(receiver).to_owned())))
             }
+            // A Unix path is absolute when it starts at the root.
+            ("java/nio/file/Path", "isAbsolute", "()Z") => {
+                Ok(Value::Int(i32::from(path_text(receiver).starts_with('/'))))
+            }
             ("java/nio/file/Path", "toAbsolutePath", "()Ljava/nio/file/Path;")
             | ("java/nio/file/Path", "normalize", "()Ljava/nio/file/Path;") => {
                 Ok(path_value(path_text(receiver)))
@@ -9980,7 +9985,10 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/IllegalAccessException"
         | "java/lang/InstantiationException"
         | "java/lang/reflect/InvocationTargetException" => "java/lang/ReflectiveOperationException",
-        "java/nio/file/FileAlreadyExistsException" => "java/nio/file/FileSystemException",
+        "java/nio/file/FileAlreadyExistsException"
+        | "java/nio/file/NotDirectoryException"
+        | "java/nio/file/DirectoryNotEmptyException" => "java/nio/file/FileSystemException",
+        "java/nio/file/ClosedWatchServiceException" => "java/lang/IllegalStateException",
         "java/io/FileNotFoundException"
         | "java/nio/file/NoSuchFileException"
         | "java/nio/file/FileSystemException" => "java/io/IOException",
@@ -15716,6 +15724,7 @@ impl NativeJar {
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -15878,6 +15887,7 @@ impl NativeJar {
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut callback_infos,
@@ -16024,6 +16034,7 @@ impl NativeJar {
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos,
@@ -18471,6 +18482,9 @@ struct Runtime<'a, H> {
     /// sit in `io_files` as empty entries; this set tells them from empty
     /// files (`file_attributes.rs`).
     io_dirs: BTreeSet<String>,
+    /// The run's watch services and keys, fed by the file model's changes
+    /// (`watch_service.rs`).
+    watch: watch_service::WatchState,
     /// Annotation values `Class#getAnnotation`/`Method#getAnnotation` handed
     /// out, keyed by the proxy marker a member query answers from.
     annotations: BTreeMap<String, Annotation>,
@@ -20965,9 +20979,12 @@ impl<H: Host> Runtime<'_, H> {
             None => format!("mem:{marker}"),
         };
         if truncate {
-            self.io_writers.insert(key, String::new());
+            self.io_writers.insert(key.clone(), String::new());
         } else {
-            self.io_writers.entry(key).or_default();
+            self.io_writers.entry(key.clone()).or_default();
+        }
+        if let Some(path) = key.strip_prefix("file:") {
+            self.watch_writer_opened(path, truncate);
         }
     }
 
@@ -20988,8 +21005,9 @@ impl<H: Host> Runtime<'_, H> {
         let Some(path) = self.io_paths.get(marker).cloned() else {
             return;
         };
-        if let Some(text) = self.io_writers.get(&format!("file:{path}")) {
-            self.io_files.insert(path, text.clone());
+        if let Some(text) = self.io_writers.get(&format!("file:{path}")).cloned() {
+            self.watch_writer_committed(&path, text.len());
+            self.io_files.insert(path, text);
         }
     }
 
@@ -21124,17 +21142,27 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("toPath", "()Ljava/nio/file/Path;") => path_value(&path),
                     ("mkdir", "()Z") | ("mkdirs", "()Z") | ("createNewFile", "()Z") => {
+                        if r.name == "mkdirs" {
+                            self.watch_directories_created(&path);
+                        } else {
+                            self.watch_created(&path);
+                        }
                         if r.name != "createNewFile" {
                             self.io_dirs.insert(path.clone());
                         }
                         self.io_files.entry(path).or_default();
                         Value::Int(1)
                     }
-                    ("delete", "()Z") => {
-                        self.io_dirs.remove(&path);
-                        self.io_files.remove(&path);
-                        Value::Int(1)
-                    }
+                    // `false` for a missing path or a directory that still
+                    // holds entries, as JDK 25's `File.delete` answers.
+                    ("delete", "()Z") => match self.delete_path(&path) {
+                        file_attributes::Deletion::Deleted => Value::Int(1),
+                        file_attributes::Deletion::Missing
+                        | file_attributes::Deletion::NotEmpty => Value::Int(0),
+                        file_attributes::Deletion::Unknown => {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                    },
                     (
                         "getPath" | "getAbsolutePath" | "getCanonicalPath" | "toString",
                         "()Ljava/lang/String;",
@@ -21191,6 +21219,7 @@ impl<H: Host> Runtime<'_, H> {
                             .get(1)
                             .map(|value| expect_string(value).to_owned())
                             .unwrap_or_default();
+                        self.watch_whole_write(&path, text.is_empty());
                         self.io_files.insert(path, text);
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
@@ -21210,12 +21239,23 @@ impl<H: Host> Runtime<'_, H> {
                                 String::from_utf8_lossy(&bytes).into_owned()
                             })
                             .unwrap_or_default();
+                        // Lines (`write(Path, Iterable)`) never reach the model's text.
+                        let bytes = args
+                            .get(1)
+                            .and_then(|value| expect_ref(value))
+                            .is_some_and(|marker| self.arrays.contains_key(marker));
+                        if bytes {
+                            self.watch_whole_write(&path, text.is_empty());
+                        } else {
+                            self.watch_change(&path, watch_service::Change::Unmodelled);
+                        }
                         self.io_files.insert(path, text);
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("createFile", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        self.watch_created(&path);
                         self.io_files.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
@@ -21224,6 +21264,11 @@ impl<H: Host> Runtime<'_, H> {
                     ("createDirectories" | "createDirectory", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        if r.name == "createDirectories" {
+                            self.watch_directories_created(&path);
+                        } else {
+                            self.watch_created(&path);
+                        }
                         self.io_dirs.insert(path.clone());
                         self.io_files.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
@@ -21234,12 +21279,32 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         return self.files_tree(r, &path, class, method).map(Some);
                     }
+                    // JDK 25: `delete` of a missing path throws
+                    // `NoSuchFileException`, `deleteIfExists` answers false;
+                    // both refuse a directory that holds entries.
                     ("delete" | "deleteIfExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        self.io_dirs.remove(&path);
-                        self.io_files.remove(&path);
-                        Value::Int(1)
+                        let thrown = |class: &str| NativeError::UncaughtException {
+                            class: class.into(),
+                            message: Some(path.clone()),
+                            frame: None,
+                        };
+                        match self.delete_path(&path) {
+                            file_attributes::Deletion::Deleted => Value::Int(1),
+                            file_attributes::Deletion::Missing if r.name == "deleteIfExists" => {
+                                Value::Int(0)
+                            }
+                            file_attributes::Deletion::Missing => {
+                                return Err(thrown("java/nio/file/NoSuchFileException"));
+                            }
+                            file_attributes::Deletion::NotEmpty => {
+                                return Err(thrown("java/nio/file/DirectoryNotEmptyException"));
+                            }
+                            file_attributes::Deletion::Unknown => {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            }
+                        }
                     }
                     ("newBufferedReader", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
@@ -28761,6 +28826,7 @@ mod tests {
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -28821,6 +28887,7 @@ mod tests {
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -35853,6 +35920,7 @@ mandatory = true
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36008,6 +36076,7 @@ mandatory = true
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36216,6 +36285,7 @@ mandatory = true
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36528,6 +36598,7 @@ mandatory = true
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36812,6 +36883,7 @@ mandatory = true
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -41952,6 +42024,7 @@ mandatory = true
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -41999,6 +42072,7 @@ mandatory = true
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
+            watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),

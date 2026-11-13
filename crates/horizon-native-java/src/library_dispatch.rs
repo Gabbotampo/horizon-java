@@ -23,6 +23,11 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_file_attributes(r, receiver, args)? {
             return Ok(Some(value));
         }
+        // Watch services over the file model (`watch_service.rs`), also as a
+        // method reference (`service::poll`).
+        if let Some(value) = self.invoke_watch_service(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // `ServiceLoader` through a method reference (`Provider::get`).
         if let Some(value) = self.invoke_service_loader(r, receiver, args)? {
             return Ok(Some(value));

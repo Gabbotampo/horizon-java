@@ -67,7 +67,7 @@ impl<H: Host> Runtime<'_, H> {
             Some(value @ Value::Ref(Some(_))) => self.array(value)?.clone(),
             _ => Vec::new(),
         };
-        let (mut atomic, mut replace) = (false, false);
+        let (mut atomic, mut replace, mut attributes) = (false, false, false);
         for option in &options {
             let name = match option {
                 Value::Ref(None) => return Err(thrown("java/lang/NullPointerException", None)),
@@ -79,7 +79,7 @@ impl<H: Host> Runtime<'_, H> {
             match (name, moving) {
                 (Some("REPLACE_EXISTING"), _) => replace = true,
                 (Some("ATOMIC_MOVE"), true) => atomic = true,
-                (Some("COPY_ATTRIBUTES"), false) => {}
+                (Some("COPY_ATTRIBUTES"), false) => attributes = true,
                 (Some(other), true) => {
                     return Err(thrown(
                         "java/lang/UnsupportedOperationException",
@@ -125,6 +125,15 @@ impl<H: Host> Runtime<'_, H> {
         // A directory stays one (`file_attributes.rs`): a copy makes an empty
         // directory, a move renames it.
         let directory = self.io_dirs.contains(&source);
+        self.watch_move_or_copy(
+            &source,
+            &target,
+            moving,
+            atomic,
+            directory,
+            attributes,
+            text.is_empty(),
+        );
         if moving {
             self.io_dirs.remove(&source);
             self.io_files.remove(&source);
