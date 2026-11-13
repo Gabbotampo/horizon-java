@@ -12,8 +12,9 @@
 //! (`javac --release 21`, then `java -cp` calling each method), quoted in each
 //! test. Where the runtime still cannot run the JDK body, its answers are the
 //! counted neutral defaults: the runtime's honesty contract, **not JVM
-//! behaviour**. The `AbstractCollection` templates now run as the JDK runs
-//! them (`jdk_skeletons/`), so those tests assert the JVM's own answers.
+//! behaviour**. The `AbstractCollection`/`AbstractSet` templates and the
+//! `Iterable` defaults now run as the JDK runs them (`jdk_skeletons/`), so
+//! those tests assert the JVM's own answers.
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
@@ -167,18 +168,13 @@ fn a_skeleton_to_string_runs_as_the_jdk_does() {
     assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `xy`. Refused before (no host row for the iterable).
+/// JDK 25: `xy`. Refused at first (no host row for the iterable), then
+/// counted; now `Iterable.forEach` runs as the JDK runs it.
 #[test]
-fn an_interface_default_on_a_jar_iterable_is_counted() {
+fn an_interface_default_on_a_jar_iterable_runs_as_the_jdk_does() {
     let (text, unknown) = run("iterableDefault");
-    assert_eq!(text, "");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/lang/Iterable#forEach(Ljava/util/function/Consumer;)V",
-            1
-        )
-    );
+    assert_eq!(text, "xy");
+    assert_eq!(unknown, Vec::new());
 }
 
 /// JDK 25: `k=7`. The key and value are `SimpleImmutableEntry`'s state.

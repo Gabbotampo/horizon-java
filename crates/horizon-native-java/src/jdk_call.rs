@@ -340,6 +340,25 @@ impl<H: Host> Runtime<'_, H> {
         self.run_site(Site::Static, &r, args)
     }
 
+    /// `value instanceof class`, answered by the `instanceof` instruction
+    /// (counted when no model can stand behind a `false`, as in a jar).
+    pub(crate) fn java_instance_of(
+        &mut self,
+        value: &Value,
+        class: &str,
+    ) -> Result<bool, NativeError> {
+        if *value == Value::Ref(None) {
+            return Ok(false);
+        }
+        let r = MethodRef {
+            owner: class.to_owned(),
+            name: String::new(),
+            descriptor: String::new(),
+        };
+        let answer = self.run_site(Site::InstanceOf, &r, std::slice::from_ref(value))?;
+        Ok(matches!(answer, Value::Int(flag) if flag != 0))
+    }
+
     /// Run one call-site frame.
     fn run_site(
         &mut self,
@@ -375,5 +394,12 @@ impl<H: Host> Runtime<'_, H> {
             },
             other => other,
         })
+    }
+
+    /// Whether `error` is a Java exception a `catch (catch_class)` in a JDK
+    /// body would catch.
+    pub(crate) fn catches(&self, error: &NativeError, catch_class: &str) -> bool {
+        matches!(error, NativeError::UncaughtException { class, .. }
+            if exception_is_subtype(self.classes, &self.linked, class, catch_class))
     }
 }
