@@ -8,7 +8,8 @@
 //! Expected values:
 //! * the metadata lines are what `fixtures/fabric_mods/demo/Describe.java`
 //!   printed on JDK 25 (`jdk-25.0.5+8`) for the same three `fabric.mod.json`
-//!   files, parsed by Fabric Loader 0.19.5's own `ModMetadataParser`;
+//!   files, and for Fabric Loader 0.19.5's own and its bundled MixinExtras
+//!   0.5.5's, parsed by Fabric Loader 0.19.5's own `ModMetadataParser`;
 //! * the order is Fabric Loader 0.19.5's: `ModResolver.findCompatibleSet`
 //!   sorts the selected mods by `ModCandidateImpl::getId` (offset 841) and
 //!   `getAllMods` is `Collections.unmodifiableList(mods)` in that order. The
@@ -29,7 +30,9 @@ const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fabri
 const ORACLE: &str = "\
 alpha: type=fabric version=1.2.0+mc26.3 name=Alpha Mod description=[Does things] environment=SERVER authors=Ann<->,Bob<b@x.example> contributors= homepage=https://h.example issues=- license=[MIT] provides=[alpha_alias] options=OBJECT(size=2,a=BOOLEAN(false),has_b=true,badges=absent) modmenu=OBJECT(size=1,a=absent,has_b=false,badges=ARRAY(size=1,0=STRING(library),5=Index 5 out of bounds for length 1)) note=STRING(hi) count=NUMBER#3 nothing=NULL#5 containsNothing=true containsMissing=false
 beta: type=fabric version=0.1 name=beta description=[] environment=UNIVERSAL authors= contributors= homepage=- issues=- license=[] provides=[] options=absent modmenu=absent note=absent count=absent nothing=absent containsNothing=false containsMissing=false
+fabricloader: type=fabric version=0.19.5 name=Fabric Loader description=[The base mod loader.] environment=UNIVERSAL authors=FabricMC<-> contributors= homepage=https://fabricmc.net issues=https://github.com/FabricMC/fabric-loader/issues license=[Apache-2.0] provides=[] options=absent modmenu=absent note=absent count=absent nothing=absent containsNothing=false containsMissing=false
 gamma: type=fabric version=2.0-beta.1 name=gamma description=[] environment=UNIVERSAL authors= contributors=Cy<-> homepage=- issues=- license=[MIT, Apache-2.0] provides=[] options=absent modmenu=absent note=absent count=absent nothing=absent containsNothing=false containsMissing=false
+mixinextras: type=fabric version=0.5.5 name=MixinExtras description=[Companion library to Mixin with lots of features to improve the compatibility and concision of your mixins!] environment=UNIVERSAL authors=LlamaLad7<-> contributors= homepage=https://github.com/LlamaLad7/MixinExtras issues=- license=[MIT] provides=[com_github_llamalad7_mixinextras] options=absent modmenu=OBJECT(size=1,a=absent,has_b=false,badges=ARRAY(size=1,0=STRING(library),5=Index 5 out of bounds for length 1)) note=absent count=absent nothing=absent containsNothing=false containsMissing=false
 ";
 
 struct Run {
@@ -174,13 +177,12 @@ fn each_container_answers_from_its_own_fabric_mod_json() {
 fn builtin_containers_answer_only_what_is_known() {
     let run = build("builtins");
     let mut host = host(&run, Some("26.3"));
-    // `java` is built from this host's own `java.vm.name` and
-    // `java.specification.version` properties (`StdHost::new`), `minecraft`
-    // from the game version; Fabric Loader's own metadata is a release
-    // Horizon does not have, so its name is counted (and answers `null`).
+    // Fabric Loader is the 0.19.5 the runtime reproduces; `java` is Java 25,
+    // whose `java.vm.name` depends on the JDK vendor, so it is counted (and
+    // answers `null`); `minecraft` is the seeded game version.
     assert_eq!(
         text(&run, &mut host, "builtins"),
-        "loader-name=null;java=Horizon native Java/21/builtin/false;\
+        "loader-name=Fabric Loader;java=null/25/builtin/false;\
          minecraft=Minecraft/26.3/UNIVERSAL/-;"
     );
     assert_eq!(

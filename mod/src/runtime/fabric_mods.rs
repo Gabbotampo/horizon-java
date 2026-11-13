@@ -25,10 +25,19 @@
 //! `contributors` are people (a string, or `{name, contact}`); `license` is a
 //! string or a list; `custom` values keep their JSON types.
 //!
-//! **Built-in and host-provided containers** answer `getId`, and `minecraft`
-//! answers `getVersion` with the game version a caller seeded. Every other read
-//! on them is counted: Horizon is not Fabric Loader, so its version, name and
-//! the rest have no true value to give.
+//! **`fabricloader` and `mixinextras`** are the containers Fabric Loader
+//! 0.19.5 builds for itself and for the MixinExtras 0.5.5 jar it bundles: V1
+//! metadata from those jars' own `fabric.mod.json` ([`LOADER_METADATA`],
+//! [`MIXINEXTRAS_METADATA`]). Named departure: Horizon has no real Fabric
+//! Loader; it reports the version whose behaviour the runtime reproduces
+//! (0.19.5, the loader this runtime is ported from and checked against). A jar
+//! in the run that ships its own MixinExtras keeps its own metadata, where
+//! Fabric would pick the newest version.
+//!
+//! **`java` and `minecraft`** are the loader's `BuiltinModMetadata` (see
+//! `builtin_metadata`). The Fabric API ids the host provides answer `getId`;
+//! every other read on them is counted, as their metadata depends on a Fabric
+//! API release Horizon does not have.
 //!
 //! **Counted, not answered:** iterating a custom object or array
 //! (`serde_json` here keeps object keys sorted, not in file order),
@@ -54,6 +63,18 @@ const CV_TYPES: &[&str] = &["OBJECT", "ARRAY", "STRING", "NUMBER", "BOOLEAN", "N
 
 /// Fabric Loader's built-in mods beside the host-provided ids.
 const BUILTIN_MODS: &[&str] = &["java", "minecraft", "fabricloader", "mixinextras"];
+
+/// Fabric Loader 0.19.5's own `fabric.mod.json` (Apache-2.0), less its
+/// `jars` list: the metadata its `fabricloader` container reports.
+const LOADER_METADATA: &str = r#"{"schemaVersion":1,"id":"fabricloader","name":"Fabric Loader","version":"0.19.5","environment":"*","description":"The base mod loader.","contact":{"homepage":"https://fabricmc.net","irc":"ircs://irc.esper.net:6697/fabric","issues":"https://github.com/FabricMC/fabric-loader/issues","sources":"https://github.com/FabricMC/fabric-loader"},"license":"Apache-2.0","icon":"assets/fabricloader/icon.png","authors":["FabricMC"]}"#;
+
+/// MixinExtras 0.5.5's `fabric.mod.json` (MIT), the jar Fabric Loader 0.19.5
+/// bundles, less its `mixins` list.
+const MIXINEXTRAS_METADATA: &str = r#"{"schemaVersion":1,"id":"mixinextras","provides":["com_github_llamalad7_mixinextras"],"version":"0.5.5","name":"MixinExtras","description":"Companion library to Mixin with lots of features to improve the compatibility and concision of your mixins!","authors":["LlamaLad7"],"contact":{"homepage":"https://github.com/LlamaLad7/MixinExtras","sources":"https://github.com/LlamaLad7/MixinExtras"},"license":"MIT","environment":"*","depends":{"fabricloader":">=0.14.25"},"custom":{"modmenu":{"badges":["library"]}}}"#;
+
+/// `java.specification.version` on the Java 25 that Minecraft 26.3 requires
+/// (`ModDiscoverer.createJavaMod` strips a leading `1.`; there is none).
+const JAVA_SPECIFICATION_VERSION: &str = "25";
 
 const PERSON_PREFIX: &str = "fabric-person/";
 const CONTACT_PREFIX: &str = "fabric-contact/";
@@ -119,12 +140,22 @@ impl StdHost {
         if let Some(document) = self.fabric_metadata.get(id) {
             return Some(std::borrow::Cow::Borrowed(document));
         }
-        let document = self
+        let own = self
             .resource_bytes
             .get("fabric.mod.json")
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())?;
-        (document.get("id").and_then(serde_json::Value::as_str) == Some(id))
-            .then_some(std::borrow::Cow::Owned(document))
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .filter(|document| document.get("id").and_then(serde_json::Value::as_str) == Some(id));
+        if let Some(document) = own {
+            return Some(std::borrow::Cow::Owned(document));
+        }
+        let loader = match id {
+            "fabricloader" => LOADER_METADATA,
+            "mixinextras" => MIXINEXTRAS_METADATA,
+            _ => return None,
+        };
+        serde_json::from_str(loader)
+            .ok()
+            .map(std::borrow::Cow::Owned)
     }
 
     /// Whether `id` is a container the loader builds without a jar.
@@ -151,11 +182,14 @@ impl StdHost {
         ids.into_iter()
             .map(|id| {
                 let version = self
-                    .fabric_metadata
-                    .get(&id)
-                    .and_then(|document| document.get("version"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
+                    .fabric_document(&id)
+                    .and_then(|document| {
+                        document
+                            .get("version")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "unknown".to_owned());
                 text(format!("mod-container/{id}/{version}"))
             })
             .collect()
@@ -365,11 +399,11 @@ impl StdHost {
     /// itself (`ModDiscoverer.createJavaMod`, `MinecraftGameProvider
     /// .getBuiltinMods`): the builder's defaults (`description` `""`,
     /// `UNIVERSAL`, no people, no license, `ContactInformation.EMPTY`, no
-    /// custom values, type `builtin`), with `java`'s version and name read
-    /// from this host's own `java.specification.version` (less a leading
-    /// `1.`) and `java.vm.name`, and `minecraft`'s name `Minecraft` and
-    /// version the game version a caller seeded. Fabric Loader, MixinExtras
-    /// and the Fabric API modules are real jars whose metadata depends on a
+    /// custom values, type `builtin`). `java`'s version is Java 25's
+    /// `java.specification.version`; its name is `java.vm.name`, which
+    /// depends on the JDK's vendor, so it is counted. `minecraft`'s name is
+    /// `Minecraft` and its version the game version a caller seeded (counted
+    /// without one). The Fabric API ids the host provides are real jars of a
     /// release Horizon does not have: only their id is known.
     fn builtin_metadata(&mut self, r: &MethodRef, id: &str) -> Result<Value, NativeError> {
         if r.name == "getId" && r.descriptor == "()Ljava/lang/String;" {
@@ -378,25 +412,16 @@ impl StdHost {
         if !matches!(id, "java" | "minecraft") {
             return self.unknown_host_call(r);
         }
-        let property = |host: &Self, key: &str| host.properties.get(key).cloned();
         let answer = match (r.name.as_str(), r.descriptor.as_str()) {
             ("getType", "()Ljava/lang/String;") => Some(text("builtin")),
             ("getVersion", "()Lnet/fabricmc/loader/api/Version;") => {
                 if id == "java" {
-                    property(self, "java.specification.version").map(|version| {
-                        text(version.strip_prefix("1.").unwrap_or(&version).to_owned())
-                    })
+                    Some(text(JAVA_SPECIFICATION_VERSION))
                 } else {
                     self.game_version.clone().map(text)
                 }
             }
-            ("getName", "()Ljava/lang/String;") => {
-                if id == "java" {
-                    property(self, "java.vm.name").map(text)
-                } else {
-                    Some(text("Minecraft"))
-                }
-            }
+            ("getName", "()Ljava/lang/String;") if id == "minecraft" => Some(text("Minecraft")),
             ("getDescription", "()Ljava/lang/String;") => Some(text("")),
             ("getEnvironment", "()Lnet/fabricmc/loader/api/metadata/ModEnvironment;") => {
                 Some(enum_marker(MOD_ENVIRONMENT, "UNIVERSAL"))

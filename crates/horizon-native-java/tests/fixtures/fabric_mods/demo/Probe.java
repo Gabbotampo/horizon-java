@@ -19,7 +19,8 @@ public final class Probe {
         StringBuilder out = new StringBuilder();
         for (ModContainer container : FabricLoader.getInstance().getAllMods()) {
             String id = container.getMetadata().getId();
-            if (id.equals("alpha") || id.equals("beta") || id.equals("gamma")) {
+            if (id.equals("alpha") || id.equals("beta") || id.equals("gamma")
+                || id.equals("fabricloader") || id.equals("mixinextras")) {
                 out.append(Describe.line(container.getMetadata())).append('\n');
             }
         }
