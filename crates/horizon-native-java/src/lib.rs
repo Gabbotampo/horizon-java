@@ -95,6 +95,7 @@ mod nested_jars;
 mod night_config;
 mod null_checks;
 mod open_options;
+mod reference_identity;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -7667,6 +7668,11 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(
                     expect_string(receiver).replace(from, &to.to_string()),
                 )))
+            }
+            // The text is the interned string's; its identity is
+            // `reference_identity.rs`'s.
+            ("java/lang/String", "intern", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(expect_string(receiver).to_string())))
             }
             ("java/lang/String", "trim", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
                 expect_string(receiver)
@@ -23569,7 +23575,19 @@ impl<H: Host> Runtime<'_, H> {
                 0xa5 | 0xa6 => {
                     let rhs = pop(&mut stack, class, method, at)?;
                     let lhs = pop(&mut stack, class, method, at)?;
-                    let take = if op == 0xa5 { lhs == rhs } else { lhs != rhs };
+                    // Identity, not value equality, for boxes and strings
+                    // (`reference_identity.rs`).
+                    let same = self.same_reference(
+                        file,
+                        method,
+                        desc,
+                        target.is_static(),
+                        code,
+                        at,
+                        &lhs,
+                        &rhs,
+                    )?;
+                    let take = if op == 0xa5 { same } else { !same };
                     let offset = read_i16(code, &mut pc)?;
                     let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
                         == AnchorOutcome::Suppress;
