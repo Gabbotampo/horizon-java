@@ -39,6 +39,9 @@ public final class HostEventsOracle {
     print("imc", HostEvents.imc(message, message, other, supplier));
     print("imcEquals", HostEvents.imcEquals(message, other));
     print("future", HostEvents.future(future, future, another));
+    print("supplierClass", HostEvents.supplierClass(supplier));
+    print("supplierTypes", HostEvents.supplierTypes(supplier));
+    print("supplierRunnable", HostEvents.supplierRunnable(supplier));
     print("posted", HostEvents.posted(cancelled, open));
     print("postedIdentity", HostEvents.postedIdentity(cancelled, cancelled));
   }

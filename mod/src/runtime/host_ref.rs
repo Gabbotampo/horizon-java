@@ -12,7 +12,10 @@
 //!
 //! * **class**: [`HostRef::class`], from the row's [`ClassRule`]: one fixed
 //!   class (`java/util/Optional`), or, for a family (jar objects, collections,
-//!   game objects), a function of the key;
+//!   game objects), a function of the key; or not known at all (a lambda the
+//!   model stands for), when only the types the object surely is are known
+//!   ([`ClassRule::Unknown`]): then `getClass()` and every answer that needs
+//!   the exact class are counted, never answered with a declared type;
 //! * **identity**: [`HostRef::canonical`], the row's predicate on the key
 //!   (below);
 //! * **`toString`/`hashCode`/`equals`/`instanceof`**: the row's [`Methods`].
@@ -178,7 +181,30 @@ pub(crate) enum ClassRule {
     /// game objects), or a class other values than handles may also be
     /// (`CompletableFuture`): the class is read from the key.
     FromKey(fn(&str) -> &str),
+    /// The object's runtime class is not known (a jar's lambda, a proxy, a
+    /// loader class the runtime does not model); `declared` are types it
+    /// surely is (the call site's declared type). `instanceof` and casts
+    /// answer from them (a supertype of one is `true`, a final class unrelated
+    /// to one `false`, anything else unknown); [`HostRef::class`] is `None`, so
+    /// `getClass()`, a `ClassCastException`'s message and anything else that
+    /// needs the exact class are counted.
+    Unknown { declared: &'static [&'static str] },
 }
+
+/// JDK classes the JLS makes `final`, for [`ClassHierarchy::is_final`] when
+/// no class file says.
+const JDK_FINAL: &[&str] = &[
+    "java/lang/String",
+    "java/lang/Class",
+    "java/lang/Boolean",
+    "java/lang/Character",
+    "java/lang/Byte",
+    "java/lang/Short",
+    "java/lang/Integer",
+    "java/lang/Long",
+    "java/lang/Float",
+    "java/lang/Double",
+];
 
 /// Answers for the values a handle holds, for a kind's [`Methods`]. `None`
 /// is "unknown here": the caller counts the call instead of guessing.
@@ -213,6 +239,12 @@ pub(crate) trait ClassHierarchy {
     /// Whether an object of class `class` is a `wanted` (internal names);
     /// `None` when unknown (a class whose chain leaves what is held).
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool>;
+
+    /// Whether `class` is `final` (no subclass can exist); `None` when not
+    /// known.
+    fn is_final(&self, class: &str) -> Option<bool> {
+        JDK_FINAL.contains(&class).then_some(true)
+    }
 }
 
 /// The JDK's own hierarchy, for a caller with no runtime: a JDK class never
@@ -263,13 +295,31 @@ pub(crate) fn never_canonical(_key: &str) -> bool {
 }
 
 /// [`InstanceOfFn`] for a kind whose class is all it is: the class and its
-/// supertypes, as `hierarchy` knows them.
+/// supertypes, as `hierarchy` knows them. For a [`ClassRule::Unknown`] kind:
+/// `true` for a supertype of a declared type; `false` only for a `final`
+/// class that is not a declared type's subtype (the object's class would
+/// have to be that very class); unknown otherwise.
 pub(crate) fn instance_of_class(
     handle: &HostRef,
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
-    hierarchy.is_instance(handle.class(), wanted)
+    let declared = match handle.kind.info().class {
+        ClassRule::Unknown { declared } => declared,
+        _ => return hierarchy.is_instance(handle.class()?, wanted),
+    };
+    if wanted == "java/lang/Object"
+        || declared
+            .iter()
+            .any(|class| hierarchy.is_instance(class, wanted) == Some(true))
+    {
+        return Some(true);
+    }
+    let disjoint = hierarchy.is_final(wanted) == Some(true)
+        && declared
+            .iter()
+            .any(|class| hierarchy.is_instance(wanted, class) == Some(false));
+    disjoint.then_some(false)
 }
 
 /// Every kind: its tag, its class, its identity, its methods.
@@ -312,9 +362,11 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::ForgeBus,
         tag: "fgbus",
-        class: ClassRule::FromKey(crate::runtime::host_events::forge_bus_class),
+        class: ClassRule::Unknown {
+            declared: &["net/minecraftforge/eventbus/api/bus/EventBus"],
+        },
         canonical: always_canonical,
-        methods: &crate::runtime::host_events::FORGE_BUS_METHODS,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricEvent,
@@ -326,9 +378,9 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::FabricInvoker,
         tag: "finv",
-        class: ClassRule::FromKey(crate::runtime::host_events::object_class),
+        class: ClassRule::Unknown { declared: &[] },
         canonical: crate::runtime::host_events::fabric_canonical,
-        methods: &crate::runtime::host_events::UNKNOWN_CLASS_METHODS,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::ImcMessage,
@@ -340,9 +392,11 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::ImcSupplier,
         tag: "imcs",
-        class: ClassRule::FromKey(crate::runtime::host_events::supplier_class),
+        class: ClassRule::Unknown {
+            declared: &["java/util/function/Supplier"],
+        },
         canonical: always_canonical,
-        methods: &crate::runtime::host_events::IMC_SUPPLIER_METHODS,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::DeferredWork,
@@ -354,9 +408,15 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::PostedEvent,
         tag: "pev",
-        class: ClassRule::FromKey(crate::runtime::host_events::event_class),
+        class: ClassRule::Unknown {
+            // A posted stand-in carries a cancelled flag: a cancellable event.
+            declared: &[
+                "net/neoforged/bus/api/Event",
+                "net/neoforged/bus/api/ICancellableEvent",
+            ],
+        },
         canonical: never_canonical,
-        methods: &crate::runtime::host_events::POSTED_EVENT_METHODS,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
 ];
 
@@ -385,7 +445,7 @@ impl HostKind {
                     .iter()
                     .filter_map(|info| match info.class {
                         ClassRule::Fixed(class) => Some((class, info.kind)),
-                        ClassRule::FromKey(_) => None,
+                        ClassRule::FromKey(_) | ClassRule::Unknown { .. } => None,
                     })
                     .collect()
             })
@@ -438,10 +498,13 @@ impl HostRef {
     }
 
     /// The class this object is (`getClass()`), internal form.
-    pub fn class(&self) -> &str {
+    /// `None` when the runtime class is not known ([`ClassRule::Unknown`]):
+    /// the caller counts what needs it.
+    pub fn class(&self) -> Option<&str> {
         match self.kind.info().class {
-            ClassRule::Fixed(class) => class,
-            ClassRule::FromKey(class_of) => class_of(&self.key),
+            ClassRule::Fixed(class) => Some(class),
+            ClassRule::FromKey(class_of) => Some(class_of(&self.key)),
+            ClassRule::Unknown { .. } => None,
         }
     }
 

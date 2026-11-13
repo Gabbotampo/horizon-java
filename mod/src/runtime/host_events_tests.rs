@@ -201,6 +201,17 @@ fn p8_host_objects_answer_as_java_25_or_count() {
             vec![future.clone(), future, deferred_work(2)],
             Exact("truetruetruefalsejava.util.concurrent.CompletableFuture|truefalsetruefalse|2"),
         ),
+        // A supplier another jar sent is the sender's lambda, a class the runtime does not know
+        // (`ClassRule::Unknown`): `getClass()` is counted (Java: a lambda class), never answered
+        // with the declared `Supplier`; `instanceof Supplier` is exact, and so is `false` for
+        // `String` and `Integer` (final, not suppliers); `instanceof Runnable` needs the class.
+        ("supplierClass", vec![imc_supplier(0)], Counted),
+        (
+            "supplierTypes",
+            vec![imc_supplier(0)],
+            Exact("truefalsefalse"),
+        ),
+        ("supplierRunnable", vec![imc_supplier(0)], Counted),
         (
             "posted",
             vec![posted_event("demo", true), posted_event("demo", false)],

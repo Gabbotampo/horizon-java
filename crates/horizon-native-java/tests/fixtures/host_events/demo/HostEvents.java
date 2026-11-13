@@ -127,6 +127,21 @@ public final class HostEvents {
         + "|" + identities(future, same, other);
   }
 
+  /** A supplier another jar sent: its class is the sender's lambda, which the runtime does not know. */
+  public static String supplierClass(Object supplier) {
+    return "" + (supplier.getClass() != null);
+  }
+
+  /** ... but it is surely a {@code Supplier}, and never a {@code String} or {@code Integer} (final). */
+  public static String supplierTypes(Object supplier) {
+    return "" + (supplier instanceof Supplier) + (supplier instanceof String) + (supplier instanceof Integer);
+  }
+
+  /** Whether it is also a {@code Runnable} depends on its class. */
+  public static String supplierRunnable(Object supplier) {
+    return "" + (supplier instanceof Runnable);
+  }
+
   /** A cancellable event, cancelled, and one that is not. */
   public static String posted(Object cancelled, Object open) {
     return "" + (cancelled instanceof net.neoforged.bus.api.Event) + (cancelled instanceof ICancellableEvent)

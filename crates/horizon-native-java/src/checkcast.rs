@@ -187,7 +187,11 @@ impl<H: Host> Runtime<'_, H> {
         if let Value::Host(handle) = value {
             return Some(match handle.instance_of(target, self) {
                 Some(true) => HostCast::Fits,
-                Some(false) => HostCast::Throws(handle.class().to_owned()),
+                // The exception names the exact class: unknown, counted.
+                Some(false) => match handle.class() {
+                    Some(class) => HostCast::Throws(class.to_owned()),
+                    None => HostCast::Unknown,
+                },
                 None => HostCast::Unknown,
             });
         }
@@ -324,7 +328,7 @@ impl<H: Host> Runtime<'_, H> {
                     Some(false) => Verdict::No,
                     None => Verdict::Unknown,
                 };
-                return (verdict, Some(handle.class().to_owned()));
+                return (verdict, handle.class().map(str::to_owned));
             }
             // A boxed number is a JDK object, never a jar type.
             Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) => {
@@ -479,6 +483,15 @@ impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
             Verdict::Yes => Some(true),
             Verdict::No => Some(false),
             Verdict::Unknown => None,
+        }
+    }
+
+    /// A held class's own `ACC_FINAL`; the JLS's final JDK classes otherwise.
+    fn is_final(&self, class: &str) -> Option<bool> {
+        const ACC_FINAL: u16 = 0x0010;
+        match self.class(class) {
+            Some(file) => class_access(file).map(|access| access & ACC_FINAL != 0),
+            None => host_ref::JdkHierarchy.is_final(class),
         }
     }
 }

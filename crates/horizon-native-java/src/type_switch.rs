@@ -59,26 +59,44 @@ impl<H: Host> Runtime<'_, H> {
     /// The index a `typeSwitch` site answers for `value`, starting at
     /// `restart`.
     pub(crate) fn type_switch_index(
-        &self,
+        &mut self,
         labels: &[SwitchLabel],
         value: &Value,
         restart: i32,
-    ) -> i32 {
+    ) -> Result<i32, NativeError> {
         if *value == Value::Ref(None) {
-            return -1;
+            return Ok(-1);
         }
         let start = usize::try_from(restart).unwrap_or(0);
         for (index, label) in labels.iter().enumerate().skip(start) {
             let matched = match label {
-                SwitchLabel::Class(class) => self.switch_instance_of(value, class),
+                // A handle answers by its kind's row; one that cannot tell is
+                // counted, as the `instanceof` opcode counts it.
+                SwitchLabel::Class(class) => match value {
+                    Value::Host(handle) => match handle.instance_of(class, &*self) {
+                        Some(known) => known,
+                        None => {
+                            let check = MethodRef {
+                                owner: class.clone(),
+                                name: "<instanceof>".into(),
+                                descriptor: "(Ljava/lang/Object;)Z".into(),
+                            };
+                            matches!(
+                                self.host.invoke(&check, std::slice::from_ref(value))?,
+                                Value::Int(flag) if flag != 0
+                            )
+                        }
+                    },
+                    _ => self.switch_instance_of(value, class),
+                },
                 SwitchLabel::String(text) => expect_ref(value).is_some_and(|marker| marker == text),
                 SwitchLabel::Int(expected) => boxed_int(value) == Some(*expected),
             };
             if matched {
-                return index as i32;
+                return Ok(index as i32);
             }
         }
-        labels.len() as i32
+        Ok(labels.len() as i32)
     }
 
     /// `value instanceof class` for a switch label: jar objects through their

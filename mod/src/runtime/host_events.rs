@@ -13,13 +13,13 @@
 //! | kind | key | class | identity |
 //! |---|---|---|---|
 //! | [`HostKind::NeoForgeBus`] | `game`, `mod/<id>`, `mod` (mod not known) | `net.neoforged.bus.EventBus` | one bus per key, except `mod` |
-//! | [`HostKind::ForgeBus`] | the event class whose `BUS` it is | not modelled (departure E2) | one per event class |
+//! | [`HostKind::ForgeBus`] | the event class whose `BUS` it is | not known; surely Forge's `bus.EventBus` | one per event class |
 //! | [`HostKind::FabricEvent`] | `<owner>.<FIELD>`, `<n>` (`createArrayBacked`), `…RegistryEntryAddedCallback.event/<registry>`, `unknown` | `…impl.base.event.ArrayBackedEvent` | one per key |
-//! | [`HostKind::FabricInvoker`] | its event's key | a lambda or proxy class (departure E2) | one per event |
+//! | [`HostKind::FabricInvoker`] | its event's key | not known (a lambda or proxy of the callback type) | one per event |
 //! | [`HostKind::ImcMessage`] | the message's index on the IMC bus | `InterModComms$IMCMessage` | one per message |
-//! | [`HostKind::ImcSupplier`] | the message's index | the sender's lambda class (E2) | one per message |
+//! | [`HostKind::ImcSupplier`] | the message's index | not known (the sender's lambda); surely a `Supplier` | one per message |
 //! | [`HostKind::DeferredWork`] | the task's index in the stage's queue | `CompletableFuture` | one per task |
-//! | [`HostKind::PostedEvent`] | `<name>`, or `cancelled/<name>` | not modelled (E2) | a fresh value |
+//! | [`HostKind::PostedEvent`] | `<name>`, or `cancelled/<name>` | not known; surely a cancellable bus `Event` | a fresh value |
 //!
 //! None of these classes overrides `toString` or `hashCode` (`IMCMessage` is a record whose
 //! supplier prints and hashes by identity), so both are unknown here and counted, as the calls on
@@ -27,21 +27,18 @@
 //! [`HostRef::same_object`] knows, counted when not. `IMCMessage.equals` compares the record's
 //! components, so only the same message is known equal.
 //!
-//! Every class is a [`ClassRule::FromKey`](crate::runtime::host_ref) rule, not a fixed class: a fixed class
-//! claims that only handles are its objects (`HostKind::of_class`), and a jar can make its own
-//! `CompletableFuture` or `IMCMessage`.
+//! A known class is a [`ClassRule::FromKey`](crate::runtime::host_ref) rule, not a fixed class: a fixed
+//! class claims that only handles are its objects (`HostKind::of_class`), and a jar can make its
+//! own `CompletableFuture` or `IMCMessage`. A class the runtime does not know is a
+//! `ClassRule::Unknown` with the types the object surely is: `instanceof` those (and their
+//! supertypes) is exact, `getClass()` and anything else that needs the class is counted.
 //!
 //! Departures, named:
 //! * **E1** the buses, events, IMC objects and futures do not cross to another jar's runtime
 //!   (`crosses_jars`), as their markers did not: on a JVM `NeoForge.EVENT_BUS` is one object for
 //!   every mod.
-//! * **E2** a Forge bus, a Fabric invoker, an IMC supplier and a posted stand-in event have no
-//!   class the runtime knows: `getClass()` names the type the call site declared
-//!   (`net.minecraftforge.eventbus.api.bus.EventBus`, `java.lang.Object`,
-//!   `java.util.function.Supplier`, `net.neoforged.bus.api.Event`), and `instanceof`/`checkcast`
-//!   against any type but the ones they surely are is counted.
 
-use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, Nested};
+use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, Nested, instance_of_class};
 use crate::runtime::{NativeError, Value};
 
 const OBJECT: &str = "java/lang/Object";
@@ -50,12 +47,9 @@ const NEOFORGE_BUS_API: &str = "net/neoforged/bus/api/IEventBus";
 /// The Forge 1.20 bus interface, which this runtime answers with the NeoForge bus model
 /// (`is_event_bus_owner`).
 const FORGE_BUS_API: &str = "net/minecraftforge/eventbus/api/IEventBus";
-const FORGE_BUS: &str = "net/minecraftforge/eventbus/api/bus/EventBus";
 const FABRIC_EVENT: &str = "net/fabricmc/fabric/impl/base/event/ArrayBackedEvent";
 const IMC_MESSAGE: &str = "net/neoforged/fml/InterModComms$IMCMessage";
-const SUPPLIER: &str = "java/util/function/Supplier";
 const FUTURE: &str = "java/util/concurrent/CompletableFuture";
-const EVENT: &str = "net/neoforged/bus/api/Event";
 
 /// The key of `value` when it is a handle of `kind`.
 pub(crate) fn key_of(value: &Value, kind: HostKind) -> Option<&str> {
@@ -167,12 +161,6 @@ fn exactly(wanted: &str, types: &[&str]) -> Option<bool> {
     Some(wanted == OBJECT || types.contains(&wanted))
 }
 
-/// `instanceof` for a kind whose class is not known: `true` for the types it surely is, unknown
-/// (counted) for any other.
-fn at_least(wanted: &str, types: &[&str]) -> Option<bool> {
-    (wanted == OBJECT || types.contains(&wanted)).then_some(true)
-}
-
 /// `Object.toString`/`Object.hashCode`: an identity hash, unknown here (counted).
 fn unknown_text(_: &HostRef, _: &mut dyn Nested) -> Result<Option<String>, NativeError> {
     Ok(None)
@@ -209,28 +197,19 @@ pub(crate) const NEOFORGE_BUS_METHODS: Methods = methods(|_, wanted, _| {
         ],
     )
 });
-pub(crate) const FORGE_BUS_METHODS: Methods = methods(|_, wanted, _| {
-    at_least(
-        wanted,
-        &[
-            FORGE_BUS,
-            "net/minecraftforge/eventbus/api/bus/CancellableEventBus",
-        ],
-    )
-});
 pub(crate) const FABRIC_EVENT_METHODS: Methods = methods(|_, wanted, _| {
     exactly(
         wanted,
         &[FABRIC_EVENT, "net/fabricmc/fabric/api/event/Event"],
     )
 });
-pub(crate) const UNKNOWN_CLASS_METHODS: Methods = methods(|_, wanted, _| at_least(wanted, &[]));
+/// A kind whose class is not known: `instanceof` answers from its declared types
+/// (`ClassRule::Unknown`).
+pub(crate) const DECLARED_TYPE_METHODS: Methods = methods(instance_of_class);
 pub(crate) const IMC_MESSAGE_METHODS: Methods = Methods {
     equals: record_equals,
     ..methods(|_, wanted, _| exactly(wanted, &[IMC_MESSAGE, "java/lang/Record"]))
 };
-pub(crate) const IMC_SUPPLIER_METHODS: Methods =
-    methods(|_, wanted, _| at_least(wanted, &[SUPPLIER]));
 pub(crate) const DEFERRED_WORK_METHODS: Methods = methods(|_, wanted, _| {
     exactly(
         wanted,
@@ -241,34 +220,19 @@ pub(crate) const DEFERRED_WORK_METHODS: Methods = methods(|_, wanted, _| {
         ],
     )
 });
-/// A posted stand-in carries a cancelled flag, so it is a cancellable event.
-pub(crate) const POSTED_EVENT_METHODS: Methods =
-    methods(|_, wanted, _| at_least(wanted, &[EVENT, "net/neoforged/bus/api/ICancellableEvent"]));
 
 /// The classes `getClass()` answers ([`crate::runtime::host_ref::ClassRule::FromKey`]).
 pub(crate) fn neoforge_bus_class(_: &str) -> &str {
     NEOFORGE_BUS
 }
-pub(crate) fn forge_bus_class(_: &str) -> &str {
-    FORGE_BUS
-}
 pub(crate) fn fabric_event_class(_: &str) -> &str {
     FABRIC_EVENT
-}
-pub(crate) fn object_class(_: &str) -> &str {
-    OBJECT
 }
 pub(crate) fn imc_message_class(_: &str) -> &str {
     IMC_MESSAGE
 }
-pub(crate) fn supplier_class(_: &str) -> &str {
-    SUPPLIER
-}
 pub(crate) fn future_class(_: &str) -> &str {
     FUTURE
-}
-pub(crate) fn event_class(_: &str) -> &str {
-    EVENT
 }
 
 /// A mod bus whose mod is not known may be any mod's: two of them are not provably one.

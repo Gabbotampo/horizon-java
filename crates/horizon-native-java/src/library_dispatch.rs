@@ -522,6 +522,25 @@ impl<H: Host> Runtime<'_, H> {
         let instance = !is_null
             && !PRIMITIVE_CLASSES.contains(&wanted.as_str())
             && self.value_instance_of(&value, &wanted);
+        // A handle whose kind cannot tell (`host_ref.rs`) is counted, as the
+        // `instanceof` opcode counts it; the host's answer stands.
+        let instance = if r.name == "isInstance"
+            && !instance
+            && matches!(value, Value::Host(_))
+            && self.instance_of_is_guess(&value, &wanted)
+        {
+            let check = MethodRef {
+                owner: wanted.clone(),
+                name: "<instanceof>".into(),
+                descriptor: "(Ljava/lang/Object;)Z".into(),
+            };
+            matches!(
+                self.host.invoke(&check, std::slice::from_ref(&value))?,
+                Value::Int(flag) if flag != 0
+            )
+        } else {
+            instance
+        };
         if r.name == "isInstance" {
             return Ok(Some(Value::Int(i32::from(instance))));
         }

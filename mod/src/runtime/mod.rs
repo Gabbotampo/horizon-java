@@ -9619,7 +9619,8 @@ fn class_of_value(value: &Value) -> Option<String> {
         // A `Float` is a `Boxed::Float`; the bare value is a `Double`.
         Value::Float(_) => Some("java/lang/Double".into()),
         Value::Boxed(boxed) => Some(boxed.class().into()),
-        Value::Host(host) => Some(host.class().into()),
+        // `None` for a handle whose runtime class is not known: counted.
+        Value::Host(host) => host.class().map(Into::into),
         Value::Void => None,
         Value::Ref(None) => None,
         Value::Ref(Some(marker)) => {
@@ -25410,7 +25411,8 @@ impl<H: Host> Runtime<'_, H> {
                     if let Some(labels) = file.type_switch_labels(index)
                         && let [value, Value::Int(restart)] = captured.as_slice()
                     {
-                        stack.push(Value::Int(self.type_switch_index(&labels, value, *restart)));
+                        let index = self.type_switch_index(&labels, value, *restart)?;
+                        stack.push(Value::Int(index));
                         continue;
                     }
                     // A string-concat site joins its captured values into the
