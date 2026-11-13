@@ -51,8 +51,8 @@ mod guava_text;
 mod hash_map_order;
 mod heap;
 mod hook_shapes;
-mod iteration_guard;
 mod host_list_iterator;
+mod iteration_guard;
 mod jar_operands;
 mod jar_text;
 mod java_format;
@@ -2192,6 +2192,19 @@ pub trait Host {
         None
     }
 
+    /// Keep a new host list iterator (`host_list_iterator.rs`) and answer its
+    /// marker; `None` for a host that keeps no list iterators.
+    fn new_list_iterator(&mut self, _state: host_list_iterator::ListIter) -> Option<String> {
+        None
+    }
+
+    /// A host list iterator's state, by marker.
+    fn list_iterator(&self, _marker: &str) -> Option<host_list_iterator::ListIter> {
+        None
+    }
+
+    fn store_list_iterator(&mut self, _marker: &str, _state: host_list_iterator::ListIter) {}
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -4087,6 +4100,21 @@ impl Host for StdHost {
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
         self.iterators.get(marker).map(|(_, index)| *index)
+    }
+
+    fn new_list_iterator(&mut self, state: host_list_iterator::ListIter) -> Option<String> {
+        let marker = format!("{}{}", host_list_iterator::PREFIX, self.next_iterator);
+        self.next_iterator = self.next_iterator.saturating_add(1);
+        self.list_iterators.insert(marker.clone(), state);
+        Some(marker)
+    }
+
+    fn list_iterator(&self, marker: &str) -> Option<host_list_iterator::ListIter> {
+        self.list_iterators.get(marker).cloned()
+    }
+
+    fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
+        self.list_iterators.insert(marker.to_owned(), state);
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -6989,10 +7017,6 @@ impl Host for StdHost {
         // responsibility.
         if r.name == "isCanceled" && r.descriptor == "()Z" {
             return Ok(Value::Int(event_is_cancelled(receiver) as i32));
-        }
-        // `listIterator` on a host list, and its iterator (`host_list_iterator.rs`).
-        if let Some(result) = self.list_iterator_call(r, receiver, args) {
-            return result;
         }
         if r.name == "iterator"
             && r.descriptor.starts_with("()L")
@@ -24025,6 +24049,12 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_list_iterator(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // `listIterator` on a host list (`host_list_iterator.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_service_loader(&r, receiver.as_ref(), &args)
                     ) {
                         // Providers built as the JDK builds them (`service_loader.rs`).
@@ -24072,13 +24102,6 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.list_iterator_for_each(&r, receiver.as_ref(), &args)
-                    ) {
-                        // A host list iterator's `forEachRemaining` with a jar
-                        // callback (`host_list_iterator.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

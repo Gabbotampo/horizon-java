@@ -51,7 +51,7 @@ pub struct IteratorGuard {
 
 /// How a fail-fast collection iterates.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum FailFast {
+pub(crate) enum FailFast {
     /// `ArrayList`/`Vector`/`Stack`: `cursor != size`, element sequence.
     ArrayList,
     /// `LinkedList`/`PriorityQueue`: `cursor < size`, element sequence.
@@ -78,7 +78,7 @@ fn fail_fast(class: &str) -> Option<FailFast> {
     })
 }
 
-fn concurrent_modification() -> NativeError {
+pub(crate) fn concurrent_modification() -> NativeError {
     NativeError::UncaughtException {
         class: "java/util/ConcurrentModificationException".into(),
         message: None,
@@ -89,7 +89,7 @@ fn concurrent_modification() -> NativeError {
 impl<H: Host> Runtime<'_, H> {
     /// The fail-fast collection `value` iterates (a view copy's map), and
     /// how.
-    fn fail_fast_source(&self, value: &Value) -> Option<(Value, FailFast)> {
+    pub(crate) fn fail_fast_source(&self, value: &Value) -> Option<(Value, FailFast)> {
         let marker = expect_ref(value)?;
         let source = self
             .host
@@ -100,7 +100,11 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// A collection's structure: its elements in order, or a map's keys.
-    fn structure_of(&self, source: &Value, how: FailFast) -> Result<Vec<String>, NativeError> {
+    pub(crate) fn structure_of(
+        &self,
+        source: &Value,
+        how: FailFast,
+    ) -> Result<Vec<String>, NativeError> {
         let items = runtime_collection_values(self.host, source)?;
         Ok(match how {
             FailFast::MapKeys => items.into_iter().step_by(2).collect(),
@@ -117,7 +121,7 @@ impl<H: Host> Runtime<'_, H> {
     /// change only a structural modification makes, `Some(false)` for none,
     /// `None` when a list's elements changed at the same size (a `set`, or a
     /// remove and an add).
-    fn structure_changed(
+    pub(crate) fn structure_changed(
         &self,
         source: &Value,
         how: FailFast,

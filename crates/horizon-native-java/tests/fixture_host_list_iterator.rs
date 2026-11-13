@@ -126,6 +126,11 @@ public final class Probe {
         return take(first + "," + it.next() + "," + list);
     }
 
+    public static String listOfIterator() {
+        ListIterator<String> it = List.of("a", "b").listIterator();
+        return take(it == null ? "null" : "made");
+    }
+
     public static String listIteratorForEach() {
         List<String> list = new ArrayList<>(List.of("a", "b", "c"));
         ListIterator<String> it = list.listIterator();
@@ -162,7 +167,6 @@ fn host_list_iterators_run_as_jdk_25_does() {
             " => [x, AA, b],java.lang.IllegalStateException:null,java.lang.IllegalStateException:null,y,2,1",
         ),
         ("previousThenRemove", " => [a, b],c,2,false"),
-        ("nonStructuralWrite", " => z,w,[z, w]"),
         ("listIteratorForEach", " => bc,3,false,c"),
     ];
     let mut failures = Vec::new();
@@ -188,5 +192,48 @@ fn host_list_iterators_run_as_jdk_25_does() {
         failures.is_empty(),
         "differ from JDK 25:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Runs `method` and answers the unknown host calls it counted.
+fn counted(method: &str) -> Vec<(String, usize)> {
+    let fixture =
+        javac_fixture::Fixture::build("host-list-iterator-counted", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let _ = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        method,
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    host.unknown_host_calls()
+}
+
+/// Not JDK behaviour, counted instead: a `set` made outside the iterator
+/// leaves the size unchanged, and without `modCount` it cannot be told from a
+/// remove and an add (which would throw), so each later `next()` is counted.
+#[test]
+fn a_same_size_change_behind_a_list_iterator_is_counted() {
+    assert_eq!(
+        counted("nonStructuralWrite"),
+        vec![(
+            "java/util/ListIterator#next()Ljava/lang/Object;".to_owned(),
+            2
+        )]
+    );
+}
+
+/// `List.of(...).listIterator()` is not modelled (the host's value does not
+/// say which JDK list it is): the call is counted, not answered.
+#[test]
+fn list_of_list_iterators_are_counted() {
+    assert_eq!(
+        counted("listOfIterator"),
+        vec![(
+            "java/util/List#listIterator()Ljava/util/ListIterator;".to_owned(),
+            1
+        )]
     );
 }
