@@ -333,6 +333,10 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         let Some(kind) = receiver_kind else {
+            if self.other_map_replace_all(r, opcode, receiver) {
+                // `hash_bulk.rs`: no other map's `replaceAll` is modelled.
+                return self.count_and_continue(r);
+            }
             if tainted_argument && self.shows_argument_order(r) {
                 return self.count_and_continue(r);
             }
@@ -377,6 +381,21 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 return self
                     .hash_remove_if(receiver, &marker, kind, &predicate)
+                    .map(Some);
+            }
+            ("replaceAll", "(Ljava/util/function/BiFunction;)V", [function]) if kind.map => {
+                let function = function.clone();
+                let unknown = self.host.take_hash_table(&marker).map(|table| {
+                    let unknown = table.order_unknown();
+                    self.host.store_hash_table(&marker, table);
+                    unknown
+                });
+                if unknown == Some(true) {
+                    return self.count_and_continue(r);
+                }
+                // `hash_bulk.rs`.
+                return self
+                    .hash_replace_all(r, receiver, &marker, &function)
                     .map(Some);
             }
             ("forEach", "(Ljava/util/function/Consumer;)V", [callback])
