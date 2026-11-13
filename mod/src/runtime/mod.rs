@@ -88,6 +88,7 @@ mod mixin_extras;
 mod mixin_plugins;
 mod mod_config_register;
 mod mod_config_spec;
+mod mod_count;
 mod mod_origin;
 mod modified_utf8;
 mod native_library;
@@ -2197,6 +2198,25 @@ pub trait Host {
         None
     }
 
+    /// A collection's `modCount` (`mod_count.rs`).
+    fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
+        mod_count::ModStamp::default()
+    }
+
+    fn store_mod_stamp(&mut self, _marker: &str, _stamp: mod_count::ModStamp) {}
+
+    /// Where a `subList` copy sits in its parent (`mod_count.rs`).
+    fn sub_list_link(&self, _marker: &str) -> Option<mod_count::SubListLink> {
+        None
+    }
+
+    fn store_sub_list_link(&mut self, _marker: &str, _link: Option<mod_count::SubListLink>) {}
+
+    /// The `subList` copies taken from `parent`.
+    fn sub_lists_of(&self, _parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        Vec::new()
+    }
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -2580,6 +2600,10 @@ pub struct StdHost {
     /// The fail-fast iterators' guards, by iterator marker
     /// (`iteration_guard.rs`).
     iterator_guards: BTreeMap<String, iteration_guard::IteratorGuard>,
+    /// Each tracked collection's `modCount` (`mod_count.rs`).
+    mod_stamps: BTreeMap<String, mod_count::ModStamp>,
+    /// `subList` copies and where they sit in their parents.
+    sub_lists: BTreeMap<String, mod_count::SubListLink>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -2699,6 +2723,8 @@ impl StdHost {
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
             iterator_guards: BTreeMap::new(),
+            mod_stamps: BTreeMap::new(),
+            sub_lists: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
@@ -4102,6 +4128,38 @@ impl Host for StdHost {
 
     fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
         self.iterator_guards.insert(marker.to_owned(), guard);
+    }
+
+    fn mod_stamp(&self, marker: &str) -> mod_count::ModStamp {
+        let marker = self.synchronized_target(marker);
+        self.mod_stamps.get(marker).copied().unwrap_or_default()
+    }
+
+    fn store_mod_stamp(&mut self, marker: &str, stamp: mod_count::ModStamp) {
+        let marker = self.synchronized_target(marker).to_owned();
+        self.mod_stamps.insert(marker, stamp);
+    }
+
+    fn sub_list_link(&self, marker: &str) -> Option<mod_count::SubListLink> {
+        if self.sub_lists.is_empty() {
+            return None;
+        }
+        self.sub_lists.get(marker).cloned()
+    }
+
+    fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
+        match link {
+            Some(link) => self.sub_lists.insert(marker.to_owned(), link),
+            None => self.sub_lists.remove(marker),
+        };
+    }
+
+    fn sub_lists_of(&self, parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        self.sub_lists
+            .iter()
+            .filter(|(_, link)| link.parent() == parent)
+            .map(|(view, link)| (view.clone(), link.clone()))
+            .collect()
     }
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
@@ -19421,7 +19479,12 @@ impl<H: Host> Runtime<'_, H> {
                 )? {
                     return Ok(Some(value));
                 }
-                return self.host.invoke(&callback.target, &values).map(Some);
+                let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
+                let value = self.host.invoke(&callback.target, &values)?;
+                if let Some(token) = token {
+                    self.mod_count_after(token, &value)?;
+                }
+                return Ok(Some(value));
             }
             // A constructor reference (`GameClass::new`, `HashMap::new`) is a
             // factory whose effective result is the constructed object, even
@@ -19496,10 +19559,15 @@ impl<H: Host> Runtime<'_, H> {
             )? {
                 return Ok(Some(value));
             }
-            return self
+            // `list::add` moves the list's `modCount` as the call would.
+            let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
+            let value = self
                 .host
-                .invoke_instance(&callback.target, &receiver, &rest)
-                .map(Some);
+                .invoke_instance(&callback.target, &receiver, &rest)?;
+            if let Some(token) = token {
+                self.mod_count_after(token, &value)?;
+            }
+            return Ok(Some(value));
         };
         let Some(method) = class.method(&callback.target.name, &callback.target.descriptor) else {
             return Ok(None);
@@ -24021,6 +24089,16 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    // A call that may move a host collection's `modCount`
+                    // (`mod_count.rs`), checked and noted around the dispatch.
+                    let mod_token = if anchor_replacement.is_none() {
+                        invoke_or_catch!(
+                            at,
+                            self.mod_count_before(&r, op, receiver.as_ref(), &args)
+                        )
+                    } else {
+                        None
+                    };
                     // Whether the answer is a jar method body's own `areturn`
                     // (which may legitimately be `null`) rather than a host or
                     // model answer.
@@ -24400,6 +24478,9 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         _ => value,
                     };
+                    if let Some(token) = mod_token.filter(|_| !jar_body) {
+                        invoke_or_catch!(at, self.mod_count_after(token, &value));
+                    }
                     if value != Value::Void {
                         stack.push(value);
                     }

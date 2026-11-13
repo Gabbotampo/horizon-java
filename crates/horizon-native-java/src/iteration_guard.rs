@@ -11,42 +11,53 @@
 //! structural change they did not make themselves.
 //!
 //! This module remembers, for each iterator a host collection hands out, the
-//! collection's structure when it was made: the element sequence of a list
-//! or queue, the keys of a map or set. Then:
+//! `modCount` (`mod_count.rs`) it started from, of the collection it
+//! checks: the collection itself, or the root of a view (a `keySet()` copy's
+//! map, a `subList`'s list, an unmodifiable view's list). Then:
 //!
-//! - **`next()`** throws `ConcurrentModificationException` when the structure
-//!   has changed: a different size or a different key set can only come from
-//!   a structural change, so `modCount` moved. A list of the same size with
-//!   different elements could be a `set` (no `modCount`) or a remove and an
-//!   add: that one is counted.
+//! - **`next()`** throws `ConcurrentModificationException` when that
+//!   `modCount` moved, even if the contents came back the same. A member
+//!   that may or may not have moved it (`ensureCapacity`) makes the step
+//!   counted. As a backstop, a size or key-set change no tracked member
+//!   made also throws.
 //! - **`hasNext()`** of a cursor iterator reads the live size, as
 //!   `ArrayList.Itr` (`cursor != size`), `LinkedList.ListItr` and
 //!   `PriorityQueue.Itr` (`cursor < size`) do: removing the second-to-last
 //!   element ends an `ArrayList` for-each without an exception, on a JVM too.
 //!   A node iterator (hash, tree) keeps the `next` node it found, which the
 //!   host's snapshot already answers.
+//! - **`ArrayDeque`** has no `modCount`: its iterator reads the live array
+//!   and throws only when it meets a slot a removal emptied, which depends
+//!   on the array's layout. A step after a change is counted.
 //! - **`ArrayList`/`Vector.forEach`** stops after the call that changed the
 //!   list and throws; `LinkedList.forEach` (`Iterable.forEach`) stops at the
 //!   next `next()`.
-//! - **`ArrayList.removeIf`** is JDK 25's: it tests every element first
-//!   (survivors up to the first match, then the rest into a bit set), throws
-//!   if the predicate changed the list (which then keeps what the predicate
-//!   added), and only then removes.
+//! - **`ArrayList`/`Vector.removeIf`** is JDK 25's: it tests every element
+//!   first (survivors up to the first match, then the rest into a bit set),
+//!   throws if `modCount` moved, and only then removes.
+//!   **`LinkedList.removeIf`** is `Collection.removeIf`: it removes through
+//!   the iterator as it goes, so a predicate that throws leaves the earlier
+//!   removals done.
 //!
-//! An iterator's own `remove()` is not modelled by the host (counted), so it
-//! never needs to move the remembered structure.
+//! An iterator's own `remove()` is not modelled by the host (counted).
 
 use super::*;
+use mod_count::{ModStamp, ModVerdict};
 
-/// A guarded iterator: its collection and that collection's structure when
-/// the iterator was made.
+/// A guarded iterator: what it walks, whose `modCount` it checks, and that
+/// count when the iterator was made.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IteratorGuard {
     source: String,
+    /// The collection whose `modCount` the iterator checks.
+    root: String,
     /// `ArrayList.Itr`'s `cursor != size` (`Some(true)`), the other cursor
     /// iterators' `cursor < size` (`Some(false)`), or a node iterator.
     cursor: Option<bool>,
+    expected: ModStamp,
     structure: Vec<String>,
+    /// `ArrayDeque`: no `modCount`.
+    deque: bool,
 }
 
 /// How a fail-fast collection iterates.
@@ -60,6 +71,8 @@ enum FailFast {
     MapKeys,
     /// A hash or tree set: its elements, as a set.
     SetElements,
+    /// `ArrayDeque`: no `modCount`.
+    Deque,
 }
 
 fn fail_fast(class: &str) -> Option<FailFast> {
@@ -74,6 +87,7 @@ fn fail_fast(class: &str) -> Option<FailFast> {
         "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/TreeSet" => {
             FailFast::SetElements
         }
+        "java/util/ArrayDeque" => FailFast::Deque,
         _ => return None,
     })
 }
@@ -87,13 +101,14 @@ fn concurrent_modification() -> NativeError {
 }
 
 impl<H: Host> Runtime<'_, H> {
-    /// The fail-fast collection `value` iterates (a view copy's map), and
-    /// how.
+    /// The fail-fast collection `value` iterates (a view copy's map, an
+    /// unmodifiable view's collection), and how.
     fn fail_fast_source(&self, value: &Value) -> Option<(Value, FailFast)> {
         let marker = expect_ref(value)?;
         let source = self
             .host
             .view_copy_source(marker)
+            .or_else(|| self.host.unmodifiable_view_source(marker))
             .map_or_else(|| value.clone(), |source| Value::Ref(Some(source)));
         let class = self.host_collection_class(&source)?;
         Some((source, fail_fast(&class)?))
@@ -109,38 +124,46 @@ impl<H: Host> Runtime<'_, H> {
                 items.sort();
                 items
             }
-            FailFast::ArrayList | FailFast::Cursor => items,
+            FailFast::ArrayList | FailFast::Cursor | FailFast::Deque => items,
         })
     }
 
-    /// Whether the structure moved since `before`: `Some(true)` for a
-    /// change only a structural modification makes, `Some(false)` for none,
-    /// `None` when a list's elements changed at the same size (a `set`, or a
-    /// remove and an add).
-    fn structure_changed(
+    /// Whether the size or the key set moved since `before`: a change
+    /// only a structural modification makes.
+    fn resized(
         &self,
         source: &Value,
         how: FailFast,
         before: &[String],
-    ) -> Result<Option<bool>, NativeError> {
+    ) -> Result<bool, NativeError> {
         let now = self.structure_of(source, how)?;
-        if now == before {
-            return Ok(Some(false));
-        }
-        if now.len() != before.len() {
-            return Ok(Some(true));
-        }
         Ok(match how {
-            FailFast::ArrayList | FailFast::Cursor => None,
             FailFast::MapKeys => {
                 let mut now = now;
                 let mut before = before.to_vec();
                 now.sort();
                 before.sort();
-                Some(now != before)
+                now != before
             }
-            FailFast::SetElements => Some(true),
+            FailFast::SetElements => now != before,
+            _ => now.len() != before.len(),
         })
+    }
+
+    /// `modCount != expectedModCount` for a guarded loop over `source`.
+    fn mod_verdict(
+        &self,
+        root: &str,
+        expected: ModStamp,
+        source: &Value,
+        how: FailFast,
+        structure: &[String],
+    ) -> Result<ModVerdict, NativeError> {
+        let verdict = self.mod_stamp(root).verdict(expected);
+        if verdict == ModVerdict::Same && self.resized(source, how, structure)? {
+            return Ok(ModVerdict::Changed);
+        }
+        Ok(verdict)
     }
 
     /// `iterator()`, `hasNext()`/`next()` of a guarded iterator, and the
@@ -164,19 +187,25 @@ impl<H: Host> Runtime<'_, H> {
                 let Some((source, how)) = self.fail_fast_source(receiver) else {
                     return Ok(None);
                 };
+                let source_marker = expect_ref(&source).cloned().unwrap_or_default();
+                let root = self.mod_count_root(&source_marker);
                 let structure = self.structure_of(&source, how)?;
+                let expected = self.mod_stamp(&root);
                 let iterator = self.host.invoke_instance(r, receiver, args)?;
                 if let Some(iterator) = expect_ref(&iterator) {
                     self.host.store_iterator_guard(
                         iterator,
                         IteratorGuard {
-                            source: expect_ref(&source).cloned().unwrap_or_default(),
+                            source: source_marker,
+                            root,
                             cursor: match how {
                                 FailFast::ArrayList => Some(true),
                                 FailFast::Cursor => Some(false),
                                 _ => None,
                             },
+                            expected,
                             structure,
+                            deque: how == FailFast::Deque,
                         },
                     );
                 }
@@ -213,10 +242,28 @@ impl<H: Host> Runtime<'_, H> {
                         .fail_fast_source(&source)
                         .map_or(FailFast::MapKeys, |(_, how)| how),
                 };
-                match self.structure_changed(&source, how, &guard.structure)? {
-                    Some(false) => Ok(None),
-                    Some(true) => Err(concurrent_modification()),
-                    None => self.host.unknown_operand_call(r).map(|_| None),
+                match self.mod_verdict(
+                    &guard.root,
+                    guard.expected,
+                    &source,
+                    how,
+                    &guard.structure,
+                )? {
+                    // A cursor iterator reads the live array (`elementData[
+                    // cursor]`): a `set` since the snapshot shows.
+                    ModVerdict::Same if guard.cursor.is_some() => {
+                        let cursor = self.host.iterator_cursor(&marker);
+                        let stepped = self.host.invoke_instance(r, receiver, args)?;
+                        let live = self.collection_elements(&source)?;
+                        Ok(Some(
+                            cursor
+                                .and_then(|cursor| live.get(cursor).cloned())
+                                .unwrap_or(stepped),
+                        ))
+                    }
+                    ModVerdict::Same => Ok(None),
+                    ModVerdict::Changed if !guard.deque => Err(concurrent_modification()),
+                    _ => self.host.unknown_operand_call(r).map(|_| None),
                 }
             }
             ("forEach", "(Ljava/util/function/Consumer;)V") => {
@@ -236,11 +283,17 @@ impl<H: Host> Runtime<'_, H> {
                 let Some((source, how)) = self.fail_fast_source(receiver) else {
                     return Ok(None);
                 };
-                if how != FailFast::ArrayList {
-                    return Ok(None);
-                }
                 let callback = args.first().cloned().unwrap_or(Value::Ref(None));
-                self.array_list_remove_if(&source, &callback).map(Some)
+                match how {
+                    FailFast::ArrayList => self.array_list_remove_if(&source, &callback).map(Some),
+                    FailFast::Cursor
+                        if self.host_collection_class(&source).as_deref()
+                            == Some("java/util/LinkedList") =>
+                    {
+                        self.iterator_remove_if(&source, &callback).map(Some)
+                    }
+                    _ => Ok(None),
+                }
             }
             _ => Ok(None),
         }
@@ -255,49 +308,35 @@ impl<H: Host> Runtime<'_, H> {
         how: FailFast,
         callback: &Value,
     ) -> Result<Value, NativeError> {
-        let before = self.structure_of(source, how)?;
+        let marker = expect_ref(source).cloned().unwrap_or_default();
+        let root = self.mod_count_root(&marker);
+        let expected = self.mod_stamp(&root);
+        let structure = self.structure_of(source, how)?;
+        // `ArrayList` reads its size once.
+        let size = structure.len();
         let mut index = 0;
         loop {
+            let verdict = self.mod_verdict(&root, expected, source, how, &structure)?;
             let live = self.collection_elements(source)?;
-            let changed = self.structure_changed(source, how, &before)?;
-            if how == FailFast::ArrayList {
-                // The loop condition reads `modCount` first, then the size
-                // `forEach` captured.
-                if changed != Some(false) || index >= before.len() {
-                    return match changed {
-                        Some(false) => Ok(Value::Void),
-                        Some(true) => Err(concurrent_modification()),
-                        None => {
-                            let counted = MethodRef {
-                                owner: "java/util/ArrayList".into(),
-                                name: "forEach".into(),
-                                descriptor: "(Ljava/util/function/Consumer;)V".into(),
-                            };
-                            self.host
-                                .unknown_operand_call(&counted)
-                                .map(|_| Value::Void)
-                        }
-                    };
-                }
-            } else {
-                if index >= live.len() {
-                    return Ok(Value::Void);
-                }
-                match changed {
-                    Some(false) => {}
-                    Some(true) => return Err(concurrent_modification()),
-                    None => {
+            let done = match how {
+                FailFast::ArrayList => verdict != ModVerdict::Same || index >= size,
+                _ => index >= live.len() || verdict != ModVerdict::Same,
+            };
+            if done {
+                return match verdict {
+                    ModVerdict::Same => Ok(Value::Void),
+                    ModVerdict::Changed => Err(concurrent_modification()),
+                    ModVerdict::Unknown => {
                         let counted = MethodRef {
-                            owner: "java/util/LinkedList".into(),
+                            owner: self.host_collection_class(source).unwrap_or_default(),
                             name: "forEach".into(),
                             descriptor: "(Ljava/util/function/Consumer;)V".into(),
                         };
-                        return self
-                            .host
+                        self.host
                             .unknown_operand_call(&counted)
-                            .map(|_| Value::Void);
+                            .map(|_| Value::Void)
                     }
-                }
+                };
             }
             let Some(element) = live.get(index).cloned() else {
                 return Ok(Value::Void);
@@ -315,7 +354,23 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// `ArrayList.removeIf`, as JDK 25 runs it.
+    /// Count a list member whose `modCount` check could not be answered.
+    fn count_list_member(
+        &mut self,
+        source: &Value,
+        name: &str,
+        descriptor: &str,
+    ) -> Result<(), NativeError> {
+        let counted = MethodRef {
+            owner: self.host_collection_class(source).unwrap_or_default(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        self.host.unknown_operand_call(&counted).map(|_| ())
+    }
+
+    /// `ArrayList.removeIf` (and `Vector`'s `bulkRemove`), as JDK 25 runs
+    /// them.
     fn array_list_remove_if(
         &mut self,
         source: &Value,
@@ -328,7 +383,10 @@ impl<H: Host> Runtime<'_, H> {
                 frame: None,
             });
         }
-        let before = self.structure_of(source, FailFast::ArrayList)?;
+        let marker = expect_ref(source).cloned().unwrap_or_default();
+        let root = self.mod_count_root(&marker);
+        let expected = self.mod_stamp(&root);
+        let structure = self.structure_of(source, FailFast::ArrayList)?;
         // `es = elementData` and `end = size` are read once.
         let es = self.collection_elements(source)?;
         let end = es.len();
@@ -346,20 +404,12 @@ impl<H: Host> Runtime<'_, H> {
                 doomed[index] = true;
             }
         }
-        match self.structure_changed(source, FailFast::ArrayList, &before)? {
-            Some(false) => {}
-            Some(true) => return Err(concurrent_modification()),
-            // A `set` (no `modCount`) or a remove and an add: unknown.
-            None => {
-                let counted = MethodRef {
-                    owner: "java/util/ArrayList".into(),
-                    name: "removeIf".into(),
-                    descriptor: "(Ljava/util/function/Predicate;)Z".into(),
-                };
-                return self
-                    .host
-                    .unknown_operand_call(&counted)
-                    .map(|_| Value::Int(0));
+        match self.mod_verdict(&root, expected, source, FailFast::ArrayList, &structure)? {
+            ModVerdict::Same => {}
+            ModVerdict::Changed => return Err(concurrent_modification()),
+            ModVerdict::Unknown => {
+                self.count_list_member(source, "removeIf", "(Ljava/util/function/Predicate;)Z")?;
+                return Ok(Value::Int(0));
             }
         }
         if first >= end {
@@ -373,5 +423,66 @@ impl<H: Host> Runtime<'_, H> {
             .collect();
         self.host.replace_mutable_collection(source, kept);
         Ok(Value::Int(1))
+    }
+
+    /// `Collection.removeIf` on a `LinkedList`: `while (it.hasNext()) if
+    /// (filter.test(it.next())) it.remove()`. Each removal happens (and
+    /// bumps `modCount`) before the next test, so a predicate that throws
+    /// leaves the earlier ones done; `next()` and `remove()` throw after a
+    /// change the predicate made.
+    fn iterator_remove_if(
+        &mut self,
+        source: &Value,
+        predicate: &Value,
+    ) -> Result<Value, NativeError> {
+        if *predicate == Value::Ref(None) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let marker = expect_ref(source).cloned().unwrap_or_default();
+        let root = self.mod_count_root(&marker);
+        let mut expected = self.mod_stamp(&root);
+        let mut structure = self.structure_of(source, FailFast::Cursor)?;
+        let mut next_index = 0;
+        let mut removed = false;
+        let check = |this: &mut Self, expected: ModStamp, structure: &[String]| match this
+            .mod_verdict(&root, expected, source, FailFast::Cursor, structure)?
+        {
+            ModVerdict::Same => Ok(true),
+            ModVerdict::Changed => Err(concurrent_modification()),
+            ModVerdict::Unknown => this
+                .count_list_member(source, "removeIf", "(Ljava/util/function/Predicate;)Z")
+                .map(|()| false),
+        };
+        loop {
+            let mut live = self.collection_elements(source)?;
+            // `hasNext`: `nextIndex < size`.
+            if next_index >= live.len() {
+                return Ok(Value::Int(i32::from(removed)));
+            }
+            if !check(self, expected, &structure)? {
+                return Ok(Value::Int(i32::from(removed)));
+            }
+            let element = live[next_index].clone();
+            next_index += 1;
+            if !self.predicate_holds(predicate, &element)? {
+                continue;
+            }
+            // `it.remove()`: the check, `unlink`, `expectedModCount++`.
+            if !check(self, expected, &structure)? {
+                return Ok(Value::Int(i32::from(removed)));
+            }
+            live = self.collection_elements(source)?;
+            next_index -= 1;
+            live.remove(next_index);
+            self.host.replace_mutable_collection(source, live);
+            self.bump_mod_count(&root, false);
+            expected = self.mod_stamp(&root);
+            structure = self.structure_of(source, FailFast::Cursor)?;
+            removed = true;
+        }
     }
 }

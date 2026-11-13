@@ -463,7 +463,8 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `ArrayDeque`'s `contains`/`remove(Object)`/`removeFirstOccurrence`
     /// (head to tail) and `removeLastOccurrence` (tail to head): `o.equals(e)`,
-    /// and `null` is never there. The host compared by marker.
+    /// and `null` is never there. The host compared by marker. Also its bulk
+    /// members, which build on those.
     fn array_deque_equality(
         &mut self,
         r: &MethodRef,
@@ -473,6 +474,11 @@ impl<H: Host> Runtime<'_, H> {
         let (name, [needle]) = (r.name.as_str(), args) else {
             return Ok(None);
         };
+        if r.descriptor == "(Ljava/util/Collection;)Z"
+            && matches!(name, "containsAll" | "removeAll" | "retainAll")
+        {
+            return self.array_deque_bulk(r, receiver, needle);
+        }
         if r.descriptor != "(Ljava/lang/Object;)Z"
             || !matches!(
                 name,
@@ -503,5 +509,74 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         Ok(Some(Value::Int(0)))
+    }
+
+    /// `ArrayDeque.containsAll` (`AbstractCollection`'s: `contains(e)` for
+    /// each of `c`'s elements, in `c`'s order) and `removeAll`/`retainAll`
+    /// (`bulkRemove(e -> c.contains(e))`, head to tail; `retainAll` keeps the
+    /// matches). Engaged when a jar `equals` takes part; a `c.contains` this
+    /// runtime cannot answer is counted.
+    fn array_deque_bulk(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        other: &Value,
+    ) -> Result<Option<Value>, NativeError> {
+        if *other == Value::Ref(None) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        if self.host_collection_kind(other).is_none() {
+            return Ok(None);
+        }
+        let elements = self.collection_elements(receiver)?;
+        let others = self.collection_elements(other)?;
+        if !elements
+            .iter()
+            .chain(&others)
+            .any(|value| self.jar_equals(value))
+        {
+            return Ok(None);
+        }
+        if r.name == "containsAll" {
+            // `c`'s iteration order must be the JDK's.
+            if self.host_list(other).is_none() {
+                return self.host.unknown_operand_call(r).map(|_| None);
+            }
+            for needle in &others {
+                let mut found = false;
+                if *needle != Value::Ref(None) {
+                    for element in &elements {
+                        if self.java_equals(needle, element)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    return Ok(Some(Value::Int(0)));
+                }
+            }
+            return Ok(Some(Value::Int(1)));
+        }
+        if !self.argument_contains_is_exact(other, &elements)? {
+            return self.host.unknown_operand_call(r).map(|_| None);
+        }
+        let retain = r.name == "retainAll";
+        let mut kept = Vec::with_capacity(elements.len());
+        for element in &elements {
+            let contained = self.argument_contains(other, element)?.unwrap_or(false);
+            if contained == retain {
+                kept.push(element.clone());
+            }
+        }
+        let changed = kept.len() != elements.len();
+        if changed {
+            self.host.replace_mutable_collection(receiver, kept);
+        }
+        Ok(Some(Value::Int(i32::from(changed))))
     }
 }
