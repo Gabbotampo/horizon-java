@@ -129,6 +129,7 @@ fn argument(value: &Value) -> Json {
         }
         Value::Boxed(boxed) => json!(boxed.int()),
         Value::Ref(Some(text)) => json!(text),
+        Value::Host(_) => json!(crate::value_text(value)),
         Value::Void => json!(""),
     }
 }

@@ -133,6 +133,113 @@ public final class Boxes2 {
 }
 "#;
 
+/// Reflection's boxing, `Byte` boxes, `NaN` keys, entry hashes and
+/// floating-point narrowing.
+const BOXES3: &str = r#"
+package demo;
+
+import java.util.*;
+import java.util.stream.*;
+
+public final class Boxes3 {
+  static float rf() { return 1.5f; }
+  static char rc() { return 'q'; }
+  static boolean rz() { return true; }
+  static short rs() { return 3; }
+  static byte rb() { return -2; }
+  static double rd() { return 2.5; }
+  static void rv() {}
+
+  /** Reflection boxes a primitive by its declared type. */
+  public static String reflection() throws Exception {
+    StringBuilder out = new StringBuilder();
+    for (String name : new String[] {"rf", "rc", "rz", "rs", "rb", "rd"}) {
+      Object v = Boxes3.class.getDeclaredMethod(name).invoke(null);
+      out.append(v).append(v.getClass().getSimpleName()).append(',');
+    }
+    out.append(Boxes3.class.getDeclaredMethod("rf").invoke(null).equals(1.5f)).append(',');
+    out.append(Boxes3.class.getDeclaredMethod("rv").invoke(null)).append('|');
+    Object[] arrays = {new float[] {1.5f}, new char[] {'x'}, new boolean[] {true}, new short[] {4}, new byte[] {5}, new double[] {0.5}, new int[] {6}, new long[] {7}};
+    for (Object array : arrays) {
+      Object v = java.lang.reflect.Array.get(array, 0);
+      out.append(v).append(v.getClass().getSimpleName()).append(',');
+    }
+    return out.toString();
+  }
+
+  /** Every byte is a cached Byte. */
+  public static String bytes() {
+    Byte b = 5;
+    Object[] a = {(byte) 4};
+    byte by = 1;
+    by++;
+    Byte c = by, d = 2;
+    return b + "|" + a[0].getClass().getSimpleName() + "|" + Optional.of((byte) 1).get() + "|" + (c == d) + "|"
+        + c.equals(d) + "|" + (b + 1) + "|" + Byte.valueOf((byte) -128).hashCode();
+  }
+
+  /** NaN is one key: Double/Float.equals compare canonical bits. */
+  public static String nanKeys() {
+    Set<Double> s = new HashSet<>();
+    s.add(Double.NaN);
+    s.add(Double.NaN);
+    Map<Double, String> m = new HashMap<>();
+    m.put(Double.NaN, "a");
+    m.put(Double.NaN, "b");
+    return s.size() + "|" + m.size() + "|" + m.get(Double.NaN) + "|"
+        + new HashSet<>(Arrays.asList(Float.NaN, Float.NaN)).size() + "|" + new HashSet<>(List.of(Double.NaN)).contains(Double.NaN)
+        + "|" + Stream.of(Double.NaN, Double.NaN).distinct().count();
+  }
+
+  public static String entryHashes() {
+    Map<Integer, String> t = new TreeMap<>();
+    t.put(3, "b");
+    return Map.entry(1.5f, 'c').hashCode() + "|" + Map.entry(1, "a").hashCode() + "|"
+        + t.entrySet().iterator().next().hashCode();
+  }
+
+  public static String narrowing() {
+    Float f = 3.99e10f;
+    Double d = -3.99e10;
+    Float n = Float.NaN;
+    return ((Number) f).shortValue() + "," + ((Number) f).byteValue() + "," + f.shortValue() + "," + f.byteValue()
+        + "," + d.shortValue() + "," + d.byteValue() + "," + n.shortValue() + "," + ((Number) 1e300).byteValue()
+        + "," + Long.valueOf(70000L).shortValue();
+  }
+}
+"#;
+
+/// A `String` spelled like a host optional, and optionals of optionals.
+const BOXES4: &str = r#"
+package demo;
+
+import java.util.*;
+
+public final class Boxes4 {
+  /** A String spelled like a host optional is a String, inside an Optional or not. */
+  public static String forgery() {
+    Object g = Optional.of("optional-value/i5").get();
+    Object h = Optional.of("optional-value/BF1069547520").get();
+    Object s = Optional.of("optional/x").get();
+    Object o = "optional/x";
+    Object e = "optional";
+    return g + "|" + Optional.of("optional-value/i5").equals(Optional.of(5)) + "|" + h + "|" + s + "|"
+        + (o instanceof Optional) + (e instanceof Optional) + "|" + e.getClass().getSimpleName() + "|"
+        + Optional.of("optional").isPresent() + "|" + ("" + o + e) + "|" + Optional.of("optional/x").equals(Optional.of("x"));
+  }
+
+  /** An optional of an optional is nested, not collapsed. */
+  public static String nested() {
+    Optional<Optional<Integer>> n = Optional.of(Optional.of(5));
+    Optional<Optional<String>> m = Optional.of(Optional.empty());
+    Object inner = n.get();
+    return n + "|" + n.get().get() + "|" + (inner instanceof Optional) + "|" + m + "|" + m.get().isPresent() + "|"
+        + Optional.of(Optional.of("x")).get().get() + "|" + n.equals(Optional.of(Optional.of(5))) + "|" + n.hashCode()
+        + "|" + Optional.of(5).map(Optional::of).get().get() + "|" + Optional.of(Optional.of(5)).get().getClass().getSimpleName();
+  }
+}
+"#;
+
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
         .map(|home| PathBuf::from(home).join("bin/javac"))
@@ -235,6 +342,73 @@ fn boxes_keep_their_class_through_optionals_text_keys_and_equality() {
         let mut host = StdHost::new();
         let value = jar.invoke_method_with_args(
             "demo.Boxes2",
+            name,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        assert_eq!(
+            value.as_ref().ok(),
+            Some(&Value::Ref(Some(expected.into()))),
+            "{name}: {value:?}, unknown calls {:?}",
+            host.unknown_host_calls()
+        );
+    }
+}
+
+/// Every expected string is what `Boxes3` printed on Java 25 (OpenJDK
+/// 25.0.5, two runs alike).
+#[test]
+fn reflection_bytes_nan_keys_entry_hashes_and_narrowing_answer_as_java_25() {
+    let jar = jar("Boxes3", BOXES3);
+    for (name, expected) in [
+        (
+            "reflection",
+            "1.5Float,qCharacter,trueBoolean,3Short,-2Byte,2.5Double,true,null|1.5Float,xCharacter,trueBoolean,4Short,5Byte,0.5Double,6Integer,7Long,",
+        ),
+        ("bytes", "5|Byte|1|true|true|6|-128"),
+        ("nanKeys", "1|1|b|1|true|1"),
+        ("entryHashes", "1069547619|96|97"),
+        ("narrowing", "-1,-1,-1,-1,0,0,0,-1,4464"),
+    ] {
+        let mut host = StdHost::new();
+        let value = jar.invoke_method_with_args(
+            "demo.Boxes3",
+            name,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        assert_eq!(
+            value.as_ref().ok(),
+            Some(&Value::Ref(Some(expected.into()))),
+            "{name}: {value:?}, unknown calls {:?}",
+            host.unknown_host_calls()
+        );
+    }
+}
+
+/// An `Optional` is a host object (`Value::Host`), never a `String`: no jar
+/// text spells one, and an optional of an optional nests. Expected strings
+/// are `Boxes4` on Java 25 (OpenJDK 25.0.5, two runs alike).
+#[test]
+fn no_string_spells_an_optional_and_optionals_nest() {
+    let jar = jar("Boxes4", BOXES4);
+    for (name, expected) in [
+        (
+            "forgery",
+            "optional-value/i5|false|optional-value/BF1069547520|optional/x|falsefalse|String|true|optional/xoptional|false",
+        ),
+        (
+            "nested",
+            "Optional[Optional[5]]|5|true|Optional[Optional.empty]|false|x|true|5|5|Optional",
+        ),
+    ] {
+        let mut host = StdHost::new();
+        let value = jar.invoke_method_with_args(
+            "demo.Boxes4",
             name,
             "()Ljava/lang/String;",
             None,

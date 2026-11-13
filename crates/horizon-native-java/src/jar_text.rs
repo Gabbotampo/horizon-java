@@ -212,6 +212,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<String, NativeError> {
+        if let Value::Host(_) = value
+            && let Some(text) = self.host.modelled_to_string(value)
+        {
+            return Ok(text);
+        }
         if matches!(value, Value::Ref(Some(_))) {
             match self.runtime_value_of(value, class, method)? {
                 Some(Value::Ref(Some(text))) => return Ok(text),

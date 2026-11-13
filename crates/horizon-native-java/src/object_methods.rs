@@ -169,7 +169,7 @@ impl<H: Host> Runtime<'_, H> {
             Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) => {
                 return Equality::Platform;
             }
-            Value::Void => return Equality::Host,
+            Value::Void | Value::Host(_) => return Equality::Host,
             Value::Ref(Some(marker)) => marker,
         };
         if let Some(class) = self.interpreted_object_class(value) {
@@ -241,11 +241,26 @@ impl<H: Host> Runtime<'_, H> {
     /// The hash of a host-modelled value: a list, set or map by the JDK's
     /// formula over its elements, an identifier by `Identifier.hashCode`.
     fn host_value_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        // `Optional.hashCode`: `Objects.hashCode(value)`.
+        if is_optional(value) {
+            return match optional_present(value) {
+                Some(held) => self.java_hash(&held),
+                None => Ok(Some(0)),
+            };
+        }
         let Some(marker) = expect_ref(value) else {
             return Ok(None);
         };
         if let Some(id) = marker.strip_prefix("identifier/") {
             return Ok(Some(hash_map_order::identifier_hash(id)));
+        }
+        if marker.starts_with("map-entry/") {
+            // `Objects.hashCode(key) ^ Objects.hashCode(value)`.
+            let (key, entry) = map_entry_parts(value)?;
+            let (Some(key), Some(entry)) = (self.java_hash(&key)?, self.java_hash(&entry)?) else {
+                return Ok(None);
+            };
+            return Ok(Some(key ^ entry));
         }
         let Some(kind) = self.host_collection_kind(value) else {
             return Ok(None);
@@ -323,6 +338,16 @@ impl<H: Host> Runtime<'_, H> {
                     ))),
                 }
             }
+            // `Optional.equals`: the other is an optional holding an equal value.
+            Equality::Host if is_optional(a) => Ok(is_optional(b)
+                && match (optional_present(a), optional_present(b)) {
+                    (Some(left), Some(right)) => match self.equality_of(&left) {
+                        Equality::Null => false,
+                        _ => self.java_equals(&left, &right)?,
+                    },
+                    (None, None) => true,
+                    _ => false,
+                }),
             Equality::Host => Ok(a == b),
         }
     }
@@ -575,6 +600,14 @@ impl<H: Host> Runtime<'_, H> {
             };
             if keeps_identity {
                 return self.count_identity_hash().map(Some);
+            }
+            // `Map.Entry.hashCode()` is `host_value_hash`'s; an entry whose
+            // key or value has no hash the runtime can compute is counted.
+            if expect_ref(receiver).is_some_and(|marker| marker.starts_with("map-entry/")) {
+                return match self.java_hash(receiver)? {
+                    Some(hash) => Ok(Some(Value::Int(hash))),
+                    None => self.host.unknown_operand_call(r).map(Some),
+                };
             }
             // A box typed as `Object` (`Object i = 7; i.hashCode()`).
             if self.equality_of(receiver) == Equality::Platform
