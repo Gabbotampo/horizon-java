@@ -17,10 +17,14 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
-        if !expect_ref(value).is_some_and(|marker| marker.starts_with("map-entry/")) {
+        // Only a text that parses as an entry is one; a string that merely
+        // starts like one stays a string.
+        let Some(Ok((key, entry_value))) = expect_ref(value)
+            .filter(|marker| marker.starts_with("map-entry/"))
+            .map(|_| map_entry_parts(value))
+        else {
             return Ok(None);
-        }
-        let (key, entry_value) = map_entry_parts(value)?;
+        };
         let key = self.value_of_text(&key, "Ljava/lang/Object;", class, method)?;
         let entry_value = self.value_of_text(&entry_value, "Ljava/lang/Object;", class, method)?;
         Ok(Some(Value::Ref(Some(format!("{key}={entry_value}")))))

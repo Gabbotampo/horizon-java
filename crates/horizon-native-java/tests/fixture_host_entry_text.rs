@@ -18,7 +18,11 @@ fn check(cases: &[(&str, &str)]) {
 
 const PROBE: &str = r#"package demo;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.TreeMap;
@@ -66,9 +70,48 @@ public final class Probe {
         return "[" + entry + "]" + new StringBuilder().append(entry) + String.valueOf(entry);
     }
 
+    static HashMap<Object, Object> one() {
+        HashMap<Object, Object> map = new HashMap<>();
+        map.put("a", 1);
+        return map;
+    }
+
+    public static String entrySetPrinted() {
+        HashMap<Object, Object> m = one();
+        return m.entrySet().toString() + "|" + String.valueOf(m.entrySet()) + "|" + ("" + m.entrySet()) + "|"
+                + Objects.toString(m.entrySet());
+    }
+
+    public static String entriesInLists() {
+        HashMap<Object, Object> m = one();
+        Map.Entry<Object, Object> entry = first(m);
+        return List.of(entry) + "|" + new ArrayList<>(m.entrySet()) + "|" + m.entrySet().stream().toList();
+    }
+
+    public static String copiedMapsEntrySets() {
+        HashMap<Object, Object> m = one();
+        return new TreeMap<>(m).entrySet() + "|" + new LinkedHashMap<>(m).entrySet();
+    }
+
+    public static String methodReferences() {
+        HashMap<Object, Object> m = one();
+        return m.entrySet().stream().map(Object::toString).collect(Collectors.joining(",")) + "|"
+                + m.entrySet().stream().map(String::valueOf).toList();
+    }
+
+    public static String formatted() { return String.format("<%s>", first(one())); }
+
+    /// Strings that only start like the host's entry encoding stay strings.
+    public static String stringsSpelledLikeEntries() {
+        String a = "map-entry/x";
+        String b = "map-entry/";
+        return a + "|" + b + "|" + List.of(a, b) + "|" + a.length() + "|" + String.valueOf(b);
+    }
+
     public static String[] all() {
         return new String[] {"hashMapEntry", "treeMapEntry", "linkedEntryWithNulls", "mapEntryFactory", "jarKeyAndValue",
-                "concatenatedAndAppended"};
+                "concatenatedAndAppended", "entrySetPrinted", "entriesInLists", "copiedMapsEntrySets", "methodReferences", "formatted",
+                "stringsSpelledLikeEntries"};
     }
 
     public static void main(String[] args) throws Exception {
@@ -86,5 +129,14 @@ fn host_entry_text_runs_as_jdk_25_does() {
         ("mapEntryFactory", "7=c|true=s"),
         ("jarKeyAndValue", "<k>=<v>|<a>=3"),
         ("concatenatedAndAppended", "[x=y]x=yx=y"),
+        ("entrySetPrinted", "[a=1]|[a=1]|[a=1]|[a=1]"),
+        ("entriesInLists", "[a=1]|[a=1]|[a=1]"),
+        ("copiedMapsEntrySets", "[a=1]|[a=1]"),
+        ("methodReferences", "a=1|[a=1]"),
+        ("formatted", "<a=1>"),
+        (
+            "stringsSpelledLikeEntries",
+            "map-entry/x|map-entry/|[map-entry/x, map-entry/]|11|map-entry/",
+        ),
     ]);
 }
