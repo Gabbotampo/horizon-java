@@ -5939,12 +5939,12 @@ impl Host for StdHost {
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         if matches!(receiver, Value::Host(_))
-            && matches!(
+            && (matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
                 ("toString", "()Ljava/lang/String;")
                     | ("hashCode", "()I")
                     | ("equals", "(Ljava/lang/Object;)Z")
-            )
+            ) || r.name == "compareTo" && object_methods::is_compare_to(&r.descriptor))
         {
             return self.host_object_method(r, receiver, args);
         }
@@ -10701,6 +10701,12 @@ impl StdHost {
             "hashCode" => handle
                 .hash_code(&mut HostNested(Some(self)))?
                 .map(Value::Int),
+            "compareTo" => {
+                let other = Self::argument(r, args, 0)?;
+                handle
+                    .compare_to(other, &mut HostNested(Some(self)))?
+                    .map(Value::Int)
+            }
             _ => {
                 let other = Self::argument(r, args, 0)?;
                 handle

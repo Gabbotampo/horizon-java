@@ -201,6 +201,10 @@ pub(crate) type InstanceOfFn = fn(&HostRef, &str, &dyn ClassHierarchy) -> Option
 /// Whether a handle means the same in another jar's runtime (NeoForge IMC):
 /// `crosses` answers for a held value.
 pub(crate) type CrossesFn = fn(&HostRef, &dyn Fn(&Value) -> bool) -> bool;
+/// `handle.compareTo(other)` (`Comparable`); `None` when it is unknown here
+/// (the caller counts it).
+pub(crate) type CompareToFn =
+    fn(&HostRef, &Value, &mut dyn Nested) -> Result<Option<i32>, NativeError>;
 
 /// The class hierarchy a kind's `instance_of` reads: the JDK's supertypes,
 /// and in the runtime the jar's own classes (a jar object's superclasses and
@@ -229,6 +233,11 @@ pub(crate) struct Methods {
     pub(crate) equals: EqualsFn,
     pub(crate) instance_of: InstanceOfFn,
     pub(crate) crosses_jars: CrossesFn,
+    /// Natural order, for a kind whose class is `Comparable`: every caller of
+    /// `compareTo` (a direct call, a sort, a `TreeMap`, `sorted()`) reaches
+    /// it. `None` for a kind that is not `Comparable`, or not modelled: the
+    /// caller counts the comparison.
+    pub(crate) compare_to: Option<CompareToFn>,
 }
 
 /// One row of the kind table.
@@ -488,6 +497,19 @@ impl HostRef {
     /// `None` when `hierarchy` cannot tell.
     pub(crate) fn instance_of(&self, wanted: &str, hierarchy: &dyn ClassHierarchy) -> Option<bool> {
         (self.methods().instance_of)(self, wanted, hierarchy)
+    }
+
+    /// `compareTo(other)`; `None` when the kind has no natural order here or
+    /// cannot compare these two.
+    pub(crate) fn compare_to(
+        &self,
+        other: &Value,
+        nested: &mut dyn Nested,
+    ) -> Result<Option<i32>, NativeError> {
+        match self.methods().compare_to {
+            Some(compare) => compare(self, other, nested),
+            None => Ok(None),
+        }
     }
 
     /// Whether this handle means the same in another jar's runtime, with

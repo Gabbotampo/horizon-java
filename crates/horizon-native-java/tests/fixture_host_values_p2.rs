@@ -56,6 +56,12 @@ const CASES: &[(&str, Outcome)] = &[
     // Java 25: `java.lang.Object|1`; the row knows UnixPath's supertypes,
     // not which one is the direct superclass or interface.
     ("classDirect", Counted),
+    // `UnixPath.compareTo` in `Collections.sort`, `TreeSet`, a direct and a
+    // `Comparable` call, `sorted()` and `TreeMap` (#164 B2).
+    (
+        "pathOrder",
+        Exact("[/z, a, a/c, b]|[x, y]|-2,1|[p, q]|k1k2"),
+    ),
     // Java 25 threw `InvalidPathException` under the POSIX locale and
     // printed `6214` under `C.UTF-8`.
     ("pathNonAscii", Counted),

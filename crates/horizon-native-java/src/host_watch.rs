@@ -53,6 +53,7 @@ pub(crate) const WATCH_KIND: Methods = Methods {
     equals: |handle, other, _| Ok(identity_equals(handle, other)),
     instance_of,
     crosses_jars: |_, _| true,
+    compare_to: None,
 };
 
 /// A service, key or event: the run's own state.

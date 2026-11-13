@@ -175,6 +175,19 @@ public final class P2 {
     return c.getSuperclass().getName() + "|" + c.getInterfaces().length;
   }
 
+  /** UnixPath.compareTo (byte order) in every caller of natural order (#164 B2). */
+  public static String pathOrder() {
+    List<Path> l = new ArrayList<>(List.of(Path.of("b"), Path.of("a/c"), Path.of("a"), Path.of("/z")));
+    Collections.sort(l);
+    TreeSet<Path> t = new TreeSet<>(List.of(Path.of("y"), Path.of("x")));
+    Comparable<Path> c = Path.of("ab");
+    TreeMap<Path, Integer> m = new TreeMap<>();
+    m.put(Path.of("k2"), 1);
+    m.put(Path.of("k1"), 2);
+    return l + "|" + t + "|" + Path.of("a").compareTo(Path.of("abc")) + "," + c.compareTo(Path.of("aa")) + "|"
+        + java.util.stream.Stream.of(Path.of("q"), Path.of("p")).sorted().toList() + "|" + m.firstKey() + m.lastKey();
+  }
+
   /** A non-ASCII path's bytes are the machine's `sun.jnu.encoding`. */
   public static String pathNonAscii() { return "" + Path.of("\u00e9").hashCode(); }
 

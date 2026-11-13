@@ -90,6 +90,25 @@ fn path_hash(path: &str) -> Option<i32> {
     })
 }
 
+/// `UnixPath.compareTo`: the first differing byte's difference
+/// (`b & 0xff`), else the length difference. Bytes are `sun.jnu.encoding`'s,
+/// so only two ASCII paths compare the same everywhere; `None` (counted)
+/// otherwise, or for anything that is no path (Java's `ClassCastException`).
+fn path_compare(path: &str, other: &Value) -> Option<i32> {
+    let other = path_key(other)?;
+    if !path.is_ascii() || !other.is_ascii() {
+        return None;
+    }
+    Some(
+        path.bytes()
+            .zip(other.bytes())
+            .find(|(a, b)| a != b)
+            .map_or(path.len() as i32 - other.len() as i32, |(a, b)| {
+                i32::from(a) - i32::from(b)
+            }),
+    )
+}
+
 pub(crate) const PATH: Methods = Methods {
     to_string: |handle, _| Ok(Some(handle.key().to_owned())),
     hash_code: |handle, _| Ok(path_hash(handle.key())),
@@ -97,6 +116,7 @@ pub(crate) const PATH: Methods = Methods {
     equals: |handle, other, _| Ok(Some(path_key(other) == Some(handle.key()))),
     instance_of: |_, wanted, _| Some(PATH_TYPES.contains(&wanted)),
     crosses_jars: |_, _| true,
+    compare_to: Some(|handle, other, _| Ok(path_compare(handle.key(), other))),
 };
 
 /// `FMLPaths`.
@@ -121,6 +141,9 @@ pub(crate) const FML_PATHS: Methods = Methods {
     equals: |handle, other, _| Ok(identity_equals(handle, other)),
     instance_of: fml_paths_instance_of,
     crosses_jars: |_, _| true,
+    // `Enum.compareTo` is the ordinal difference; the model keeps no
+    // ordinals for `FMLPaths`: counted.
+    compare_to: None,
 };
 
 /// An enum constant: its class, `Enum` and `Enum`'s interfaces.
