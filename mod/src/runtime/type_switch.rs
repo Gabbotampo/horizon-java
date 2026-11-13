@@ -116,10 +116,7 @@ impl<H: Host> Runtime<'_, H> {
 /// An `int` a switch value carries, boxed or not.
 fn boxed_int(value: &Value) -> Option<i32> {
     match value {
-        Value::Int(value) => Some(*value),
-        Value::Ref(Some(marker)) => marker
-            .strip_prefix("integer:")
-            .and_then(|text| text.parse().ok()),
+        Value::Int(value) | Value::Boxed(crate::runtime::Boxed::Integer(value)) => Some(*value),
         _ => None,
     }
 }

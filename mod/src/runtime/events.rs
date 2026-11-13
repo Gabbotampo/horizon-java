@@ -2587,7 +2587,7 @@ mod tests {
             host.game_event_call(&get, &rules, &[keep])
                 .unwrap()
                 .unwrap(),
-            Value::Ref(Some("boolean:false".into()))
+            Value::Boxed(crate::runtime::Boxed::Boolean(false))
         );
         // `registryAccess` with no registries listed refuses by name.
         assert!(matches!(

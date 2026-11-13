@@ -615,11 +615,10 @@ fn compound_copy_is_deep_and_get_compound_or_empty_answers_the_live_child() {
     };
     assert_eq!(read(&mut fixture, &elements[0]), tag(&case["copy"]));
     assert_eq!(read(&mut fixture, &elements[1]), tag(&case["orEmptyOnInt"]));
-    // A `boolean` boxed into an `Object[]` is the runtime's `Boolean` marker.
+    // A `boolean` boxed into an `Object[]` is the runtime's `Boolean`.
     assert_eq!(
         elements[2],
-        text(&format!(
-            "boolean:{}",
+        Value::Boxed(crate::Boxed::Boolean(
             case["childIdentity"].as_bool().unwrap()
         ))
     );
@@ -644,7 +643,7 @@ fn compound_put_answers_the_previous_tag_and_refuses_null_as_the_server_jar_does
     // The oracle's first put answered null and the second the tag it replaced.
     assert_eq!(case["first"], serde_json::Value::Null);
     assert_eq!(elements[0], Value::Ref(None));
-    assert_eq!(elements[1], text("boolean:true"));
+    assert_eq!(elements[1], Value::Boxed(crate::Boxed::Boolean(true)));
     assert_eq!(
         elements[2],
         text(case["nullPut"]["message"].as_str().unwrap())
