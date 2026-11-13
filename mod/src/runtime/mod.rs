@@ -27,6 +27,7 @@ mod collection_base;
 mod collection_callback;
 mod color_collection;
 mod commons_io;
+mod commons_pair;
 mod concurrent_sync;
 pub mod content;
 mod declarations_content;
@@ -83,6 +84,7 @@ mod jdk_text_oracle;
 mod jvm_dispatch;
 mod lambda_boxing;
 mod library_dispatch;
+mod linked_resources;
 mod list_equality;
 mod map_compute;
 mod method_handles;
@@ -90,6 +92,7 @@ mod mixin_extras;
 mod mixin_plugins;
 mod mod_config_register;
 mod mod_config_spec;
+mod mod_count;
 mod mod_origin;
 mod modified_utf8;
 mod native_library;
@@ -120,6 +123,7 @@ mod sequenced;
 mod service_loader;
 mod stack_walk;
 mod string_constructors;
+mod synchronized_views;
 mod tim_sort;
 mod tree_map;
 mod type_switch;
@@ -2239,6 +2243,25 @@ pub trait Host {
         None
     }
 
+    /// A collection's `modCount` (`mod_count.rs`).
+    fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
+        mod_count::ModStamp::default()
+    }
+
+    fn store_mod_stamp(&mut self, _marker: &str, _stamp: mod_count::ModStamp) {}
+
+    /// Where a `subList` copy sits in its parent (`mod_count.rs`).
+    fn sub_list_link(&self, _marker: &str) -> Option<mod_count::SubListLink> {
+        None
+    }
+
+    fn store_sub_list_link(&mut self, _marker: &str, _link: Option<mod_count::SubListLink>) {}
+
+    /// The `subList` copies taken from `parent`.
+    fn sub_lists_of(&self, _parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        Vec::new()
+    }
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -2602,6 +2625,9 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// `Collections.synchronized*` views and the collection each wraps
+    /// (`synchronized_views.rs`).
+    synchronized_views: BTreeMap<String, String>,
     /// `List.reversed()` views: view marker → (its list, whether it writes
     /// through) (`sequenced.rs`).
     reversed_views: BTreeMap<String, (String, bool)>,
@@ -2628,6 +2654,10 @@ pub struct StdHost {
     /// The fail-fast iterators' guards, by iterator marker
     /// (`iteration_guard.rs`).
     iterator_guards: BTreeMap<String, iteration_guard::IteratorGuard>,
+    /// Each tracked collection's `modCount` (`mod_count.rs`).
+    mod_stamps: BTreeMap<String, mod_count::ModStamp>,
+    /// `subList` copies and where they sit in their parents.
+    sub_lists: BTreeMap<String, mod_count::SubListLink>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -2740,6 +2770,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
             hash_tables: BTreeMap::new(),
             collection_comparators: BTreeMap::new(),
@@ -2750,6 +2781,8 @@ impl StdHost {
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
             iterator_guards: BTreeMap::new(),
+            mod_stamps: BTreeMap::new(),
+            sub_lists: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
@@ -2946,9 +2979,12 @@ impl StdHost {
     /// Query an explicitly seeded resource marker without crossing into the
     /// host filesystem or process classpath.
     pub fn resource(&self, name: &str) -> Option<&str> {
+        let name = name.strip_prefix('/').unwrap_or(name);
         self.resources
-            .get(name.strip_prefix('/').unwrap_or(name))
+            .get(name)
             .map(String::as_str)
+            // A linked jar's, after the running jar's (`linked_resources.rs`).
+            .or_else(|| self.linked_classes.resource(name).map(|(marker, _)| marker))
     }
 
     /// Alias named for callers that want to make the query boundary explicit.
@@ -2972,7 +3008,16 @@ impl StdHost {
         let Some(marker) = self.resource(name).map(str::to_owned) else {
             return Value::Ref(None);
         };
-        if let Some(bytes) = self.resource_bytes.get(name).cloned() {
+        let bytes = self.resource_bytes.get(name).cloned().or_else(|| {
+            (!self.resources.contains_key(name))
+                .then(|| {
+                    self.linked_classes
+                        .resource(name)
+                        .map(|(_, bytes)| bytes.to_vec())
+                })
+                .flatten()
+        });
+        if let Some(bytes) = bytes {
             self.resource_streams.insert(marker.clone(), (bytes, 0));
         } else {
             self.resource_streams
@@ -3144,7 +3189,7 @@ impl StdHost {
     }
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<String>> {
-        let marker = expect_ref(receiver)?;
+        let marker = self.synchronized_target(expect_ref(receiver)?);
         if let Some(values) = self.view_values(marker) {
             return Some(values);
         }
@@ -4126,7 +4171,8 @@ impl Host for StdHost {
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
         if let Some(marker) = expect_ref(value) {
-            self.mutable_collections.insert(marker.to_owned(), values);
+            let marker = self.synchronized_target(marker).to_owned();
+            self.mutable_collections.insert(marker, values);
         }
     }
 
@@ -4182,6 +4228,38 @@ impl Host for StdHost {
 
     fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
         self.iterator_guards.insert(marker.to_owned(), guard);
+    }
+
+    fn mod_stamp(&self, marker: &str) -> mod_count::ModStamp {
+        let marker = self.synchronized_target(marker);
+        self.mod_stamps.get(marker).copied().unwrap_or_default()
+    }
+
+    fn store_mod_stamp(&mut self, marker: &str, stamp: mod_count::ModStamp) {
+        let marker = self.synchronized_target(marker).to_owned();
+        self.mod_stamps.insert(marker, stamp);
+    }
+
+    fn sub_list_link(&self, marker: &str) -> Option<mod_count::SubListLink> {
+        if self.sub_lists.is_empty() {
+            return None;
+        }
+        self.sub_lists.get(marker).cloned()
+    }
+
+    fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
+        match link {
+            Some(link) => self.sub_lists.insert(marker.to_owned(), link),
+            None => self.sub_lists.remove(marker),
+        };
+    }
+
+    fn sub_lists_of(&self, parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        self.sub_lists
+            .iter()
+            .filter(|(_, link)| link.parent() == parent)
+            .map(|(view, link)| (view.clone(), link.clone()))
+            .collect()
     }
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
@@ -4960,6 +5038,9 @@ impl Host for StdHost {
                 "singletonMap",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
             ) => Ok(collection_value("map", args)),
+            ("java/util/Collections", name, _) if name.starts_with("synchronized") => self
+                .synchronized_view(r, args)
+                .unwrap_or_else(|| self.unknown_host_call(r)),
             ("java/util/Collections", "unmodifiableList", "(Ljava/util/List;)Ljava/util/List;")
             | ("java/util/Collections", "unmodifiableSet", "(Ljava/util/Set;)Ljava/util/Set;")
             | ("java/util/Collections", "unmodifiableMap", "(Ljava/util/Map;)Ljava/util/Map;") => {
@@ -5576,6 +5657,11 @@ impl Host for StdHost {
         // The loading stages' event objects (`neoforge_lifecycle.rs`).
         if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
+        }
+        // A synchronized view runs every call on what it wraps
+        // (`synchronized_views.rs`).
+        if let Some(wrapped) = self.synchronized_receiver(receiver) {
+            return self.invoke_instance(r, &wrapped, args);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_instance(r, receiver) {
@@ -12711,6 +12797,9 @@ pub struct LinkedClassTable {
     /// path, it only answers what a supplied jar declared.
     services: BTreeMap<String, Vec<String>>,
     providers: usize,
+    /// Each linked jar's resources by name, with the marker the host answers
+    /// for them (`linked_resources.rs`).
+    resources: BTreeMap<String, (String, Vec<u8>)>,
 }
 
 impl LinkedClassTable {
@@ -12738,6 +12827,7 @@ impl LinkedClassTable {
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
         let added = self.link_classes(id, jar.classes.values().cloned())?;
+        self.link_resources(jar);
         self.link_services(jar);
         Ok(added)
     }
@@ -19492,7 +19582,12 @@ impl<H: Host> Runtime<'_, H> {
                 )? {
                     return Ok(Some(value));
                 }
-                return self.host.invoke(&callback.target, &values).map(Some);
+                let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
+                let value = self.host.invoke(&callback.target, &values)?;
+                if let Some(token) = token {
+                    self.mod_count_after(token, &value)?;
+                }
+                return Ok(Some(value));
             }
             // A constructor reference (`GameClass::new`, `HashMap::new`) is a
             // factory whose effective result is the constructed object, even
@@ -19573,10 +19668,15 @@ impl<H: Host> Runtime<'_, H> {
             )? {
                 return Ok(Some(value));
             }
-            return self
+            // `list::add` moves the list's `modCount` as the call would.
+            let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
+            let value = self
                 .host
-                .invoke_instance(&callback.target, &receiver, &rest)
-                .map(Some);
+                .invoke_instance(&callback.target, &receiver, &rest)?;
+            if let Some(token) = token {
+                self.mod_count_after(token, &value)?;
+            }
+            return Ok(Some(value));
         };
         let Some(method) = class.method(&callback.target.name, &callback.target.descriptor) else {
             return Ok(None);
@@ -19786,14 +19886,39 @@ impl<H: Host> Runtime<'_, H> {
     /// sibling jars the host linked. This keeps reflection useful for
     /// bootstrap code without permitting arbitrary classpath or filesystem
     /// loading: a class neither source declares still answers `null`.
-    fn class_for_name(&self, args: &[Value]) -> Result<Value, NativeError> {
-        let binary = expect_string(
+    /// `Class.forName`, as JDK 25 runs it: `forName(String)` loads and
+    /// **initializes** the class (`forName0(name, true, ..)`), so its static
+    /// initializer runs here, at the call, and a failure in it surfaces as the
+    /// `ExceptionInInitializerError` it is. `forName(String, boolean,
+    /// ClassLoader)` initializes only when asked; `forName(Module, String)`
+    /// never does, and takes the name as its second argument. night-config's
+    /// `FormatDetector.<clinit>` relies on the first: it `forName`s
+    /// `TomlFormat`, whose own `<clinit>` registers the `toml` extension.
+    fn class_for_name(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        let module_overload = r.descriptor.starts_with("(Ljava/lang/Module;");
+        let name = if module_overload {
+            args.get(1)
+        } else {
             args.first()
-                .ok_or_else(|| NativeError::Metadata("Class.forName needs a class name".into()))?,
+        };
+        let binary = expect_string(
+            name.ok_or_else(|| NativeError::Metadata("Class.forName needs a class name".into()))?,
         );
         let internal = binary.replace('.', "/");
-        if self.has_class(&internal)
-            || library_dispatch::jdk_class_exists(&internal)
+        if self.has_class(&internal) {
+            let initialize = match r.descriptor.as_str() {
+                "(Ljava/lang/String;)Ljava/lang/Class;" => true,
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;" => {
+                    !matches!(args.get(1), Some(Value::Int(0)))
+                }
+                _ => false,
+            };
+            if initialize {
+                self.ensure_initialized(&internal)?;
+            }
+            return Ok(Value::Ref(Some(internal)));
+        }
+        if library_dispatch::jdk_class_exists(&internal)
             || self.host.platform_class_present(&internal)
         {
             return Ok(Value::Ref(Some(internal)));
@@ -24071,6 +24196,16 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    // A call that may move a host collection's `modCount`
+                    // (`mod_count.rs`), checked and noted around the dispatch.
+                    let mod_token = if anchor_replacement.is_none() {
+                        invoke_or_catch!(
+                            at,
+                            self.mod_count_before(&r, op, receiver.as_ref(), &args)
+                        )
+                    } else {
+                        None
+                    };
                     // Whether the answer is a jar method body's own `areturn`
                     // (which may legitimately be `null`) rather than a host or
                     // model answer.
@@ -24242,6 +24377,11 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_mod_config_spec(&r, receiver.as_ref(), &args)
                     ) {
                         value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_commons_pair(&r, receiver.as_ref(), &args))
+                    {
+                        // commons-lang3 `Pair` (`commons_pair.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_field_access(&r, receiver.as_ref(), &args, class)
@@ -24293,7 +24433,7 @@ impl<H: Host> Runtime<'_, H> {
                         && r.name == "forName"
                         && r.descriptor.ends_with(")Ljava/lang/Class;")
                     {
-                        invoke_or_catch!(at, self.class_for_name(&args))
+                        invoke_or_catch!(at, self.class_for_name(&r, &args))
                     } else if let Some(value) = self.invoke_class_interfaces(&r, receiver.as_ref())
                     {
                         value
@@ -24465,6 +24605,9 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         _ => value,
                     };
+                    if let Some(token) = mod_token.filter(|_| !jar_body) {
+                        invoke_or_catch!(at, self.mod_count_after(token, &value));
+                    }
                     if value != Value::Void {
                         stack.push(value);
                     }
@@ -36652,14 +36795,28 @@ mandatory = true
         );
         assert_eq!(
             runtime
-                .class_for_name(&[Value::Ref(Some("demo.Reflective".into()))])
+                .class_for_name(
+                    &MethodRef {
+                        owner: "java/lang/Class".into(),
+                        name: "forName".into(),
+                        descriptor: "(Ljava/lang/String;)Ljava/lang/Class;".into(),
+                    },
+                    &[Value::Ref(Some("demo.Reflective".into()))]
+                )
                 .unwrap(),
             Value::Ref(Some("demo/Reflective".into()))
         );
         // The JVM throws for an absent class; a platform probe catches the
         // exception and tries its next loader.
         let missing = runtime
-            .class_for_name(&[Value::Ref(Some("demo.Missing".into()))])
+            .class_for_name(
+                &MethodRef {
+                    owner: "java/lang/Class".into(),
+                    name: "forName".into(),
+                    descriptor: "(Ljava/lang/String;)Ljava/lang/Class;".into(),
+                },
+                &[Value::Ref(Some("demo.Missing".into()))],
+            )
             .unwrap_err();
         assert!(matches!(
             missing,
