@@ -122,7 +122,7 @@ impl<H: Host> Runtime<'_, H> {
     /// object of a jar class that implements the interface is an
     /// `invokeinterface` to that class's body. Anything else (a host marker
     /// standing in for a callback) did not run.
-    fn run_functional(
+    pub(crate) fn run_functional(
         &mut self,
         target: (&str, &str, &str),
         callback: &Value,
@@ -153,7 +153,11 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `Predicate.test`, as a boolean. A predicate the runtime cannot run did
     /// not select the element, which is what the host's neutral answer was.
-    fn predicate_holds(&mut self, callback: &Value, value: &Value) -> Result<bool, NativeError> {
+    pub(crate) fn predicate_holds(
+        &mut self,
+        callback: &Value,
+        value: &Value,
+    ) -> Result<bool, NativeError> {
         if let Some(answer) = self.invoke_callback(callback, std::slice::from_ref(value))? {
             return Ok(matches!(answer, Value::Int(flag) if flag != 0));
         }
