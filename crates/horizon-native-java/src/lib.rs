@@ -2417,10 +2417,6 @@ const ENUM_DECLARED_METHODS: &[&str] = &[
 /// A real `try`/`catch` chain has a handful; the bound keeps a crafted class
 /// from making every throw walk an unbounded table.
 const MAX_EXCEPTION_HANDLERS: usize = 256;
-/// Distinct empty collections handed out for unmodelled calls that declare a
-/// collection return. Past this the shared read-only marker keeps a jar from
-/// growing the host without bound.
-const MAX_NEUTRAL_COLLECTIONS: usize = 256;
 /// Service providers `seed_host` reads from one jar's `META-INF/services`
 /// files. A real jar lists a handful; the bound caps a crafted file.
 const MAX_SEEDED_SERVICE_PROVIDERS: usize = 256;
@@ -2766,17 +2762,22 @@ impl StdHost {
         Value::default_for(descriptor)
     }
 
-    /// A distinct empty collection marker for one unmodelled call.
+    /// A new, distinct, empty mutable collection the host keeps.
     ///
-    /// The marker carries its own name so mutating it (`put`, `add`) never
-    /// changes what another call site sees. Past
-    /// [`MAX_NEUTRAL_COLLECTIONS`] the shared read-only marker is returned: a
-    /// jar with thousands of unmodelled collection calls still runs, and its
-    /// mutations simply stop being retained.
+    /// Every host-made collection comes from here: an unmodelled call's
+    /// neutral answer, but also `subList`, `Lists.newArrayList(..)`, a
+    /// synchronized view, `stringPropertyNames`. The marker carries its own
+    /// number, so a write to one never reaches another.
+    ///
+    /// This used to stop after 256 and hand out the shared kind marker
+    /// (`list`, `map`, `set`) instead. Writes to that marker were kept in one
+    /// shared row, so every collection made past the limit aliased the others,
+    /// and `size()` (that row) disagreed with `get` (the bare marker, read as
+    /// an empty literal): night-config's `AbstractConfig.set` saw a three-part
+    /// path answer `get(2)` with `IndexOutOfBoundsException: Index 2 out of
+    /// bounds for length 2`. A jar's own `new ArrayList()` was never limited,
+    /// and the execution budget bounds how many either kind a run can make.
     fn empty_collection(&mut self, kind: &str) -> Value {
-        if self.next_neutral_collection >= MAX_NEUTRAL_COLLECTIONS {
-            return collection_empty(kind);
-        }
         let class = match kind {
             "map" => "java/util/LinkedHashMap",
             "set" => "java/util/LinkedHashSet",
