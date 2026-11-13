@@ -59,7 +59,9 @@ public final class Probe {
         Files.createDirectory(Path.of("g"));
         Files.move(Path.of("g"), Path.of("h"));
         out.append(is(Path.of("g"))).append(',').append(is(Path.of("h"))).append('|');
-        out.append(kind(Path.of("."))).append(',').append(is(Path.of("")));
+        out.append(kind(Path.of("."))).append(',').append(is(Path.of(""))).append('|');
+        out.append(java.util.stream.Stream.of(a, nested, missing)
+            .filter(Files::isDirectory).toList().size());
         return out.toString();
     }
 

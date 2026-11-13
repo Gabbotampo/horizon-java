@@ -24213,12 +24213,6 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_file_attributes(&r, receiver.as_ref(), &args)
-                    ) {
-                        // `Files.readAttributes`/`isDirectory` (`file_attributes.rs`).
-                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_files_move(&r, &args))
                     {
