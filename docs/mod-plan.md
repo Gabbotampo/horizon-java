@@ -237,7 +237,10 @@ drops", and it travels through the same bake. Without the package the item is na
   `UseEntityCallback`/`EntityInteract#getHand` as `MAIN_HAND`/`OFF_HAND`. `getItemInHand(hand)` is
   the hook's own stack (an empty hand when it carries none) and the other hand is read from the
   host. Before, the bridge named the hand only when exactly one hand held the hook's stack, so two
-  empty hands (the common case) gave a counted unknown hand.
+  empty hands (the common case) gave a counted unknown hand. The firing also names the level, the
+  acting player's (#2784's read; `EntityInteract#getLevel` is `getEntity().level()`, and
+  `handleInteract` finds the target in that level), and `EntityInteract#getTarget()` answers the
+  clicked entity.
 - **A player's level (#2747).** `PlayerRef` names a player's identity, permission and messages, and
   `host.players().acting_player()` names the player a block or entity hook is about, but no read
   gives the level that player stands in. So the `Level` argument of Fabric's `AttackBlockCallback`,

@@ -999,7 +999,11 @@ impl Hooks for HorizonJava {
         let player = host.players().acting_player();
         let held = player
             .and_then(|player| server_facts::held_items(host, player, event.hand, event.stack));
-        let context = entity_interact_context(player.map(|player| player.uuid()), held, event);
+        let level = player
+            .and_then(|player| player.entity().level(&*host))
+            .map(|level| level.dimension_id().to_owned());
+        let context =
+            entity_interact_context(player.map(|player| player.uuid()), level, held, event);
         let fired = self.fire_bridged(
             Some(&mut *host),
             Lifecycle::None,
@@ -1344,10 +1348,13 @@ impl HorizonJava {
 /// The firing context of an `entity_interact`: the acting player, the hook's hand (Fabric's
 /// `UseEntityCallback` `InteractionHand`, NeoForge's `EntityInteract#getHand`: the hand of the
 /// interact packet `ServerGamePacketListenerImpl.handleInteract` is handling, so main then off as the
-/// client tries them), the clicked entity, and what the player holds. `getItemInHand(hand)` is the hook's own `stack` (an
+/// client tries them), the clicked entity, and what the player holds. The level is the player's
+/// (`EntityInteract#getLevel` is `getEntity().level()`, Fabric's `world` is `player.level()`), and
+/// the clicked entity stands in it: `handleInteract` looks the target up in the player's level. `getItemInHand(hand)` is the hook's own `stack` (an
 /// empty hand when it is none), the other hand is read from the host.
 fn entity_interact_context(
     player: Option<u128>,
+    level: Option<String>,
     held: Option<HeldItems>,
     event: &EntityInteractEvent<'_>,
 ) -> EventContext {
@@ -1358,8 +1365,9 @@ fn entity_interact_context(
         entity: Some(FacadeEntity {
             id: event.entity,
             kind: event.kind.to_owned(),
-            level: None,
+            level: level.clone(),
         }),
+        level,
         ..EventContext::default()
     }
 }
@@ -2723,11 +2731,14 @@ mod tests {
                 stack: None,
                 cancelled: false,
             };
-            let context = entity_interact_context(Some(7), None, &event);
+            let level = Some("minecraft:the_nether".to_owned());
+            let context = entity_interact_context(Some(7), level.clone(), None, &event);
             assert_eq!(context.off_hand, off);
             assert_eq!(context.player, Some(7));
+            assert_eq!(context.level, level);
             let entity = context.entity.expect("the clicked entity");
             assert_eq!((entity.id, entity.kind.as_str()), (3, "minecraft:cow"));
+            assert_eq!(entity.level, level);
         }
     }
 
