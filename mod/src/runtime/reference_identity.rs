@@ -314,16 +314,13 @@ impl<H: Host> Runtime<'_, H> {
         // The old answer, kept when the comparison is counted.
         let equal = lhs == rhs;
         // A host handle (`host_ref.rs`): different handles are different
-        // objects and a canonical kind's equal handles one object; equal
-        // handles of a by-value kind are one object only when the same
-        // producer provably flows to both sides. Equal keys never answer
-        // identity.
+        // objects, a canonical kind's equal handles one object, and so is a
+        // handle and its own clone (`HostRef::same_object`); other equal
+        // handles are one object only when the same producer provably flows
+        // to both sides. Equal keys never answer identity.
         if let (Value::Host(left), Value::Host(right)) = (lhs, rhs) {
-            if left != right {
-                return Ok(false);
-            }
-            if left.canonical() {
-                return Ok(true);
+            if let Some(same) = left.same_object(right) {
+                return Ok(same);
             }
             let same = frame
                 .flow

@@ -63,15 +63,72 @@
 //! canonical predicate, and a `Methods` (the kind's module, like
 //! `host_optional.rs`). Nothing else matches on kinds for object methods.
 
-use std::sync::Arc;
+use std::{
+    cmp::Ordering,
+    hash::{Hash, Hasher},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+};
 
 use crate::{NativeError, Value};
 
 /// A host object: its family and the family's identity text.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Equality, hashing and order are the `(kind, key)` pair's: two handles with
+/// equal keys are equal values. `origin` is not part of the value: it names
+/// the construction that made this handle, so a clone (the same Java
+/// reference flowing on through locals, fields, arrays and the host's
+/// collections) shares it, and two constructions never do. Same origin is
+/// therefore the same object; different origins prove nothing (a model may
+/// wrap one Java object twice), see [`HostRef::same_object`].
+#[derive(Clone)]
 pub struct HostRef {
     kind: HostKind,
     key: Arc<str>,
+    origin: u64,
+}
+
+/// The next [`HostRef::origin`]: only ever compared for equality, never shown.
+static NEXT_ORIGIN: AtomicU64 = AtomicU64::new(1);
+
+impl PartialEq for HostRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.key == other.key
+    }
+}
+
+impl Eq for HostRef {}
+
+impl Hash for HostRef {
+    fn hash<S: Hasher>(&self, state: &mut S) {
+        self.kind.hash(state);
+        self.key.hash(state);
+    }
+}
+
+impl PartialOrd for HostRef {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HostRef {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.kind, &self.key).cmp(&(other.kind, &other.key))
+    }
+}
+
+impl std::fmt::Debug for HostRef {
+    /// The value only: an origin differs run to run and would make any text
+    /// that prints a handle unstable.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRef")
+            .field("kind", &self.kind)
+            .field("key", &self.key)
+            .finish()
+    }
 }
 
 /// The families moved onto handles so far; the rest are still `Ref` text
@@ -226,10 +283,11 @@ impl HostKind {
 impl HostRef {
     /// A handle with `key` as it is (a number, a name). A key that holds
     /// values is built with [`Self::of_values`].
-    pub fn new(kind: HostKind, key: impl Into<Arc<str>>) -> Self {
+    pub(crate) fn new(kind: HostKind, key: impl Into<Arc<str>>) -> Self {
         Self {
             kind,
             key: key.into(),
+            origin: NEXT_ORIGIN.fetch_add(1, AtomicOrdering::Relaxed),
         }
     }
 
@@ -276,6 +334,19 @@ impl HostRef {
     /// Whether two handles equal to this one are the same object.
     pub fn canonical(&self) -> bool {
         (self.kind.info().canonical)(&self.key)
+    }
+
+    /// `self == other` as the JVM compares references, where it is known:
+    /// different values are different objects; equal values of a canonical
+    /// kind, or a handle and its own clone (one construction flowing to both
+    /// sides), are one object. `None` for two equal handles of a kind that
+    /// is not canonical from different constructions: maybe two objects,
+    /// maybe one Java object a model wrapped twice. The caller counts it.
+    pub(crate) fn same_object(&self, other: &HostRef) -> Option<bool> {
+        if self != other {
+            return Some(false);
+        }
+        (self.canonical() || self.origin == other.origin).then_some(true)
     }
 
     fn methods(&self) -> &'static Methods {

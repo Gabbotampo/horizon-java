@@ -2254,6 +2254,14 @@ pub trait Host {
         None
     }
 
+    /// The values a mutable collection marker holds as the host keeps them
+    /// (`Value`s, not their markers), so a host handle keeps its
+    /// construction (`HostRef::same_object`). `None` when the host keeps no
+    /// such table for `value`.
+    fn mutable_collection_entries(&self, _value: &Value) -> Option<Vec<Value>> {
+        None
+    }
+
     /// Replace the elements of a mutable collection marker. The host's table
     /// is the only place a collection the interpreter mutated lasts, so a host
     /// that keeps no collection state has nothing to replace.
@@ -4306,6 +4314,11 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<String>> {
         self.mutable_values(value)
+    }
+
+    fn mutable_collection_entries(&self, value: &Value) -> Option<Vec<Value>> {
+        let marker = self.synchronized_target(expect_ref(value)?);
+        self.mutable_collections.get(marker).cloned()
     }
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
@@ -7215,24 +7228,6 @@ impl Host for StdHost {
                 ) if is_map_owner(owner) => {
                     let key = Self::argument(r, args, 0)?.clone();
                     let value = Self::argument(r, args, 1)?.clone();
-                    // An `IdentityHashMap` keys by identity. A handle equal to
-                    // a key already there, of a kind whose equal handles may be
-                    // two objects (`host_ref.rs`), is one key or two: counted,
-                    // and kept as its own key (two separately made handles
-                    // are two objects far more often than one).
-                    if marker.starts_with("java/util/IdentityHashMap#")
-                        && matches!(&key, Value::Host(handle) if !handle.canonical())
-                        && self.mutable_collections.get(marker).is_some_and(|values| {
-                            values.as_chunks::<2>().0.iter().any(|pair| pair[0] == key)
-                        })
-                    {
-                        self.unknown_host_call(r)?;
-                        self.mutable_collections
-                            .entry(marker.to_owned())
-                            .or_default()
-                            .extend([key, value]);
-                        return Ok(Value::Ref(None));
-                    }
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
