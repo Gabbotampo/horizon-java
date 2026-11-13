@@ -232,10 +232,17 @@ drops", and it travels through the same bake. Without the package the item is na
   package may declare an owned namespace that differs from its id, or the join matches
   `namespaces` rather than `id`.
 
-- **`block_break_after`.** The runtime records Fabric `PlayerBlockBreakEvents.AFTER`; NeoForge has
-  no counterpart (`BreakBlockEvent` is before the block goes). `break_block` fires before the block
-  is destroyed, so there is no moment to fire the Fabric listener from. Add a listen-only hook
-  after the block and its drops are gone.
+- **`block_break_after`** (#2806). Answered since the `1cc882b8e0` pin by the fork's own
+  `player_destroyed_block` hook, which fires at the `Block.destroy` call in
+  `ServerPlayerGameMode.destroyBlock`, once `Level.removeBlock` succeeded: the call Fabric API's
+  `ServerPlayerGameModeMixin.onBlockBroken` injects at to fire `PlayerBlockBreakEvents.AFTER`
+  (creative breaks included, never a canceled or level-side break). The bridge fires `AFTER` there
+  with the acting player's level (`destroyBlock`'s `this.level`), the position, the block, and the
+  `BlockEntity` as `null` when none stood there. When one did, the hook gives its saved data, not
+  a live object, so that argument is a marker whose reads are counted. The hook's `state` is what
+  the removal took out; it differs from Fabric's `adjustedState` only for a tripwire cut with
+  shears (`DISARMED` set in the level, the armed state returned), and the runtime's block state
+  names only the block, so no listener sees the difference. NeoForge has no event here.
 - **The hand on `entity_interact` (#2797).** The hook's contract says `self.hand` and it fires once
   per hand, but the game's `native_entity_interact(entity, kind, stack, claimed)` in
   `crates/horizon-client/src/game/native_hooks/base.rs` never takes a hand, so the event cannot
