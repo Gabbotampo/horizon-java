@@ -1062,6 +1062,12 @@ pub struct EventContext {
     /// What `player` holds and their game mode, read by the hook for this
     /// firing (`facade_world.rs`). `None` makes those reads refuse.
     pub held: Option<HeldItems>,
+    /// Whether a block entity stood at `pos`, for Fabric `PlayerBlockBreakEvents.AFTER`'s
+    /// `BlockEntity` (the `level.getBlockEntity(pos)` `destroyBlock` read before the removal).
+    /// `Some(false)` passes `null`, as vanilla does for a block without one; `Some(true)` passes
+    /// a marker whose reads are counted, because the host hands over the entity's saved data, not
+    /// a live object. `None` (a hook that does not say) passes `null`, as before.
+    pub block_entity: Option<bool>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -2216,7 +2222,13 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             vec![subject(), damage(), Value::Float(f64::from(context.amount))]
         }
         Shape::EntityDamage => vec![subject(), damage()],
-        Shape::BlockBreak => vec![level(), player(), pos(), block_state(), Value::Ref(None)],
+        Shape::BlockBreak => {
+            let block_entity = match context.block_entity {
+                Some(true) => missing("block-entity"),
+                Some(false) | None => Value::Ref(None),
+            };
+            vec![level(), player(), pos(), block_state(), block_entity]
+        }
         Shape::UseBlock => {
             // The hit result names its block and face: `game/block-hit/x,y,z/UP`.
             let hit = context.pos.map_or_else(
@@ -2758,6 +2770,52 @@ mod tests {
             &[],
         );
         assert!(matches!(name, Some(Err(NativeError::UnknownHostCall(_)))));
+    }
+
+    /// Fabric `PlayerBlockBreakEvents.AFTER` gets `destroyBlock`'s `this.level`, the player, the
+    /// position, the state and the `BlockEntity` it read before the removal: `null` when no block
+    /// entity stood there, otherwise an object this host cannot rebuild from saved data, so a
+    /// counted marker rather than a `null` that would say "none".
+    #[test]
+    fn an_after_break_passes_the_level_and_a_null_or_counted_block_entity() {
+        let firing = |block_entity| {
+            EventFiring::new(
+                GameEvent::BlockBreakAfter,
+                Arc::new(EventFacade::default()),
+                EventContext {
+                    level: Some("minecraft:the_nether".into()),
+                    player: Some(7),
+                    pos: Some([1, 2, 3]),
+                    block: Some("minecraft:chest".into()),
+                    block_entity,
+                    ..EventContext::default()
+                },
+            )
+        };
+        let without = fabric_arguments(Shape::BlockBreak, &firing(Some(false))).unwrap();
+        assert_eq!(without[0], level_marker("minecraft:the_nether"));
+        assert_eq!(without[1], player_marker(7));
+        assert_eq!(without[3], block_state_marker("minecraft:chest"));
+        assert_eq!(without[4], Value::Ref(None));
+
+        let with = fabric_arguments(Shape::BlockBreak, &firing(Some(true))).unwrap();
+        assert_eq!(with[4], marker("game/unknown/block-entity".into()));
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(firing(Some(true))));
+        let before = host.unknown_host_call_count();
+        let read = host
+            .game_event_call(
+                &MethodRef {
+                    owner: "net/minecraft/world/level/block/entity/BlockEntity".into(),
+                    name: "getBlockPos".into(),
+                    descriptor: "()Lnet/minecraft/core/BlockPos;".into(),
+                },
+                &with[4],
+                &[],
+            )
+            .unwrap();
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(host.unknown_host_call_count(), before + 1);
     }
 
     /// A firing that names the block and the position lets a block-break
