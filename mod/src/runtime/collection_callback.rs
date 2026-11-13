@@ -161,6 +161,11 @@ impl<H: Host> Runtime<'_, H> {
                 frame: None,
             });
         }
+        // A fail-fast iterator checks `modCount` as its JDK class does
+        // (`iteration_guard.rs`).
+        if let Some(answer) = self.guarded_for_each_remaining(r, it, &action)? {
+            return Ok(Some(answer));
+        }
         let mut at = start;
         while at < len {
             let element = self.host.host_iterator_next(&marker)?;
