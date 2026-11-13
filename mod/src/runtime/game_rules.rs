@@ -171,9 +171,10 @@ fn argument(default: GameRuleValue, value: &Value) -> Option<GameRuleValue> {
     match default {
         GameRuleValue::Bool(_) => boxed_boolean(value).map(GameRuleValue::Bool),
         GameRuleValue::Int(_) => match value {
-            // Only a box: an `int` on the stack is not a `GameRule<Integer>`
-            // argument, `serialize` takes an `Object`.
-            Value::Boxed(_) => boxed_integer(value).map(GameRuleValue::Int),
+            // `serialize` takes an `Object`, so this is a box: an `Integer`
+            // from `valueOf`, or one the runtime holds as its value (read
+            // back from a collection).
+            Value::Boxed(_) | Value::Int(_) => boxed_integer(value).map(GameRuleValue::Int),
             _ => None,
         },
     }

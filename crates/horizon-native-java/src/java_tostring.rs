@@ -33,6 +33,7 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("duration/", "java/time/Duration"),
         ("tag-key/", "net/minecraft/tags/TagKey"),
         ("optional/", "java/util/Optional"),
+        ("optional-value/", "java/util/Optional"),
         ("optional-int/", "java/util/OptionalInt"),
         ("optional-long/", "java/util/OptionalLong"),
         ("optional-double/", "java/util/OptionalDouble"),
@@ -41,6 +42,8 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
         ("locale/", "java/util/Locale"),
         ("mod-origin/", "net/fabricmc/loader/api/metadata/ModOrigin"),
         ("unicode-block/", "java/lang/Character$UnicodeBlock"),
+        // `key + "=" + value` (`Map.entry`, an entry from `entrySet()`).
+        ("map-entry/", "java/util/Map$Entry"),
     ];
     for (prefix, owner) in prefix {
         if marker.starts_with(prefix) {

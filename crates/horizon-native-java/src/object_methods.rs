@@ -56,12 +56,29 @@ pub(crate) enum Equality {
 }
 
 /// `hashCode()` of a box: `Boolean`'s 1231/1237, the value of an
-/// `Integer`/`Short`/`Byte`, the code unit of a `Character`.
+/// `Integer`/`Short`/`Byte`, the code unit of a `Character`, a `Float`'s
+/// `floatToIntBits`.
 fn boxed_hash(boxed: Boxed) -> i32 {
     match boxed {
         Boxed::Boolean(true) => 1231,
         Boxed::Boolean(false) => 1237,
+        Boxed::Float(bits) => java_float_bits(f64::from(f32::from_bits(bits))) as i32,
         other => other.int(),
+    }
+}
+
+/// `hashCode()` of a value the runtime holds as itself (a box): `None` for
+/// a reference, whose hash its own class decides.
+pub(crate) fn platform_hash(value: &Value) -> Option<i32> {
+    match value {
+        // An `Integer` (a `Boolean` stored as an int hashes 1231/1237 on a
+        // JVM: the runtime cannot tell the two apart).
+        Value::Int(value) => Some(*value),
+        Value::Long(value) => Some(long_hash(*value)),
+        // A bare floating-point value is a `Double` (a `Float` is boxed).
+        Value::Float(value) => Some(double_hash(*value)),
+        Value::Boxed(boxed) => Some(boxed_hash(*boxed)),
+        _ => None,
     }
 }
 
@@ -199,14 +216,8 @@ impl<H: Host> Runtime<'_, H> {
                 hash_code: None, ..
             } => Ok(None),
             Equality::Platform => Ok(match value {
-                // An `Integer` (a `Boolean` stored as an int hashes 1231/1237
-                // on a JVM: the runtime cannot tell the two apart).
-                Value::Int(value) => Some(*value),
-                Value::Long(value) => Some(long_hash(*value)),
-                Value::Float(_) => None,
-                Value::Boxed(boxed) => Some(boxed_hash(*boxed)),
                 Value::Ref(Some(marker)) => Some(hash_map_order::java_string_hash(marker)),
-                _ => None,
+                other => platform_hash(other),
             }),
             Equality::Jar {
                 hash_code: Some(owner),
@@ -580,9 +591,14 @@ impl<H: Host> Runtime<'_, H> {
 /// `Double`/`Float` compares canonical bits (`NaN` equals `NaN`, `0.0` is not
 /// `-0.0`).
 fn platform_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
+    match (&*boxed::canonical(a), &*boxed::canonical(b)) {
         (Value::Float(a), Value::Float(b)) => java_double_bits(*a) == java_double_bits(*b),
-        _ => a == b,
+        // `Float.equals` compares `floatToIntBits` (one NaN, two zeros).
+        (Value::Boxed(Boxed::Float(a)), Value::Boxed(Boxed::Float(b))) => {
+            java_float_bits(f64::from(f32::from_bits(*a)))
+                == java_float_bits(f64::from(f32::from_bits(*b)))
+        }
+        (a, b) => a == b,
     }
 }
 
