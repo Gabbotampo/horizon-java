@@ -12,6 +12,9 @@
 //! `Ldemo/Probe;mark(Ljava/lang/String;)V` must run twice, in call order, and
 //! leave `other` alone.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{MethodRef, NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
@@ -36,15 +39,8 @@ fn files_under(root: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-fn build_jar(
-    name: &str,
-    sources: BTreeMap<&str, &str>,
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-mixin-invoke-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_jar(name: &str, sources: BTreeMap<&str, &str>) -> (scratch::Scratch, std::path::PathBuf) {
+    let root = scratch::Scratch::new(&format!("mixin-invoke-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();

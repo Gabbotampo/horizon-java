@@ -1,5 +1,8 @@
 //! Source-built coverage for the long overloads of the bounded `Math` host.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -24,12 +27,8 @@ public final class MathLongEntrypoint {
 }
 "#;
 
-fn build_fixture() -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-math-long-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_fixture() -> scratch::Scratch {
+    let root = scratch::Scratch::new("math-long");
     let source_path = root.join("src/demo/MathLongEntrypoint.java");
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();
@@ -59,7 +58,7 @@ fn build_fixture() -> PathBuf {
     jar.write_all(&fs::read(root.join("classes/demo/MathLongEntrypoint.class")).unwrap())
         .unwrap();
     jar.finish().unwrap();
-    jar_path
+    root.into_path(jar_path)
 }
 
 fn call(

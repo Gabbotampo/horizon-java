@@ -17,14 +17,11 @@
 //! Hard-coding an ordinal would bind the test to this fixture's allocation order
 //! and break the moment it allocates one more object.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
-use std::{
-    fs,
-    io::Write,
-    path::PathBuf,
-    process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
 
 const MOD_CLASS: &str = "demo.CapabilityMod";
@@ -41,15 +38,8 @@ fn javac() -> PathBuf {
         .unwrap_or_else(|| "javac".into())
 }
 
-fn scratch_root(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-neoforge-capability-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&root);
-    root
+fn scratch_root(name: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("neoforge-capability-{name}"))
 }
 
 /// The host surface the mod compiles against: NeoForge capability classes plus
@@ -161,7 +151,7 @@ import net.neoforged.neoforge.items.IItemHandler;
 }
 "#;
 
-fn build_jar(name: &str) -> (PathBuf, NativeJar) {
+fn build_jar(name: &str) -> (scratch::Scratch, NativeJar) {
     let root = scratch_root(name);
     let (src, classes) = (root.join("src"), root.join("classes"));
     let mut sources = stubs()

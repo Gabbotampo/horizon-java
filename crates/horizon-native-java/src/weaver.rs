@@ -2713,7 +2713,7 @@ impl SwitchKind {
 
 /// The alignment padding a switch at `at` needs so its first operand starts on
 /// a 4-byte boundary counted from the start of the `code` array.
-fn switch_padding(at: usize) -> usize {
+pub(crate) fn switch_padding(at: usize) -> usize {
     (4 - (at + 1) % 4) % 4
 }
 
@@ -2746,7 +2746,7 @@ impl CodeScan {
 
 /// The byte size of one fixed-length instruction, or `None` for an opcode whose
 /// size the caller has to work out (`tableswitch`, `lookupswitch`, `wide`).
-fn instruction_size(opcode: u8) -> Option<usize> {
+pub(crate) fn instruction_size(opcode: u8) -> Option<usize> {
     Some(match opcode {
         0x00..=0x0f => 1,
         0x10 => 2,
@@ -2779,7 +2779,7 @@ fn instruction_size(opcode: u8) -> Option<usize> {
 
 /// The length of a `wide`-prefixed instruction at `at`: `wide` plus a two-byte
 /// local index plus, for `iinc`, its two-byte constant.
-fn wide_instruction_size(label: &str, code: &[u8], at: usize) -> Result<usize, String> {
+pub(crate) fn wide_instruction_size(label: &str, code: &[u8], at: usize) -> Result<usize, String> {
     let sub = code
         .get(at + 1)
         .copied()
@@ -2961,7 +2961,11 @@ fn scan_code(label: &str, code: &[u8]) -> Result<CodeScan, String> {
 
 /// The signed relative offset of one branch instruction, or `None` when the
 /// opcode has no bytecode offset operand.
-fn branch_target(opcode: u8, code: &[u8], at: usize) -> Result<Option<(bool, usize)>, String> {
+pub(crate) fn branch_target(
+    opcode: u8,
+    code: &[u8],
+    at: usize,
+) -> Result<Option<(bool, usize)>, String> {
     let wide = match opcode {
         0x99..=0xa8 | 0xc6 | 0xc7 => false,
         0xc8 | 0xc9 => true,

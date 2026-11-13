@@ -40,8 +40,7 @@ const SEPARATOR_FREE_MARKERS: &[&str] = &[
     "guava-cache-builder",
     "mixin-environment",
     "stack-walker",
-    // The empty optionals (`EMPTY_OPTIONAL*` in lib.rs).
-    "optional",
+    // The empty primitive optionals (`EMPTY_OPTIONAL_*` in lib.rs).
     "optional-int",
     "optional-long",
     "optional-double",
@@ -200,6 +199,9 @@ mod tests {
             "#ff0000",
             "minecraft:block/stone",
             "config.json",
+            // Spelled like the boxes once were; boxes are no longer text.
+            "integer:5",
+            "true",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
@@ -207,8 +209,6 @@ mod tests {
             "demo/Main#3",
             "list/4",
             "registry/minecraft:item",
-            "integer:5",
-            "true",
             "path:/horizon/game",
             "string-builder/2",
             "@indy:demo/Main:0:demo/Main#lambda$0()V:",

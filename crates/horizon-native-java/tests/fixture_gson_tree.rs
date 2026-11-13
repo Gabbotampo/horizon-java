@@ -698,26 +698,23 @@ fn gson_reads_text_into_tree_classes() {
 }
 
 /// What the model does not answer is counted, never approximated. On the
-/// real jar the probe prints `0.1|true|{"a":1}`: a boxed `0.1f` is a `Float`
-/// whose text differs from the `Double` the untyped runtime cannot rule out,
-/// `JsonNull.hashCode()` is an identity hash, and `{a:1}` uses the lenient unquoted name the parser does not reproduce.
+/// real jar the probe prints `0.1|true|{"a":1}`: `JsonNull.hashCode()` is an
+/// identity hash, and `{a:1}` uses the lenient unquoted name the parser does
+/// not reproduce. A boxed `0.1f` is a `Float` the runtime keeps apart from a
+/// `Double` (`Boxed::Float`), so its text `0.1` is answered.
 #[test]
 fn what_the_model_cannot_answer_is_counted() {
     let fixture = Fixture::build("counted");
     let mut host = StdHost::new();
-    fixture.call("counted", &mut host).unwrap();
+    let answer = fixture.call("counted", &mut host).unwrap();
     let counted = host
         .unknown_host_calls()
         .iter()
         .map(|(call, _)| call.clone())
         .collect::<Vec<_>>();
-    // The host records the unanswered `toString` under the owner it
-    // stringifies through; any owner's `toString` counts.
     assert!(
-        counted
-            .iter()
-            .any(|call| call.ends_with("#toString()Ljava/lang/String;")),
-        "the ambiguous number's text was not counted: {counted:?}"
+        matches!(&answer, Value::Ref(Some(text)) if text.starts_with("0.1|")),
+        "a Float's JSON text is its own: {answer:?}"
     );
     for call in [
         "com/google/gson/JsonNull#hashCode()I",
