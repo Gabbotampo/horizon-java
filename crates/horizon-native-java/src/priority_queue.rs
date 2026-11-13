@@ -234,6 +234,32 @@ impl<H: Host> Runtime<'_, H> {
             ("contains", "(Ljava/lang/Object;)Z", [element]) => {
                 Ok(boolean(self.heap_index_of(heap, element)?.is_some()))
             }
+            ("containsAll", "(Ljava/util/Collection;)Z", [source]) => {
+                // `AbstractCollection.containsAll`: `contains(e)` for each of
+                // `c`'s elements, in `c`'s order.
+                if *source == Value::Ref(None) {
+                    return Err(thrown("java/lang/NullPointerException"));
+                }
+                if self.host_collection_kind(source) != Some(object_methods::CollectionKind::List) {
+                    let others = self.collection_elements(source).unwrap_or_default();
+                    let pure = heap
+                        .es
+                        .iter()
+                        .chain(&others)
+                        .all(|value| self.pure_equality(value));
+                    if !pure && self.host_collection_kind(source).is_some() {
+                        // `c`'s order decides which `equals` run: counted.
+                        return self.host.unknown_operand_call(r).map(|_| None);
+                    }
+                    return Ok(None);
+                }
+                for element in self.collection_elements(source)? {
+                    if self.heap_index_of(heap, &element)?.is_none() {
+                        return Ok(boolean(false));
+                    }
+                }
+                Ok(boolean(true))
+            }
             ("clear", "()V", []) => {
                 heap.es.clear();
                 Ok(Some(Value::Void))
