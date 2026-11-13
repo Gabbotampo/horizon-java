@@ -1283,10 +1283,15 @@ impl StdHost {
         {
             return Some(marker(format!("enum/{}/{}", r.owner, r.name)));
         }
+        // Forge EventBus 7's per-event bus, typed exactly (a `BusGroup` is no
+        // `EventBus`).
         if r.name == "BUS"
             && r.owner.starts_with(FORGE_EVENT_ROOT)
-            && r.descriptor
-                .starts_with("Lnet/minecraftforge/eventbus/api/bus/")
+            && matches!(
+                r.descriptor.as_str(),
+                "Lnet/minecraftforge/eventbus/api/bus/EventBus;"
+                    | "Lnet/minecraftforge/eventbus/api/bus/CancellableEventBus;"
+            )
         {
             return Some(crate::runtime::host_events::forge_bus(&r.owner));
         }

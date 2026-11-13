@@ -132,6 +132,17 @@ public final class HostEvents {
     return "" + (a == b) + a.equals(b) + identities(a, b);
   }
 
+  /** A class no Mixin can make a Fabric event's superclass; an interface only a Mixin could add. */
+  public static String fabricNotAClass() {
+    Object e = ServerLifecycleEvents.SERVER_STARTING;
+    return "" + (e instanceof FinalList) + (e instanceof Integer);
+  }
+
+  public static String fabricOtherInterface() {
+    Object e = ServerLifecycleEvents.SERVER_STARTING;
+    return "" + (e instanceof rvx.MissingIface);
+  }
+
   /** IMC messages: one record read twice, another, and a supplier. */
   public static String imc(Object message, Object same, Object other, Object supplier) {
     return "" + (message instanceof IMCMessage) + (message instanceof Record) + (message instanceof Supplier)

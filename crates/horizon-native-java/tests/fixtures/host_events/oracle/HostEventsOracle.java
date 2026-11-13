@@ -39,6 +39,8 @@ public final class HostEventsOracle {
     print("bus", HostEvents.bus(game, game, mod));
     print("busForge", HostEvents.busForge(game));
     print("fabric", HostEvents.fabric());
+    print("fabricNotAClass", HostEvents.fabricNotAClass());
+    print("fabricOtherInterface", HostEvents.fabricOtherInterface());
     print("fabricInvoker", HostEvents.fabricInvoker());
     print("fabricInvokerSame", HostEvents.fabricInvokerSame());
     print("imc", HostEvents.imc(message, message, other, supplier));

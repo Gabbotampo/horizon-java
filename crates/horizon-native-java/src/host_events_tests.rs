@@ -105,16 +105,13 @@ fn run(method: &str, args: &[Value]) -> (Result<Value, String>, Vec<(String, usi
         "({})Ljava/lang/String;",
         "Ljava/lang/Object;".repeat(args.len())
     );
+    // `Class.method` runs another probe class than `demo/HostEvents`.
+    let (class, method) = method
+        .split_once('.')
+        .unwrap_or(("demo/HostEvents", method));
     let mut host = StdHost::new();
     let answer = jar()
-        .invoke_method_with_args(
-            "demo/HostEvents",
-            method,
-            &descriptor,
-            None,
-            args,
-            &mut host,
-        )
+        .invoke_method_with_args(class, method, &descriptor, None, args, &mut host)
         .map_err(|error| error.to_string());
     (answer, host.unknown_host_calls())
 }
@@ -176,6 +173,17 @@ fn p8_host_objects_answer_as_java_25_or_count() {
                 "truenet.fabricmc.fabric.impl.base.event.ArrayBackedEventtrue|falsefalsetruefalse|falsefalse|true|2",
             ),
         ),
+        // A Fabric event is no jar class (a Mixin cannot add a superclass) nor an `Integer`
+        // (final JDK): exact. An interface no loaded Mixin adds may still come from another jar's
+        // Mixin: counted (Java, no Mixin applied: `false`).
+        ("fabricNotAClass", vec![], Exact("falsefalse")),
+        ("fabricOtherInterface", vec![], Counted),
+        // A Mixin accessor on `ArrayBackedEvent` (c2me's `IArrayBackedEvent`) is part of every
+        // Fabric event: `instanceof` and the cast hold. Expected from Mixin's contract (the
+        // interface joins the target's), not a JVM run: no Mixin applies on a plain JVM. One named
+        // by text only, which the runtime's Mixin scan does not read, is counted.
+        ("demo/HostEventsMixin.accessor", vec![], Exact("truetrue")),
+        ("demo/HostEventsMixin.namedAccessor", vec![], Counted),
         // `register` builds a new invoker (`ArrayBackedEvent.update`): two reads may be two
         // objects (Java: `true|falsefalse`), so `==` and `equals` on them are counted ...
         ("fabricInvoker", vec![], Counted),

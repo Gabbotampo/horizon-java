@@ -209,181 +209,28 @@ pub(crate) enum ClassRule {
     },
 }
 
-/// JDK classes whose whole supertype closure (every superclass and every
-/// interface, transitively, the class itself included) is known: Java 25's,
-/// read by reflection. A class here is `final` when the flag says so.
-const JDK_CLOSED: &[(&str, bool, &[&str])] = &[
-    ("java/lang/Object", false, &["java/lang/Object"]),
-    (
-        "java/lang/String",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/CharSequence",
-            "java/lang/Comparable",
-            "java/lang/Object",
-            "java/lang/String",
-            "java/lang/constant/Constable",
-            "java/lang/constant/ConstantDesc",
-        ],
-    ),
-    (
-        "java/lang/Class",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Class",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-            "java/lang/invoke/TypeDescriptor",
-            "java/lang/invoke/TypeDescriptor$OfField",
-            "java/lang/reflect/AnnotatedElement",
-            "java/lang/reflect/GenericDeclaration",
-            "java/lang/reflect/Type",
-        ],
-    ),
-    (
-        "java/lang/Boolean",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Boolean",
-            "java/lang/Comparable",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-        ],
-    ),
-    (
-        "java/lang/Character",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Character",
-            "java/lang/Comparable",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-        ],
-    ),
-    (
-        "java/lang/Byte",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Byte",
-            "java/lang/Comparable",
-            "java/lang/Number",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-        ],
-    ),
-    (
-        "java/lang/Short",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Comparable",
-            "java/lang/Number",
-            "java/lang/Object",
-            "java/lang/Short",
-            "java/lang/constant/Constable",
-        ],
-    ),
-    (
-        "java/lang/Integer",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Comparable",
-            "java/lang/Integer",
-            "java/lang/Number",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-            "java/lang/constant/ConstantDesc",
-        ],
-    ),
-    (
-        "java/lang/Long",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Comparable",
-            "java/lang/Long",
-            "java/lang/Number",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-            "java/lang/constant/ConstantDesc",
-        ],
-    ),
-    (
-        "java/lang/Float",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Comparable",
-            "java/lang/Float",
-            "java/lang/Number",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-            "java/lang/constant/ConstantDesc",
-        ],
-    ),
-    (
-        "java/lang/Double",
-        true,
-        &[
-            "java/io/Serializable",
-            "java/lang/Comparable",
-            "java/lang/Double",
-            "java/lang/Number",
-            "java/lang/Object",
-            "java/lang/constant/Constable",
-            "java/lang/constant/ConstantDesc",
-        ],
-    ),
-    (
-        "java/util/Optional",
-        true,
-        &["java/lang/Object", "java/util/Optional"],
-    ),
-    (
-        "java/util/OptionalInt",
-        true,
-        &["java/lang/Object", "java/util/OptionalInt"],
-    ),
-    (
-        "java/util/OptionalLong",
-        true,
-        &["java/lang/Object", "java/util/OptionalLong"],
-    ),
-    (
-        "java/util/OptionalDouble",
-        true,
-        &["java/lang/Object", "java/util/OptionalDouble"],
-    ),
-];
-
-/// `class`'s row in [`JDK_CLOSED`]: whether it is final, and its closure.
+/// `class`'s generated Java 25 row (`jdk_closure.rs`): whether it is final, and every supertype
+/// (the class itself left out).
 fn jdk_closed(class: &str) -> Option<(bool, &'static [&'static str])> {
-    JDK_CLOSED
-        .iter()
-        .find(|(name, _, _)| *name == class)
-        .map(|(_, is_final, closure)| (*is_final, *closure))
+    crate::runtime::jdk_closure::class(class).map(|row| (row.is_final, row.supertypes.as_slice()))
 }
 
 /// Whether an object whose exact class is `class` is provably not a
-/// `wanted`: `wanted` is a `final` [`JDK_CLOSED`] class other than `class`,
+/// `wanted`: `wanted` is a `final` JDK class (Java 25's table) other than `class`,
 /// whose only instances are of that very class.
 pub(crate) fn exact_class_rules_out(class: &str, wanted: &str) -> bool {
     class != wanted && jdk_closed(wanted).is_some_and(|(is_final, _)| is_final)
 }
 
 /// Whether no object can be both a `class` and a `declared`, proved: `class`
-/// is `final` and its whole supertype closure is known without `declared`.
-/// Only the JDK classes of [`JDK_CLOSED`] qualify. A jar class never does:
+/// is `final` and its whole supertype set is known without `declared`.
+/// Only the JDK classes of Java 25's table (`jdk_closure.rs`) qualify. A jar class never does:
 /// another jar's Mixin (or a class this runtime does not hold) can add an
 /// interface to it, which no single jar's runtime sees.
 pub(crate) fn proves_not_instance(class: &str, declared: &str) -> bool {
-    jdk_closed(class).is_some_and(|(is_final, closure)| is_final && !closure.contains(&declared))
+    class != declared
+        && jdk_closed(class)
+            .is_some_and(|(is_final, supertypes)| is_final && !supertypes.contains(&declared))
 }
 
 /// Answers for the values a handle holds, for a kind's [`Methods`]. `None`
@@ -424,6 +271,11 @@ pub(crate) trait ClassHierarchy {
     /// `Some(false)` only when proved; `None` when unknown (a class whose
     /// chain leaves what is known).
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool>;
+
+    /// Whether `class` is an interface; `None` when unknown.
+    fn is_interface(&self, class: &str) -> Option<bool> {
+        crate::runtime::jdk_closure::class(class).map(|row| row.is_interface)
+    }
 }
 
 /// The JDK's own hierarchy, for a caller with no runtime: a JDK class never
@@ -431,9 +283,11 @@ pub(crate) trait ClassHierarchy {
 pub(crate) struct JdkHierarchy;
 
 impl ClassHierarchy for JdkHierarchy {
-    /// `true` from the JDK model's supertypes; `false` only when proved: a
-    /// [`JDK_CLOSED`] class's closure lacks `wanted`, or a JDK class against
-    /// a type outside the JDK (which no JDK class extends or implements).
+    /// `true` from the JDK models' supertypes; `false` only when proved: a
+    /// class of Java 25's table lacks `wanted`, `wanted` is a final JDK class
+    /// other than `class`, or a JDK class against a type outside every system
+    /// module's packages (the loaders that define JDK classes cannot see a
+    /// jar's or a game's). Unknown otherwise.
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
         if wanted == "java/lang/Object"
             || class == wanted
@@ -441,17 +295,13 @@ impl ClassHierarchy for JdkHierarchy {
         {
             return Some(true);
         }
-        if let Some((_, closure)) = jdk_closed(class) {
-            return Some(closure.contains(&wanted));
+        if let Some((_, supertypes)) = jdk_closed(class) {
+            return Some(supertypes.contains(&wanted));
         }
         if exact_class_rules_out(class, wanted) {
             return Some(false);
         }
-        let jdk = |name: &str| {
-            ["java/", "javax/", "jdk/"]
-                .iter()
-                .any(|p| name.starts_with(p))
-        };
+        let jdk = crate::runtime::jdk_closure::in_jdk_package;
         (jdk(class) && !jdk(wanted)).then_some(false)
     }
 }

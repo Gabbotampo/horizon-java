@@ -701,146 +701,47 @@ impl crate::StdHost {
 /// value type: java/lang/Integer") refused values the JVM accepts. Only the
 /// public types a library tests for are listed.
 fn platform_supertypes(class: &str) -> &'static [&'static str] {
-    const NUMBER: &[&str] = &[
-        "java/lang/Number",
-        "java/lang/Comparable",
-        "java/io/Serializable",
-        "java/lang/constant/Constable",
-    ];
-    const COMPARABLE_VALUE: &[&str] = &[
-        "java/lang/Comparable",
-        "java/io/Serializable",
-        "java/lang/constant/Constable",
-    ];
-    const LIST: &[&str] = &[
-        "java/util/List",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractList",
-        "java/util/AbstractCollection",
-        "java/util/RandomAccess",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const LINKED_LIST: &[&str] = &[
-        "java/util/List",
-        "java/util/Deque",
-        "java/util/Queue",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSequentialList",
-        "java/util/AbstractList",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SEQUENCED_SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/SequencedSet",
-        "java/util/SequencedCollection",
+    // The classes the platform models answer for. Their supertypes are Java 25's, generated
+    // (`jdk_closure.rs`), not written by hand: the hand rows made `WeakHashMap` a `Cloneable`,
+    // `Hashtable` an `AbstractMap` and `CopyOnWriteArrayList` an `AbstractList` (#163).
+    const CLASSES: &[&str] = &[
+        "java/lang/Integer",
+        "java/lang/Long",
+        "java/lang/Short",
+        "java/lang/Byte",
+        "java/lang/Float",
+        "java/lang/Double",
+        "java/lang/Boolean",
+        "java/lang/Character",
+        "java/util/ArrayList",
+        "java/util/Vector",
+        "java/util/Stack",
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "java/util/LinkedList",
         "java/util/HashSet",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SORTED_SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/SortedSet",
-        "java/util/NavigableSet",
-        "java/util/SequencedSet",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SEQUENCED_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/SequencedMap",
+        "java/util/concurrent/CopyOnWriteArraySet",
+        "java/util/LinkedHashSet",
+        "java/util/TreeSet",
+        "java/util/concurrent/ConcurrentSkipListSet",
         "java/util/HashMap",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
+        "java/util/IdentityHashMap",
+        "java/util/WeakHashMap",
+        "java/util/EnumMap",
+        "java/util/Hashtable",
+        "java/util/LinkedHashMap",
+        "java/util/TreeMap",
+        "java/util/concurrent/ConcurrentSkipListMap",
+        "java/util/concurrent/ConcurrentHashMap",
+        "java/util/ArrayDeque",
+        "java/util/concurrent/ConcurrentLinkedDeque",
+        "java/util/PriorityQueue",
+        "java/util/concurrent/ConcurrentLinkedQueue",
+        "java/io/File",
     ];
-    const SORTED_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/SortedMap",
-        "java/util/NavigableMap",
-        "java/util/SequencedMap",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const CONCURRENT_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/concurrent/ConcurrentMap",
-        "java/util/AbstractMap",
-        "java/io/Serializable",
-    ];
-    const DEQUE: &[&str] = &[
-        "java/util/Deque",
-        "java/util/Queue",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const QUEUE: &[&str] = &[
-        "java/util/Queue",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractQueue",
-        "java/util/AbstractCollection",
-        "java/io/Serializable",
-    ];
-    match class {
-        "java/lang/Integer" | "java/lang/Long" | "java/lang/Short" | "java/lang/Byte"
-        | "java/lang/Float" | "java/lang/Double" => NUMBER,
-        "java/lang/Boolean" | "java/lang/Character" => COMPARABLE_VALUE,
-        "java/util/ArrayList"
-        | "java/util/Vector"
-        | "java/util/Stack"
-        | "java/util/concurrent/CopyOnWriteArrayList" => LIST,
-        "java/util/LinkedList" => LINKED_LIST,
-        "java/util/HashSet" | "java/util/concurrent/CopyOnWriteArraySet" => SET,
-        "java/util/LinkedHashSet" => SEQUENCED_SET,
-        "java/util/TreeSet" | "java/util/concurrent/ConcurrentSkipListSet" => SORTED_SET,
-        "java/util/HashMap"
-        | "java/util/IdentityHashMap"
-        | "java/util/WeakHashMap"
-        | "java/util/EnumMap"
-        | "java/util/Hashtable" => MAP,
-        "java/util/LinkedHashMap" => SEQUENCED_MAP,
-        "java/util/TreeMap" | "java/util/concurrent/ConcurrentSkipListMap" => SORTED_MAP,
-        "java/util/concurrent/ConcurrentHashMap" => CONCURRENT_MAP,
-        "java/util/ArrayDeque" | "java/util/concurrent/ConcurrentLinkedDeque" => DEQUE,
-        "java/util/PriorityQueue" | "java/util/concurrent/ConcurrentLinkedQueue" => QUEUE,
-        "java/io/File" => &["java/io/Serializable", "java/lang/Comparable"],
-        _ => &[],
+    if CLASSES.contains(&class) {
+        crate::jdk_closure::below_object(class)
+    } else {
+        &[]
     }
 }
 

@@ -88,6 +88,7 @@ mod java_tostring;
 mod jdk_call;
 mod jdk_character;
 mod jdk_character_table;
+mod jdk_closure;
 mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;

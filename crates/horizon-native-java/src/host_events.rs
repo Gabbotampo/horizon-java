@@ -228,7 +228,9 @@ fn record_equals(
 }
 
 /// `instanceof` for a kind whose whole type is known: `true` for the listed types, `false` for
-/// any other (the classes are the loader's own, no jar extends them).
+/// any other. Only for classes no Mixin transforms: bus-8 and FML classes sit outside the game
+/// layer Mixins target, and `CompletableFuture` is a JDK class (Java 25's supertypes, checked
+/// with `javap`).
 fn exactly(wanted: &str, types: &[&str]) -> Option<bool> {
     Some(wanted == OBJECT || types.contains(&wanted))
 }
@@ -270,12 +272,30 @@ pub(crate) const NEOFORGE_BUS_METHODS: Methods = methods(|_, wanted, _| {
         ],
     )
 });
-pub(crate) const FABRIC_EVENT_METHODS: Methods = methods(|_, wanted, _| {
-    exactly(
+pub(crate) const FABRIC_EVENT_METHODS: Methods = methods(fabric_event_instance_of);
+
+/// `instanceof` on a Fabric event. `ArrayBackedEvent` is a Fabric API class, which a Mixin may give
+/// any interface (c2me's `@Mixin(ArrayBackedEvent.class) interface IArrayBackedEvent`): `true` for
+/// its own supertypes and for an interface a loaded Mixin plan adds (the runtime's scan, through
+/// `hierarchy`); `false` only where no Mixin can change it (a class, which a Mixin cannot make a
+/// superclass; a final JDK class); counted otherwise (an interface another jar's Mixin may add).
+fn fabric_event_instance_of(
+    _: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if exactly(
         wanted,
         &[FABRIC_EVENT, "net/fabricmc/fabric/api/event/Event"],
-    )
-});
+    ) == Some(true)
+        || hierarchy.is_instance(FABRIC_EVENT, wanted) == Some(true)
+    {
+        return Some(true);
+    }
+    (hierarchy.is_interface(wanted) == Some(false)
+        || crate::host_ref::exact_class_rules_out(FABRIC_EVENT, wanted))
+    .then_some(false)
+}
 /// A kind whose class is not known: `instanceof` answers from its declared types
 /// (`ClassRule::Unknown`).
 pub(crate) const DECLARED_TYPE_METHODS: Methods = methods(instance_of_class);

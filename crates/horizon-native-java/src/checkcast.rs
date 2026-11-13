@@ -443,17 +443,14 @@ impl<H: Host> Runtime<'_, H> {
                 return Verdict::Yes;
             }
             let Some(file) = self.class(&current) else {
-                // A JDK class never extends or implements a type outside the
-                // JDK; against a JDK type only the JDK's own answer stands
-                // (`AbstractList` is a `Collection`), unknown where the model
-                // has none. A game class never extends a held jar class.
-                let jdk = |name: &str| {
-                    ["java/", "javax/", "jdk/"]
-                        .iter()
-                        .any(|prefix| name.starts_with(prefix))
-                };
+                // A JDK class's supertypes all come from system-module
+                // packages (`jdk_closure.rs`): it is never a jar's or a game's
+                // type. Against a JDK-module type only the JDK's own answer
+                // stands (`AbstractList` is a `Collection`, `IIOMetadataNode`
+                // an `org.w3c.dom.Element`), unknown where none is known. A
+                // game class never extends a held jar class.
                 if current.starts_with("java/") {
-                    if !jdk(target) {
+                    if !crate::jdk_closure::in_jdk_package(target) {
                         return Verdict::No;
                     }
                     return match host_ref::ClassHierarchy::is_instance(
@@ -565,6 +562,11 @@ impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
         if wanted == "java/lang/Object" || class == wanted {
             return Some(true);
         }
+        // A loaded Mixin plan that adds `wanted` to `class` (a Fabric API
+        // class too, `ArrayBackedEvent`): the woven class implements it.
+        if self.mixin_adds_interface(class, wanted) {
+            return Some(true);
+        }
         if self.class(class).is_none() {
             return host_ref::JdkHierarchy.is_instance(class, wanted);
         }
@@ -581,6 +583,14 @@ impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
         match self.hierarchy_verdict(class, wanted, wanted_is_interface) {
             Verdict::Yes => Some(true),
             Verdict::No | Verdict::Unknown => None,
+        }
+    }
+
+    /// A held class's own `ACC_INTERFACE`; Java 25's table for a JDK class.
+    fn is_interface(&self, class: &str) -> Option<bool> {
+        match self.class(class) {
+            Some(file) => class_access(file).map(|access| access & ACC_INTERFACE != 0),
+            None => host_ref::JdkHierarchy.is_interface(class),
         }
     }
 }
