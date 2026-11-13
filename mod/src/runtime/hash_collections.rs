@@ -429,6 +429,21 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = expect_ref(receiver).cloned() else {
             return Ok(None);
         };
+        if self.host.is_view_copy(&marker)
+            && r.name == "forEach"
+            && r.descriptor == "(Ljava/util/function/Consumer;)V"
+            && let (Some(source), Some(kind)) = (
+                self.host.view_copy_source(&marker),
+                self.host.view_copy_kind(&marker),
+            )
+        {
+            let action = args.first().cloned().unwrap_or(Value::Ref(None));
+            let map = Value::Ref(Some(source));
+            return match self.view_for_each(r, &map, &kind, &action)? {
+                Some(answer) => Ok(Some(Some(answer))),
+                None => Ok(None),
+            };
+        }
         if self.host.is_view_copy(&marker) && java_immutable::is_mutator(&r.name) {
             return self.count_and_continue(r).map(Some);
         }
@@ -469,8 +484,150 @@ impl<H: Host> Runtime<'_, H> {
         let copy = self.host.invoke_instance(r, receiver, args)?;
         if let Some(copy) = expect_ref(&copy) {
             self.host.note_view_copy(copy, &marker);
+            self.host.note_view_kind(copy, &r.name);
         }
         Ok(Some(Some(copy)))
+    }
+
+    /// Re-read every view copy of the map `marker` from it: a `keySet()`/
+    /// `values()`/`entrySet()` kept in a variable follows the map, as the
+    /// JDK's views do.
+    pub(crate) fn refresh_map_views(&mut self, marker: &str) {
+        let views = self.host.view_copies_of(marker);
+        if views.is_empty() {
+            return;
+        }
+        let Ok(entries) = self.collection_elements(&Value::Ref(Some(marker.to_owned()))) else {
+            return;
+        };
+        for view in views {
+            let contents: Vec<Value> = match self.host.view_copy_kind(&view).as_deref() {
+                Some("keySet") => entries.iter().step_by(2).cloned().collect(),
+                Some("values") => entries.iter().skip(1).step_by(2).cloned().collect(),
+                Some("entrySet") => entries
+                    .chunks(2)
+                    .filter_map(|pair| match pair {
+                        [key, value] => Some(map_entry_value(key, value)),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => continue,
+            };
+            self.host
+                .replace_mutable_collection(&Value::Ref(Some(view)), contents);
+        }
+    }
+
+    /// `forEach` on a map's `keySet()`/`values()`/`entrySet()`. `HashMap`'s
+    /// and `LinkedHashMap`'s views override it: they walk the live table (or
+    /// linked list), reading each value as it is then, and check `modCount`
+    /// once at the end; a key removed ahead is not visited, and
+    /// `LinkedHashMap` also visits a key added behind (one added to a hash
+    /// table is counted: where it lands is the table's business), and stops
+    /// when the current key is removed. Other maps' views run
+    /// `Iterable.forEach`: the loop's next step throws.
+    fn view_for_each(
+        &mut self,
+        r: &MethodRef,
+        map: &Value,
+        kind: &str,
+        action: &Value,
+    ) -> Result<Option<Value>, NativeError> {
+        if *action == Value::Ref(None) {
+            return Err(concurrent_modification_or_npe(false));
+        }
+        let Some(marker) = expect_ref(map).cloned() else {
+            return Ok(None);
+        };
+        let class = self.host_collection_class(map).unwrap_or_default();
+        let hash = matches!(
+            class.as_str(),
+            "java/util/HashMap" | "java/util/LinkedHashMap"
+        );
+        let linked = class == "java/util/LinkedHashMap";
+        if !hash && class != "java/util/TreeMap" {
+            return Ok(None);
+        }
+        if let Some(table_kind) = self.hash_table_kind(map) {
+            self.resync_hash_table(map)?;
+            let table = self.take_table(&marker, table_kind);
+            let unknown = table.order_unknown();
+            self.host.store_hash_table(&marker, table);
+            if unknown {
+                return self.count_and_continue(r);
+            }
+        }
+        let keys_of = |this: &Self| -> Result<Vec<Value>, NativeError> {
+            Ok(this
+                .collection_elements(map)?
+                .into_iter()
+                .step_by(2)
+                .collect())
+        };
+        let snapshot = keys_of(self)?;
+        let expected = self.mod_stamp(&marker);
+        let mut counted = false;
+        let mut index = 0;
+        let mut current: Option<Value> = None;
+        loop {
+            let live = keys_of(self)?;
+            let next = if linked {
+                // `e = e.after` on the live list.
+                match &current {
+                    None => live.first().cloned(),
+                    Some(key) => match live.iter().position(|k| k == key) {
+                        Some(at) => live.get(at + 1).cloned(),
+                        None => None,
+                    },
+                }
+            } else {
+                // The table (or tree) as it was, without the removed keys.
+                let mut found = None;
+                while index < snapshot.len() {
+                    let key = snapshot[index].clone();
+                    index += 1;
+                    if !hash && index > 1 && self.mod_stamp(&marker) != expected {
+                        // `Iterable.forEach`: the next `next()` throws.
+                        return Err(concurrent_modification_or_npe(true));
+                    }
+                    if !hash || live.contains(&key) {
+                        found = Some(key);
+                        break;
+                    }
+                }
+                found
+            };
+            let Some(key) = next else {
+                break;
+            };
+            if hash && !linked && !counted && live.iter().any(|k| !snapshot.contains(k)) {
+                // A key added to the table: where it lands decides whether
+                // the walk meets it.
+                self.host.unknown_operand_call(r)?;
+                counted = true;
+            }
+            let entries = self.collection_elements(map)?;
+            let value = Self::stored_value(&entries, &key);
+            let element = match kind {
+                "keySet" => key.clone(),
+                "values" => value,
+                _ => map_entry_value(&key, &value),
+            };
+            self.run_functional(
+                (
+                    "java/util/function/Consumer",
+                    "accept",
+                    "(Ljava/lang/Object;)V",
+                ),
+                action,
+                &[element],
+            )?;
+            current = Some(key);
+        }
+        if hash && self.mod_stamp(&marker) != expected {
+            return Err(concurrent_modification_or_npe(true));
+        }
+        Ok(Some(Value::Void))
     }
 
     /// Whether a call that is handed a collection of unknown order can show
@@ -1125,6 +1282,20 @@ impl<H: Host> Runtime<'_, H> {
 fn concurrent_modification() -> NativeError {
     NativeError::UncaughtException {
         class: "java/util/ConcurrentModificationException".into(),
+        message: None,
+        frame: None,
+    }
+}
+
+/// `ConcurrentModificationException` (`true`) or `NullPointerException`.
+fn concurrent_modification_or_npe(cme: bool) -> NativeError {
+    NativeError::UncaughtException {
+        class: if cme {
+            "java/util/ConcurrentModificationException"
+        } else {
+            "java/lang/NullPointerException"
+        }
+        .into(),
         message: None,
         frame: None,
     }

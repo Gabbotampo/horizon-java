@@ -2226,6 +2226,18 @@ pub trait Host {
         None
     }
 
+    /// Which view (`keySet`, `values`, `entrySet`) a copy is.
+    fn note_view_kind(&mut self, _marker: &str, _kind: &str) {}
+
+    fn view_copy_kind(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// The view copies taken from the map `source`.
+    fn view_copies_of(&self, _source: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// A collection's `modCount` (`mod_count.rs`).
     fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
         mod_count::ModStamp::default()
@@ -2631,6 +2643,8 @@ pub struct StdHost {
     hash_tables: BTreeMap<String, hash_table::HashTable>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
     view_copies: BTreeMap<String, String>,
+    /// Which view each copy is (`keySet`, `values`, `entrySet`).
+    view_kinds: BTreeMap<String, String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2769,6 +2783,7 @@ impl StdHost {
             reversed_views: BTreeMap::new(),
             hash_tables: BTreeMap::new(),
             view_copies: BTreeMap::new(),
+            view_kinds: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -4176,6 +4191,25 @@ impl Host for StdHost {
 
     fn is_view_copy(&self, marker: &str) -> bool {
         self.view_copies.contains_key(marker)
+    }
+
+    fn note_view_kind(&mut self, marker: &str, kind: &str) {
+        self.view_kinds.insert(marker.to_owned(), kind.to_owned());
+    }
+
+    fn view_copy_kind(&self, marker: &str) -> Option<String> {
+        self.view_kinds.get(marker).cloned()
+    }
+
+    fn view_copies_of(&self, source: &str) -> Vec<String> {
+        if self.view_copies.is_empty() {
+            return Vec::new();
+        }
+        self.view_copies
+            .iter()
+            .filter(|(_, from)| from.as_str() == source)
+            .map(|(view, _)| view.clone())
+            .collect()
     }
 
     fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
