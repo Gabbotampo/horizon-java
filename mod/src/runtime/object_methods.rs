@@ -28,12 +28,20 @@
 //!   the two above, and a direct read of an identity hash is counted instead
 //!   of answered with a made-up number.
 //!
+//! [`Runtime::pure_equality`] says whether running a value's `equals` and
+//! `hashCode` can have an observable effect. A string, a box, an identity
+//! object and a record whose components are all pure cannot, so a model may
+//! ask about them in any order and as often as it likes; anything else must
+//! be asked exactly when and as often as the JDK asks.
+
 use super::*;
 
 /// `Object.equals(Object)`.
 pub(crate) const EQUALS: &str = "(Ljava/lang/Object;)Z";
 /// `Object.hashCode()`.
 pub(crate) const HASH_CODE: &str = "()I";
+/// How deep [`Runtime::pure_equality`] follows record components.
+const MAX_PURITY_DEPTH: usize = 8;
 
 /// Whose `equals` and `hashCode` a value runs.
 #[derive(Clone, Debug, PartialEq)]
@@ -197,6 +205,50 @@ impl<H: Host> Runtime<'_, H> {
         Equality::Host
     }
 
+    /// Whether running `value`'s `equals` and `hashCode` has no observable
+    /// effect: a string, a box, `null`, an identity object, and a record whose
+    /// generated members compare only pure components.
+    pub(crate) fn pure_equality(&self, value: &Value) -> bool {
+        self.pure_equality_at(value, 0)
+    }
+
+    fn pure_equality_at(&self, value: &Value, depth: usize) -> bool {
+        match self.equality_of(value) {
+            Equality::Null | Equality::Platform | Equality::Identity => true,
+            Equality::Host => false,
+            Equality::Jar { equals, hash_code } => {
+                if depth >= MAX_PURITY_DEPTH {
+                    return false;
+                }
+                let Some(class) = self.interpreted_object_class(value) else {
+                    return false;
+                };
+                // Both members must be the record's generated ones.
+                if equals.as_deref() != Some(class.as_str())
+                    || hash_code.as_deref() != Some(class.as_str())
+                {
+                    return false;
+                }
+                let Some(file) = self.class(&class) else {
+                    return false;
+                };
+                let (Some(index), Some(_)) = (
+                    generated_record_site(file, "equals", EQUALS),
+                    generated_record_site(file, "hashCode", HASH_CODE),
+                ) else {
+                    return false;
+                };
+                let Some(components) = record_components(file, index) else {
+                    return false;
+                };
+                components.iter().all(|component| {
+                    let field = self.record_field(value, &component.field);
+                    self.pure_equality_at(&field, depth + 1)
+                })
+            }
+        }
+    }
+
     /// A record field's value, read as the bootstrap's getter handle reads it.
     fn record_field(&self, receiver: &Value, field: &MethodRef) -> Value {
         instance_field_key(receiver, field)
@@ -348,7 +400,14 @@ impl<H: Host> Runtime<'_, H> {
                     (None, None) => true,
                     _ => false,
                 }),
-            Equality::Host => Ok(a == b),
+            Equality::Host => {
+                if self.host_collection_kind(a) == Some(CollectionKind::List)
+                    && self.host_collection_kind(b) == Some(CollectionKind::List)
+                {
+                    return self.list_equals(a, b);
+                }
+                Ok(a == b)
+            }
         }
     }
 
@@ -616,7 +675,7 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(Some(Value::Int(hash)));
             }
         }
-        Ok(None)
+        self.invoke_list_equality(r, opcode, receiver, args)
     }
 }
 

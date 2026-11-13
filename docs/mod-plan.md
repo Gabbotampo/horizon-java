@@ -243,12 +243,15 @@ drops", and it travels through the same bake. Without the package the item is na
   the removal took out; it differs from Fabric's `adjustedState` only for a tripwire cut with
   shears (`DISARMED` set in the level, the armed state returned), and the runtime's block state
   names only the block, so no listener sees the difference. NeoForge has no event here.
-- **The hand on `entity_interact` (#2797).** The hook's contract says `self.hand` and it fires once
-  per hand, but the game's `native_entity_interact(entity, kind, stack, claimed)` in
-  `crates/horizon-client/src/game/native_hooks/base.rs` never takes a hand, so the event cannot
-  carry one. The mod names the hand from its stack when exactly one hand holds it, and leaves it
-  unknown (a counted unknown read) when both hands agree, two empty hands included. Filed as
-  `arismoko/horizon#2797`; the fix is to pass `hand: Hand` through that call and its event.
+- **The hand on `entity_interact` (#2797).** Answered since the `1cc882b8e0` pin:
+  `EntityInteractEvent.hand` is the interact packet's hand, and the bridge passes it to
+  `UseEntityCallback`/`EntityInteract#getHand` as `MAIN_HAND`/`OFF_HAND`. `getItemInHand(hand)` is
+  the hook's own stack (an empty hand when it carries none) and the other hand is read from the
+  host. Before, the bridge named the hand only when exactly one hand held the hook's stack, so two
+  empty hands (the common case) gave a counted unknown hand. The firing also names the level, the
+  acting player's (#2784's read; `EntityInteract#getLevel` is `getEntity().level()`, and
+  `handleInteract` finds the target in that level), and `EntityInteract#getTarget()` answers the
+  clicked entity.
 - **A player's level (#2747).** `PlayerRef` names a player's identity, permission and messages, and
   `host.players().acting_player()` names the player a block or entity hook is about, but no read
   gives the level that player stands in. So the `Level` argument of Fabric's `AttackBlockCallback`,
@@ -424,8 +427,8 @@ crates/horizon-mod-package crates/cargo-horizon-mod docs/native-mods.md docs/mod
   - `blocks`: **a code-declared block now gets a block item by default** (#3119:
     `Block::default()` has `item: true`, "as in JSON"). This mod sets `block.item = false` explicitly
     (`content.rs::block_entry`), so its declarations are unchanged.
-  - `entity_interact`: the event carries `hand` (#2797's carry). This mod still reads the acting hand
-    from the host. Wiring the field is a follow-up.
+  - `entity_interact`: the event carries `hand` (#2797's carry), which the bridge now passes
+    through (see "Fork seams needed").
   - `player_clone`: the event carries `original: OriginalPlayerRef`, a hook-scoped view of the old
     player (#3040), which the bridge now lends to `getOriginal`/`COPY_FROM` (see "Fork seams needed").
   - `right_click_block`: it now fires for spectators too, and `use_block`/`use_item` `Default` got

@@ -82,7 +82,7 @@ use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
     Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
     EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow,
-    GameRuleChangedEvent, Hand, Hooks, Host, HostSide, InteractionResult, ItemStack, ItemsEvent,
+    GameRuleChangedEvent, Hand, Hooks, Host, HostSide, InteractionResult, ItemsEvent,
     LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef,
     LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
     LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
@@ -99,7 +99,7 @@ use runtime::brigadier::{
 };
 use runtime::events::{
     EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadeOriginal,
-    FacadePlayer, GameEvent, GameListener, PhaseOrdering, ServerFacts, dispatch_order,
+    FacadePlayer, GameEvent, GameListener, HeldItems, PhaseOrdering, ServerFacts, dispatch_order,
 };
 use runtime::{ExecutionBudget, NativeJar, StdHost};
 use serde_json::json;
@@ -1081,9 +1081,9 @@ impl Hooks for HorizonJava {
         let click = event.click;
         // `player.getItemInHand(hand)` is the hook's own stack; the other hand and the game
         // mode are read from the host for this firing only.
-        let held = host
-            .player(click.player)
-            .and_then(|player| server_facts::held_items(host, player, click.hand, click.stack));
+        let held = host.player(click.player).and_then(|player| {
+            server_facts::held_items(host, player, click.hand, Some(click.stack))
+        });
         let context = EventContext {
             level: Some(dimension_id(click.dimension).to_owned()),
             player: Some(click.player),
@@ -1135,21 +1135,14 @@ impl Hooks for HorizonJava {
         host: &mut dyn ServerHost,
         event: &mut EntityInteractEvent<'_>,
     ) -> Flow {
-        let context = EventContext {
-            player: self.acting_player(host),
-            // The hook fires once per hand with that hand's stack (Fabric's `UseEntityCallback`
-            // carries the `InteractionHand`); the pin's event names the stack, not the hand, so
-            // which of the acting player's hands holds it is what tells them apart.
-            off_hand: self
-                .acting_hand(host, event.stack)
-                .map(|hand| hand == Hand::Off),
-            entity: Some(FacadeEntity {
-                id: event.entity,
-                kind: event.kind.to_owned(),
-                level: None,
-            }),
-            ..EventContext::default()
-        };
+        let player = host.players().acting_player();
+        let held = player
+            .and_then(|player| server_facts::held_items(host, player, event.hand, event.stack));
+        let level = player
+            .and_then(|player| player.entity().level(&*host))
+            .map(|level| level.dimension_id().to_owned());
+        let context =
+            entity_interact_context(player.map(|player| player.uuid()), level, held, event);
         let fired = self.fire_bridged(
             Some(&mut *host),
             Lifecycle::None,
@@ -1288,18 +1281,6 @@ impl Hooks for HorizonJava {
 }
 
 impl HorizonJava {
-    /// Which hand the acting player used: the event's `stack` is the held stack of that hand, so
-    /// it matches exactly one of the player's two hands. `None` when it matches both or neither —
-    /// two identical stacks, the common both-empty case included — because the hook does not carry
-    /// the hand (`arismoko/horizon#2797`) and a guess here would be a confident wrong answer.
-    fn acting_hand(&self, host: &dyn ServerHost, stack: Option<&ItemStack>) -> Option<Hand> {
-        let player = host.players().acting_player()?;
-        let living = host.living(player.entity())?;
-        let main = living.hand_item(host, Hand::Main);
-        let off = living.hand_item(host, Hand::Off);
-        one_hand(stack, main.as_ref(), off.as_ref())
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -1503,18 +1484,31 @@ impl HorizonJava {
     }
 }
 
-/// The hand `held` names among the two, or `None` when it names both or neither: the hook's
-/// stack is the acting hand's, so exactly one hand holding it is the only conclusive answer.
-fn one_hand<T: PartialEq>(held: Option<&T>, main: Option<&T>, off: Option<&T>) -> Option<Hand> {
-    let holds = |hand: Option<&T>| match (held, hand) {
-        (Some(held), Some(hand)) => held == hand,
-        (Some(_), None) => false,
-        (None, hand) => hand.is_none(),
-    };
-    match (holds(main), holds(off)) {
-        (true, false) => Some(Hand::Main),
-        (false, true) => Some(Hand::Off),
-        _ => None,
+/// The firing context of an `entity_interact`: the acting player, the hook's hand (Fabric's
+/// `UseEntityCallback` `InteractionHand`, NeoForge's `EntityInteract#getHand`: the hand of the
+/// interact packet `ServerGamePacketListenerImpl.handleInteract` is handling, so main then off as the
+/// client tries them), the clicked entity, and what the player holds: `getItemInHand(hand)` is the
+/// hook's own `stack` (an empty hand when it is none), the other hand is read from the host. The
+/// level is the player's (`EntityInteract#getLevel` is `getEntity().level()`, Fabric's `world` is
+/// `player.level()`), and the clicked entity stands in it: `handleInteract` looks the target up in
+/// the player's level.
+fn entity_interact_context(
+    player: Option<u128>,
+    level: Option<String>,
+    held: Option<HeldItems>,
+    event: &EntityInteractEvent<'_>,
+) -> EventContext {
+    EventContext {
+        player,
+        off_hand: Some(event.hand == Hand::Off),
+        held,
+        entity: Some(FacadeEntity {
+            id: event.entity,
+            kind: event.kind.to_owned(),
+            level: level.clone(),
+        }),
+        level,
+        ..EventContext::default()
     }
 }
 
@@ -2985,27 +2979,28 @@ mod tests {
         assert_eq!(caught("runs", || 7).unwrap(), 7);
     }
 
-    /// Only one hand holding the stack names the hand; two equal stacks cannot tell them apart
-    /// (two empty hands included), so the hand is unknown rather than guessed.
+    /// `EntityInteract#getHand`/`UseEntityCallback`'s hand is the hook's own `hand`, never a guess
+    /// from the stacks: two empty hands (where the old stack-matching left it unknown) still name
+    /// the off hand when the game asks about the off hand.
     #[test]
-    fn the_acting_hand_is_named_only_when_one_hand_holds_the_stack() {
-        assert_eq!(
-            one_hand(Some(&"stick"), Some(&"stick"), Some(&"paper")),
-            Some(Hand::Main)
-        );
-        assert_eq!(
-            one_hand(Some(&"paper"), Some(&"stick"), Some(&"paper")),
-            Some(Hand::Off)
-        );
-        assert_eq!(
-            one_hand::<&str>(None, Some(&"stick"), None),
-            Some(Hand::Off)
-        );
-        assert_eq!(one_hand::<&str>(None, None, None), None);
-        assert_eq!(
-            one_hand(Some(&"stick"), Some(&"stick"), Some(&"stick")),
-            None
-        );
+    fn an_entity_interaction_names_the_hooks_hand() {
+        for (hand, off) in [(Hand::Main, Some(false)), (Hand::Off, Some(true))] {
+            let event = EntityInteractEvent {
+                hand,
+                entity: 3,
+                kind: "minecraft:cow",
+                stack: None,
+                cancelled: false,
+            };
+            let level = Some("minecraft:the_nether".to_owned());
+            let context = entity_interact_context(Some(7), level.clone(), None, &event);
+            assert_eq!(context.off_hand, off);
+            assert_eq!(context.player, Some(7));
+            assert_eq!(context.level, level);
+            let entity = context.entity.expect("the clicked entity");
+            assert_eq!((entity.id, entity.kind.as_str()), (3, "minecraft:cow"));
+            assert_eq!(entity.level, level);
+        }
     }
 
     /// `AFTER`'s `BlockEntity` is `null` only when no block entity stood at the position; the
