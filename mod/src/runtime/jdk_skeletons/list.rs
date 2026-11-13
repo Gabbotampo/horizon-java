@@ -154,7 +154,11 @@ fn check_index(index: i32, length: i32) -> Result<(), NativeError> {
 impl<H: Host> Runtime<'_, H> {
     /// A field of an object this module or a jar keeps (`modCount`, an
     /// iterator's cursor): the JVM default until written.
-    fn jdk_field(&self, object: &Value, (owner, name, descriptor): (&str, &str, &str)) -> Value {
+    pub(super) fn jdk_field(
+        &self,
+        object: &Value,
+        (owner, name, descriptor): (&str, &str, &str),
+    ) -> Value {
         expect_ref(object)
             .and_then(|marker| {
                 self.fields
@@ -168,7 +172,7 @@ impl<H: Host> Runtime<'_, H> {
         int_of(&self.jdk_field(object, field))
     }
 
-    fn put_jdk_field(
+    pub(super) fn put_jdk_field(
         &mut self,
         object: &Value,
         (owner, name, descriptor): (&str, &str, &str),

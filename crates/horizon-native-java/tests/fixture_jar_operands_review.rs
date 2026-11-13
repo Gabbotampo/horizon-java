@@ -153,22 +153,13 @@ fn calls(rows: &[(&str, usize)]) -> Vec<(String, usize)> {
 
 /// JDK 25: `0149|1|5|x1`. The receiver's class decides which default runs,
 /// not the call site's type (`Squares s; s.forEach(...)`). The list's
-/// `Iterable.forEach` now runs as the JDK runs it (`0149`, through
-/// `AbstractList.Itr`); the map's defaults are still counted.
+/// `Iterable.forEach` and the map's `getOrDefault`/`forEach` now run as the
+/// JDK runs them; they were counted.
 #[test]
-fn defaults_reached_through_the_jar_type_are_counted() {
+fn defaults_reached_through_the_jar_type_run_as_the_jdk_does() {
     let (text, unknown) = run("typedByJarClass");
-    assert_eq!(text, "0149|null|null|");
-    assert_eq!(
-        unknown,
-        calls(&[
-            ("java/util/Map#forEach(Ljava/util/function/BiConsumer;)V", 1),
-            (
-                "java/util/Map#getOrDefault(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                2
-            ),
-        ])
-    );
+    assert_eq!(text, "0149|1|5|x1");
+    assert_eq!(unknown, Vec::new());
 }
 
 /// JDK 25: `0`. The most specific declaring interface's default

@@ -52,6 +52,7 @@ use crate::jdk_call::{Site, throw};
 mod collection;
 mod defaults;
 mod list;
+mod map;
 mod set_queue;
 
 pub(crate) use list::{ABSTRACT_LIST, SEQUENTIAL_LIST};
@@ -67,8 +68,11 @@ enum Body {
     Default,
     /// `list.rs`: `AbstractList`, `AbstractSequentialList`, `List`'s defaults.
     List,
-    /// `list.rs`: a member a private JDK class declares (`AbstractList.Itr`).
+    /// `list.rs`/`map.rs`: a member a private JDK class declares
+    /// (`AbstractList.Itr`, `AbstractMap`'s key set).
     Internal,
+    /// `map.rs`: `AbstractMap`, its entries, `Map`'s defaults.
+    Map,
 }
 
 /// Which file implements `owner.name descriptor`, if any.
@@ -82,6 +86,8 @@ fn body_for(owner: &str, name: &str, descriptor: &str) -> Option<Body> {
         Some(Body::Default)
     } else if list::BODIES.contains(&key) {
         Some(Body::List)
+    } else if map::BODIES.contains(&key) {
+        Some(Body::Map)
     } else {
         None
     }
@@ -195,6 +201,9 @@ const IMPLEMENTED_BASES: &[&str] = &[
     ABSTRACT_QUEUE,
     ABSTRACT_LIST,
     SEQUENTIAL_LIST,
+    map::ABSTRACT_MAP,
+    map::SIMPLE_ENTRY,
+    map::IMMUTABLE_ENTRY,
 ];
 
 /// The private JDK classes the bodies construct: `(class, superclass,
@@ -213,6 +222,10 @@ const INTERNAL: &[(&str, &str, &[&str])] = &[
         "java/lang/Object",
         &["java/util/ListIterator"],
     ),
+    (map::KEY_SET, ABSTRACT_SET, &[]),
+    (map::VALUES, ABSTRACT_COLLECTION, &[]),
+    (map::KEY_ITERATOR, "java/lang/Object", &[ITERATOR]),
+    (map::VALUE_ITERATOR, "java/lang/Object", &[ITERATOR]),
 ];
 
 /// Whether `class` is a private JDK class `wanted` is a supertype of (or is),
@@ -314,7 +327,13 @@ impl<H: Host> Runtime<'_, H> {
             let class = class.to_owned();
             return self.invoke_internal(&class, r, opcode, this, args);
         }
-        let Some(base) = self.stateless_jar_object(this) else {
+        // A jar object on a skeleton, or a `SimpleEntry`/`SimpleImmutableEntry`
+        // itself (its state is the same two fields either way).
+        let direct_entry = expect_ref(this)
+            .and_then(|marker| jvm_dispatch::constructed_object_class(marker))
+            .filter(|class| [map::SIMPLE_ENTRY, map::IMMUTABLE_ENTRY].contains(class))
+            .map(str::to_owned);
+        let Some(base) = self.stateless_jar_object(this).or(direct_entry) else {
             return Ok(None);
         };
         let Some(owner) = self.skeleton_selection(r, opcode, this, &base) else {
@@ -323,6 +342,10 @@ impl<H: Host> Runtime<'_, H> {
         // A skeleton constructor: `AbstractCollection()` and its kin keep no
         // state the subclass can observe.
         if r.name == "<init>" {
+            if map::is_entry_constructor(&owner, &r.descriptor) {
+                self.entry_init(&owner, this, args)?;
+                return Ok(Some(Value::Void));
+            }
             return Ok(jdk_skeleton_constructor(&owner, &r.descriptor).then_some(Value::Void));
         }
         if !IMPLEMENTED_BASES.contains(&base.as_str()) {
@@ -350,7 +373,8 @@ impl<H: Host> Runtime<'_, H> {
             .iter()
             .find(|(internal, _, _)| *internal == current)
         {
-            if list::OWN_MEMBERS.contains(&(current, r.name.as_str(), r.descriptor.as_str())) {
+            let member = (current, r.name.as_str(), r.descriptor.as_str());
+            if list::OWN_MEMBERS.contains(&member) || map::OWN_MEMBERS.contains(&member) {
                 let owner = current.to_owned();
                 return self.run_body(Body::Internal, &owner, r, this, args);
             }
@@ -367,6 +391,13 @@ impl<H: Host> Runtime<'_, H> {
             });
         match owner {
             Some(owner) => self.run_skeleton_body(owner, r, this, args),
+            // `Object.equals`, which a private class that no skeleton gives
+            // an `equals` inherits (`values()`'s view, the iterators): identity.
+            None if (r.name.as_str(), r.descriptor.as_str())
+                == ("equals", "(Ljava/lang/Object;)Z") =>
+            {
+                Ok(Some(boolean(args.first() == Some(this))))
+            }
             None => Ok(None),
         }
     }
@@ -463,7 +494,11 @@ impl<H: Host> Runtime<'_, H> {
             Body::SetQueue => self.set_queue_body(owner, name, descriptor, this, args),
             Body::Default => self.interface_default_body(owner, name, descriptor, this, args),
             Body::List => self.list_body(owner, name, descriptor, this, args),
+            Body::Internal if owner.starts_with(map::ABSTRACT_MAP) => {
+                self.map_view_body(owner, name, this, args)
+            }
             Body::Internal => self.internal_body(owner, name, descriptor, this, args),
+            Body::Map => self.map_body(owner, name, descriptor, this, args),
         };
         stack_walk::leave();
         self.depth -= 1;
@@ -696,6 +731,7 @@ fn jdk_skeleton_constructor(owner: &str, descriptor: &str) -> bool {
             ABSTRACT_QUEUE,
             ABSTRACT_LIST,
             SEQUENTIAL_LIST,
+            map::ABSTRACT_MAP,
         ]
         .contains(&owner)
 }
