@@ -25,6 +25,19 @@
 //! left half-written. Earlier the class stayed marked initialized, which is
 //! what jamlib's `Event#listeners` hit in a strict game-hook firing.
 //!
+//! * JVMS §5.5 step 6: before the superclass and `<clinit>`, every static
+//!   field with a `ConstantValue` attribute (JVMS §4.7.2) takes its constant.
+//!   javac inlines such constants at their use sites, but a `getstatic` from
+//!   another compiler (or from a class compiled against an older, non-constant
+//!   version of the field) reads the field itself, and must see the constant
+//!   rather than the type's default. OpenJDK 27 (HotSpot) applies the
+//!   attribute to every static field, final or not, and stores an `int`
+//!   constant into a narrower field as `i2b`/`i2s`/`i2c` would, and into a
+//!   `boolean` as its lowest bit (a hand-made class with 300, 70000, -1 and 2
+//!   in `byte`, `short`, `char` and `boolean` fields reads 44, 4464, 65535 and
+//!   0). A constant whose pool entry does not fit the field's type is a
+//!   format error the JVM refuses at load; it is left unassigned here.
+//!
 //! The state lives in the runtime's initialized-class set, which the host
 //! persists between entrypoints and callbacks. An erroneous class is recorded
 //! there under a key no internal class name can collide with (it starts with a
@@ -43,6 +56,70 @@ const REFUSED_FAILURE: &str = "refused:";
 const MAX_REFUSAL_CHARS: usize = 512;
 /// Superinterfaces one class initialization walks at most.
 const MAX_INITIALIZED_SUPERINTERFACES: usize = 256;
+
+/// `(name, descriptor, value)` of every static field of a class file that has
+/// a `ConstantValue` attribute whose constant fits the field's type.
+fn static_constant_values(raw: &[u8]) -> Result<Vec<(String, String, Value)>, NativeError> {
+    let mut reader = Reader::new(raw);
+    reader.skip(8)?;
+    let pool = read_pool(&mut reader)?;
+    reader.skip(6)?; // access, this, super
+    let interfaces = reader.u2()? as usize;
+    reader.skip(interfaces * 2)?;
+    let mut constants = Vec::new();
+    for _ in 0..reader.u2()? {
+        let access = reader.u2()?;
+        let name = utf8(&pool, reader.u2()?)?;
+        let descriptor = utf8(&pool, reader.u2()?)?;
+        for _ in 0..reader.u2()? {
+            let attribute = utf8(&pool, reader.u2()?)?;
+            let length = reader.u4()? as usize;
+            if access & 0x0008 == 0 || attribute != "ConstantValue" || length != 2 {
+                reader.skip(length)?;
+                continue;
+            }
+            let index = reader.u2()?;
+            if let Some(value) = constant_for_field(&pool, index, &descriptor) {
+                constants.push((name.clone(), descriptor.clone(), value));
+            }
+        }
+    }
+    Ok(constants)
+}
+
+/// The value a `ConstantValue` pool entry gives a field of `descriptor`
+/// (JVMS §4.7.2's table), narrowed as HotSpot stores it; `None` when the
+/// entry's kind does not match the type.
+fn constant_for_field(pool: &[Cp], index: u16, descriptor: &str) -> Option<Value> {
+    let int = match pool.get(index as usize) {
+        Some(Cp::Integer(value)) => Some(*value),
+        _ => None,
+    };
+    Some(match descriptor {
+        "I" => Value::Int(int?),
+        "S" => Value::Int(i32::from(int? as i16)),
+        "C" => Value::Int(i32::from(int? as u16)),
+        "B" => Value::Int(i32::from(int? as i8)),
+        "Z" => Value::Int(int? & 1),
+        "J" => match pool.get(index as usize)? {
+            Cp::Long(value) => Value::Long(*value),
+            _ => return None,
+        },
+        "F" => match pool.get(index as usize)? {
+            Cp::Float(value) => Value::Float(f64::from(*value)),
+            _ => return None,
+        },
+        "D" => match pool.get(index as usize)? {
+            Cp::Double(value) => Value::Float(*value),
+            _ => return None,
+        },
+        "Ljava/lang/String;" => match pool.get(index as usize)? {
+            Cp::String(_) => constant_value(pool, index).ok()?,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
 
 /// The key prefix every record for `class` starts with.
 fn erroneous_class_prefix(class: &str) -> String {
@@ -83,6 +160,8 @@ impl<H: Host> Runtime<'_, H> {
         if !self.initialized_classes.insert(class.to_owned()) {
             return Ok(());
         }
+        // Step 6: the `ConstantValue` statics, before anything else runs.
+        self.assign_constant_values(class)?;
         let supertypes = self.initialize_supertypes(class);
         let outcome = match supertypes {
             // A supertype's failure is this class's failure, propagated as is.
@@ -115,6 +194,24 @@ impl<H: Host> Runtime<'_, H> {
                 .insert(format!("{}{cause}", erroneous_class_prefix(class)));
         }
         outcome
+    }
+
+    /// JVMS §5.5 step 6 (module docs): each static field's `ConstantValue`,
+    /// read from the class's bytes. A value already there (a host that seeded
+    /// the field) is kept.
+    fn assign_constant_values(&mut self, class: &str) -> Result<(), NativeError> {
+        let Some(file) = self.class(class) else {
+            return Ok(());
+        };
+        if file.raw.is_empty() {
+            return Ok(());
+        }
+        for (name, descriptor, value) in static_constant_values(&file.raw)? {
+            self.static_fields
+                .entry(format!("{class}#{name}{descriptor}"))
+                .or_insert(value);
+        }
+        Ok(())
     }
 
     /// The recorded cause of an erroneous class, or `None`.

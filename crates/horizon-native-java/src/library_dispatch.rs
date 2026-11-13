@@ -18,6 +18,20 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // `Files.readAttributes`/`isDirectory` (`file_attributes.rs`), also
+        // as a method reference (`filter(Files::isDirectory)`).
+        if let Some(value) = self.invoke_file_attributes(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        // Watch services over the file model (`watch_service.rs`), also as a
+        // method reference (`service::poll`).
+        if let Some(value) = self.invoke_watch_service(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        // `ServiceLoader` through a method reference (`Provider::get`).
+        if let Some(value) = self.invoke_service_loader(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // NightConfig's read-with-default (`night_config.rs`).
         if let Some(value) = night_config::invoke(r, args) {
             return Ok(Some(value));
@@ -84,6 +98,10 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(value));
         }
         if let Some(value) = self.invoke_mapped_registry(r, receiver, args) {
+            return Ok(Some(value));
+        }
+        // Gson's JSON tree, for a method reference and `String.valueOf`.
+        if let Some(value) = self.invoke_gson_tree(r, receiver, args)? {
             return Ok(Some(value));
         }
         Ok(None)
@@ -433,6 +451,12 @@ impl<H: Host> Runtime<'_, H> {
             name: "toString".into(),
             descriptor: "()Ljava/lang/String;".into(),
         };
+        // A commons-lang3 pair prints `(left,right)` (`commons_pair.rs`).
+        if let Some(Value::Ref(Some(text))) =
+            self.invoke_commons_pair(&to_string, Some(value), &[])?
+        {
+            return Ok(Some(text));
+        }
         Ok(
             match self.invoke_library_model(&to_string, Some(value), &[], class, method)? {
                 Some(Value::Ref(Some(text))) => Some(text),
@@ -444,10 +468,16 @@ impl<H: Host> Runtime<'_, H> {
     /// The `instanceof` answers this module and the proxy model add to the
     /// opcode's own: unboxed boxes and proxies.
     pub(super) fn library_instance_of(&self, value: &Value, wanted: &str) -> bool {
+        // A host handle answers by its kind's row (`host_ref.rs`); an unknown
+        // answer is `instance_of_is_guess`'s to count.
+        if let Value::Host(handle) = value {
+            return handle.instance_of(wanted, self) == Some(true);
+        }
         unboxed_instance_of(value, wanted)
             || expect_ref(value).is_some_and(|marker| {
                 self.proxy_instance_of(marker, wanted)
                     || crate::value_class::string_instance_of(marker, wanted)
+                    || crate::gson_tree::instance_of(marker, wanted)
             })
     }
 
@@ -488,15 +518,41 @@ impl<H: Host> Runtime<'_, H> {
         let value = args.first().cloned().unwrap_or(Value::Ref(None));
         let is_null = matches!(value, Value::Ref(None));
         // A primitive class has no instances; `int.class.isInstance(1)` is
-        // false on the JVM too.
-        let instance = !is_null
-            && !PRIMITIVE_CLASSES.contains(&wanted.as_str())
-            && self.value_instance_of(&value, &wanted);
+        // false on the JVM too. A host handle answers by its kind's row, an
+        // unknown answer counted (`checkcast.rs`).
+        let instance = match &value {
+            Value::Host(handle) => self.handle_instance_of(handle, &wanted)?,
+            _ => {
+                !is_null
+                    && !PRIMITIVE_CLASSES.contains(&wanted.as_str())
+                    && self.value_instance_of(&value, &wanted)
+            }
+        };
         if r.name == "isInstance" {
             return Ok(Some(Value::Int(i32::from(instance))));
         }
         if is_null || instance {
             return Ok(Some(value));
+        }
+        // A host handle, or a cast to a handle kind's class (`checkcast.rs`):
+        // `Cannot cast <getClass().getName()> to <getName()>`, or counted.
+        match self.host_cast(&value, &wanted) {
+            Some(crate::checkcast::HostCast::Throws(class)) => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/ClassCastException".into(),
+                    message: Some(format!(
+                        "Cannot cast {} to {}",
+                        class.replace('/', "."),
+                        wanted.replace('/', ".")
+                    )),
+                    frame: None,
+                });
+            }
+            Some(crate::checkcast::HostCast::Unknown) => {
+                self.count_cast(&value, &wanted)?;
+                return Ok(Some(value));
+            }
+            Some(crate::checkcast::HostCast::Fits) | None => {}
         }
         // Only a class the runtime can judge throws; anything else keeps the
         // value, as the opcode-level `checkcast` does.
@@ -1108,12 +1164,18 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
         }
-        let joined = parts
-            .iter()
-            .filter(|part| !part.is_empty())
-            .map(|part| part.trim_end_matches('/'))
-            .collect::<Vec<_>>()
-            .join("/");
+        if !parts.iter().all(|part| host_path::encodable(part)) {
+            self.host.unknown_operand_call(r)?;
+        }
+        // `UnixFileSystem.getPath`: `first`, then each non-empty part after
+        // a `/` (none before the first text); `path_value` normalizes.
+        let mut joined = String::new();
+        for part in parts.iter().filter(|part| !part.is_empty()) {
+            if !joined.is_empty() {
+                joined.push('/');
+            }
+            joined.push_str(part);
+        }
         Ok(Some(path_value(&joined)))
     }
 
@@ -1397,14 +1459,14 @@ pub(super) fn unboxed_instance_of(value: &Value, wanted: &str) -> bool {
             | "java/lang/constant/ConstantDesc"
     );
     match value {
-        Value::Float(number) => {
-            shared
-                || wanted == "java/lang/Double"
-                || (wanted == "java/lang/Float"
-                    && (number.is_nan() || f64::from(*number as f32) == *number))
-        }
+        // A `Float` is a `Boxed::Float`; a bare floating-point value is a
+        // `Double`.
+        Value::Float(_) => shared || wanted == "java/lang/Double",
         Value::Long(_) => shared || wanted == "java/lang/Long",
         Value::Int(_) => shared || wanted == "java/lang/Integer",
+        Value::Boxed(boxed) => crate::jdk_model::class_instance_of(boxed.class(), wanted),
+        // A host handle is `library_instance_of`'s (it needs the hierarchy).
+        Value::Host(_) => false,
         _ => false,
     }
 }

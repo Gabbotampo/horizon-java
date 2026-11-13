@@ -1,17 +1,16 @@
 //! A source-built legacy Forge fixture that crosses the bounded capability and
 //! `LazyOptional` boundary with a real constructor and lambda callback.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
 
 #[test]
 fn source_built_legacy_forge_fixture_reads_seeded_capability() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-forge-capability-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("forge-capability");
     let src = root.join("src");
     let classes = root.join("classes");
     for package in [

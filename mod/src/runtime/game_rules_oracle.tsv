@@ -1,0 +1,65 @@
+# GameRulesOracle (tests/fixtures/game_rules) on the 26.3 server-game.jar and its libraries, OpenJDK 25.0.5+8 (elysium).
+# field, id(), getIdentifier(), toString(), getDescriptionId(), gameRuleType(), defaultValue() class:value, serialize(default), getCommandResult(default), feature-gated, valueClass(), getAsString on new GameRules(FeatureFlags.VANILLA_SET)
+ADVANCE_TIME	advance_time	minecraft:advance_time	advance_time	gamerule.minecraft.advance_time	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+ADVANCE_WEATHER	advance_weather	minecraft:advance_weather	advance_weather	gamerule.minecraft.advance_weather	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+ALLOW_ENTERING_NETHER_USING_PORTALS	allow_entering_nether_using_portals	minecraft:allow_entering_nether_using_portals	allow_entering_nether_using_portals	gamerule.minecraft.allow_entering_nether_using_portals	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+BLOCK_DROPS	block_drops	minecraft:block_drops	block_drops	gamerule.minecraft.block_drops	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+BLOCK_EXPLOSION_DROP_DECAY	block_explosion_drop_decay	minecraft:block_explosion_drop_decay	block_explosion_drop_decay	gamerule.minecraft.block_explosion_drop_decay	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+COMMAND_BLOCKS_WORK	command_blocks_work	minecraft:command_blocks_work	command_blocks_work	gamerule.minecraft.command_blocks_work	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+COMMAND_BLOCK_OUTPUT	command_block_output	minecraft:command_block_output	command_block_output	gamerule.minecraft.command_block_output	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+DROWNING_DAMAGE	drowning_damage	minecraft:drowning_damage	drowning_damage	gamerule.minecraft.drowning_damage	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+ELYTRA_MOVEMENT_CHECK	elytra_movement_check	minecraft:elytra_movement_check	elytra_movement_check	gamerule.minecraft.elytra_movement_check	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+ENDER_PEARLS_VANISH_ON_DEATH	ender_pearls_vanish_on_death	minecraft:ender_pearls_vanish_on_death	ender_pearls_vanish_on_death	gamerule.minecraft.ender_pearls_vanish_on_death	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+ENTITY_DROPS	entity_drops	minecraft:entity_drops	entity_drops	gamerule.minecraft.entity_drops	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+FALL_DAMAGE	fall_damage	minecraft:fall_damage	fall_damage	gamerule.minecraft.fall_damage	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+FIRE_DAMAGE	fire_damage	minecraft:fire_damage	fire_damage	gamerule.minecraft.fire_damage	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+FIRE_SPREAD_RADIUS_AROUND_PLAYER	fire_spread_radius_around_player	minecraft:fire_spread_radius_around_player	fire_spread_radius_around_player	gamerule.minecraft.fire_spread_radius_around_player	INT	java.lang.Integer:128	128	128	false	java.lang.Integer	128
+FORGIVE_DEAD_PLAYERS	forgive_dead_players	minecraft:forgive_dead_players	forgive_dead_players	gamerule.minecraft.forgive_dead_players	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+FREEZE_DAMAGE	freeze_damage	minecraft:freeze_damage	freeze_damage	gamerule.minecraft.freeze_damage	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+GLOBAL_SOUND_EVENTS	global_sound_events	minecraft:global_sound_events	global_sound_events	gamerule.minecraft.global_sound_events	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+IMMEDIATE_RESPAWN	immediate_respawn	minecraft:immediate_respawn	immediate_respawn	gamerule.minecraft.immediate_respawn	BOOL	java.lang.Boolean:false	false	0	false	java.lang.Boolean	false
+KEEP_INVENTORY	keep_inventory	minecraft:keep_inventory	keep_inventory	gamerule.minecraft.keep_inventory	BOOL	java.lang.Boolean:false	false	0	false	java.lang.Boolean	false
+LAVA_SOURCE_CONVERSION	lava_source_conversion	minecraft:lava_source_conversion	lava_source_conversion	gamerule.minecraft.lava_source_conversion	BOOL	java.lang.Boolean:false	false	0	false	java.lang.Boolean	false
+LIMITED_CRAFTING	limited_crafting	minecraft:limited_crafting	limited_crafting	gamerule.minecraft.limited_crafting	BOOL	java.lang.Boolean:false	false	0	false	java.lang.Boolean	false
+LOCATOR_BAR	locator_bar	minecraft:locator_bar	locator_bar	gamerule.minecraft.locator_bar	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+LOG_ADMIN_COMMANDS	log_admin_commands	minecraft:log_admin_commands	log_admin_commands	gamerule.minecraft.log_admin_commands	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+MAX_BLOCK_MODIFICATIONS	max_block_modifications	minecraft:max_block_modifications	max_block_modifications	gamerule.minecraft.max_block_modifications	INT	java.lang.Integer:32768	32768	32768	false	java.lang.Integer	32768
+MAX_COMMAND_FORKS	max_command_forks	minecraft:max_command_forks	max_command_forks	gamerule.minecraft.max_command_forks	INT	java.lang.Integer:65536	65536	65536	false	java.lang.Integer	65536
+MAX_COMMAND_SEQUENCE_LENGTH	max_command_sequence_length	minecraft:max_command_sequence_length	max_command_sequence_length	gamerule.minecraft.max_command_sequence_length	INT	java.lang.Integer:65536	65536	65536	false	java.lang.Integer	65536
+MAX_ENTITY_CRAMMING	max_entity_cramming	minecraft:max_entity_cramming	max_entity_cramming	gamerule.minecraft.max_entity_cramming	INT	java.lang.Integer:24	24	24	false	java.lang.Integer	24
+MAX_MINECART_SPEED	max_minecart_speed	minecraft:max_minecart_speed	max_minecart_speed	gamerule.minecraft.max_minecart_speed	INT	java.lang.Integer:8	8	8	true	java.lang.Integer	THROWS java.lang.IllegalArgumentException: Tried to access invalid game rule minecraft:max_minecart_speed
+MAX_SNOW_ACCUMULATION_HEIGHT	max_snow_accumulation_height	minecraft:max_snow_accumulation_height	max_snow_accumulation_height	gamerule.minecraft.max_snow_accumulation_height	INT	java.lang.Integer:1	1	1	false	java.lang.Integer	1
+MOB_DROPS	mob_drops	minecraft:mob_drops	mob_drops	gamerule.minecraft.mob_drops	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+MOB_EXPLOSION_DROP_DECAY	mob_explosion_drop_decay	minecraft:mob_explosion_drop_decay	mob_explosion_drop_decay	gamerule.minecraft.mob_explosion_drop_decay	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+MOB_GRIEFING	mob_griefing	minecraft:mob_griefing	mob_griefing	gamerule.minecraft.mob_griefing	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+NATURAL_HEALTH_REGENERATION	natural_health_regeneration	minecraft:natural_health_regeneration	natural_health_regeneration	gamerule.minecraft.natural_health_regeneration	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+PLAYER_MOVEMENT_CHECK	player_movement_check	minecraft:player_movement_check	player_movement_check	gamerule.minecraft.player_movement_check	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+PLAYERS_NETHER_PORTAL_CREATIVE_DELAY	players_nether_portal_creative_delay	minecraft:players_nether_portal_creative_delay	players_nether_portal_creative_delay	gamerule.minecraft.players_nether_portal_creative_delay	INT	java.lang.Integer:0	0	0	false	java.lang.Integer	0
+PLAYERS_NETHER_PORTAL_DEFAULT_DELAY	players_nether_portal_default_delay	minecraft:players_nether_portal_default_delay	players_nether_portal_default_delay	gamerule.minecraft.players_nether_portal_default_delay	INT	java.lang.Integer:80	80	80	false	java.lang.Integer	80
+PLAYERS_SLEEPING_PERCENTAGE	players_sleeping_percentage	minecraft:players_sleeping_percentage	players_sleeping_percentage	gamerule.minecraft.players_sleeping_percentage	INT	java.lang.Integer:100	100	100	false	java.lang.Integer	100
+PROJECTILES_CAN_BREAK_BLOCKS	projectiles_can_break_blocks	minecraft:projectiles_can_break_blocks	projectiles_can_break_blocks	gamerule.minecraft.projectiles_can_break_blocks	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+PVP	pvp	minecraft:pvp	pvp	gamerule.minecraft.pvp	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+RAIDS	raids	minecraft:raids	raids	gamerule.minecraft.raids	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+RANDOM_TICK_SPEED	random_tick_speed	minecraft:random_tick_speed	random_tick_speed	gamerule.minecraft.random_tick_speed	INT	java.lang.Integer:3	3	3	false	java.lang.Integer	3
+REDUCED_DEBUG_INFO	reduced_debug_info	minecraft:reduced_debug_info	reduced_debug_info	gamerule.minecraft.reduced_debug_info	BOOL	java.lang.Boolean:false	false	0	false	java.lang.Boolean	false
+RESPAWN_RADIUS	respawn_radius	minecraft:respawn_radius	respawn_radius	gamerule.minecraft.respawn_radius	INT	java.lang.Integer:10	10	10	false	java.lang.Integer	10
+SEND_COMMAND_FEEDBACK	send_command_feedback	minecraft:send_command_feedback	send_command_feedback	gamerule.minecraft.send_command_feedback	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SHOW_ADVANCEMENT_MESSAGES	show_advancement_messages	minecraft:show_advancement_messages	show_advancement_messages	gamerule.minecraft.show_advancement_messages	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SHOW_DEATH_MESSAGES	show_death_messages	minecraft:show_death_messages	show_death_messages	gamerule.minecraft.show_death_messages	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPAWNER_BLOCKS_WORK	spawner_blocks_work	minecraft:spawner_blocks_work	spawner_blocks_work	gamerule.minecraft.spawner_blocks_work	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPAWN_MOBS	spawn_mobs	minecraft:spawn_mobs	spawn_mobs	gamerule.minecraft.spawn_mobs	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPAWN_MONSTERS	spawn_monsters	minecraft:spawn_monsters	spawn_monsters	gamerule.minecraft.spawn_monsters	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPAWN_PATROLS	spawn_patrols	minecraft:spawn_patrols	spawn_patrols	gamerule.minecraft.spawn_patrols	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPAWN_PHANTOMS	spawn_phantoms	minecraft:spawn_phantoms	spawn_phantoms	gamerule.minecraft.spawn_phantoms	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPAWN_WANDERING_TRADERS	spawn_wandering_traders	minecraft:spawn_wandering_traders	spawn_wandering_traders	gamerule.minecraft.spawn_wandering_traders	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPAWN_WARDENS	spawn_wardens	minecraft:spawn_wardens	spawn_wardens	gamerule.minecraft.spawn_wardens	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPECTATORS_GENERATE_CHUNKS	spectators_generate_chunks	minecraft:spectators_generate_chunks	spectators_generate_chunks	gamerule.minecraft.spectators_generate_chunks	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+SPREAD_VINES	spread_vines	minecraft:spread_vines	spread_vines	gamerule.minecraft.spread_vines	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+TNT_EXPLODES	tnt_explodes	minecraft:tnt_explodes	tnt_explodes	gamerule.minecraft.tnt_explodes	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+TNT_EXPLOSION_DROP_DECAY	tnt_explosion_drop_decay	minecraft:tnt_explosion_drop_decay	tnt_explosion_drop_decay	gamerule.minecraft.tnt_explosion_drop_decay	BOOL	java.lang.Boolean:false	false	0	false	java.lang.Boolean	false
+UNIVERSAL_ANGER	universal_anger	minecraft:universal_anger	universal_anger	gamerule.minecraft.universal_anger	BOOL	java.lang.Boolean:false	false	0	false	java.lang.Boolean	false
+WATER_SOURCE_CONVERSION	water_source_conversion	minecraft:water_source_conversion	water_source_conversion	gamerule.minecraft.water_source_conversion	BOOL	java.lang.Boolean:true	true	1	false	java.lang.Boolean	true
+serialize-false	false	0
+serialize-int	-7	-7
+get-gated	java.lang.IllegalArgumentException	Tried to access invalid game rule minecraft:max_minecart_speed
+after-set	java.lang.Boolean:true	java.lang.Integer:7	true	7

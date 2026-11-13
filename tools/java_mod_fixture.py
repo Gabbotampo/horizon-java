@@ -14,7 +14,12 @@ on ``PATH`` and zips it with Fabric metadata.
 one (the definition of ``ran-clean`` in the mod's report). ``lifecycle`` registers Fabric
 ``SERVER_STARTED`` and ``SERVER_STOPPING`` listeners that print a line, which milestone 2a shows
 in the game log. ``command`` registers ``/javahello [name]`` through Fabric's
-``CommandRegistrationCallback``, which milestone 2b runs in the game.
+``CommandRegistrationCallback``, which milestone 2b runs in the game. ``content`` registers one
+plain item and one plain block, which milestone 3 turns into game content (the runtime infers a
+``minecraft:stick`` item and a ``minecraft:stone`` block), and ships the jar's own assets, name
+and loot for the milestone 3b bake: a generated 16x16 ruby texture and ruby block texture, their
+item definitions, models and blockstate, ``lang/en_us.json`` (Ruby, Block of Ruby), and the block's
+loot table dropping one ruby.
 
 The loader and game classes are compiled as stubs so ``javac`` accepts the mod, but only the
 mod's own classes go into the jar: the native host answers the API classes, exactly as it does
@@ -26,10 +31,12 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 # Common stubs every fixture compiles against; none of them enter the jar.
@@ -260,8 +267,163 @@ public class MutableComponent implements Component {}
 """,
 }
 
+CONTENT_STUBS: dict[str, str] = {
+    "net/minecraft/core/Registry.java": """
+package net.minecraft.core;
+public interface Registry<T> {
+    static <V, T extends V> T register(Registry<V> registry,
+        net.minecraft.resources.Identifier location, T value) { return value; }
+}
+""",
+    "net/minecraft/core/registries/Registries.java": """
+package net.minecraft.core.registries;
+public final class Registries {
+    public static final net.minecraft.core.Registry<net.minecraft.world.item.Item> ITEM = null;
+    public static final net.minecraft.core.Registry<net.minecraft.world.level.block.Block> BLOCK = null;
+}
+""",
+    "net/minecraft/resources/Identifier.java": """
+package net.minecraft.resources;
+public final class Identifier {
+    public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; }
+}
+""",
+    "net/minecraft/world/item/Item.java": """
+package net.minecraft.world.item;
+public class Item {
+    public Item(Item.Properties properties) {}
+    public static class Properties {}
+}
+""",
+    "net/minecraft/world/level/block/state/BlockBehaviour.java": """
+package net.minecraft.world.level.block.state;
+public class BlockBehaviour {
+    public static class Properties {
+        public static BlockBehaviour.Properties of() { return null; }
+    }
+}
+""",
+    "net/minecraft/world/level/block/Block.java": """
+package net.minecraft.world.level.block;
+public class Block {
+    public Block(net.minecraft.world.level.block.state.BlockBehaviour.Properties properties) {}
+}
+""",
+}
+
+# The 16x16 art the content fixture ships, generated here so no binary is committed. The game's
+# content bake copies it; the proof checks that this exact colour reaches the hotbar.
+RUBY_BASE = (0xB3, 0x1F, 0x3E, 255)
+RUBY_DARK = (0x5E, 0x0B, 0x1F, 255)
+RUBY_LIGHT = (0xE8, 0x5A, 0x78, 255)
+
+
+def png(pixels: list[list[tuple[int, int, int, int]]]) -> bytes:
+    """A minimal RGBA PNG: the fixture's own texture, deterministic and dependency-free."""
+    height, width = len(pixels), len(pixels[0])
+    raw = b"".join(b"\x00" + b"".join(bytes(pixel) for pixel in row) for row in pixels)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def ruby_item_texture() -> bytes:
+    """A 16x16 cut gem: dark outline, ruby fill, a light diagonal facet."""
+    pixels = []
+    for y in range(16):
+        row = []
+        for x in range(16):
+            edge = x in (2, 15) or y in (1, 14) or x - y >= 13 or y - x >= 13
+            if edge:
+                row.append(RUBY_DARK)
+            elif y == x or y == x + 1:
+                row.append(RUBY_LIGHT)
+            else:
+                row.append(RUBY_BASE)
+        pixels.append(row)
+    return png(pixels)
+
+
+def ruby_block_texture() -> bytes:
+    """A 16x16 ruby block: a framed face with a faceted middle, the same palette."""
+    pixels = []
+    for y in range(16):
+        row = []
+        for x in range(16):
+            border = x in (0, 15) or y in (0, 15)
+            inner_border = x in (1, 14) or y in (1, 14)
+            facet = x in (7, 8) or y in (7, 8)
+            if border:
+                row.append(RUBY_DARK)
+            elif inner_border or facet:
+                row.append(RUBY_LIGHT)
+            else:
+                row.append(RUBY_BASE)
+        pixels.append(row)
+    return png(pixels)
+
+
+def content_assets() -> dict[str, bytes]:
+    """The content fixture's jar assets: model, item definition, texture, name and loot."""
+    cube = {
+        "parent": "minecraft:block/cube_all",
+        "textures": {"all": "m3_fixture:block/ruby_block"},
+    }
+    return {
+        "assets/m3_fixture/textures/item/ruby.png": ruby_item_texture(),
+        "assets/m3_fixture/textures/block/ruby_block.png": ruby_block_texture(),
+        "assets/m3_fixture/items/ruby.json": (
+            b'{"model":{"type":"minecraft:model","model":"m3_fixture:item/ruby"}}'
+        ),
+        "assets/m3_fixture/items/ruby_block.json": (
+            b'{"model":{"type":"minecraft:model","model":"m3_fixture:block/ruby_block"}}'
+        ),
+        "assets/m3_fixture/models/item/ruby.json": (
+            b'{"parent":"minecraft:item/generated",'
+            b'"textures":{"layer0":"m3_fixture:item/ruby"}}'
+        ),
+        "assets/m3_fixture/models/block/ruby_block.json": json.dumps(cube).encode(),
+        "assets/m3_fixture/blockstates/ruby_block.json": (
+            b'{"variants":{"":{"model":"m3_fixture:block/ruby_block"}}}'
+        ),
+        "assets/m3_fixture/lang/en_us.json": (
+            b'{"item.m3_fixture.ruby":"Ruby",'
+            b'"block.m3_fixture.ruby_block":"Block of Ruby"}'
+        ),
+        # A stone-template block keeps stone's "needs the right tool" rule, so the jar names its
+        # own block as pickaxe-mineable; without this a pickaxe would break it and drop nothing.
+        "data/minecraft/tags/block/mineable/pickaxe.json": (
+            b'{"values":["m3_fixture:ruby_block"]}'
+        ),
+        "data/m3_fixture/loot_table/blocks/ruby_block.json": json.dumps(
+            {
+                "type": "minecraft:block",
+                "pools": [
+                    {
+                        "rolls": 1,
+                        "entries": [{"type": "minecraft:item", "name": "m3_fixture:ruby"}],
+                    }
+                ],
+                "random_sequence": "m3_fixture:blocks/ruby_block",
+            }
+        ).encode(),
+    }
+
+
 # The mod id, entrypoint class and jar name per fixture; the mod's log line names the id.
-FIXTURES: dict[str, dict[str, str]] = {
+FIXTURES: dict[str, dict] = {
     "m0": {
         "id": "m0_fixture",
         "entry": "m0fixture.Hello",
@@ -309,6 +471,37 @@ public final class Lifecycle {
             System.out.println("m2a: SERVER_STARTED ran"));
         ServerLifecycleEvents.SERVER_STOPPING.register(server ->
             System.out.println("m2a: SERVER_STOPPING ran"));
+    }
+}
+""",
+    },
+    "content": {
+        "id": "m3_fixture",
+        "entry": "m3fixture.Content",
+        "jar": "m3_fixture.jar",
+        "stubs": CONTENT_STUBS,
+        "assets": content_assets(),
+        "source": """
+package m3fixture;
+
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+
+public final class Content {
+    public void onInitialize() {
+        // Milestone 3: one plain item and one plain block, each registered the way a real mod
+        // registers content. The native runtime infers the declaration from the constructor's
+        // property chain and the bridge turns it into the game's content.
+        Registry.register(Registries.ITEM,
+            Identifier.fromNamespaceAndPath("m3_fixture", "ruby"),
+            new Item(new Item.Properties()));
+        Registry.register(Registries.BLOCK,
+            Identifier.fromNamespaceAndPath("m3_fixture", "ruby_block"),
+            new Block(BlockBehaviour.Properties.of()));
     }
 }
 """,
@@ -402,6 +595,168 @@ public final class Events {
 }
 """,
     },
+    # Milestone 2d: the death-after hook, and the hand an entity click carries.
+    "m2d": {
+        "id": "m2d_fixture",
+        "entry": "m2dfixture.Events",
+        "jar": "m2d_fixture.jar",
+        "stubs": {
+            **HOOK_STUBS,
+            "net/fabricmc/fabric/api/entity/event/v1/ServerLivingEntityEvents.java": """
+package net.fabricmc.fabric.api.entity.event.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.LivingEntity;
+public final class ServerLivingEntityEvents {
+    public static final Event<AfterDeath> AFTER_DEATH = null;
+    public interface AfterDeath { void afterDeath(LivingEntity entity, DamageSource source); }
+}
+""",
+            "net/fabricmc/fabric/api/event/player/UseEntityCallback.java": """
+package net.fabricmc.fabric.api.event.player;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.EntityHitResult;
+public final class UseEntityCallback {
+    public static final Event<UseEntity> EVENT = null;
+    public interface UseEntity {
+        InteractionResult interact(Player player, Level world, InteractionHand hand, Entity entity,
+            EntityHitResult hit);
+    }
+}
+""",
+            "net/minecraft/world/InteractionHand.java": """
+package net.minecraft.world;
+public enum InteractionHand { MAIN_HAND, OFF_HAND }
+""",
+            "net/minecraft/world/InteractionResult.java": """
+package net.minecraft.world;
+public class InteractionResult {
+    public static final InteractionResult PASS = null;
+}
+""",
+            "net/minecraft/world/entity/Entity.java": """
+package net.minecraft.world.entity;
+public class Entity {
+    public int getId() { return 0; }
+}
+""",
+            "net/minecraft/world/entity/LivingEntity.java": """
+package net.minecraft.world.entity;
+public class LivingEntity extends Entity {}
+""",
+            "net/minecraft/world/damagesource/DamageSource.java": """
+package net.minecraft.world.damagesource;
+public class DamageSource {}
+""",
+            "net/minecraft/world/phys/EntityHitResult.java": """
+package net.minecraft.world.phys;
+public class EntityHitResult {}
+""",
+        },
+        "source": """
+package m2dfixture;
+
+import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.event.player.UseEntityCallback;
+import net.minecraft.world.InteractionResult;
+
+public final class Events {
+    public void onInitialize() {
+        // Fabric's AFTER_DEATH: the mob's id after its loot and death message.
+        ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) ->
+            System.out.println("m2d: after death id=" + entity.getId()));
+        // Read the hand: a named hand answers its name; an unknown one is counted by the
+        // runtime and the listener still runs (the name reads as null).
+        UseEntityCallback.EVENT.register((player, world, hand, entity, hit) -> {
+            System.out.println("m2d: interact hand=" + hand.name()
+                + " id=" + entity.getId());
+            return InteractionResult.PASS;
+        });
+    }
+}
+""",
+    },
+    # The COPY_FROM listener reads `alive`: false on the death respawn, true when a player leaves
+    # the End after the credits (the End case is not reachable from a control socket).
+    "copy_from": {
+        "id": "copyfrom_fixture",
+        "entry": "copyfromfixture.Events",
+        "jar": "copyfrom_fixture.jar",
+        "stubs": {
+            "net/fabricmc/fabric/api/entity/event/v1/ServerPlayerEvents.java": """
+package net.fabricmc.fabric.api.entity.event.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.server.level.ServerPlayer;
+public final class ServerPlayerEvents {
+    public static final Event<CopyFrom> COPY_FROM = null;
+    public static final Event<AfterRespawn> AFTER_RESPAWN = null;
+    public interface CopyFrom {
+        void copyFromPlayer(ServerPlayer oldPlayer, ServerPlayer newPlayer, boolean alive);
+    }
+    public interface AfterRespawn {
+        void afterRespawn(ServerPlayer oldPlayer, ServerPlayer newPlayer, boolean alive);
+    }
+}
+""",
+            "net/minecraft/server/level/ServerPlayer.java": """
+package net.minecraft.server.level;
+public class ServerPlayer {
+    public String getScoreboardName() { return ""; }
+}
+""",
+        },
+        "source": """
+package copyfromfixture;
+
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
+
+public final class Events {
+    public void onInitialize() {
+        // COPY_FROM's `alive` is vanilla's keep-all-data flag: false on the death respawn,
+        // true when the player leaves the End after the credits.
+        ServerPlayerEvents.COPY_FROM.register((oldPlayer, newPlayer, alive) ->
+            System.out.println("copyfrom: copy_from alive=" + alive));
+        ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) ->
+            System.out.println("copyfrom: after_respawn alive=" + alive));
+    }
+}
+""",
+    },
+    # A block and an item the jar registers itself, in the mod's own namespace so the bridge
+    # declares them (instead of a baked package). The block has no BlockItem, so a `give` of the
+    # block's id has to fail: that is what tells an invented item from a declared one.
+    "own_content": {
+        "id": "own_content_fixture",
+        "entry": "owncontent.Content",
+        "jar": "own_content_fixture.jar",
+        "stubs": CONTENT_STUBS,
+        "source": """
+package owncontent;
+
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+
+public final class Content {
+    public void onInitialize() {
+        Registry.register(Registries.ITEM,
+            Identifier.fromNamespaceAndPath("horizon_java", "proof_item"),
+            new Item(new Item.Properties()));
+        Registry.register(Registries.BLOCK,
+            Identifier.fromNamespaceAndPath("horizon_java", "proof_block"),
+            new Block(BlockBehaviour.Properties.of()));
+    }
+}
+""",
+    },
 }
 
 # Kept for callers that imported milestone 1's names.
@@ -469,6 +824,8 @@ def build(out: Path, kind: str = "m0") -> Path:
         # The stubs are compile-time only; the native host answers those classes.
         with zipfile.ZipFile(jar, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("fabric.mod.json", json.dumps(metadata, indent=2))
+            for name, data in sorted(fixture.get("assets", {}).items()):
+                archive.writestr(name, data)
             for class_file in sorted(classes.rglob("*.class")):
                 archive.write(class_file, class_file.relative_to(classes).as_posix())
     return jar

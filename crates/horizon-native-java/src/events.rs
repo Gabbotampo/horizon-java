@@ -56,6 +56,7 @@ use crate::{
 };
 
 pub use crate::facade_server::{GameRuleValue, ServerFacts};
+pub use crate::facade_world::{FacadeStack, HeldItems};
 
 /// One game event the game can fire, whatever loader named it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -868,13 +869,9 @@ const SUBSCRIBE_EVENT: &[&str] = &[
     "Lnet/neoforged/bus/api/SubscribeEvent;",
     "Lnet/minecraftforge/eventbus/api/SubscribeEvent;",
 ];
-const EVENT_BUS_SUBSCRIBER: &[&str] = &[
-    "Lnet/neoforged/fml/common/EventBusSubscriber;",
-    "Lnet/neoforged/fml/common/Mod$EventBusSubscriber;",
-];
 
 /// The game event and loader an event class names, if the game fires it.
-fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
+pub(crate) fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
     let client = class
         .strip_prefix(NEOFORGE_CLIENT_EVENT_ROOT)
         .map(|rest| (rest, EventLoader::NeoForge))
@@ -899,8 +896,9 @@ fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
         .map(|(_, event)| (*event, loader))
 }
 
-fn fabric_field(marker: &str) -> Option<&'static FabricField> {
-    let (owner, field) = marker.strip_prefix("fabric-event/")?.rsplit_once('.')?;
+/// The API field a Fabric event handle (`host_events.rs`) names.
+fn fabric_field(event: &Value) -> Option<&'static FabricField> {
+    let (owner, field) = crate::host_events::fabric_field_of(event)?;
     FABRIC_FIELDS
         .iter()
         .find(|row| row.owner == owner && row.field == field)
@@ -990,6 +988,10 @@ pub struct FacadeLevel {
     pub id: String,
     pub game_time: i64,
     pub day_time: i64,
+    /// The level's world border as `[min_x, min_z, max_x, max_z]`, vanilla's
+    /// `getMinX()`... (`facade_world.rs`); `None` when the game gave none, so
+    /// `getWorldBorder()` refuses.
+    pub world_border: Option<[f64; 4]>,
 }
 
 /// A non-player entity as the façade shows it.
@@ -1003,13 +1005,29 @@ pub struct FacadeEntity {
     pub level: Option<String>,
 }
 
+/// A clone's old player (`PlayerEvent.Clone#getOriginal`, Fabric `COPY_FROM`'s `oldPlayer`), as
+/// the game reads it during the clone hook. A fact the game does not give is `None`, and that
+/// read refuses (counted).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FacadeOriginal {
+    pub uuid: u128,
+    /// The player's name: the old and the new player share one game profile.
+    pub name: Option<String>,
+    /// The dimension id the old player was in (where they died, or the End).
+    pub level: Option<String>,
+    pub position: Option<[f64; 3]>,
+    pub health: Option<f32>,
+}
+
 /// The server state every firing exposes, snapshotted by the game.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EventFacade {
     /// `MinecraftServer.getTickCount()`.
     pub tick_count: i32,
     pub dedicated: bool,
-    pub max_players: i32,
+    /// `MinecraftServer.getMaxPlayers()`, when the host knows the server's configured limit.
+    /// `None` (the default) makes a read refuse and count instead of answering a made-up 0.
+    pub max_players: Option<i32>,
     pub players: Vec<FacadePlayer>,
     pub levels: Vec<FacadeLevel>,
     /// Server-wide facts (world folder, game rules, registries, the channels
@@ -1029,8 +1047,15 @@ pub struct EventContext {
     pub entity: Option<FacadeEntity>,
     /// The damage type id of a death (`minecraft:player_attack`).
     pub damage: Option<String>,
-    /// The damage amount of an `ALLOW_DEATH`, `ALLOW_DAMAGE` or `AFTER_DAMAGE`.
+    /// The damage amount of an `ALLOW_DEATH`, `ALLOW_DAMAGE` or `AFTER_DAMAGE`; for
+    /// `AFTER_DAMAGE` it is the amount the hit dealt (`hurtServer`'s `damage` at its return,
+    /// Fabric's `damageTaken`).
     pub amount: f32,
+    /// `AFTER_DAMAGE`'s `baseDamageTaken`, the damage before the hit's reductions
+    /// (`hurtServer`'s `originalDamage`). `None` when the host hook does not name it: the
+    /// argument then reaches the listener as a `game/unknown/...` marker whose reads are
+    /// counted, never as a copy of `amount`.
+    pub base_amount: Option<f32>,
     /// The block a use, attack or break is about.
     pub pos: Option<[i32; 3]>,
     /// The block id at `pos` (`minecraft:stone`), for a Fabric block-break
@@ -1038,14 +1063,33 @@ pub struct EventContext {
     pub block: Option<String>,
     /// The face clicked (`[0, 1, 0]` is the top).
     pub face: Option<[i32; 3]>,
-    /// The off hand acts (the main hand otherwise).
-    pub off_hand: bool,
+    /// The hand that acted: `Some(false)` the main hand, `Some(true)` the off hand.
+    /// `None` when the hook does not name it or the two hands cannot be told
+    /// apart: the Java argument is then a marker whose reads are counted
+    /// unknowns (the listener still runs).
+    pub off_hand: Option<bool>,
     /// `AFTER_RESPAWN`/`COPY_FROM`'s `alive` (back from the End, not a
     /// death); `AFTER_DAMAGE`'s `blocked`.
     pub flag: bool,
     /// The level a player left (`AFTER_PLAYER_CHANGE_LEVEL`'s origin);
     /// `level` is the destination.
     pub origin: Option<String>,
+    /// What `player` holds and their game mode, read by the hook for this
+    /// firing (`facade_world.rs`). `None` makes those reads refuse.
+    pub held: Option<HeldItems>,
+    /// A clone's old player, for `PlayerEvent.Clone#getOriginal` and `COPY_FROM`'s `oldPlayer`.
+    /// `None` refuses `getOriginal` (counted).
+    pub original: Option<FacadeOriginal>,
+    /// Whether a block entity stood at `pos`, for Fabric `PlayerBlockBreakEvents.AFTER`'s
+    /// `BlockEntity` (the `level.getBlockEntity(pos)` `destroyBlock` read before the removal).
+    /// `Some(false)` passes `null`, as vanilla does for a block without one; `Some(true)` passes
+    /// a marker whose reads are counted, because the host hands over the entity's saved data, not
+    /// a live object. `None` (a hook that does not say) passes `null`, as before.
+    pub block_entity: Option<bool>,
+    /// NeoForge `ServerTickEvent`/`LevelTickEvent#hasTime`: the host's
+    /// `MinecraftServer.haveTime()`, read once when the tick hook fires (NeoForge
+    /// evaluates its `BooleanSupplier` at each call). `None` refuses the read.
+    pub has_time: Option<bool>,
 }
 
 /// One firing of one event, carried across every listener of every jar.
@@ -1120,6 +1164,15 @@ fn player_marker(uuid: u128) -> Value {
     marker(format!("game/player/{uuid:032x}"))
 }
 
+/// A clone's old player: its own holder (`neoforge_original.rs`) and façade, never the new
+/// player's `game/player/` marker.
+fn original_marker(uuid: u128) -> Value {
+    marker(format!(
+        "{}{uuid:032x}",
+        crate::neoforge_attachments::ORIGINAL_PREFIX
+    ))
+}
+
 fn dimension_key(id: &str) -> Value {
     marker(format!("resource-key/dimension/{id}"))
 }
@@ -1134,6 +1187,8 @@ enum Facade<'a> {
     PlayerList,
     Level(&'a str),
     Player(u128),
+    /// A clone's old player (`game/original-player/<uuid>`).
+    OriginalPlayer(u128),
     Connection(u128),
     Entity(i32),
     Event,
@@ -1158,6 +1213,7 @@ fn facade(marker: &str) -> Option<Facade<'_>> {
     Some(match kind {
         "level" => Facade::Level(id),
         "player" => Facade::Player(hex()?),
+        "original-player" => Facade::OriginalPlayer(hex()?),
         "connection" => Facade::Connection(hex()?),
         "entity" => Facade::Entity(id.parse().ok()?),
         _ => Facade::Opaque,
@@ -1165,9 +1221,45 @@ fn facade(marker: &str) -> Option<Facade<'_>> {
 }
 
 impl StdHost {
+    /// Record the level one firing names into the server's level ledger.
+    ///
+    /// `MinecraftServer.getAllLevels()` is every level in the server's level
+    /// map. The game's hook payloads do not carry that map, but every
+    /// level-scoped firing names its level and `LevelLoad`/`LevelUnload` say
+    /// when one appears and goes away. The ledger is the set announced and not
+    /// yet unloaded, so a listener at `server_started` (before any level tick)
+    /// still sees the levels the server opened.
+    pub fn note_firing_levels(&mut self, firing: &EventFiring) {
+        for level in &firing.facade.levels {
+            self.note_level(level.clone());
+        }
+        if let Some(id) = firing.context.level.as_deref()
+            && !self.levels.iter().any(|level| level.id == id)
+        {
+            self.note_level(FacadeLevel {
+                id: id.to_owned(),
+                ..FacadeLevel::default()
+            });
+        }
+        if firing.event == GameEvent::LevelUnload
+            && let Some(id) = firing.context.level.as_deref()
+        {
+            self.levels.retain(|level| level.id != id);
+        }
+    }
+
+    /// Add one level to the ledger, replacing the facts an earlier firing gave
+    /// for it.
+    fn note_level(&mut self, level: FacadeLevel) {
+        match self.levels.iter_mut().find(|known| known.id == level.id) {
+            Some(known) => *known = level,
+            None => self.levels.push(level),
+        }
+    }
+
     /// The statics a listener's registration and body read through the host:
-    /// a Fabric `Event` field keeps its name (`fabric-event/<owner>.<FIELD>`),
-    /// a Forge event's `BUS` names its event, and the façade answers
+    /// a Fabric `Event` field is the event handle naming its owner and field,
+    /// a Forge event's `BUS` the bus handle naming its event (`host_events.rs`), and the façade answers
     /// `InteractionResult` and dimension constants plus the field read of a
     /// join handler's `player`.
     pub(crate) fn game_event_static(&self, r: &MethodRef) -> Option<Value> {
@@ -1179,7 +1271,7 @@ impl StdHost {
         if r.descriptor == "Lnet/fabricmc/fabric/api/event/Event;"
             && r.owner.starts_with("net/fabricmc/fabric/api/")
         {
-            return Some(marker(format!("fabric-event/{}.{}", r.owner, r.name)));
+            return Some(crate::host_events::fabric_field_event(&r.owner, &r.name));
         }
         // `Event.DEFAULT_PHASE` and the `EventPriority` constants: what a
         // listener's order is registered with (`order.rs`).
@@ -1191,12 +1283,17 @@ impl StdHost {
         {
             return Some(marker(format!("enum/{}/{}", r.owner, r.name)));
         }
+        // Forge EventBus 7's per-event bus, typed exactly (a `BusGroup` is no
+        // `EventBus`).
         if r.name == "BUS"
             && r.owner.starts_with(FORGE_EVENT_ROOT)
-            && r.descriptor
-                .starts_with("Lnet/minecraftforge/eventbus/api/bus/")
+            && matches!(
+                r.descriptor.as_str(),
+                "Lnet/minecraftforge/eventbus/api/bus/EventBus;"
+                    | "Lnet/minecraftforge/eventbus/api/bus/CancellableEventBus;"
+            )
         {
-            return Some(marker(format!("forge-bus/{}", r.owner)));
+            return Some(crate::host_events::forge_bus(&r.owner));
         }
         match (r.owner.as_str(), r.name.as_str()) {
             ("net/minecraft/world/InteractionResult", name)
@@ -1280,13 +1377,16 @@ impl StdHost {
             };
         }
         // The server-wide markers (rules, registries, a rule, a level
-        // resource) answer from the firing's server facts; outside a firing
-        // there are none, and the call refuses.
+        // resource) answer from the firing's server facts. Outside a firing
+        // there are none, so only what a marker holds by itself answers (a rule's id and default, a resource's id).
         if facade_server::owns(text) {
             return Some(match self.game_event.as_deref() {
                 Some(firing) => facade_server::answer(&firing.facade.server, text, r, args),
-                None => Err(NativeError::UnknownHostCall(r.clone())),
+                None => facade_server::answer(&ServerFacts::default(), text, r, args),
             });
+        }
+        if let Some(answer) = self.world_facade_call(text, r, args) {
+            return Some(answer);
         }
         if let Some(hit) = text.strip_prefix("game/block-hit/") {
             return Some(
@@ -1367,6 +1467,12 @@ impl StdHost {
                 _ => None,
             };
         }
+        // An argument the hook does not give reaches the listener as `game/unknown/<what>`:
+        // a read is counted in the jar's unknown-host calls and answered neutrally, so the
+        // callback keeps running instead of losing the rest of its work to one missing value.
+        if text.starts_with("game/unknown/") {
+            return Some(self.unknown_host_call(r));
+        }
         let answer = self.facade_answer(&kind, r, args);
         Some(answer.ok_or_else(|| NativeError::UnknownHostCall(r.clone())))
     }
@@ -1388,12 +1494,21 @@ impl StdHost {
                 ("isSingleplayer", "Z") => flag(!facade.dedicated),
                 ("isRunning" | "isSameThread", "Z") => flag(true),
                 ("getPlayerCount", "I") => int(facade.players.len() as i32),
-                ("getMaxPlayers", "I") => int(facade.max_players),
+                // A server whose limit the host does not know refuses this read, so the
+                // listener counts it instead of hearing a default that looks configured.
+                ("getMaxPlayers", "I") => facade.max_players.map(Value::Int),
                 ("getServerVersion", "Ljava/lang/String;") => Some(marker("26.3".into())),
                 ("getPlayerList", _) => Some(marker(PLAYER_LIST.into())),
                 ("overworld", _) => Some(level_marker("minecraft:overworld")),
                 ("getAllLevels", _) => {
-                    let levels = facade.levels.iter().map(|l| level_marker(&l.id)).collect();
+                    // The firing's own list when the game gave one, else the
+                    // levels the firings announced (the game's hook payloads
+                    // carry no level map).
+                    let levels = if facade.levels.is_empty() {
+                        self.levels.iter().map(|l| level_marker(&l.id)).collect()
+                    } else {
+                        facade.levels.iter().map(|l| level_marker(&l.id)).collect()
+                    };
                     Some(self.facade_list("levels", levels))
                 }
                 _ => None,
@@ -1408,7 +1523,9 @@ impl StdHost {
                     Some(self.facade_list("players", players))
                 }
                 ("getPlayerCount", "I") => int(facade.players.len() as i32),
-                ("getMaxPlayers", "I") => int(facade.max_players),
+                // A server whose limit the host does not know refuses this read, so the
+                // listener counts it instead of hearing a default that looks configured.
+                ("getMaxPlayers", "I") => facade.max_players.map(Value::Int),
                 ("getServer", _) => Some(marker(SERVER.into())),
                 ("getPlayer", _) if r.descriptor.starts_with("(Ljava/util/UUID;)") => {
                     let wanted = args.first().and_then(expect_ref)?.strip_prefix("uuid/")?;
@@ -1433,11 +1550,18 @@ impl StdHost {
                 _ => None,
             },
             Facade::Level(id) => {
-                let level = facade.levels.iter().find(|l| l.id == *id);
+                let level = facade
+                    .levels
+                    .iter()
+                    .find(|l| l.id == *id)
+                    .or_else(|| self.levels.iter().find(|l| l.id == *id));
                 match (name, returns) {
                     ("getServer", _) => Some(marker(SERVER.into())),
                     ("getGameTime", "J") => Some(Value::Long(level?.game_time)),
                     ("getDayTime", "J") => Some(Value::Long(level?.day_time)),
+                    ("getWorldBorder", "Lnet/minecraft/world/level/border/WorldBorder;") => level?
+                        .world_border
+                        .map(|_| crate::facade_world::border_marker(id)),
                     ("isClientSide", "Z") => flag(false),
                     ("dimension", _) => Some(dimension_key(id)),
                     ("players", _) => {
@@ -1453,15 +1577,57 @@ impl StdHost {
                 }
             }
             Facade::Player(uuid) => {
+                // Identity comes from the firing's `PlayerRef`, which carries
+                // the UUID even after the player left the listed players: a
+                // `player_logged_out` listener hears about a player the server
+                // has already removed (`Hooks::player_logged_out`). Reading a
+                // name still needs the listed record, and a dimension is not
+                // part of `PlayerRef` at the pinned mod API (`arismoko/horizon#2747`).
+                match (name, returns) {
+                    ("getUUID", _) => return uuid_value(&uuid_text(*uuid)).ok(),
+                    ("getStringUUID", _) => return Some(marker(uuid_text(*uuid))),
+                    _ => {}
+                }
+                if let Some(answer) = crate::facade_world::player_member(
+                    context.player,
+                    context.held.as_ref(),
+                    *uuid,
+                    r,
+                    args,
+                ) {
+                    return answer;
+                }
                 let p = player(*uuid)?;
                 match (name, returns) {
-                    ("getUUID", _) => uuid_value(&uuid_text(*uuid)).ok(),
-                    ("getStringUUID", _) => Some(marker(uuid_text(*uuid))),
                     ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
                     ("getId", "I") => Some(Value::Int(p.entity_id?)),
                     ("isAlive", "Z") => flag(true),
                     ("level" | "serverLevel", _) => p.level.as_deref().map(level_marker),
+                    ("getServer", _) => Some(marker(SERVER.into())),
+                    _ => None,
+                }
+            }
+            // The old player's facts as the game read them for this clone; anything else (its
+            // inventory, entity id, held items) refuses.
+            Facade::OriginalPlayer(uuid) => {
+                let original = context.original.as_ref().filter(|o| o.uuid == *uuid)?;
+                let axis = |i: usize| original.position.map(|p| Value::Float(p[i]));
+                match (name, returns) {
+                    ("getUUID", _) => uuid_value(&uuid_text(*uuid)).ok(),
+                    ("getStringUUID", _) => Some(marker(uuid_text(*uuid))),
+                    ("getScoreboardName" | "getPlainTextName", _) => {
+                        original.name.clone().map(marker)
+                    }
+                    ("getName", _) => original
+                        .name
+                        .as_deref()
+                        .map(|name| component_value("literal", name)),
+                    ("level" | "serverLevel", _) => original.level.as_deref().map(level_marker),
+                    ("getX", "D") => axis(0),
+                    ("getY", "D") => axis(1),
+                    ("getZ", "D") => axis(2),
+                    ("getHealth", "F") => original.health.map(|h| Value::Float(f64::from(h))),
                     ("getServer", _) => Some(marker(SERVER.into())),
                     _ => None,
                 }
@@ -1486,21 +1652,29 @@ impl StdHost {
                     .pos
                     .as_ref()
                     .map(|[x, y, z]| marker(format!("block-pos/{x},{y},{z}"))),
-                ("getHand", _) => Some(marker(format!(
-                    "enum/net/minecraft/world/InteractionHand/{}",
-                    if context.off_hand {
-                        "OFF_HAND"
-                    } else {
-                        "MAIN_HAND"
-                    }
-                ))),
+                ("getHand", _) => Some(hand_marker(context.off_hand)),
+                // `PlayerInteractEvent.EntityInteract#getTarget`: the clicked entity.
+                ("getTarget", _) if event == GameEvent::UseEntity => context
+                    .entity
+                    .as_ref()
+                    .map(|entity| marker(format!("game/entity/{}", entity.id))),
                 ("getState", _) => context.block.as_deref().map(block_state_marker),
                 ("getEntity" | "getPlayer" | "player" | "entity", _) => context_subject(&context),
                 ("getSource" | "source", _) => context
                     .damage
                     .as_ref()
                     .map(|damage| marker(format!("game/damage/{damage}"))),
-                ("hasTime", "Z") => flag(true),
+                ("hasTime", "Z") => context.has_time.and_then(flag),
+                // NeoForge `PlayerEvent.Clone#isWasDeath`: `ServerPlayer.restoreFrom(old,
+                // keepEverything)` posts `new Clone(this, old, !keepEverything)` (@371-382 of the
+                // 26.3 patched server). The firing's flag is Fabric `COPY_FROM`'s `alive`, which
+                // is that same `keepEverything`, so the answer is its negation.
+                ("isWasDeath", "Z") if event == GameEvent::PlayerCopy => flag(!context.flag),
+                // `getOriginal()`: the old player the game lends for the clone hook (#3040).
+                ("getOriginal", _) if event == GameEvent::PlayerCopy => context
+                    .original
+                    .as_ref()
+                    .map(|original| original_marker(original.uuid)),
                 ("isCanceled", "Z") => flag(cancelled),
                 ("setCanceled", "V") => {
                     let cancel = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
@@ -1519,6 +1693,44 @@ impl StdHost {
         }
     }
 
+    /// A call on a world-border, held-stack or item marker
+    /// (`facade_world.rs`), or `None` for any other receiver. Outside a firing
+    /// they refuse: their facts belong to the firing that handed them out.
+    fn world_facade_call(
+        &self,
+        text: &str,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        use crate::facade_world::{ITEM, STACK, WORLD_BORDER};
+        let firing = self.game_event.as_deref();
+        if let Some(dimension) = text.strip_prefix(WORLD_BORDER) {
+            let bounds = firing.and_then(|firing| {
+                firing
+                    .facade
+                    .levels
+                    .iter()
+                    .chain(&self.levels)
+                    .find(|level| level.id == dimension)
+                    .and_then(|level| level.world_border)
+            });
+            return Some(crate::facade_world::border_answer(text, bounds, r, args));
+        }
+        if let Some(rest) = text.strip_prefix(STACK) {
+            let context = firing.map(|firing| &firing.context);
+            return Some(crate::facade_world::stack_answer(
+                text,
+                rest,
+                context.and_then(|context| context.player),
+                context.and_then(|context| context.held.as_ref()),
+                r,
+                args,
+            ));
+        }
+        let id = text.strip_prefix(ITEM)?;
+        Some(crate::facade_world::item_answer(text, id, r, args))
+    }
+
     /// A fresh list marker holding `values`, through the host's own
     /// collection table so `size`/`get`/`iterator` work on it.
     fn facade_list(&mut self, what: &str, values: Vec<Value>) -> Value {
@@ -1527,15 +1739,19 @@ impl StdHost {
         Value::Ref(Some(marker))
     }
 
-    /// Every listener this host recorded, with its event identity, plus the
-    /// static `@EventBusSubscriber` methods `jar` declares. `server` drops
-    /// subscribers marked `Dist.CLIENT`.
+    /// Every listener this host recorded, with its event identity. The static
+    /// `@EventBusSubscriber` methods are among the NeoForge bus listeners once
+    /// [`NativeJar::inject_event_subscribers`] ran, validated as FML injects
+    /// them (`neoforge_inject.rs`).
     pub fn game_listeners(&self, jar: &NativeJar, server: bool) -> GameListeners {
         let mut out = GameListeners::default();
         for invocation in &self.invocations {
             listeners_from(invocation, jar, &mut out);
         }
-        subscriber_classes(jar, server, &mut out);
+        // NeoForge bus-8 `addListener`s, each already checked to name a fired class.
+        for listener in &self.neoforge_bus.listeners {
+            push_neoforge_listener(listener, &mut out);
+        }
         if server {
             // A server never fires a client event: a common entrypoint's
             // client registrations count as events it does not fire.
@@ -1704,10 +1920,10 @@ fn count_unsupported(out: &mut GameListeners, source: String) {
 fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameListeners) {
     let owner = invocation.method.owner.as_str();
     let name = invocation.method.name.as_str();
-    let receiver = invocation.receiver.as_ref().and_then(expect_ref);
+    let receiver = invocation.receiver.as_ref();
     // Fabric: `<Field>.addPhaseOrdering(first, second)`, kept for the order.
     if owner == FABRIC_EVENT && name == "addPhaseOrdering" {
-        if let Some(row) = receiver.and_then(|r| fabric_field(r))
+        if let Some(row) = receiver.and_then(fabric_field)
             && let [first, second] = invocation.args.as_slice()
         {
             out.phase_orderings.push(PhaseOrdering {
@@ -1720,14 +1936,14 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     }
     // Fabric: `<Field>.register([phase,] listener)` on a named Event field.
     if owner == FABRIC_EVENT && name == "register" {
-        let Some(receiver) = receiver else {
+        let Some(event) = receiver else {
             return;
         };
-        let Some(source) = receiver.strip_prefix("fabric-event/") else {
+        let Some(source) = crate::host_events::fabric_event_name(event) else {
             return;
         };
-        let Some(row) = fabric_field(receiver) else {
-            count_unsupported(out, source.to_owned());
+        let Some(row) = fabric_field(event) else {
+            count_unsupported(out, source);
             return;
         };
         let source = fabric_source(row);
@@ -1782,11 +1998,11 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     }
     // Forge EventBus 7: `<Event>.BUS.addListener([priority,] [alwaysCancelling,] listener)`.
     if FORGE_BUSES.contains(&owner) && name == "addListener" {
-        let Some(class) = receiver.and_then(|r| r.strip_prefix("forge-bus/")) else {
+        let Some(class) = receiver.and_then(crate::host_events::forge_bus_event) else {
             return;
         };
         push_bus_listener(
-            class,
+            &class,
             invocation,
             jar,
             out,
@@ -1894,6 +2110,23 @@ fn push_bus_listener(
     });
 }
 
+/// A NeoForge bus-8 listener (`neoforge_bus.rs`) as the listener the game fires.
+fn push_neoforge_listener(listener: &crate::neoforge_bus::BusListener, out: &mut GameListeners) {
+    let Some((event, loader)) = bus_event(&listener.class) else {
+        return;
+    };
+    out.listeners.push(GameListener {
+        event,
+        loader,
+        source: listener.class.clone(),
+        callback: listener.callback.clone(),
+        receives_cancelled: listener.receive_canceled,
+        order: ListenerOrder::Priority(listener.priority),
+        shape: None,
+        combine: Combine::Void,
+    });
+}
+
 /// The `@SubscribeEvent` methods of `class`: static ones without a receiver,
 /// instance ones on `object`.
 fn subscribe_methods(
@@ -1958,40 +2191,16 @@ fn subscribe_methods(
     }
 }
 
-/// NeoForge's automatic subscribers: every `@EventBusSubscriber` class's
-/// static `@SubscribeEvent` methods, without a `register` call.
-fn subscriber_classes(jar: &NativeJar, server: bool, out: &mut GameListeners) {
-    for (name, file) in &jar.classes {
-        let Some(annotation) = file
-            .annotations
-            .iter()
-            .find(|a| EVENT_BUS_SUBSCRIBER.contains(&a.descriptor.as_str()))
-        else {
-            continue;
-        };
-        if server && subscriber_client_only(annotation) {
-            continue;
-        }
-        subscribe_methods(jar, name, None, out);
+/// The `InteractionHand` argument a firing names, or a marker whose every read
+/// is counted as an unknown host call when the hook does not say which hand acted.
+fn hand_marker(off_hand: Option<bool>) -> Value {
+    match off_hand {
+        Some(off) => marker(format!(
+            "enum/net/minecraft/world/InteractionHand/{}",
+            if off { "OFF_HAND" } else { "MAIN_HAND" }
+        )),
+        None => marker("game/unknown/hand".into()),
     }
-}
-
-/// `@EventBusSubscriber(value = Dist.CLIENT)`: the class only loads on a client.
-fn subscriber_client_only(annotation: &crate::Annotation) -> bool {
-    fn names(value: &crate::AnnotationValue, out: &mut Vec<String>) {
-        match value {
-            crate::AnnotationValue::String(text) => out.push(text.clone()),
-            crate::AnnotationValue::Array(values) => {
-                values.iter().for_each(|value| names(value, out))
-            }
-            _ => {}
-        }
-    }
-    let mut dists = Vec::new();
-    if let Some(value) = annotation.values.get("value") {
-        names(value, &mut dists);
-    }
-    !dists.is_empty() && dists.iter().all(|dist| dist.ends_with(".CLIENT"))
 }
 
 /// The Fabric argument list of `shape` for this firing.
@@ -2016,20 +2225,22 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             .map_or_else(|| missing("player"), player_marker)
     };
     let subject = || context_subject(context).unwrap_or_else(|| missing("entity"));
+    // The entity a click or an attack is aimed at: `subject()` is the player when the firing
+    // names one, which is the acting player, not the target.
+    let target = || {
+        context
+            .entity
+            .as_ref()
+            .map(|entity| marker(format!("game/entity/{}", entity.id)))
+            .unwrap_or_else(|| missing("entity"))
+    };
     let damage = || {
         marker(format!(
             "game/damage/{}",
             context.damage.as_deref().unwrap_or("minecraft:generic")
         ))
     };
-    let hand = || {
-        let hand = if context.off_hand {
-            "OFF_HAND"
-        } else {
-            "MAIN_HAND"
-        };
-        marker(format!("enum/net/minecraft/world/InteractionHand/{hand}"))
-    };
+    let hand = || hand_marker(context.off_hand);
     let opaque = |what: &str| marker(format!("game/{what}/0"));
     // `block-pos/x,y,z`, the host's block position value (`getX`...).
     let pos = || {
@@ -2082,7 +2293,13 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             vec![subject(), damage(), Value::Float(f64::from(context.amount))]
         }
         Shape::EntityDamage => vec![subject(), damage()],
-        Shape::BlockBreak => vec![level(), player(), pos(), block_state(), Value::Ref(None)],
+        Shape::BlockBreak => {
+            let block_entity = match context.block_entity {
+                Some(true) => missing("block-entity"),
+                Some(false) | None => Value::Ref(None),
+            };
+            vec![level(), player(), pos(), block_state(), block_entity]
+        }
         Shape::UseBlock => {
             // The hit result names its block and face: `game/block-hit/x,y,z/UP`.
             let hit = context.pos.map_or_else(
@@ -2095,15 +2312,25 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
         Shape::AfterDamage => vec![
             subject(),
             damage(),
-            Value::Float(f64::from(context.amount)),
+            // Fabric's `(LivingEntity, DamageSource, float baseDamageTaken, float damageTaken,
+            // boolean blocked)`: two distinct amounts, or a counted marker for the base one.
+            context.base_amount.map_or_else(
+                || missing("base damage"),
+                |amount| Value::Float(f64::from(amount)),
+            ),
             Value::Float(f64::from(context.amount)),
             Value::Int(i32::from(context.flag)),
         ],
-        // Horizon keeps one player across a respawn: the old and the new
-        // player are the same marker.
+        // `COPY_FROM(oldPlayer, newPlayer, alive)`: the old player is the clone's original. Without
+        // one (`AFTER_RESPAWN`, whose hook names no old player) both are the one marker Horizon
+        // keeps across a respawn.
         Shape::PlayerPair => {
             let player = player();
-            vec![player.clone(), player, Value::Int(i32::from(context.flag))]
+            let old = context
+                .original
+                .as_ref()
+                .map_or_else(|| player.clone(), |original| original_marker(original.uuid));
+            vec![old, player, Value::Int(i32::from(context.flag))]
         }
         Shape::ChangeLevel => vec![
             player(),
@@ -2115,7 +2342,7 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
             level(),
         ],
         Shape::UseItem => vec![player(), level(), hand()],
-        Shape::AttackEntity => vec![player(), level(), hand(), subject(), opaque("entity-hit")],
+        Shape::AttackEntity => vec![player(), level(), hand(), target(), opaque("entity-hit")],
         Shape::Commands => {
             let selection = if firing.facade.dedicated {
                 "DEDICATED"
@@ -2199,6 +2426,7 @@ impl NativeJar {
             None => vec![event_marker(firing.event)],
         };
         let marks = host.call_log_marks();
+        host.note_firing_levels(firing);
         host.game_event = Some(Box::new(firing.clone()));
         let result = self.invoke_listener_callback(&listener.callback, event_args, host, budget);
         if let Some(after) = host.game_event.take() {
@@ -2356,7 +2584,7 @@ mod tests {
             host.game_event_call(&world_path, &server, std::slice::from_ref(&root))
                 .unwrap()
                 .unwrap(),
-            Value::Ref(Some("path:/horizon/game/world/.".into()))
+            crate::path_value("/horizon/game/world/.")
         );
         let rules = host
             .game_event_call(
@@ -2386,7 +2614,7 @@ mod tests {
             host.game_event_call(&get, &rules, &[keep])
                 .unwrap()
                 .unwrap(),
-            Value::Ref(Some("boolean:false".into()))
+            Value::Boxed(crate::Boxed::Boolean(false))
         );
         // `registryAccess` with no registries listed refuses by name.
         assert!(matches!(
@@ -2422,6 +2650,73 @@ mod tests {
     }
 
     #[test]
+    fn after_damage_arguments_are_the_base_amount_the_taken_amount_and_blocking() {
+        // Fabric's afterDamage(LivingEntity, DamageSource, float baseDamageTaken,
+        // float damageTaken, boolean blocked): javap of LivingEntityMixin passes the
+        // `originalDamage` local, then `hurtServer`'s `amount`, then `blocked`. Two
+        // distinct amounts; the base one must never be a copy of the taken one.
+        let firing = EventFiring::new(
+            GameEvent::LivingAfterDamage,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                amount: 3.5,
+                base_amount: Some(10.0),
+                flag: true,
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AfterDamage, &firing).unwrap();
+        assert_eq!(args[2], Value::Float(10.0));
+        assert_eq!(args[3], Value::Float(3.5));
+        assert_eq!(args[4], Value::Int(1));
+        // A host that does not name the base amount hands the listener a marker whose
+        // reads are counted, not the taken amount again.
+        let firing = EventFiring::new(
+            GameEvent::LivingAfterDamage,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                amount: 3.5,
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AfterDamage, &firing).unwrap();
+        assert_eq!(args[2], marker("game/unknown/base damage".into()));
+        assert_eq!(args[3], Value::Float(3.5));
+    }
+
+    #[test]
+    fn a_server_player_limit_the_facade_does_not_know_refuses() {
+        let call = MethodRef {
+            owner: "net/minecraft/server/MinecraftServer".into(),
+            name: "getMaxPlayers".into(),
+            descriptor: "()I".into(),
+        };
+        let server = marker(SERVER.into());
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::ServerStarted,
+            Arc::new(EventFacade {
+                max_players: Some(20),
+                ..EventFacade::default()
+            }),
+            EventContext::default(),
+        )));
+        assert_eq!(
+            host.game_event_call(&call, &server, &[]).unwrap().unwrap(),
+            Value::Int(20)
+        );
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::ServerStarted,
+            Arc::new(EventFacade::default()),
+            EventContext::default(),
+        )));
+        assert!(matches!(
+            host.game_event_call(&call, &server, &[]),
+            Some(Err(NativeError::UnknownHostCall(_)))
+        ));
+    }
+
+    #[test]
     fn uuid_text_is_the_canonical_java_form() {
         // java.util.UUID(0x0123456789abcdef, 0xfedcba9876543210).toString()
         assert_eq!(
@@ -2453,22 +2748,27 @@ mod tests {
 
     #[test]
     fn client_events_name_their_fabric_fields_and_bus_classes() {
-        let row = fabric_field(
-            "fabric-event/net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.END_CLIENT_TICK",
+        let field =
+            |owner, name| fabric_field(&crate::host_events::fabric_field_event(owner, name));
+        let row = field(
+            "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents",
+            "END_CLIENT_TICK",
         )
         .unwrap();
         assert_eq!(
             (row.event, row.method, row.shape),
             (GameEvent::ClientTickEnd, "onEndTick", Shape::Minecraft)
         );
-        let join = fabric_field(
-            "fabric-event/net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents.JOIN",
+        let join = field(
+            "net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents",
+            "JOIN",
         )
         .unwrap();
         assert_eq!(join.event, GameEvent::ClientJoin);
         // The server's own `JOIN` stays the server's.
-        let server_join = fabric_field(
-            "fabric-event/net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents.JOIN",
+        let server_join = field(
+            "net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents",
+            "JOIN",
         )
         .unwrap();
         assert_eq!(server_join.event, GameEvent::PlayerJoin);
@@ -2500,6 +2800,103 @@ mod tests {
             mask | event.bit()
         });
         assert_eq!(mask.count_ones() as usize, GameEvent::ALL.len());
+    }
+
+    /// `PlayerRef` carries a player's UUID even when the server has already
+    /// removed them from its player list, which is the moment
+    /// `player_logged_out` fires (baguettelib reads `getUUID` there). A name
+    /// read has no `PlayerRef` source and still refuses; the dimension read
+    /// (`arismoko/horizon#2747`) is deliberately not answered.
+    #[test]
+    fn a_leaving_player_answers_its_uuid_and_refuses_its_name() {
+        let call = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let alex = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128;
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::PlayerLeave,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(alex),
+                ..EventContext::default()
+            },
+        )));
+        let player = player_marker(alex);
+        let uuid = host
+            .game_event_call(
+                &call(
+                    "net/minecraft/server/level/ServerPlayer",
+                    "getUUID",
+                    "()Ljava/util/UUID;",
+                ),
+                &player,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            uuid,
+            Value::Ref(Some("uuid/01234567-89ab-cdef-fedc-ba9876543210".into()))
+        );
+        let name = host.game_event_call(
+            &call(
+                "net/minecraft/server/level/ServerPlayer",
+                "getName",
+                "()Lnet/minecraft/network/chat/Component;",
+            ),
+            &player,
+            &[],
+        );
+        assert!(matches!(name, Some(Err(NativeError::UnknownHostCall(_)))));
+    }
+
+    /// Fabric `PlayerBlockBreakEvents.AFTER` gets `destroyBlock`'s `this.level`, the player, the
+    /// position, the state and the `BlockEntity` it read before the removal: `null` when no block
+    /// entity stood there, otherwise an object this host cannot rebuild from saved data, so a
+    /// counted marker rather than a `null` that would say "none".
+    #[test]
+    fn an_after_break_passes_the_level_and_a_null_or_counted_block_entity() {
+        let firing = |block_entity| {
+            EventFiring::new(
+                GameEvent::BlockBreakAfter,
+                Arc::new(EventFacade::default()),
+                EventContext {
+                    level: Some("minecraft:the_nether".into()),
+                    player: Some(7),
+                    pos: Some([1, 2, 3]),
+                    block: Some("minecraft:chest".into()),
+                    block_entity,
+                    ..EventContext::default()
+                },
+            )
+        };
+        let without = fabric_arguments(Shape::BlockBreak, &firing(Some(false))).unwrap();
+        assert_eq!(without[0], level_marker("minecraft:the_nether"));
+        assert_eq!(without[1], player_marker(7));
+        assert_eq!(without[3], block_state_marker("minecraft:chest"));
+        assert_eq!(without[4], Value::Ref(None));
+
+        let with = fabric_arguments(Shape::BlockBreak, &firing(Some(true))).unwrap();
+        assert_eq!(with[4], marker("game/unknown/block-entity".into()));
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(firing(Some(true))));
+        let before = host.unknown_host_call_count();
+        let read = host
+            .game_event_call(
+                &MethodRef {
+                    owner: "net/minecraft/world/level/block/entity/BlockEntity".into(),
+                    name: "getBlockPos".into(),
+                    descriptor: "()Lnet/minecraft/core/BlockPos;".into(),
+                },
+                &with[4],
+                &[],
+            )
+            .unwrap();
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(host.unknown_host_call_count(), before + 1);
     }
 
     /// A firing that names the block and the position lets a block-break
@@ -2567,20 +2964,171 @@ mod tests {
                 .unwrap();
             assert_eq!(answer, Value::Int(expected), "{name}");
         }
-        // An argument the hook does not give refuses instead of answering.
+        // An argument the hook does not give answers neutrally and is counted, so one missing
+        // value does not fail the rest of the listener.
         let missing = marker("game/unknown/level".into());
-        let refused = host.game_event_call(
-            &call(
-                "net/minecraft/server/level/ServerLevel",
-                "getGameTime",
-                "()J",
+        let before = host.unknown_host_call_count();
+        let answered = host
+            .game_event_call(
+                &call(
+                    "net/minecraft/server/level/ServerLevel",
+                    "getGameTime",
+                    "()J",
+                ),
+                &missing,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(answered, Value::Long(0));
+        assert_eq!(host.unknown_host_call_count(), before + 1);
+    }
+
+    /// Fabric `COPY_FROM(oldPlayer, newPlayer, alive)`: with the clone's original the two players
+    /// are different markers, the old one the original's own; without one they stay the one
+    /// player Horizon keeps across a respawn.
+    #[test]
+    fn copy_from_passes_the_original_as_the_old_player() {
+        let alex = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let firing = |original| {
+            EventFiring::new(
+                GameEvent::PlayerCopy,
+                Arc::new(EventFacade::default()),
+                EventContext {
+                    player: Some(alex),
+                    flag: true,
+                    original,
+                    ..EventContext::default()
+                },
+            )
+        };
+        let lent = FacadeOriginal {
+            uuid: alex,
+            ..FacadeOriginal::default()
+        };
+        let args = fabric_arguments(Shape::PlayerPair, &firing(Some(lent))).unwrap();
+        assert_eq!(
+            args[0],
+            marker("game/original-player/0123456789abcdef0011223344556677".into())
+        );
+        assert_eq!(args[1], player_marker(alex));
+        assert_eq!(args[2], Value::Int(1));
+        let args = fabric_arguments(Shape::PlayerPair, &firing(None)).unwrap();
+        assert_eq!(args[0], player_marker(alex));
+    }
+
+    /// A click's or an attack's entity argument is the target, not the acting player: vanilla's
+    /// `Entity` parameter is what the callback calls `getId`/`level` on.
+    #[test]
+    fn attack_entity_arguments_name_the_target_entity() {
+        let alex = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let firing = EventFiring::new(
+            GameEvent::UseEntity,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(alex),
+                entity: Some(FacadeEntity {
+                    id: 42,
+                    kind: "minecraft:cow".into(),
+                    level: None,
+                }),
+                off_hand: Some(true),
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AttackEntity, &firing).unwrap();
+        assert_eq!(args[0], player_marker(alex));
+        assert_eq!(
+            args[2],
+            marker("enum/net/minecraft/world/InteractionHand/OFF_HAND".into())
+        );
+        assert_eq!(args[3], marker("game/entity/42".into()));
+    }
+
+    /// NeoForge's `EntityInteract#getTarget()` is the clicked entity and `getLevel()` the
+    /// player's level: the same entity and level a Fabric `UseEntityCallback` is handed.
+    #[test]
+    fn an_entity_interaction_answers_its_target_and_level() {
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(EventFiring::new(
+            GameEvent::UseEntity,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(7),
+                level: Some("minecraft:the_nether".into()),
+                entity: Some(FacadeEntity {
+                    id: 42,
+                    kind: "minecraft:cow".into(),
+                    level: Some("minecraft:the_nether".into()),
+                }),
+                off_hand: Some(false),
+                ..EventContext::default()
+            },
+        )));
+        let event = event_marker(GameEvent::UseEntity);
+        let call = |host: &mut StdHost, name: &str, returns: &str| {
+            host.game_event_call(
+                &MethodRef {
+                    owner: "net/neoforged/neoforge/event/entity/player/PlayerInteractEvent$EntityInteract"
+                        .into(),
+                    name: name.into(),
+                    descriptor: format!("(){returns}"),
+                },
+                &event,
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(
+            call(
+                &mut host,
+                "getTarget",
+                "Lnet/minecraft/world/entity/Entity;"
             ),
-            &missing,
-            &[],
+            marker("game/entity/42".into())
         );
-        assert!(
-            matches!(refused, Some(Err(NativeError::UnknownHostCall(_)))),
-            "{refused:?}"
+        assert_eq!(
+            call(&mut host, "getLevel", "Lnet/minecraft/world/level/Level;"),
+            level_marker("minecraft:the_nether")
         );
+    }
+
+    /// A firing that does not know which hand acted passes a hand marker no read answers:
+    /// the read is counted as an unknown host call and the listener keeps running.
+    #[test]
+    fn an_unknown_hand_is_passed_through_and_its_reads_are_counted() {
+        let firing = EventFiring::new(
+            GameEvent::UseEntity,
+            Arc::new(EventFacade::default()),
+            EventContext {
+                player: Some(7),
+                entity: Some(FacadeEntity {
+                    id: 42,
+                    kind: "minecraft:cow".into(),
+                    level: None,
+                }),
+                off_hand: None,
+                ..EventContext::default()
+            },
+        );
+        let args = fabric_arguments(Shape::AttackEntity, &firing).unwrap();
+        assert_eq!(args[2], marker("game/unknown/hand".into()));
+        let mut host = StdHost::new();
+        host.game_event = Some(Box::new(firing));
+        let before = host.unknown_host_call_count();
+        let read = host
+            .game_event_call(
+                &MethodRef {
+                    owner: "net/minecraft/world/InteractionHand".into(),
+                    name: "name".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                },
+                &args[2],
+                &[],
+            )
+            .unwrap();
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(host.unknown_host_call_count(), before + 1);
     }
 }
