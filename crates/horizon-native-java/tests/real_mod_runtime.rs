@@ -2,6 +2,9 @@
 //! during the test so the native probe is exercised against real class files,
 //! annotations, and loader metadata rather than hand-written bytecode.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
@@ -31,12 +34,8 @@ fn build_jar(
     sources: BTreeMap<&str, &str>,
     metadata_path: &str,
     metadata: &[u8],
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-real-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+) -> (scratch::Scratch, std::path::PathBuf) {
+    let root = scratch::Scratch::new(&format!("real-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();

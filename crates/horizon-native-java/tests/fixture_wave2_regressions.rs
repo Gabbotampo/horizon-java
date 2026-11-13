@@ -16,13 +16,15 @@
 //! throws as Guava does; the jar carries only `demo/`, so the runtime's own
 //! Guava model answers it).
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use zip::write::SimpleFileOptions;
 
@@ -125,14 +127,7 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
 /// Compile the probe, pack its `demo/` classes into a jar and run
 /// `demo.Probe.<method>()`, answering the string it returns.
 fn run(test: &str, method: &str) -> String {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-wave2-{test}-{}-{unique}",
-        std::process::id()
-    ));
+    let root = scratch::Scratch::new(&format!("wave2-{test}"));
     let classes = root.join("classes");
     let mut javac = Command::new(javac());
     javac.args(["--release", "21", "-d"]).arg(&classes);

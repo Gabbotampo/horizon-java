@@ -11,6 +11,9 @@
 //! run in, and the precise diagnostics for the shapes this bounded runtime
 //! refuses.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{MethodRef, MixinExecutionReport, NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -42,12 +45,8 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn build_jar(name: &str, sources: BTreeMap<&str, &str>) -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-mixin-overwrite-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+fn build_jar(name: &str, sources: BTreeMap<&str, &str>) -> (scratch::Scratch, PathBuf) {
+    let root = scratch::Scratch::new(&format!("mixin-overwrite-{name}"));
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(&classes).unwrap();

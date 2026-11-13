@@ -1,17 +1,16 @@
 //! A source-built Fabric fixture that crosses the native event registration
 //! boundary with a real `invokedynamic` listener marker.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{MethodRef, NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
 
 #[test]
 fn source_built_fabric_fixture_registers_and_dispatches_listener() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-fabric-event-fixture-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("fabric-event-fixture");
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(src.join("demo")).unwrap();
