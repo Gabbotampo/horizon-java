@@ -158,14 +158,25 @@ impl<H: Host> Runtime<'_, H> {
     /// `value`: it runs a jar `equals` body, or it is `null`, which `List.of`
     /// refuses to look up.
     fn jar_equals(&self, value: &Value) -> bool {
-        *value == Value::Ref(None)
-            || matches!(
+        *value == Value::Ref(None) || self.runs_jar_equals(value)
+    }
+
+    /// Whether `value.equals` runs a jar body: a jar object with its own
+    /// `equals`, or a host handle holding one (`Optional.of(record)`, whose
+    /// kind's `equals` asks the held value's, `host_ref.rs`).
+    fn runs_jar_equals(&self, value: &Value) -> bool {
+        match value {
+            Value::Host(handle) => handle
+                .values()
+                .is_some_and(|held| held.iter().any(|held| self.runs_jar_equals(held))),
+            value => matches!(
                 self.equality_of(value),
                 Equality::Jar {
                     equals: Some(_),
                     ..
                 }
-            )
+            ),
+        }
     }
 
     /// `list.indexOf(o)` (`last` for `lastIndexOf`) under `rules`.

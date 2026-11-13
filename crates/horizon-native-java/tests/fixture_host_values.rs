@@ -128,7 +128,9 @@ public final class HostValues {
     Optional<Node> a = Optional.of(new Node("a"));
     return a.hashCode() + "," + a.equals(Optional.of(new Node("a"))) + a.equals(Optional.of(new Node("b")))
         + "," + a + "," + Objects.hash(a) + "," + Optional.of(List.of(1, 2)).hashCode()
-        + "," + Optional.of(new ArrayList<>(List.of(1, 2))).hashCode() + "," + a.toString().length();
+        + "," + Optional.of(new ArrayList<>(List.of(1, 2))).hashCode() + "," + a.toString().length()
+        + "," + new ArrayList<>(List.of(Optional.of(new Node("b")), a)).indexOf(Optional.of(new Node("a")))
+        + List.of(a).contains(Optional.of(new Node("a"))) + List.of(a).equals(List.of(Optional.of(new Node("a"))));
   }
 
   static String castString(Object o) {
@@ -252,8 +254,12 @@ fn no_string_spells_an_optional_and_the_optionals_answer_as_java_25() {
             "nan",
             "truetrue2146959360,false-2147483648,1truefalse,OptionalDouble[NaN]true",
         ),
-        // A held jar object's own `hashCode` (42), `equals` and `toString`.
-        ("jarHeld", "42,truefalse,Optional[Node(a)],73,994,994,17"),
+        // A held jar object's own `hashCode` (42), `equals` and `toString`,
+        // also inside a host list (`list_equality.rs`).
+        (
+            "jarHeld",
+            "42,truefalse,Optional[Node(a)],73,994,994,17,1truetrue",
+        ),
         // A handle is its class: `checkcast` throws Java 25's exception.
         (
             "casts",
