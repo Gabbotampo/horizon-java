@@ -228,6 +228,13 @@ impl<H: Host> Runtime<'_, H> {
     /// `AbstractCollection.toArray(T[] a)`.
     fn array_into(&mut self, this: &Value, a: &Value) -> Result<Value, NativeError> {
         let size = self.size_of(Site::Virtual, ABSTRACT_COLLECTION, this)?;
+        // `a.length` on a null array, after `size()`.
+        if *a == Value::Ref(None) {
+            return Err(throw(
+                "java/lang/NullPointerException",
+                Some("Cannot read the array length".into()),
+            ));
+        }
         let given = self.array(a)?.len();
         let r = if given >= size.max(0) as usize {
             a.clone()

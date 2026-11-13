@@ -281,6 +281,12 @@ fn build_site(
     Ok((out, method_descriptor))
 }
 
+/// The error a JDK body's call returns when the host counted the call and
+/// answered a neutral `null` the body would dereference. The skeleton frame
+/// turns it into the body's own neutral answer, so the run stays counted
+/// (`ran-hollow`) without an NPE Java would never throw.
+pub(crate) const ABANDONED: &str = "JDK body stopped at a counted host answer";
+
 /// A Java exception of `class` with `message`, as a JDK body throws it.
 pub(crate) fn throw(class: &str, message: Option<String>) -> NativeError {
     NativeError::UncaughtException {
@@ -321,7 +327,18 @@ impl<H: Host> Runtime<'_, H> {
         let mut values = Vec::with_capacity(args.len() + 1);
         values.push(receiver.clone());
         values.extend_from_slice(args);
-        self.run_site(kind, &r, &values)
+        let counted = self.host.counted_unknown_calls();
+        let value = self.run_site(kind, &r, &values)?;
+        // A counted, neutral `null` where the JDK body goes on to use the
+        // answer (an iterator, a view): the body stops rather than throw an
+        // NPE Java never would into the jar.
+        if value == Value::Ref(None)
+            && self.host.counted_unknown_calls() > counted
+            && return_desc(descriptor).starts_with("Ljava/util/")
+        {
+            return Err(NativeError::Metadata(ABANDONED.into()));
+        }
+        Ok(value)
     }
 
     /// `owner.name(args)` as `invokestatic`, through a call-site frame.
