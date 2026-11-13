@@ -387,12 +387,12 @@ impl<H: Host> Runtime<'_, H> {
         let NativeError::UncaughtException {
             class: caught,
             message,
-            ..
+            frame,
         } = error
         else {
             return error;
         };
-        let cause = self.caught_throwable(&caught, message);
+        let cause = self.caught_throwable(&caught, message, frame.as_deref());
         let thrown = self.new_object(class);
         let init = MethodRef {
             owner: class.to_owned(),
@@ -402,9 +402,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Err(error) = self.host.invoke_instance(&init, &thrown, &[cause]) {
             return error;
         }
-        let text = expect_ref(&thrown).and_then(|marker| self.host.throwable_message(marker));
-        jar_throwables::note_in_flight(class, &text, &thrown);
-        throw(class, text)
+        // Thrown as that object, filed under a fresh origin
+        // (`jar_throwables.rs`).
+        self.throw_object(&thrown, None)
     }
 
     /// Run one call-site frame.
