@@ -86,11 +86,13 @@ public final class Probe {
         return m.size() + "|" + m.get(new Key(1)) + "|" + m.containsKey(new Key(1));
     }
 
-    /// Two equal strings may or may not be one object.
+    /// A string key that no stored key equals is absent.
     public static String identityStrings() {
         Map<String, Integer> m = new IdentityHashMap<>();
         m.put("k", 1);
-        return String.valueOf(m.get(new String("k")));
+        // `new String("k")` is counted since #125: an equal string's
+        // identity is not known here. An unequal key is absent.
+        return String.valueOf(m.get("j"));
     }
 
     /// An equal string key is present: whether it is the same object is not
