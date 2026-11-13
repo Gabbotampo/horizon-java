@@ -200,24 +200,12 @@ fn fail_fast_iteration_throws_where_jdk_25_does() {
     );
 }
 
-/// A list of the same size with other elements: a `set` (no `modCount`)
-/// or a remove and an add (a JVM throws). Counted.
+/// A `set` while iterating moves no `modCount`, and the iterator reads the
+/// live array, so the loop sees the new element (`abz`).
 #[test]
-fn a_set_or_a_remove_and_add_while_iterating_is_counted() {
-    let fixture = fixture("a-set-or-a-remove-and-add-while-iteratin");
-    let cases: &[(&str, &[(&str, usize)])] = &[(
-        "setWhileIterating",
-        &[("java/util/Iterator#next()Ljava/lang/Object;", 2)],
-    )];
-    for (method, expected) in cases {
-        let mut host = fixture.jar.seed_host(StdHost::new());
-        fixture.text_on(&mut host, method);
-        let counted = host.unknown_host_calls();
-        for (call, count) in *expected {
-            assert!(
-                counted.iter().any(|(c, n)| c == call && n == count),
-                "{method}: {counted:?}"
-            );
-        }
-    }
+fn a_set_while_iterating_is_seen_and_does_not_throw() {
+    assert_exact(
+        "a-set-while-iterating-is-seen-and-does-n",
+        &[("setWhileIterating", "abz[a, b, z]")],
+    );
 }
