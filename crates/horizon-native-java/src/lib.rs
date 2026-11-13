@@ -19,6 +19,7 @@ mod block_item_id;
 pub mod brigadier;
 mod checkcast;
 mod class_init;
+mod class_precedence;
 pub mod client_surface;
 mod collection_base;
 mod collection_callback;
@@ -126,6 +127,7 @@ use weaver::{
     InvokeShift, Shift, SiteSelector, SliceBounds, weave_extended_classes_with_instance_callbacks,
 };
 
+pub use class_precedence::RunLoader;
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
 pub use heap::{CallLogMark, JavaHeap};
 pub use java_nbt::{MAX_DEPTH as NBT_MAX_DEPTH, Nbt, NbtCompound};
@@ -2459,6 +2461,10 @@ pub struct StdHost {
     /// clock read.  Keeping the value seeded makes bootstrap replayable.
     current_time_millis: i32,
     mods: BTreeMap<String, String>,
+    /// The loader this run is on and the running jar's own loader-namespace
+    /// classes, for class precedence (`class_precedence.rs`).
+    run_loader: class_precedence::RunLoader,
+    own_loader_classes: BTreeSet<String>,
     environment_type: String,
     /// The game version a caller seeded for `ModList` and `DetectedVersion`.
     /// `None` keeps both questions unanswered instead of inventing a release.
@@ -2623,6 +2629,8 @@ impl StdHost {
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
+            run_loader: class_precedence::RunLoader::default(),
+            own_loader_classes: BTreeSet::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
             development_environment: false,
@@ -4067,7 +4075,7 @@ impl Host for StdHost {
     /// APIs itself, so a pack jar's copy of one of those classes never takes
     /// the host's place.
     fn models_class(&self, name: &str) -> bool {
-        host_models_class(name)
+        host_models_class(name) && !self.runs_jar_copy(name)
     }
 
     /// A jar seeded with Fabric entrypoints runs on Fabric Loader, whose
@@ -15546,6 +15554,8 @@ impl NativeJar {
         // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
         // is linked, so a bundled class is not a missing class here.
         let _nested = nested_jars::link_nested_jars(&mut host, self);
+        host = host.with_run_loader(self.run_loader());
+        host.own_loader_classes = self.loader_namespace_classes();
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
                 .fabric_version
@@ -24042,6 +24052,13 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_jar_loader_copy(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // A jar's copy of a loader class its run's loader
+                        // lacks (`class_precedence.rs`).
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
