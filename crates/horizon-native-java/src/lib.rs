@@ -53,6 +53,7 @@ mod hash_map_order;
 mod hash_table;
 mod heap;
 mod hook_shapes;
+mod iteration_guard;
 mod jar_compare;
 mod jar_operands;
 mod jar_text;
@@ -2207,11 +2208,29 @@ pub trait Host {
     fn store_red_black_tree(&mut self, _marker: &str, _tree: tree_map::RedBlackTree) {}
 
     /// Remember that `marker` is the copy a map's `keySet()`/`values()`/
-    /// `entrySet()` answered, whose mutators cannot reach the map.
-    fn note_view_copy(&mut self, _marker: &str) {}
+    /// `entrySet()` answered (from the map `source`), whose mutators cannot
+    /// reach the map.
+    fn note_view_copy(&mut self, _marker: &str, _source: &str) {}
 
     fn is_view_copy(&self, _marker: &str) -> bool {
         false
+    }
+
+    /// The guard a fail-fast iterator carries (`iteration_guard.rs`).
+    fn iterator_guard(&self, _marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        None
+    }
+
+    fn store_iterator_guard(&mut self, _marker: &str, _guard: iteration_guard::IteratorGuard) {}
+
+    /// How far a host iterator has gone (its next index).
+    fn iterator_cursor(&self, _marker: &str) -> Option<usize> {
+        None
+    }
+
+    /// The map a `keySet()`/`values()`/`entrySet()` copy was taken from.
+    fn view_copy_source(&self, _marker: &str) -> Option<String> {
+        None
     }
 
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
@@ -2588,7 +2607,7 @@ pub struct StdHost {
     /// The red-black trees of tree maps and sets, by marker.
     red_black_trees: BTreeMap<String, tree_map::RedBlackTree>,
     /// The copies maps' `keySet()`/`values()`/`entrySet()` answered.
-    view_copies: BTreeSet<String>,
+    view_copies: BTreeMap<String, String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -2600,6 +2619,9 @@ pub struct StdHost {
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    /// The fail-fast iterators' guards, by iterator marker
+    /// (`iteration_guard.rs`).
+    iterator_guards: BTreeMap<String, iteration_guard::IteratorGuard>,
     /// Callback-local values returned by NeoForge's `LazyOptional` façade.
     /// The marker is intentionally host-owned: an opaque Java object must not
     /// become a live native capability until a game adapter supplies it.
@@ -2716,11 +2738,12 @@ impl StdHost {
             hash_tables: BTreeMap::new(),
             collection_comparators: BTreeMap::new(),
             red_black_trees: BTreeMap::new(),
-            view_copies: BTreeSet::new(),
+            view_copies: BTreeMap::new(),
             locales: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            iterator_guards: BTreeMap::new(),
             lazy_optionals: BTreeMap::new(),
             capability_values: BTreeMap::new(),
             item_handlers: BTreeMap::new(),
@@ -4124,12 +4147,29 @@ impl Host for StdHost {
         self.red_black_trees.insert(marker.to_owned(), tree);
     }
 
-    fn note_view_copy(&mut self, marker: &str) {
-        self.view_copies.insert(marker.to_owned());
+    fn note_view_copy(&mut self, marker: &str, source: &str) {
+        self.view_copies
+            .insert(marker.to_owned(), source.to_owned());
+    }
+
+    fn view_copy_source(&self, marker: &str) -> Option<String> {
+        self.view_copies.get(marker).cloned()
     }
 
     fn is_view_copy(&self, marker: &str) -> bool {
-        self.view_copies.contains(marker)
+        self.view_copies.contains_key(marker)
+    }
+
+    fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        self.iterator_guards.get(marker).cloned()
+    }
+
+    fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
+        self.iterator_guards.insert(marker.to_owned(), guard);
+    }
+
+    fn iterator_cursor(&self, marker: &str) -> Option<usize> {
+        self.iterators.get(marker).map(|(_, index)| *index)
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -24063,6 +24103,12 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // `equals`/`hashCode` as the JVM runs them
                         // (`object_methods.rs`, `list_equality.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_iteration_guard(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // Fail-fast iteration (`iteration_guard.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

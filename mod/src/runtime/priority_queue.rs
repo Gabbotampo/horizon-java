@@ -28,6 +28,8 @@ use super::*;
 struct Heap {
     es: Vec<Value>,
     comparator: Option<Value>,
+    /// The queue's row, which a callback may change behind `es`.
+    receiver: Option<Value>,
 }
 
 fn thrown(class: &str) -> NativeError {
@@ -169,6 +171,7 @@ impl<H: Host> Runtime<'_, H> {
         let mut heap = Heap {
             es: self.collection_elements(receiver)?,
             comparator: self.host.collection_comparator(&marker),
+            receiver: Some(receiver.clone()),
         };
         let before = heap.es.clone();
         let result = self.priority_queue_member(r, receiver, &mut heap, args);
@@ -259,6 +262,34 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Ok(boolean(changed))
             }
+            ("forEach", "(Ljava/util/function/Consumer;)V", [action]) => {
+                // `for (i = 0, n = size; i < n; i++) action.accept(es[i])`,
+                // then the `modCount` check. After a change the JDK reads the
+                // array it captured, which may since have been sifted: counted.
+                let action = action.clone();
+                let before = heap.es.clone();
+                let mut counted = false;
+                for element in before.clone() {
+                    self.run_functional(
+                        (
+                            "java/util/function/Consumer",
+                            "accept",
+                            "(Ljava/lang/Object;)V",
+                        ),
+                        &action,
+                        &[element],
+                    )?;
+                    if !counted && self.collection_elements(receiver)? != before {
+                        self.host.unknown_operand_call(r)?;
+                        counted = true;
+                    }
+                }
+                heap.es = self.collection_elements(receiver)?;
+                if heap.es != before {
+                    return Err(thrown("java/util/ConcurrentModificationException"));
+                }
+                Ok(Some(Value::Void))
+            }
             (name @ ("removeAll" | "retainAll"), "(Ljava/util/Collection;)Z", [source]) => {
                 if *source == Value::Ref(None) {
                     return Err(thrown("java/lang/NullPointerException"));
@@ -288,6 +319,15 @@ impl<H: Host> Runtime<'_, H> {
     /// `bulkRemove`: drop the doomed elements, keep the rest in array order,
     /// and `heapify` when anything went.
     fn bulk_remove(&mut self, heap: &mut Heap, doomed: &[bool]) -> Result<bool, NativeError> {
+        // `if (modCount != expectedModCount) throw CME`, before compacting:
+        // a predicate that changed the queue leaves it as it made it.
+        if let Some(receiver) = &heap.receiver {
+            let live = self.collection_elements(receiver)?;
+            if live != heap.es {
+                heap.es = live;
+                return Err(thrown("java/util/ConcurrentModificationException"));
+            }
+        }
         if !doomed.contains(&true) {
             return Ok(false);
         }
@@ -359,6 +399,7 @@ impl<H: Host> Runtime<'_, H> {
         let mut heap = Heap {
             es: elements,
             comparator: lent.clone(),
+            receiver: None,
         };
         // A `SortedSet` is already in order; a `PriorityQueue` (exactly that
         // class) is already a heap; anything else is heapified.
