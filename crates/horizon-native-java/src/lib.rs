@@ -115,6 +115,7 @@ mod registry_contents;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
+mod string_code_points;
 mod string_constructors;
 mod synchronized_views;
 mod type_switch;
@@ -19263,6 +19264,12 @@ impl<H: Host> Runtime<'_, H> {
         // A composition marker closes over the two callbacks it joined. Running
         // it means running both, in the order the combinator defines — not
         // answering the marker itself.
+        // `Function.identity()` / `UnaryOperator.identity()` (`string_code_points.rs`).
+        if marker == string_code_points::FUNCTION_IDENTITY
+            || marker == string_code_points::UNARY_IDENTITY
+        {
+            return Ok(Some(args.first().cloned().unwrap_or(Value::Ref(None))));
+        }
         if let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
             && let Some((left, right)) = rest.split_once('|')
         {
@@ -21309,6 +21316,47 @@ impl<H: Host> Runtime<'_, H> {
                         let slice = slice_utf16(text, start, length);
                         self.io_write(&marker, &slice);
                         Value::Void
+                    }
+                    // `write(char[])` and `write(char[], off, len)`: the units in
+                    // range. An index outside the array (each writer class has
+                    // its own exception text) and an unpaired surrogate, which
+                    // the model's text cannot hold, are counted.
+                    ("write", "([C)V" | "([CII)V") => {
+                        let units = args
+                            .first()
+                            .map(|array| self.array(array).cloned())
+                            .transpose()?
+                            .unwrap_or_default();
+                        let (start, length) = if r.descriptor == "([C)V" {
+                            (0, units.len() as i64)
+                        } else {
+                            (
+                                i64::from(expect_int(r, StdHost::argument(r, args, 1)?)?),
+                                i64::from(expect_int(r, StdHost::argument(r, args, 2)?)?),
+                            )
+                        };
+                        let in_range = start >= 0
+                            && length >= 0
+                            && start.saturating_add(length) <= units.len() as i64;
+                        let text = in_range
+                            .then(|| {
+                                let slice = units[start as usize..(start + length) as usize]
+                                    .iter()
+                                    .map(|unit| match unit {
+                                        Value::Int(unit) => *unit as u16,
+                                        _ => 0,
+                                    })
+                                    .collect::<Vec<_>>();
+                                String::from_utf16(&slice).ok()
+                            })
+                            .flatten();
+                        match text {
+                            Some(text) => {
+                                self.io_write(&marker, &text);
+                                Value::Void
+                            }
+                            None => self.host.unknown_operand_call(r)?,
+                        }
                     }
                     ("write", "(I)V") => {
                         let code = args
@@ -24038,6 +24086,11 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         value
                     } else if let Some(value) = self.invoke_arrays(&r, &args, class, method)? {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_code_points(&r, receiver.as_ref(), &args))
+                    {
+                        // `String.codePoints().forEach` (`string_code_points.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
