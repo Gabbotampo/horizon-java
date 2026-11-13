@@ -58,6 +58,9 @@ pub struct IteratorGuard {
     structure: Vec<String>,
     /// `ArrayDeque`: no `modCount`.
     deque: bool,
+    /// An `ArrayDeque` iterator whose layout is known: its `cursor` slot and
+    /// `remaining` count (`array_deque.rs`).
+    deque_cursor: Option<(usize, usize)>,
 }
 
 /// How a fail-fast collection iterates.
@@ -192,6 +195,11 @@ impl<H: Host> Runtime<'_, H> {
                 let structure = self.structure_of(&source, how)?;
                 let expected = self.capture_mod_count(&source);
                 let deque = !self.has_mod_count(&source);
+                // `DeqIterator`: `cursor = head`, `remaining = size()`.
+                let deque_cursor = (how == FailFast::Deque)
+                    .then(|| self.host.deque_layout(&source_marker))
+                    .flatten()
+                    .map(|layout| (layout.head(), structure.len()));
                 let iterator = self.host.invoke_instance(r, receiver, args)?;
                 if let Some(iterator) = expect_ref(&iterator) {
                     self.host.store_iterator_guard(
@@ -207,6 +215,7 @@ impl<H: Host> Runtime<'_, H> {
                             expected,
                             structure,
                             deque,
+                            deque_cursor,
                         },
                     );
                 }
@@ -216,6 +225,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(guard) = self.host.iterator_guard(&marker) else {
                     return Ok(None);
                 };
+                if let Some((_, remaining)) = guard.deque_cursor {
+                    return Ok(Some(Value::Int(i32::from(remaining > 0))));
+                }
                 let Some(not_equal) = guard.cursor else {
                     return Ok(None);
                 };
@@ -235,6 +247,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(guard) = self.host.iterator_guard(&marker) else {
                     return Ok(None);
                 };
+                if guard.deque_cursor.is_some() {
+                    return self.deque_next(r, &marker, guard).map(Some);
+                }
                 let source = Value::Ref(Some(guard.source.clone()));
                 let how = match guard.cursor {
                     Some(true) => FailFast::ArrayList,
@@ -266,6 +281,10 @@ impl<H: Host> Runtime<'_, H> {
                     ModVerdict::Changed if !guard.deque => Err(concurrent_modification()),
                     _ => self.host.unknown_operand_call(r).map(|_| None),
                 }
+            }
+            ("forEach", "(Ljava/util/function/Consumer;)V") if self.is_array_deque(receiver) => {
+                let action = args.first().cloned().unwrap_or(Value::Ref(None));
+                self.deque_for_each(r, receiver, &action)
             }
             ("forEach", "(Ljava/util/function/Consumer;)V") => {
                 let Some((source, how)) = self.fail_fast_source(receiver) else {
@@ -488,5 +507,42 @@ impl<H: Host> Runtime<'_, H> {
             structure = self.structure_of(source, FailFast::Cursor)?;
             removed = true;
         }
+    }
+
+    /// `DeqIterator.next()`: the live array's slot at `cursor`, a
+    /// `ConcurrentModificationException` if a removal emptied it, then the
+    /// next slot (of the array as it is now).
+    fn deque_next(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        mut guard: IteratorGuard,
+    ) -> Result<Value, NativeError> {
+        let Some((cursor, remaining)) = guard.deque_cursor else {
+            return Ok(Value::Ref(None));
+        };
+        if remaining == 0 {
+            return Err(NativeError::UncaughtException {
+                class: "java/util/NoSuchElementException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let source = Value::Ref(Some(guard.source.clone()));
+        let Some(layout) = self.host.deque_layout(&guard.source) else {
+            // The layout is no longer known: the host's snapshot, counted.
+            self.host.unknown_operand_call(r)?;
+            return self
+                .host
+                .invoke_instance(r, &Value::Ref(Some(marker.to_owned())), &[]);
+        };
+        let live = self.collection_elements(&source)?;
+        let element = layout.slot(cursor, &live);
+        if element == Value::Ref(None) {
+            return Err(concurrent_modification());
+        }
+        guard.deque_cursor = Some((layout.next_slot(cursor), remaining - 1));
+        self.host.store_iterator_guard(marker, guard);
+        Ok(element)
     }
 }
