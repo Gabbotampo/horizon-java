@@ -711,7 +711,7 @@ impl<H: Host> Runtime<'_, H> {
                     let found = if o == Value::Ref(None) {
                         e == Value::Ref(None)
                     } else {
-                        self.java_equals(&o, &e)?
+                        self.virtual_equals(&o, &e)?
                     };
                     if found {
                         return iterator(self, report, "()I");
@@ -806,7 +806,7 @@ impl<H: Host> Runtime<'_, H> {
                     let equal = if o1 == Value::Ref(None) {
                         o2 == Value::Ref(None)
                     } else {
-                        self.java_equals(&o1, &o2)?
+                        self.virtual_equals(&o1, &o2)?
                     };
                     if !equal {
                         return Ok(boolean(false));
@@ -824,7 +824,7 @@ impl<H: Host> Runtime<'_, H> {
                     let h = if e == Value::Ref(None) {
                         0
                     } else {
-                        self.java_hash(&e)?
+                        self.virtual_hash(&e)?
                     };
                     hash = hash.wrapping_mul(31).wrapping_add(h);
                 }

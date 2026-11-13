@@ -559,8 +559,8 @@ impl<H: Host> Runtime<'_, H> {
                 &other,
                 &[],
             )?;
-            let equal =
-                mine == theirs || (mine != Value::Ref(None) && self.java_equals(&mine, &theirs)?);
+            let equal = mine == theirs
+                || (mine != Value::Ref(None) && self.virtual_equals(&mine, &theirs)?);
             if !equal {
                 return Ok(Some(boolean(false)));
             }
@@ -613,7 +613,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `a.equals(b)` (`invokevirtual Object.equals`).
-    fn java_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
+    fn virtual_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
         let answer = self.call_virtual(
             Site::Virtual,
             "java/lang/Object",
@@ -626,7 +626,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `value.hashCode()` (`invokevirtual Object.hashCode`).
-    fn java_hash(&mut self, value: &Value) -> Result<i32, NativeError> {
+    fn virtual_hash(&mut self, value: &Value) -> Result<i32, NativeError> {
         Ok(int_of(&self.call_virtual(
             Site::Virtual,
             "java/lang/Object",
@@ -638,7 +638,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `String.valueOf(value)`, as `StringBuilder.append(Object)` prints it.
-    fn java_text(&mut self, value: &Value) -> Result<String, NativeError> {
+    fn virtual_text(&mut self, value: &Value) -> Result<String, NativeError> {
         let text = self.call_static(
             "java/lang/String",
             "valueOf",
