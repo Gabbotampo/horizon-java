@@ -44,6 +44,7 @@ mod facade_text;
 mod facade_world;
 mod field_access;
 mod field_get_set;
+mod file_attributes;
 mod files_copy;
 mod files_move;
 mod frame_bound;
@@ -15798,6 +15799,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -15959,6 +15961,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut callback_infos,
@@ -16104,6 +16107,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos,
@@ -18546,6 +18550,11 @@ struct Runtime<'a, H> {
     /// never touches the host filesystem: a bootstrap that saves defaults and
     /// reads them back sees these bytes and nothing else.
     io_files: BTreeMap<String, String>,
+    /// The directories this invocation made (`createDirectory`,
+    /// `createDirectories`, `File.mkdir`/`mkdirs`), by path text. They also
+    /// sit in `io_files` as empty entries; this set tells them from empty
+    /// files (`file_attributes.rs`).
+    io_dirs: BTreeSet<String>,
     /// Annotation values `Class#getAnnotation`/`Method#getAnnotation` handed
     /// out, keyed by the proxy marker a member query answers from.
     annotations: BTreeMap<String, Annotation>,
@@ -21190,10 +21199,14 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-                    ("exists", "()Z") | ("isFile", "()Z") => {
-                        Value::Int(i32::from(self.io_files.contains_key(&path)))
-                    }
-                    ("isDirectory", "()Z") => Value::Int(0),
+                    ("exists", "()Z") => Value::Int(i32::from(self.io_files.contains_key(&path))),
+                    // `file_attributes.rs`: what the model knows the path to be.
+                    ("isFile", "()Z") => Value::Int(i32::from(
+                        self.file_kind(&path) == file_attributes::FileKind::RegularFile,
+                    )),
+                    ("isDirectory", "()Z") => Value::Int(i32::from(
+                        self.file_kind(&path) == file_attributes::FileKind::Directory,
+                    )),
                     ("length", "()J") => {
                         Value::Long(self.io_files.get(&path).map_or(0, |text| text.len() as i64))
                     }
@@ -21219,10 +21232,14 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("toPath", "()Ljava/nio/file/Path;") => path_value(&path),
                     ("mkdir", "()Z") | ("mkdirs", "()Z") | ("createNewFile", "()Z") => {
+                        if r.name != "createNewFile" {
+                            self.io_dirs.insert(path.clone());
+                        }
                         self.io_files.entry(path).or_default();
                         Value::Int(1)
                     }
                     ("delete", "()Z") => {
+                        self.io_dirs.remove(&path);
                         self.io_files.remove(&path);
                         Value::Int(1)
                     }
@@ -21315,6 +21332,7 @@ impl<H: Host> Runtime<'_, H> {
                     ("createDirectories" | "createDirectory", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        self.io_dirs.insert(path.clone());
                         self.io_files.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
@@ -21327,6 +21345,7 @@ impl<H: Host> Runtime<'_, H> {
                     ("delete" | "deleteIfExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        self.io_dirs.remove(&path);
                         self.io_files.remove(&path);
                         Value::Int(1)
                     }
@@ -28889,6 +28908,7 @@ mod tests {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -28948,6 +28968,7 @@ mod tests {
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -35979,6 +36000,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36133,6 +36155,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36340,6 +36363,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36651,6 +36675,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -36934,6 +36959,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -42074,6 +42100,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
@@ -42120,6 +42147,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
             callback_infos: &mut CallbackInfos::new(),
