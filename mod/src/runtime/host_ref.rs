@@ -163,6 +163,14 @@ pub enum HostKind {
     WatchService,
     WatchKey,
     WatchEvent,
+    /// `java.lang.reflect.Field`: key the member's facts in the nested-key
+    /// encoding, then `#<copy>` for a copy a lookup minted (`host_reflect.rs`).
+    ReflectField,
+    /// `java.lang.reflect.Method`: key the member's facts (`host_reflect.rs`).
+    ReflectMethod,
+    /// `java.lang.reflect.Constructor`: key the member's facts
+    /// (`host_reflect.rs`).
+    ReflectConstructor,
 }
 
 /// How a kind's Java class follows from its key.
@@ -264,7 +272,6 @@ pub(crate) fn always_canonical(_key: &str) -> bool {
 }
 
 /// The canonical predicate of a kind whose every object is a fresh value.
-#[allow(dead_code)]
 pub(crate) fn never_canonical(_key: &str) -> bool {
     false
 }
@@ -350,6 +357,27 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("sun/nio/fs/AbstractWatchKey$Event"),
         canonical: always_canonical,
         methods: &crate::runtime::host_watch::WATCH_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::ReflectField,
+        tag: "rfld",
+        class: ClassRule::Fixed(crate::runtime::host_reflect::FIELD),
+        canonical: crate::runtime::host_reflect::field_canonical,
+        methods: &crate::runtime::host_reflect::MEMBER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ReflectMethod,
+        tag: "rmth",
+        class: ClassRule::Fixed(crate::runtime::host_reflect::METHOD),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_reflect::MEMBER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ReflectConstructor,
+        tag: "rctr",
+        class: ClassRule::Fixed(crate::runtime::host_reflect::CONSTRUCTOR),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_reflect::MEMBER_METHODS,
     },
 ];
 
