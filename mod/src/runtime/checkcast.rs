@@ -76,6 +76,8 @@ fn in_java_base(class: &str) -> bool {
         "java/net/",
         "java/time/",
         "java/text/",
+        // `sun.nio.fs.UnixPath`, the watch service's classes.
+        "sun/nio/",
     ];
     const ELSEWHERE: &[&str] = &[
         "java/lang/instrument/",
