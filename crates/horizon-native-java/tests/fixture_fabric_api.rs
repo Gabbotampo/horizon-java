@@ -296,16 +296,15 @@ fn fabric_api_bootstrap_registers_both_listeners_in_declaration_order() {
             }
         })
         .collect();
-    assert_eq!(
-        receivers,
-        [
-            (
-                HostKind::FabricEvent,
-                format!("{SERVER_LIFECYCLE}.SERVER_STARTING")
-            ),
-            (HostKind::FabricEvent, format!("{COMMAND_CALLBACK}.EVENT")),
-        ]
-    );
+    // The key holds the owner and the field (escaped, `host_events.rs`).
+    assert_eq!(receivers.len(), 2);
+    for ((kind, key), (owner, field)) in receivers.iter().zip([
+        (SERVER_LIFECYCLE, "SERVER_STARTING"),
+        (COMMAND_CALLBACK, "EVENT"),
+    ]) {
+        assert_eq!(*kind, HostKind::FabricEvent);
+        assert!(key.contains(owner) && key.ends_with(field), "{key}");
+    }
 
     // Both listeners are recorded, in declaration order, with the resolved
     // callback target.  They are bound instance method references, so the

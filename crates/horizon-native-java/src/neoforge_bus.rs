@@ -77,9 +77,7 @@
 
 use crate::events::ListenerCallback;
 use crate::neoforge_event_classes::{ABSTRACT, CANCELLABLE, EVENT_CLASSES, MOD_BUS};
-use crate::{
-    Host, HostKind, MethodRef, NativeError, Runtime, Value, expect_ref, parse_callback_marker,
-};
+use crate::{Host, MethodRef, NativeError, Runtime, Value, expect_ref, parse_callback_marker};
 
 pub(crate) use crate::host_events::{game_bus, mod_bus};
 
@@ -105,9 +103,9 @@ pub(crate) enum BusKind {
 }
 
 pub(crate) fn bus_kind(receiver: Option<&Value>) -> BusKind {
-    match receiver.and_then(|bus| crate::host_events::key_of(bus, HostKind::NeoForgeBus)) {
-        Some("game") => BusKind::Game,
-        Some(_) => BusKind::Mod,
+    match receiver.and_then(crate::host_events::is_game_bus) {
+        Some(true) => BusKind::Game,
+        Some(false) => BusKind::Mod,
         None => BusKind::Unknown,
     }
 }

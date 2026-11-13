@@ -14,6 +14,6 @@ records and `DeferredWorkQueue#enqueueWork` futures, fabric-api-base 2.0.6's `Ev
 
 ```sh
 CP=bus-8.0.5.jar:loader-12.0.12.jar:neoforge-26.3.0.101-universal.jar:typetools-0.6.3.jar:log4j-api-2.26.0.jar:asm-9.11.jar:mergetool-2.0.7-api.jar:fabric-api-base-2.0.6+fcdff87f5d.jar:fabric-lifecycle-events-v1-4.1.9+ffef5f675d.jar:minecraft-26.3-client.jar
-javac --release 21 -d out -cp $CP demo/HostEvents.java oracle/HostEventsOracle.java
+javac --release 21 -d out -cp $CP demo/HostEvents.java oracle/HostEventsOracle.java stubs/rvx/MissingIface.java stubs/net/minecraftforge/eventbus/api/IEventBus.java
 $JAVA25/bin/java -cp out:$CP HostEventsOracle
 ```

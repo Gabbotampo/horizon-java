@@ -4970,7 +4970,7 @@ impl Host for StdHost {
             ("net/fabricmc/fabric/api/event/EventFactory", "createArrayBacked", descriptor)
                 if descriptor.ends_with("Lnet/fabricmc/fabric/api/event/Event;") =>
             {
-                let event = host_events::fabric_event(&self.next_fabric_event.to_string());
+                let event = host_events::fabric_array_event(self.next_fabric_event);
                 self.next_fabric_event = self.next_fabric_event.saturating_add(1);
                 Ok(event)
             }
@@ -4983,9 +4983,8 @@ impl Host for StdHost {
                 "net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback",
                 "event",
                 "(Lnet/minecraft/core/Registry;)Lnet/fabricmc/fabric/api/event/Event;",
-            ) => Ok(host_events::fabric_event(&format!(
-                "net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback.event/{}",
-                expect_string(Self::argument(r, args, 0)?)
+            ) => Ok(host_events::fabric_registry_event(expect_string(
+                Self::argument(r, args, 0)?,
             ))),
             ("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;") => {
                 let value = expect_int(r, Self::argument(r, args, 0)?)?;
@@ -38446,7 +38445,7 @@ mandatory = true
                 ],
             )
             .unwrap();
-        assert_eq!(event, crate::runtime::host_events::fabric_event("0"));
+        assert_eq!(event, crate::runtime::host_events::fabric_array_event(0));
         let register = MethodRef {
             owner: "net/fabricmc/fabric/api/event/Event".into(),
             name: "register".into(),

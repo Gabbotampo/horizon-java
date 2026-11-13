@@ -419,7 +419,30 @@ impl<H: Host> Runtime<'_, H> {
                 return Verdict::Yes;
             }
             let Some(file) = self.class(&current) else {
-                if current.starts_with("java/") || target_is_interface == Some(false) {
+                // A JDK class never extends or implements a type outside the
+                // JDK; against a JDK type only the JDK's own answer stands
+                // (`AbstractList` is a `Collection`), unknown where the model
+                // has none. A game class never extends a held jar class.
+                let jdk = |name: &str| {
+                    ["java/", "javax/", "jdk/"]
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                };
+                if current.starts_with("java/") {
+                    if !jdk(target) {
+                        return Verdict::No;
+                    }
+                    return match host_ref::ClassHierarchy::is_instance(
+                        &host_ref::JdkHierarchy,
+                        &current,
+                        target,
+                    ) {
+                        Some(true) => Verdict::Yes,
+                        Some(false) => Verdict::No,
+                        None => Verdict::Unknown,
+                    };
+                }
+                if target_is_interface == Some(false) {
                     return Verdict::No;
                 }
                 return Verdict::Unknown;
@@ -431,12 +454,58 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return Verdict::Yes;
             }
+            // An interface the runtime does not hold may extend an interface
+            // target (another jar's interface over this one's, or over a JDK
+            // or platform interface): not a "no". A platform interface never
+            // extends a jar type.
+            if target_is_interface != Some(false)
+                && file
+                    .interface_names()
+                    .iter()
+                    .any(|interface| self.interface_leaves_held(interface, target))
+            {
+                return Verdict::Unknown;
+            }
             if file.super_name.is_empty() || file.super_name == current {
                 return Verdict::No;
             }
             current = file.super_name.clone();
         }
         Verdict::Unknown
+    }
+
+    /// Whether `interface`'s superinterfaces reach one the runtime does not
+    /// hold that could still extend `target`: one outside the JDK and the
+    /// platforms (an absent jar's), or any unheld one when `target` is
+    /// itself not held.
+    fn interface_leaves_held(&self, interface: &str, target: &str) -> bool {
+        const PLATFORM: &[&str] = &[
+            "java/",
+            "javax/",
+            "jdk/",
+            "net/minecraft/",
+            "com/mojang/",
+            "net/fabricmc/",
+            "net/neoforged/",
+            "net/minecraftforge/",
+        ];
+        let held_target = self.class(target).is_some();
+        let mut queue = std::collections::VecDeque::from([interface.to_owned()]);
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(current) = queue.pop_front() {
+            if seen.len() >= MAX_SUPERCLASS_WALK || !seen.insert(current.clone()) {
+                continue;
+            }
+            match self.class(&current) {
+                Some(file) => queue.extend(file.interface_names()),
+                None if !held_target => return true,
+                None if !PLATFORM.iter().any(|prefix| current.starts_with(prefix)) => {
+                    return true;
+                }
+                None => {}
+            }
+        }
+        false
     }
 
     /// Whether one of the jar's `@Mixin`s gives `class` the interface `target`
@@ -479,19 +548,12 @@ impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
             .class(wanted)
             .and_then(class_access)
             .map(|access| access & ACC_INTERFACE != 0);
+        // A "no" is not a proof for a jar class: another jar's Mixin, or an
+        // interface this runtime does not hold, can make it a `wanted`
+        // (`host_ref::proves_not_instance`).
         match self.hierarchy_verdict(class, wanted, wanted_is_interface) {
             Verdict::Yes => Some(true),
-            Verdict::No => Some(false),
-            Verdict::Unknown => None,
-        }
-    }
-
-    /// A held class's own `ACC_FINAL`; the JLS's final JDK classes otherwise.
-    fn is_final(&self, class: &str) -> Option<bool> {
-        const ACC_FINAL: u16 = 0x0010;
-        match self.class(class) {
-            Some(file) => class_access(file).map(|access| access & ACC_FINAL != 0),
-            None => host_ref::JdkHierarchy.is_final(class),
+            Verdict::No | Verdict::Unknown => None,
         }
     }
 }

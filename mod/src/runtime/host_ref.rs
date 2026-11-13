@@ -182,29 +182,187 @@ pub(crate) enum ClassRule {
     /// (`CompletableFuture`): the class is read from the key.
     FromKey(fn(&str) -> &str),
     /// The object's runtime class is not known (a jar's lambda, a proxy, a
-    /// loader class the runtime does not model); `declared` are types it
-    /// surely is (the call site's declared type). `instanceof` and casts
-    /// answer from them (a supertype of one is `true`, a final class unrelated
-    /// to one `false`, anything else unknown); [`HostRef::class`] is `None`, so
-    /// `getClass()`, a `ClassCastException`'s message and anything else that
-    /// needs the exact class are counted.
-    Unknown { declared: &'static [&'static str] },
+    /// loader class the runtime does not model). `declared` answers, for a
+    /// key, the types the object surely is (the call site's declared type).
+    /// [`HostRef::class`] is `None`, so `getClass()`, a
+    /// `ClassCastException`'s message and anything else that needs the exact
+    /// class are counted; `instanceof` and casts follow
+    /// [`instance_of_class`]: `true` for a declared type's supertype, `false`
+    /// only where [`proves_not_instance`] proves it, counted otherwise.
+    Unknown {
+        declared: fn(&str) -> &'static [&'static str],
+    },
 }
 
-/// JDK classes the JLS makes `final`, for [`ClassHierarchy::is_final`] when
-/// no class file says.
-const JDK_FINAL: &[&str] = &[
-    "java/lang/String",
-    "java/lang/Class",
-    "java/lang/Boolean",
-    "java/lang/Character",
-    "java/lang/Byte",
-    "java/lang/Short",
-    "java/lang/Integer",
-    "java/lang/Long",
-    "java/lang/Float",
-    "java/lang/Double",
+/// JDK classes whose whole supertype closure (every superclass and every
+/// interface, transitively, the class itself included) is known: Java 25's,
+/// read by reflection. A class here is `final` when the flag says so.
+const JDK_CLOSED: &[(&str, bool, &[&str])] = &[
+    ("java/lang/Object", false, &["java/lang/Object"]),
+    (
+        "java/lang/String",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/CharSequence",
+            "java/lang/Comparable",
+            "java/lang/Object",
+            "java/lang/String",
+            "java/lang/constant/Constable",
+            "java/lang/constant/ConstantDesc",
+        ],
+    ),
+    (
+        "java/lang/Class",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Class",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+            "java/lang/invoke/TypeDescriptor",
+            "java/lang/invoke/TypeDescriptor$OfField",
+            "java/lang/reflect/AnnotatedElement",
+            "java/lang/reflect/GenericDeclaration",
+            "java/lang/reflect/Type",
+        ],
+    ),
+    (
+        "java/lang/Boolean",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Boolean",
+            "java/lang/Comparable",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+        ],
+    ),
+    (
+        "java/lang/Character",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Character",
+            "java/lang/Comparable",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+        ],
+    ),
+    (
+        "java/lang/Byte",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Byte",
+            "java/lang/Comparable",
+            "java/lang/Number",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+        ],
+    ),
+    (
+        "java/lang/Short",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Comparable",
+            "java/lang/Number",
+            "java/lang/Object",
+            "java/lang/Short",
+            "java/lang/constant/Constable",
+        ],
+    ),
+    (
+        "java/lang/Integer",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Comparable",
+            "java/lang/Integer",
+            "java/lang/Number",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+            "java/lang/constant/ConstantDesc",
+        ],
+    ),
+    (
+        "java/lang/Long",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Comparable",
+            "java/lang/Long",
+            "java/lang/Number",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+            "java/lang/constant/ConstantDesc",
+        ],
+    ),
+    (
+        "java/lang/Float",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Comparable",
+            "java/lang/Float",
+            "java/lang/Number",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+            "java/lang/constant/ConstantDesc",
+        ],
+    ),
+    (
+        "java/lang/Double",
+        true,
+        &[
+            "java/io/Serializable",
+            "java/lang/Comparable",
+            "java/lang/Double",
+            "java/lang/Number",
+            "java/lang/Object",
+            "java/lang/constant/Constable",
+            "java/lang/constant/ConstantDesc",
+        ],
+    ),
+    (
+        "java/util/Optional",
+        true,
+        &["java/lang/Object", "java/util/Optional"],
+    ),
+    (
+        "java/util/OptionalInt",
+        true,
+        &["java/lang/Object", "java/util/OptionalInt"],
+    ),
+    (
+        "java/util/OptionalLong",
+        true,
+        &["java/lang/Object", "java/util/OptionalLong"],
+    ),
+    (
+        "java/util/OptionalDouble",
+        true,
+        &["java/lang/Object", "java/util/OptionalDouble"],
+    ),
 ];
+
+/// `class`'s row in [`JDK_CLOSED`]: whether it is final, and its closure.
+fn jdk_closed(class: &str) -> Option<(bool, &'static [&'static str])> {
+    JDK_CLOSED
+        .iter()
+        .find(|(name, _, _)| *name == class)
+        .map(|(_, is_final, closure)| (*is_final, *closure))
+}
+
+/// Whether no object can be both a `class` and a `declared`, proved: `class`
+/// is `final` and its whole supertype closure is known without `declared`.
+/// Only the JDK classes of [`JDK_CLOSED`] qualify. A jar class never does:
+/// another jar's Mixin (or a class this runtime does not hold) can add an
+/// interface to it, which no single jar's runtime sees.
+pub(crate) fn proves_not_instance(class: &str, declared: &str) -> bool {
+    jdk_closed(class).is_some_and(|(is_final, closure)| is_final && !closure.contains(&declared))
+}
 
 /// Answers for the values a handle holds, for a kind's [`Methods`]. `None`
 /// is "unknown here": the caller counts the call instead of guessing.
@@ -236,15 +394,10 @@ pub(crate) type CrossesFn = fn(&HostRef, &dyn Fn(&Value) -> bool) -> bool;
 /// and in the runtime the jar's own classes (a jar object's superclasses and
 /// interfaces, a Mixin's added interface), which a family kind needs.
 pub(crate) trait ClassHierarchy {
-    /// Whether an object of class `class` is a `wanted` (internal names);
-    /// `None` when unknown (a class whose chain leaves what is held).
+    /// Whether an object of class `class` is a `wanted` (internal names).
+    /// `Some(false)` only when proved; `None` when unknown (a class whose
+    /// chain leaves what is known).
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool>;
-
-    /// Whether `class` is `final` (no subclass can exist); `None` when not
-    /// known.
-    fn is_final(&self, class: &str) -> Option<bool> {
-        JDK_FINAL.contains(&class).then_some(true)
-    }
 }
 
 /// The JDK's own hierarchy, for a caller with no runtime: a JDK class never
@@ -252,8 +405,25 @@ pub(crate) trait ClassHierarchy {
 pub(crate) struct JdkHierarchy;
 
 impl ClassHierarchy for JdkHierarchy {
+    /// `true` from the JDK model's supertypes; `false` only when proved: a
+    /// [`JDK_CLOSED`] class's closure lacks `wanted`, or a JDK class against
+    /// a type outside the JDK (which no JDK class extends or implements).
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
-        Some(wanted == "java/lang/Object" || crate::runtime::jdk_model::class_instance_of(class, wanted))
+        if wanted == "java/lang/Object"
+            || class == wanted
+            || crate::runtime::jdk_model::class_instance_of(class, wanted)
+        {
+            return Some(true);
+        }
+        if let Some((_, closure)) = jdk_closed(class) {
+            return Some(closure.contains(&wanted));
+        }
+        let jdk = |name: &str| {
+            ["java/", "javax/", "jdk/"]
+                .iter()
+                .any(|p| name.starts_with(p))
+        };
+        (jdk(class) && !jdk(wanted)).then_some(false)
     }
 }
 
@@ -296,16 +466,16 @@ pub(crate) fn never_canonical(_key: &str) -> bool {
 
 /// [`InstanceOfFn`] for a kind whose class is all it is: the class and its
 /// supertypes, as `hierarchy` knows them. For a [`ClassRule::Unknown`] kind:
-/// `true` for a supertype of a declared type; `false` only for a `final`
-/// class that is not a declared type's subtype (the object's class would
-/// have to be that very class); unknown otherwise.
+/// `true` for a supertype of a declared type; `false` only where
+/// [`proves_not_instance`] proves a declared type rules `wanted` out; unknown
+/// (counted) otherwise.
 pub(crate) fn instance_of_class(
     handle: &HostRef,
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
     let declared = match handle.kind.info().class {
-        ClassRule::Unknown { declared } => declared,
+        ClassRule::Unknown { declared } => declared(handle.key()),
         _ => return hierarchy.is_instance(handle.class()?, wanted),
     };
     if wanted == "java/lang/Object"
@@ -315,11 +485,12 @@ pub(crate) fn instance_of_class(
     {
         return Some(true);
     }
-    let disjoint = hierarchy.is_final(wanted) == Some(true)
-        && declared
-            .iter()
-            .any(|class| hierarchy.is_instance(wanted, class) == Some(false));
-    disjoint.then_some(false)
+    // The object is a `declared`; `wanted` is final and provably not one, so
+    // the object cannot be a `wanted`.
+    declared
+        .iter()
+        .any(|class| proves_not_instance(wanted, class))
+        .then_some(false)
 }
 
 /// Every kind: its tag, its class, its identity, its methods.
@@ -363,7 +534,7 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::ForgeBus,
         tag: "fgbus",
         class: ClassRule::Unknown {
-            declared: &["net/minecraftforge/eventbus/api/bus/EventBus"],
+            declared: crate::runtime::host_events::forge_bus_types,
         },
         canonical: always_canonical,
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
@@ -372,14 +543,17 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::FabricEvent,
         tag: "fevt",
         class: ClassRule::FromKey(crate::runtime::host_events::fabric_event_class),
-        canonical: crate::runtime::host_events::fabric_canonical,
+        canonical: always_canonical,
         methods: &crate::runtime::host_events::FABRIC_EVENT_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricInvoker,
         tag: "finv",
-        class: ClassRule::Unknown { declared: &[] },
-        canonical: crate::runtime::host_events::fabric_canonical,
+        class: ClassRule::Unknown {
+            declared: crate::runtime::host_events::no_types,
+        },
+        // `register` builds a new invoker: two reads are not provably one.
+        canonical: never_canonical,
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
@@ -393,7 +567,7 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::ImcSupplier,
         tag: "imcs",
         class: ClassRule::Unknown {
-            declared: &["java/util/function/Supplier"],
+            declared: crate::runtime::host_events::supplier_types,
         },
         canonical: always_canonical,
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
@@ -409,11 +583,7 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::PostedEvent,
         tag: "pev",
         class: ClassRule::Unknown {
-            // A posted stand-in carries a cancelled flag: a cancellable event.
-            declared: &[
-                "net/neoforged/bus/api/Event",
-                "net/neoforged/bus/api/ICancellableEvent",
-            ],
+            declared: crate::runtime::host_events::posted_event_types,
         },
         canonical: never_canonical,
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,

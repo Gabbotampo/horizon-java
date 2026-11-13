@@ -85,6 +85,11 @@ public final class HostEvents {
         + "|" + identities(game, again, mod, NeoForge.EVENT_BUS);
   }
 
+  /** NeoForge's {@code EventBus} is not Forge's bus interface. */
+  public static String busForge(Object game) {
+    return "" + (game instanceof net.minecraftforge.eventbus.api.IEventBus);
+  }
+
   /** {@code EventBus} prints and hashes by identity. */
   public static String busText(Object game) {
     return game + "," + game.hashCode();
@@ -102,8 +107,29 @@ public final class HostEvents {
     Object field = ServerLifecycleEvents.SERVER_STARTING;
     return "" + (a instanceof Event) + ((Object) a).getClass().getName() + (field instanceof Event)
         + "|" + (a == b) + a.equals(b) + a.equals(a) + a.equals("fabric-event/0") + "|"
-        + (invoker == a.invoker()) + (a.invoker() == b.invoker()) + invoker.equals(a) + "|"
-        + (field == ServerLifecycleEvents.SERVER_STARTING) + "|" + identities(a, a, b, invoker, a.invoker());
+        + (a.invoker() == b.invoker()) + invoker.equals(a) + "|"
+        + (field == ServerLifecycleEvents.SERVER_STARTING) + "|" + identities(a, a, b);
+  }
+
+  /** {@code register} builds a new invoker: two reads may be two objects. */
+  public static String fabricInvoker() {
+    Event<Runnable> e = EventFactory.createArrayBacked(Runnable.class, all -> () -> {
+      for (Runnable r : all) r.run();
+    });
+    Object a = e.invoker(), b = e.invoker();
+    e.register((Runnable) () -> {});
+    Object c = e.invoker();
+    return "" + (a == b) + "|" + (a == c) + a.equals(c);
+  }
+
+  /** One invoker read, held twice: one object. */
+  public static String fabricInvokerSame() {
+    Event<Runnable> e = EventFactory.createArrayBacked(Runnable.class, all -> () -> {
+      for (Runnable r : all) r.run();
+    });
+    Object a = e.invoker();
+    Object b = a;
+    return "" + (a == b) + a.equals(b) + identities(a, b);
   }
 
   /** IMC messages: one record read twice, another, and a supplier. */
@@ -142,10 +168,61 @@ public final class HostEvents {
     return "" + (supplier instanceof Runnable);
   }
 
-  /** A cancellable event, cancelled, and one that is not. */
-  public static String posted(Object cancelled, Object open) {
+  /** A final class that is a {@code Supplier} through an interface of a jar that is not loaded. */
+  static final class FinalViaMissing implements rvx.MissingIface {
+    public Object get() {
+      return null;
+    }
+  }
+
+  /** A final jar class whose superclass is the JDK's. */
+  static final class FinalList extends AbstractList<Object> {
+    public Object get(int index) {
+      return null;
+    }
+
+    public int size() {
+      return 0;
+    }
+  }
+
+  /** Neither final class can be ruled out from what the runtime holds (a supplier may be one). */
+  public static String supplierFinalViaMissing(Object supplier) {
+    return "" + (supplier instanceof FinalViaMissing);
+  }
+
+  public static String supplierFinalList(Object supplier) {
+    return "" + (supplier instanceof FinalList);
+  }
+
+  /**
+   * A jar object over an absent jar's interface may still be a platform type (that interface's
+   * parents are unknown); one over a JDK superclass is not (no JDK class implements one).
+   */
+  public static String jarViaMissing() {
+    Object o = new FinalViaMissing();
+    return "" + (o instanceof net.minecraftforge.eventbus.api.IEventBus);
+  }
+
+  public static String jarViaJdk() {
+    Object o = new FinalList();
+    return "" + (o instanceof net.minecraftforge.eventbus.api.IEventBus);
+  }
+
+  /** A cancellable event, cancelled. */
+  public static String posted(Object cancelled) {
     return "" + (cancelled instanceof net.neoforged.bus.api.Event) + (cancelled instanceof ICancellableEvent)
-        + ((ICancellableEvent) cancelled).isCanceled() + ((ICancellableEvent) open).isCanceled();
+        + ((ICancellableEvent) cancelled).isCanceled();
+  }
+
+  /** An event that is not cancellable. */
+  public static String postedOpen(Object open) {
+    String which = switch (open) {
+      case ICancellableEvent c -> "C";
+      case net.neoforged.bus.api.Event e -> "E";
+      default -> "d";
+    };
+    return "" + (open instanceof net.neoforged.bus.api.Event) + which;
   }
 
   /** {@code ==} on two events. */

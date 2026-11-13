@@ -16,8 +16,10 @@ import net.neoforged.neoforge.common.NeoForge;
  * messages are loader-12.0.12's {@code IMCMessage} records.
  */
 public final class HostEventsOracle {
-  /** A jar's own cancellable event. */
+  /** A jar's own cancellable event, and a plain one. */
   static final class Cancellable extends Event implements ICancellableEvent {}
+
+  static final class Plain extends Event {}
 
   public static void main(String[] args) {
     IEventBus game = NeoForge.EVENT_BUS;
@@ -30,19 +32,27 @@ public final class HostEventsOracle {
     Object another = queue.enqueueWork((ModContainer) null, () -> {});
     Cancellable cancelled = new Cancellable();
     cancelled.setCanceled(true);
-    Cancellable open = new Cancellable();
+    Plain open = new Plain();
     print("encoded", HostEvents.encoded());
     print("spelled", HostEvents.spelled());
     print("spelledTypes", HostEvents.spelledTypes());
     print("bus", HostEvents.bus(game, game, mod));
+    print("busForge", HostEvents.busForge(game));
     print("fabric", HostEvents.fabric());
+    print("fabricInvoker", HostEvents.fabricInvoker());
+    print("fabricInvokerSame", HostEvents.fabricInvokerSame());
     print("imc", HostEvents.imc(message, message, other, supplier));
     print("imcEquals", HostEvents.imcEquals(message, other));
     print("future", HostEvents.future(future, future, another));
     print("supplierClass", HostEvents.supplierClass(supplier));
     print("supplierTypes", HostEvents.supplierTypes(supplier));
     print("supplierRunnable", HostEvents.supplierRunnable(supplier));
-    print("posted", HostEvents.posted(cancelled, open));
+    print("supplierFinalViaMissing", HostEvents.supplierFinalViaMissing(supplier));
+    print("supplierFinalList", HostEvents.supplierFinalList(supplier));
+    print("jarViaMissing", HostEvents.jarViaMissing());
+    print("jarViaJdk", HostEvents.jarViaJdk());
+    print("posted", HostEvents.posted(cancelled));
+    print("postedOpen", HostEvents.postedOpen(open));
     print("postedIdentity", HostEvents.postedIdentity(cancelled, cancelled));
   }
 

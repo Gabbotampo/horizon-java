@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use super::{deferred_work, game_bus, imc_message, imc_supplier, mod_bus, posted_event};
+use super::{
+    deferred_work, fabric_array_event, fabric_event_name, fabric_field_event, fabric_field_of,
+    fabric_registry_event, forge_bus, forge_bus_event, game_bus, imc_message, imc_supplier,
+    is_cancelled_event, is_game_bus, mod_bus, posted_event,
+};
 use crate::runtime::{NativeJar, StdHost, Value};
 
 enum Outcome {
@@ -160,6 +164,8 @@ fn p8_host_objects_answer_as_java_25_or_count() {
             vec![bus.clone(), bus.clone(), mod_bus(Some("demo"))],
             Exact("truetruefalsenet.neoforged.bus.EventBus|truefalsetruetrue|truefalsefalse|2"),
         ),
+        // `EventBus` implements only the NeoForge bus interfaces.
+        ("busForge", vec![game_bus()], Exact("false")),
         // `EventBus` prints and hashes by identity: no stable value.
         ("busText", vec![game_bus()], Counted),
         // Two `createArrayBacked` events, their invokers, and an API field read twice.
@@ -167,9 +173,14 @@ fn p8_host_objects_answer_as_java_25_or_count() {
             "fabric",
             vec![],
             Exact(
-                "truenet.fabricmc.fabric.impl.base.event.ArrayBackedEventtrue|falsefalsetruefalse|truefalsefalse|true|3",
+                "truenet.fabricmc.fabric.impl.base.event.ArrayBackedEventtrue|falsefalsetruefalse|falsefalse|true|2",
             ),
         ),
+        // `register` builds a new invoker (`ArrayBackedEvent.update`): two reads may be two
+        // objects (Java: `true|falsefalse`), so `==` and `equals` on them are counted ...
+        ("fabricInvoker", vec![], Counted),
+        // ... while one read held twice is one object.
+        ("fabricInvokerSame", vec![], Exact("truetrue1")),
         (
             "imc",
             vec![
@@ -212,10 +223,26 @@ fn p8_host_objects_answer_as_java_25_or_count() {
             Exact("truefalsefalse"),
         ),
         ("supplierRunnable", vec![imc_supplier(0)], Counted),
+        // A final class is ruled out only when its whole hierarchy is known: one that is a
+        // `Supplier` through an absent jar's interface, or a jar class over a JDK superclass (another
+        // jar's Mixin may add an interface), is counted (Java: `false` for this lambda).
+        ("supplierFinalViaMissing", vec![imc_supplier(0)], Counted),
+        ("supplierFinalList", vec![imc_supplier(0)], Counted),
+        // `hierarchy_verdict` (checkcast.rs), audited: a jar class's absent-jar interface may extend
+        // a platform interface (counted; Java: `false`), while a JDK superclass never implements one.
+        ("jarViaMissing", vec![], Counted),
+        ("jarViaJdk", vec![], Exact("false")),
         (
             "posted",
-            vec![posted_event("demo", true), posted_event("demo", false)],
-            Exact("truetruetruefalse"),
+            vec![posted_event("demo", true)],
+            Exact("truetruetrue"),
+        ),
+        // A stand-in that is not cancelled is surely an `Event`, but not surely cancellable: the
+        // type switch counts `case ICancellableEvent` and picks Java's `case Event`.
+        (
+            "postedOpen",
+            vec![posted_event("demo", false)],
+            CountedAs("trueE"),
         ),
         // A posted event is a fresh value: the same handle is one object; two made alike may be
         // two objects, which the key does not say, so that `==` is counted.
@@ -245,4 +272,61 @@ fn p8_host_objects_answer_as_java_25_or_count() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Keys hold jar text (a mod id, a field name, an event name) only through the escaping encoder:
+/// names with every separator read back as themselves and never alias another object.
+#[test]
+fn keys_never_alias_jar_text() {
+    let names = [
+        "",
+        "x",
+        "game",
+        "mod",
+        "cancelled/x",
+        "a,b",
+        "a\\",
+        "\\,",
+        ",",
+        "i1,rx",
+        "rx",
+        "a.b",
+        "hpev:x",
+    ];
+    let mut seen: Vec<Value> = Vec::new();
+    let mut fresh = |value: Value| {
+        assert!(!seen.contains(&value), "{value:?} aliases another key");
+        seen.push(value);
+    };
+    fresh(game_bus());
+    fresh(mod_bus(None));
+    for name in names {
+        for cancelled in [false, true] {
+            let event = posted_event(name, cancelled);
+            assert_eq!(is_cancelled_event(&event), cancelled, "{name:?}");
+            fresh(event);
+        }
+        let bus = mod_bus(Some(name));
+        assert_eq!(is_game_bus(&bus), Some(false), "{name:?}");
+        fresh(bus);
+        let bus = forge_bus(name);
+        assert_eq!(forge_bus_event(&bus).as_deref(), Some(name));
+        fresh(bus);
+        for owner in names {
+            let event = fabric_field_event(owner, name);
+            assert_eq!(
+                fabric_field_of(&event),
+                Some((owner.to_owned(), name.to_owned()))
+            );
+            fresh(event);
+        }
+        let event = fabric_registry_event(name);
+        assert_eq!(fabric_field_of(&event), None);
+        fresh(event);
+    }
+    assert_eq!(is_game_bus(&game_bus()), Some(true));
+    assert_eq!(is_game_bus(&mod_bus(None)), Some(false));
+    let array = fabric_array_event(7);
+    assert_eq!(fabric_event_name(&array).as_deref(), Some("7"));
+    fresh(array);
 }

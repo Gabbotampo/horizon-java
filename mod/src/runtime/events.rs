@@ -50,9 +50,9 @@ use std::{collections::BTreeMap, sync::Arc};
 pub use order::{ListenerOrder, PhaseOrdering, dispatch_order};
 
 use crate::runtime::{
-    ExecutionBudget, HostInvocation, HostKind, MethodRef, NativeError, NativeJar, StdHost, Value,
-    arg_count, component_value, expect_ref, facade_server, parse_callback_marker, return_desc,
-    stable_hash, uuid_value,
+    ExecutionBudget, HostInvocation, MethodRef, NativeError, NativeJar, StdHost, Value, arg_count,
+    component_value, expect_ref, facade_server, parse_callback_marker, return_desc, stable_hash,
+    uuid_value,
 };
 
 pub use crate::runtime::facade_server::{GameRuleValue, ServerFacts};
@@ -896,9 +896,9 @@ pub(crate) fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
         .map(|(_, event)| (*event, loader))
 }
 
-/// The API field a Fabric event's key (`<owner>.<FIELD>`, `host_events.rs`) names.
-fn fabric_field(key: &str) -> Option<&'static FabricField> {
-    let (owner, field) = key.rsplit_once('.')?;
+/// The API field a Fabric event handle (`host_events.rs`) names.
+fn fabric_field(event: &Value) -> Option<&'static FabricField> {
+    let (owner, field) = crate::runtime::host_events::fabric_field_of(event)?;
     FABRIC_FIELDS
         .iter()
         .find(|row| row.owner == owner && row.field == field)
@@ -1258,8 +1258,8 @@ impl StdHost {
     }
 
     /// The statics a listener's registration and body read through the host:
-    /// a Fabric `Event` field keeps its name (`fabric-event/<owner>.<FIELD>`),
-    /// a Forge event's `BUS` names its event, and the façade answers
+    /// a Fabric `Event` field is the event handle naming its owner and field,
+    /// a Forge event's `BUS` the bus handle naming its event (`host_events.rs`), and the façade answers
     /// `InteractionResult` and dimension constants plus the field read of a
     /// join handler's `player`.
     pub(crate) fn game_event_static(&self, r: &MethodRef) -> Option<Value> {
@@ -1271,10 +1271,7 @@ impl StdHost {
         if r.descriptor == "Lnet/fabricmc/fabric/api/event/Event;"
             && r.owner.starts_with("net/fabricmc/fabric/api/")
         {
-            return Some(crate::runtime::host_events::fabric_event(&format!(
-                "{}.{}",
-                r.owner, r.name
-            )));
+            return Some(crate::runtime::host_events::fabric_field_event(&r.owner, &r.name));
         }
         // `Event.DEFAULT_PHASE` and the `EventPriority` constants: what a
         // listener's order is registered with (`order.rs`).
@@ -1919,10 +1916,9 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     let owner = invocation.method.owner.as_str();
     let name = invocation.method.name.as_str();
     let receiver = invocation.receiver.as_ref();
-    let key_of = |kind| receiver.and_then(|r| crate::runtime::host_events::key_of(r, kind));
     // Fabric: `<Field>.addPhaseOrdering(first, second)`, kept for the order.
     if owner == FABRIC_EVENT && name == "addPhaseOrdering" {
-        if let Some(row) = key_of(HostKind::FabricEvent).and_then(fabric_field)
+        if let Some(row) = receiver.and_then(fabric_field)
             && let [first, second] = invocation.args.as_slice()
         {
             out.phase_orderings.push(PhaseOrdering {
@@ -1935,11 +1931,14 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     }
     // Fabric: `<Field>.register([phase,] listener)` on a named Event field.
     if owner == FABRIC_EVENT && name == "register" {
-        let Some(source) = key_of(HostKind::FabricEvent) else {
+        let Some(event) = receiver else {
             return;
         };
-        let Some(row) = fabric_field(source) else {
-            count_unsupported(out, source.to_owned());
+        let Some(source) = crate::runtime::host_events::fabric_event_name(event) else {
+            return;
+        };
+        let Some(row) = fabric_field(event) else {
+            count_unsupported(out, source);
             return;
         };
         let source = fabric_source(row);
@@ -1994,11 +1993,11 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
     }
     // Forge EventBus 7: `<Event>.BUS.addListener([priority,] [alwaysCancelling,] listener)`.
     if FORGE_BUSES.contains(&owner) && name == "addListener" {
-        let Some(class) = key_of(HostKind::ForgeBus) else {
+        let Some(class) = receiver.and_then(crate::runtime::host_events::forge_bus_event) else {
             return;
         };
         push_bus_listener(
-            class,
+            &class,
             invocation,
             jar,
             out,
@@ -2744,23 +2743,29 @@ mod tests {
 
     #[test]
     fn client_events_name_their_fabric_fields_and_bus_classes() {
-        let row = fabric_field(
-            "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents.END_CLIENT_TICK",
+        let field =
+            |owner, name| fabric_field(&crate::runtime::host_events::fabric_field_event(owner, name));
+        let row = field(
+            "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientTickEvents",
+            "END_CLIENT_TICK",
         )
         .unwrap();
         assert_eq!(
             (row.event, row.method, row.shape),
             (GameEvent::ClientTickEnd, "onEndTick", Shape::Minecraft)
         );
-        let join = fabric_field(
-            "net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents.JOIN",
+        let join = field(
+            "net/fabricmc/fabric/api/client/networking/v1/ClientPlayConnectionEvents",
+            "JOIN",
         )
         .unwrap();
         assert_eq!(join.event, GameEvent::ClientJoin);
         // The server's own `JOIN` stays the server's.
-        let server_join =
-            fabric_field("net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents.JOIN")
-                .unwrap();
+        let server_join = field(
+            "net/fabricmc/fabric/api/networking/v1/ServerPlayConnectionEvents",
+            "JOIN",
+        )
+        .unwrap();
         assert_eq!(server_join.event, GameEvent::PlayerJoin);
         assert_eq!(
             bus_event("net/neoforged/neoforge/client/event/ClientTickEvent$Post"),
