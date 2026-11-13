@@ -5532,6 +5532,16 @@ impl Host for StdHost {
                         method: r.name.clone(),
                     })
             }
+            // Java's float extrema: a NaN operand gives NaN, and -0.0 < 0.0.
+            ("java/lang/Math", "max" | "min", "(DD)D" | "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(Value::Float(java_float_extremum(
+                    left,
+                    right,
+                    r.name == "max",
+                )))
+            }
             ("java/lang/Math", "max", "(II)I") => Ok(Value::Int(
                 expect_int(r, Self::argument(r, args, 0)?)?
                     .max(expect_int(r, Self::argument(r, args, 1)?)?),
@@ -9823,6 +9833,30 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ENCHANTMENT", "minecraft:enchantment"),
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
+
+/// `Math.max`/`Math.min` on `double` or `float` as Java defines them.
+fn java_float_extremum(left: f64, right: f64, max: bool) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        return f64::NAN;
+    }
+    if left == 0.0 && right == 0.0 {
+        // Equal zeros: max prefers +0.0, min prefers -0.0.
+        let positive = left.is_sign_positive() && right.is_sign_positive();
+        let negative = left.is_sign_negative() && right.is_sign_negative();
+        return if max {
+            if negative { -0.0 } else { 0.0 }
+        } else if positive {
+            0.0
+        } else {
+            -0.0
+        };
+    }
+    if max {
+        left.max(right)
+    } else {
+        left.min(right)
+    }
+}
 
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
@@ -29179,6 +29213,42 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// `Math.max`/`min` on doubles and floats follow Java: NaN wins, and the
+    /// signed zeros order as -0.0 < 0.0.
+    #[test]
+    fn jdk_float_extrema_follow_java() {
+        let mut host = StdHost::new();
+        let jdk = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let call = |host: &mut StdHost, r: &MethodRef, a: f64, b: f64| match host
+            .invoke(r, &[Value::Float(a), Value::Float(b)])
+            .unwrap()
+        {
+            Value::Float(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let max = jdk("java/lang/Math", "max", "(DD)D");
+        let min = jdk("java/lang/Math", "min", "(DD)D");
+        assert_eq!(call(&mut host, &max, 2.5, -1.0), 2.5);
+        assert!(call(&mut host, &max, f64::NAN, 1.0).is_nan());
+        assert!(call(&mut host, &min, 1.0, f64::NAN).is_nan());
+        assert!(call(&mut host, &max, -0.0, 0.0).is_sign_positive());
+        assert!(call(&mut host, &min, 0.0, -0.0).is_sign_negative());
+        assert_eq!(
+            call(&mut host, &jdk("java/lang/Math", "min", "(FF)F"), 3.0, 0.5),
+            0.5
+        );
+        assert_eq!(
+            host.unknown_host_call_count(),
+            0,
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
 
     /// A class with one static `m()V` that returns, the smallest shape the
     /// weaver accepts. Pool: 1 name, 2 Class 1, 3 `java/lang/Object`, 4 Class 3,
