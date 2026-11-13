@@ -52,6 +52,7 @@ mod heap;
 mod hook_shapes;
 mod jar_operands;
 mod jar_text;
+mod jar_throwables;
 mod java_format;
 mod java_format_args;
 mod java_identifier;
@@ -5524,17 +5525,40 @@ impl Host for StdHost {
             let marker = expect_ref(receiver)
                 .ok_or_else(|| NativeError::Metadata("malformed Throwable marker".into()))?;
             if r.name == "<init>" {
-                let message = args.first().and_then(|value| match value {
-                    Value::Ref(Some(text)) => Some(text.clone()),
-                    Value::Ref(None) => None,
-                    _ => None,
-                });
-                let cause = args.iter().find_map(|value| match value {
-                    Value::Ref(Some(value)) if is_throwable_marker(value) => {
-                        Some(Value::Ref(Some(value.clone())))
-                    }
-                    _ => None,
-                });
+                // The cause is the `Throwable` parameter, whatever class the
+                // argument is (a jar exception's name need not end in
+                // `Exception`); `Throwable(Throwable cause)`'s message is
+                // `cause.toString()`, `null` for a null cause.
+                let parameters = descriptor_arguments(&r.descriptor);
+                let cause = parameters
+                    .iter()
+                    .position(|parameter| parameter == "Ljava/lang/Throwable;")
+                    .and_then(|index| args.get(index))
+                    .filter(|value| **value != Value::Ref(None))
+                    .cloned();
+                let message = if r.descriptor == "(Ljava/lang/Throwable;)V" {
+                    cause.as_ref().and_then(expect_ref).map(|cause| {
+                        let class = cause
+                            .split_once('#')
+                            .map_or(cause.as_str(), |(class, _)| class);
+                        let name = class.replace('/', ".");
+                        match self.throwable_messages.get(cause).cloned().flatten() {
+                            Some(message) => format!("{name}: {message}"),
+                            None => name,
+                        }
+                    })
+                } else {
+                    args.first().and_then(|value| match value {
+                        Value::Ref(Some(text))
+                            if parameters
+                                .first()
+                                .is_none_or(|p| p != "Ljava/lang/Throwable;") =>
+                        {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+                };
                 self.throwable_messages.insert(marker.clone(), message);
                 self.throwable_causes.insert(marker.clone(), cause);
                 return Ok(Value::Void);
@@ -5564,9 +5588,10 @@ impl Host for StdHost {
                     let class = marker
                         .split_once('#')
                         .map_or(marker.as_str(), |(class, _)| class);
-                    let class = class.rsplit('/').next().unwrap_or(class);
+                    // `getClass().getName()`: the binary name, package included.
+                    let class = class.replace('/', ".");
                     let Some(Some(message)) = self.throwable_messages.get(marker) else {
-                        return Ok(Value::Ref(Some(class.to_owned())));
+                        return Ok(Value::Ref(Some(class)));
                     };
                     return Ok(Value::Ref(Some(format!("{class}: {message}"))));
                 }
@@ -22451,6 +22476,10 @@ impl<H: Host> Runtime<'_, H> {
     /// The throwable value a Java handler receives for a throw the host or a
     /// nested frame raised, tagged with the message the throw carries.
     fn caught_throwable(&mut self, class: &str, message: Option<String>) -> Value {
+        // The object a jar frame threw, when this is its throw.
+        if let Some(value) = jar_throwables::take_in_flight(class, &message) {
+            return value;
+        }
         let value = self.new_object(class);
         if let Some(marker) = expect_ref(&value) {
             self.host.record_throwable(marker, message);
@@ -24592,7 +24621,9 @@ impl<H: Host> Runtime<'_, H> {
                     if thrown == Value::Ref(None) {
                         invoke_or_catch!(at, Err(null_checks::throw_null()))
                     }
-                    let thrown_class = thrown_class(&thrown);
+                    // A jar class extending a JDK exception is its own class
+                    // (`jar_throwables.rs`).
+                    let thrown_class = self.throwable_class(&thrown);
                     if let Some(handler) =
                         self.exception_handler(file, method, desc, at, &thrown_class)?
                     {
@@ -24601,9 +24632,12 @@ impl<H: Host> Runtime<'_, H> {
                         pc = handler;
                         continue;
                     }
+                    let message = self.thrown_text(&thrown);
+                    // The handler that catches this throw gets this object.
+                    jar_throwables::note_in_flight(&thrown_class, &message, &thrown);
                     return Err(NativeError::UncaughtException {
                         class: thrown_class,
-                        message: thrown_message(&thrown, self.host),
+                        message,
                         frame: Some(format!("{class}#{method} +{at}")),
                     });
                 }
@@ -37895,7 +37929,8 @@ mandatory = true
         };
         assert_eq!(
             host.invoke_instance(&to_string, &error, &[]).unwrap(),
-            Value::Ref(Some("IllegalStateException: bad state".into()))
+            // JDK 25: `getClass().getName() + ": " + message`, the binary name.
+            Value::Ref(Some("java.lang.IllegalStateException: bad state".into()))
         );
     }
 
