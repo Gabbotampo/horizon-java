@@ -153,6 +153,14 @@ impl<H: Host> Runtime<'_, H> {
         );
     }
 
+    /// The component class recorded for `array`, if any.
+    pub(super) fn array_component(&self, array: &str) -> Option<String> {
+        match self.fields.get(&format!("{array}{ARRAY_COMPONENT_FIELD}")) {
+            Some(Value::Ref(Some(component))) => Some(component.clone()),
+            _ => None,
+        }
+    }
+
     /// `array.getClass()` for an array whose component is known, and
     /// `Class.getComponentType()` of an array class (null for any other
     /// class, as on the JVM).
