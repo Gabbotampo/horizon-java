@@ -17,6 +17,7 @@ mod annotation_values;
 mod attachment_codec;
 mod block_item_id;
 pub mod brigadier;
+mod charset_decoder;
 mod checkcast;
 mod class_init;
 pub mod client_surface;
@@ -34,6 +35,7 @@ mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
 mod executors;
+mod fabric_mods;
 mod fabric_registry;
 mod facade_saved_data;
 mod facade_server;
@@ -41,6 +43,7 @@ mod facade_text;
 mod facade_world;
 mod field_access;
 mod field_get_set;
+mod files_copy;
 mod frame_bound;
 mod game_codecs;
 mod game_hooks;
@@ -2498,10 +2501,6 @@ const ENUM_DECLARED_METHODS: &[&str] = &[
 /// A real `try`/`catch` chain has a handful; the bound keeps a crafted class
 /// from making every throw walk an unbounded table.
 const MAX_EXCEPTION_HANDLERS: usize = 256;
-/// Distinct empty collections handed out for unmodelled calls that declare a
-/// collection return. Past this the shared read-only marker keeps a jar from
-/// growing the host without bound.
-const MAX_NEUTRAL_COLLECTIONS: usize = 256;
 /// Service providers `seed_host` reads from one jar's `META-INF/services`
 /// files. A real jar lists a handful; the bound caps a crafted file.
 const MAX_SEEDED_SERVICE_PROVIDERS: usize = 256;
@@ -2547,6 +2546,8 @@ pub struct StdHost {
     /// clock read.  Keeping the value seeded makes bootstrap replayable.
     current_time_millis: i32,
     mods: BTreeMap<String, String>,
+    /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
+    fabric_metadata: BTreeMap<String, serde_json::Value>,
     environment_type: String,
     /// The game version a caller seeded for `ModList` and `DetectedVersion`.
     /// `None` keeps both questions unanswered instead of inventing a release.
@@ -2613,6 +2614,8 @@ pub struct StdHost {
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
     /// for one that owns its elements, `Some(source)` for a view.
     unmodifiable_collections: BTreeMap<String, Option<String>>,
+    /// UTF-8 decoders `Charset.newDecoder` made (`charset_decoder.rs`).
+    charset_decoders: BTreeMap<String, charset_decoder::DecoderState>,
     /// `Collections.synchronized*` views and the collection each wraps
     /// (`synchronized_views.rs`).
     synchronized_views: BTreeMap<String, String>,
@@ -2728,6 +2731,7 @@ impl StdHost {
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
+            fabric_metadata: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
             development_environment: false,
@@ -2756,6 +2760,7 @@ impl StdHost {
             holders: BTreeMap::new(),
             mutable_collections: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
             reversed_views: BTreeMap::new(),
             hash_tables: BTreeMap::new(),
@@ -2867,17 +2872,22 @@ impl StdHost {
         Value::default_for(descriptor)
     }
 
-    /// A distinct empty collection marker for one unmodelled call.
+    /// A new, distinct, empty mutable collection the host keeps.
     ///
-    /// The marker carries its own name so mutating it (`put`, `add`) never
-    /// changes what another call site sees. Past
-    /// [`MAX_NEUTRAL_COLLECTIONS`] the shared read-only marker is returned: a
-    /// jar with thousands of unmodelled collection calls still runs, and its
-    /// mutations simply stop being retained.
+    /// Every host-made collection comes from here: an unmodelled call's
+    /// neutral answer, but also `subList`, `Lists.newArrayList(..)`, a
+    /// synchronized view, `stringPropertyNames`. The marker carries its own
+    /// number, so a write to one never reaches another.
+    ///
+    /// This used to stop after 256 and hand out the shared kind marker
+    /// (`list`, `map`, `set`) instead. Writes to that marker were kept in one
+    /// shared row, so every collection made past the limit aliased the others,
+    /// and `size()` (that row) disagreed with `get` (the bare marker, read as
+    /// an empty literal): night-config's `AbstractConfig.set` saw a three-part
+    /// path answer `get(2)` with `IndexOutOfBoundsException: Index 2 out of
+    /// bounds for length 2`. A jar's own `new ArrayList()` was never limited,
+    /// and the execution budget bounds how many either kind a run can make.
     fn empty_collection(&mut self, kind: &str) -> Value {
-        if self.next_neutral_collection >= MAX_NEUTRAL_COLLECTIONS {
-            return collection_empty(kind);
-        }
         let class = match kind {
             "map" => "java/util/LinkedHashMap",
             "set" => "java/util/LinkedHashSet",
@@ -3059,6 +3069,7 @@ impl StdHost {
     /// A jar present beside this one is a loaded mod for `isModLoaded` and
     /// `ModList.isLoaded`, declared as a dependency or not.
     fn record_loaded_mod(&mut self, jar: &NativeJar) {
+        self.record_fabric_metadata(jar);
         if let Some(id) = jar.fabric_id.as_deref().or(jar.neoforge_id.as_deref()) {
             let version = jar
                 .fabric_version
@@ -3312,33 +3323,6 @@ impl StdHost {
             // that never happened.
             ("store" | "storeToXML" | "list" | "save", _) => self.unknown_host_call(r).map(Some),
             _ => Ok(None),
-        }
-    }
-
-    /// One `custom` entry of the jar's own `fabric.mod.json`.
-    ///
-    /// Fabric exposes build metadata (a commit hash, a CI URL) through
-    /// `ModMetadata.getCustomValue`, and a bootstrap formats it into a version
-    /// string. The jar's metadata document is a resource the host already
-    /// holds, so the answer is read from it; a key the document does not
-    /// declare stays `null`, which is what Fabric answers.
-    fn fabric_custom_value(&self, key: &str) -> Value {
-        let Some(bytes) = self.resource_bytes.get("fabric.mod.json") else {
-            return Value::Ref(None);
-        };
-        let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-            return Value::Ref(None);
-        };
-        let Some(value) = document.get("custom").and_then(|custom| custom.get(key)) else {
-            return Value::Ref(None);
-        };
-        match value {
-            serde_json::Value::String(text) => Value::Ref(Some(format!("custom-value/{text}"))),
-            serde_json::Value::Bool(flag) => Value::Ref(Some(format!("custom-boolean/{flag}"))),
-            serde_json::Value::Number(number) => {
-                Value::Ref(Some(format!("custom-number/{number}")))
-            }
-            other => Value::Ref(Some(format!("custom-value/{other}"))),
         }
     }
 
@@ -4319,8 +4303,16 @@ impl Host for StdHost {
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
+        // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
+        if let Some(value) = Self::fabric_mods_static(r) {
+            return Ok(value);
+        }
         // NeoForge's side, path and mod-container constants.
         if let Some(value) = self.neoforge_loader_static(r) {
+            return Ok(value);
+        }
+        // `CodingErrorAction`'s constants (`charset_decoder.rs`).
+        if let Some(value) = Self::coding_error_action_static(r) {
             return Ok(value);
         }
         // `Character.UnicodeBlock` constants (`jdk_character.rs`).
@@ -5627,6 +5619,10 @@ impl Host for StdHost {
         if let Some(value) = self.guava_text(r, Some(receiver), args) {
             return value;
         }
+        // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
+        if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
+            return value;
+        }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
             return Ok(value);
@@ -5634,6 +5630,10 @@ impl Host for StdHost {
         // The loading stages' event objects (`neoforge_lifecycle.rs`).
         if let Some(value) = self.neoforge_lifecycle_instance(r, receiver, args) {
             return Ok(value);
+        }
+        // UTF-8 decoders and their error actions (`charset_decoder.rs`).
+        if let Some(value) = self.charset_decoder_call(r, receiver, args) {
+            return value;
         }
         // A synchronized view runs every call on what it wraps
         // (`synchronized_views.rs`).
@@ -8592,14 +8592,6 @@ impl Host for StdHost {
                     Value::Ref(Some(format!("optional/{name}")))
                 }))
             }
-            ("net/fabricmc/loader/api/FabricLoader", "getAllMods", "()Ljava/util/List;") => {
-                let values = self
-                    .mods
-                    .iter()
-                    .map(|(id, version)| Value::Ref(Some(format!("mod-container/{id}/{version}"))))
-                    .collect::<Vec<_>>();
-                Ok(collection_value("list", &values))
-            }
             (
                 "net/fabricmc/loader/api/FabricLoader",
                 "getEntrypoints" | "getEntrypointContainers",
@@ -8749,40 +8741,6 @@ impl Host for StdHost {
                 "getDescription",
                 "()Ljava/lang/String;",
             ) => Ok(Value::Ref(Some(String::new()))),
-            (
-                "net/fabricmc/loader/api/metadata/ModMetadata",
-                "getCustomValue",
-                "(Ljava/lang/String;)Lnet/fabricmc/loader/api/metadata/CustomValue;",
-            ) => {
-                let key = expect_string(Self::argument(r, args, 0)?);
-                Ok(self.fabric_custom_value(key))
-            }
-            (
-                "net/fabricmc/loader/api/metadata/CustomValue",
-                "getAsString",
-                "()Ljava/lang/String;",
-            ) => Ok(Value::Ref(Some(
-                expect_string(receiver)
-                    .strip_prefix("custom-value/")
-                    .unwrap_or_else(|| expect_string(receiver))
-                    .to_owned(),
-            ))),
-            (
-                "net/fabricmc/loader/api/metadata/CustomValue",
-                "getAsNumber",
-                "()Ljava/lang/Number;",
-            ) => Ok(Value::Ref(Some(
-                expect_string(receiver)
-                    .strip_prefix("custom-number/")
-                    .unwrap_or_else(|| expect_string(receiver))
-                    .to_owned(),
-            ))),
-            ("net/fabricmc/loader/api/metadata/CustomValue", "getAsBoolean", "()Z") => {
-                Ok(Value::Int(i32::from(
-                    expect_string(receiver).starts_with("custom-boolean/true")
-                        || expect_string(receiver).ends_with(":true"),
-                )))
-            }
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getProvides",
@@ -10085,6 +10043,8 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
         "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
+        // `Files.copy`'s options (`files_copy.rs`).
+        "java/nio/file/StandardCopyOption" => files_copy::STANDARD_COPY_OPTIONS,
         _ => return None,
     })
 }
@@ -10138,6 +10098,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/IllegalAccessException"
         | "java/lang/InstantiationException"
         | "java/lang/reflect/InvocationTargetException" => "java/lang/ReflectiveOperationException",
+        "java/nio/file/FileAlreadyExistsException" => "java/nio/file/FileSystemException",
         "java/io/FileNotFoundException"
         | "java/nio/file/NoSuchFileException"
         | "java/nio/file/FileSystemException" => "java/io/IOException",
@@ -15748,6 +15709,7 @@ impl NativeJar {
         // A jar's bundled libraries are on its class path in a real loader
         // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
         // is linked, so a bundled class is not a missing class here.
+        host.record_fabric_metadata(self);
         let _nested = nested_jars::link_nested_jars(&mut host, self);
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
@@ -19947,6 +19909,9 @@ impl<H: Host> Runtime<'_, H> {
                 "java/lang/Iterable",
             ],
             "map" => &["java/util/Map"],
+            // A host map entry (`HashMap`/`TreeMap` node, `Map.entry`): every
+            // one implements only `Map.Entry`.
+            "map-entry" => &["java/util/Map$Entry"],
             _ => &[],
         };
         if collection_kinds.contains(&wanted) {
@@ -24304,6 +24269,11 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_files_copy(&r, &args))
+                    {
+                        // `Files.copy(InputStream, ..)` (`files_copy.rs`).
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -34748,27 +34718,18 @@ mandatory = true
             container_value,
             Value::Ref(Some("mod-container/demo/1.2.3".into()))
         );
+        // Fabric declares `Collection<ModContainer> getAllMods()`. A mod only
+        // seeded with `with_mod` is a loaded id, not a Fabric jar with its own
+        // metadata, so the list holds the loader's built-in and host-provided
+        // containers only, in mod-id order (`fabric_mods.rs`).
         let all_mods = MethodRef {
             owner: "net/fabricmc/loader/api/FabricLoader".into(),
             name: "getAllMods".into(),
-            descriptor: "()Ljava/util/List;".into(),
+            descriptor: "()Ljava/util/Collection;".into(),
         };
         let all_mods_value = host.invoke_instance(&all_mods, &loader, &[]).unwrap();
-        assert_eq!(
-            host.invoke_instance(
-                &MethodRef {
-                    owner: "java/util/List".into(),
-                    name: "size".into(),
-                    descriptor: "()I".into(),
-                },
-                &all_mods_value,
-                &[],
-            )
-            .unwrap(),
-            Value::Int(1)
-        );
-        assert_eq!(
-            host.invoke_instance(
+        let first = host
+            .invoke_instance(
                 &MethodRef {
                     owner: "java/util/List".into(),
                     name: "get".into(),
@@ -34777,8 +34738,10 @@ mandatory = true
                 &all_mods_value,
                 &[Value::Int(0)],
             )
-            .unwrap(),
-            container_value
+            .unwrap();
+        assert_eq!(
+            first,
+            Value::Ref(Some("mod-container/fabric-api/0.165.0+26.3".into()))
         );
         let present = MethodRef {
             owner: "java/util/Optional".into(),
@@ -36812,10 +36775,7 @@ mandatory = true
         let commit = host
             .invoke_instance(&get, &metadata, &[Value::Ref(Some("commit".into()))])
             .unwrap();
-        assert_eq!(
-            commit,
-            Value::Ref(Some("custom-value/abcdef0123456789".into()))
-        );
+        assert_ne!(commit, Value::Ref(None));
         let text = MethodRef {
             owner: "net/fabricmc/loader/api/metadata/CustomValue".into(),
             name: "getAsString".into(),
