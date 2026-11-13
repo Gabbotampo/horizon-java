@@ -441,6 +441,12 @@ impl<H: Host> Runtime<'_, H> {
             name: "toString".into(),
             descriptor: "()Ljava/lang/String;".into(),
         };
+        // A commons-lang3 pair prints `(left,right)` (`commons_pair.rs`).
+        if let Some(Value::Ref(Some(text))) =
+            self.invoke_commons_pair(&to_string, Some(value), &[])?
+        {
+            return Ok(Some(text));
+        }
         Ok(
             match self.invoke_library_model(&to_string, Some(value), &[], class, method)? {
                 Some(Value::Ref(Some(text))) => Some(text),
