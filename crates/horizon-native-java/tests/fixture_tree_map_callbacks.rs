@@ -24,6 +24,15 @@ public final class Probe {
         public int compareTo(C o) { log.append('c').append(n).append(o.n).append(' '); return Integer.compare(n, o.n); }
     }
 
+    /// A tree map filled by `put` in argument order (`Map.of`'s order
+    /// depends on SALT).
+    @SuppressWarnings("unchecked")
+    static <K, V> TreeMap<K, V> tree(Object... kv) {
+        TreeMap<K, V> t = new TreeMap<>();
+        for (int i = 0; i < kv.length; i += 2) t.put((K) kv[i], (V) kv[i + 1]);
+        return t;
+    }
+
     /// The reviewer's `firstEntry` programs on #111.
     public static String firstEntryKeys() {
         TreeMap<Integer, String> t = new TreeMap<>();
@@ -111,20 +120,20 @@ public final class Probe {
 
     /// A function that changes the map: CME after it.
     public static String computeChangesMap() {
-        TreeMap<Integer, Integer> t = new TreeMap<>(Map.of(1, 1, 2, 2));
+        TreeMap<Integer, Integer> t = tree(1, 1, 2, 2);
         try { t.computeIfAbsent(3, k -> { t.put(9, 9); return 3; }); return "no" + t; }
         catch (ConcurrentModificationException e) { return "CME" + t; }
     }
 
     public static String mergeChangesMap() {
-        TreeMap<Integer, Integer> t = new TreeMap<>(Map.of(1, 1, 2, 2));
+        TreeMap<Integer, Integer> t = tree(1, 1, 2, 2);
         try { t.merge(2, 5, (a, b) -> { t.remove(1); return a + b; }); return "no" + t; }
         catch (ConcurrentModificationException e) { return "CME" + t; }
     }
 
     /// A value replaced inside the function is not structural.
     public static String computeReplacesValue() {
-        TreeMap<Integer, Integer> t = new TreeMap<>(Map.of(1, 1, 2, 2));
+        TreeMap<Integer, Integer> t = tree(1, 1, 2, 2);
         try { t.compute(2, (k, v) -> { t.put(1, 10); return v + 1; }); return "no" + t; }
         catch (ConcurrentModificationException e) { return "CME" + t; }
     }
@@ -158,7 +167,7 @@ public final class Probe {
     }
 
     public static String mapForEachLastRemove() {
-        TreeMap<Integer, String> t = new TreeMap<>(Map.of(1, "a", 2, "b", 3, "c"));
+        TreeMap<Integer, String> t = tree(1, "a", 2, "b", 3, "c");
         StringBuilder sb = new StringBuilder();
         try { t.forEach((k, v) -> { sb.append(k); if (k == 3) t.remove(1); }); sb.append("no"); }
         catch (ConcurrentModificationException e) { sb.append("CME"); }
@@ -166,7 +175,7 @@ public final class Probe {
     }
 
     public static String mapForEachPlain() {
-        TreeMap<String, Integer> t = new TreeMap<>(Map.of("b", 2, "a", 1, "c", 3));
+        TreeMap<String, Integer> t = tree("b", 2, "a", 1, "c", 3);
         StringBuilder sb = new StringBuilder();
         t.forEach((k, v) -> sb.append(k).append(v.intValue()));
         return sb.toString();
@@ -182,7 +191,7 @@ public final class Probe {
     }
 
     public static String valuesLoopRemove() {
-        TreeMap<Integer, String> t = new TreeMap<>(Map.of(1, "a", 2, "b", 3, "c"));
+        TreeMap<Integer, String> t = tree(1, "a", 2, "b", 3, "c");
         StringBuilder sb = new StringBuilder();
         try { for (String v : t.values()) { sb.append(v); if (v.equals("a")) t.remove(3); } sb.append("no"); }
         catch (ConcurrentModificationException e) { sb.append("CME"); }
@@ -190,7 +199,7 @@ public final class Probe {
     }
 
     public static String entryLoopPutExisting() {
-        TreeMap<Integer, String> t = new TreeMap<>(Map.of(1, "a", 2, "b"));
+        TreeMap<Integer, String> t = tree(1, "a", 2, "b");
         StringBuilder sb = new StringBuilder();
         try { for (Map.Entry<Integer, String> e : t.entrySet()) { sb.append(e.getKey()); t.put(2, "z"); } sb.append("no"); }
         catch (ConcurrentModificationException e) { sb.append("CME"); }
