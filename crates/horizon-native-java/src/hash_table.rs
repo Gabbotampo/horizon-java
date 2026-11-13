@@ -101,8 +101,12 @@ impl HashTable {
         }
     }
 
-    /// Whether the table's iteration order is unknown.
+    /// Whether the table's iteration order is unknown. One entry (or none)
+    /// has only one order, wherever it sits.
     pub(crate) fn order_unknown(&self) -> bool {
+        if self.len() <= 1 {
+            return false;
+        }
         !self.unplaced.is_empty() || self.treeified || self.access_order || self.tainted
     }
 
