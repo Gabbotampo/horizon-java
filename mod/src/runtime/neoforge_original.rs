@@ -197,10 +197,8 @@ impl<H: Host> Runtime<'_, H> {
             }
             HolderOp::Has => Value::Int(i32::from(matches!(current, Current::Value(_)))),
             HolderOp::ExistingOrNull => value(current),
-            HolderOp::Existing => match value(current) {
-                Value::Ref(Some(marker)) => Value::Ref(Some(format!("optional/{marker}"))),
-                _ => Value::Ref(Some(EMPTY_OPTIONAL.into())),
-            },
+            // `Optional.ofNullable(data)`.
+            HolderOp::Existing => crate::runtime::optional_wrap(value(current)),
             HolderOp::Remove => {
                 if !self
                     .original(player)
