@@ -7,6 +7,9 @@
 //! (Eclipse Adoptium 25.0.5+8-LTS; `javac --release 17`, then `java`), the
 //! runtime Minecraft 26.3 ships.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -122,11 +125,7 @@ fn javac() -> PathBuf {
 /// Compile the fixture into a jar of its own; each test passes its own tag so
 /// parallel tests never share a build root.
 fn jar(tag: &str) -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-text-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new(&format!("text-{tag}"));
     let source = root.join("src/demo/TextEntrypoint.java");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::create_dir_all(root.join("classes")).unwrap();
