@@ -19436,8 +19436,12 @@ impl<H: Host> Runtime<'_, H> {
             // zero-argument `Supplier` (`HashMap::new`) has no values at all,
             // so this comes before the receiver split below.
             if callback.target.name == "<init>" {
+                // `String::new` over a `char[]`/`int[]` builds its text; any
+                // other `String::new` is counted (`string_constructors.rs`).
+                if let Some(text) = string_constructors::build(self, &callback.target, &values)? {
+                    return Ok(Some(Value::Ref(Some(text))));
+                }
                 let object = self.new_object(&callback.target.owner);
-                // `String::new` is counted (`string_constructors.rs`).
                 if string_constructors::count(self, &callback.target)?.is_none() {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
@@ -24097,6 +24101,20 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // FML's `InterModComms` (`neoforge_imc.rs`).
                         value
+                    } else if let Some(text) =
+                        invoke_or_catch!(at, string_constructors::build(self, &r, &args))
+                    {
+                        // `new String(char[]|int[], ..)` (`string_constructors.rs`):
+                        // the allocation marker becomes the text it built.
+                        if let Some(marker @ Value::Ref(Some(_))) = receiver.as_ref() {
+                            let built = Value::Ref(Some(text));
+                            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                                if slot == marker {
+                                    *slot = built.clone();
+                                }
+                            }
+                        }
+                        Value::Void
                     } else if let Some(value) =
                         invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
