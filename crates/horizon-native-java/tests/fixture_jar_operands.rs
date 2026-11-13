@@ -10,8 +10,11 @@
 //!
 //! The JVM's answers are OpenJDK 25.0.5's output for the same `Probe`
 //! (`javac --release 21`, then `java -cp` calling each method), quoted in each
-//! test. The runtime's answers are the counted neutral defaults. They are the
-//! runtime's honesty contract, **not JVM behaviour**.
+//! test. Where the runtime still cannot run the JDK body, its answers are the
+//! counted neutral defaults: the runtime's honesty contract, **not JVM
+//! behaviour**. The `AbstractCollection`/`AbstractSet` templates and the
+//! `Iterable` defaults now run as the JDK runs them (`jdk_skeletons/`), so
+//! those tests assert the JVM's own answers.
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
@@ -128,32 +131,22 @@ fn counted(key: &str, times: usize) -> Vec<(String, usize)> {
 }
 
 /// JDK 25: `true|false|3`. `contains` is `AbstractCollection`'s template over
-/// the set's own iterator; `isEmpty` (`size() == 0`) and `size` run exactly.
+/// the set's own iterator, now run as the JDK runs it (`jdk_skeletons/`); it
+/// was counted before.
 #[test]
-fn an_inherited_template_is_counted() {
+fn an_inherited_template_runs_as_the_jdk_does() {
     let (text, unknown) = run("inheritedTemplates");
-    assert_eq!(text, "false|false|3");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/util/AbstractCollection#contains(Ljava/lang/Object;)Z",
-            1
-        )
-    );
+    assert_eq!(text, "true|false|3");
+    assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `3`. The fastutil `EntrySet` shape from the DFU investigation.
+/// JDK 25: `3`. The fastutil `EntrySet` shape from the DFU investigation,
+/// now run as the JDK runs it; it was counted (and empty) before.
 #[test]
-fn to_array_on_a_skeleton_subclass_is_counted() {
+fn to_array_on_a_skeleton_subclass_runs_as_the_jdk_does() {
     let (text, unknown) = run("toArrayLength");
-    assert_eq!(text, "0");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/util/AbstractCollection#toArray([Ljava/lang/Object;)[Ljava/lang/Object;",
-            1
-        )
-    );
+    assert_eq!(text, "3");
+    assert_eq!(unknown, Vec::new());
 }
 
 /// JDK 25: `3`. The copy constructor reads its argument's elements.
@@ -167,67 +160,39 @@ fn a_jar_collection_argument_is_counted() {
     );
 }
 
-/// JDK 25: `[a, b, c]`.
+/// JDK 25: `[a, b, c]`, now printed as the JDK prints it.
 #[test]
-fn a_skeleton_to_string_is_counted() {
+fn a_skeleton_to_string_runs_as_the_jdk_does() {
     let (text, unknown) = run("printed");
-    assert_eq!(text, "null");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/util/AbstractCollection#toString()Ljava/lang/String;",
-            1
-        )
-    );
+    assert_eq!(text, "[a, b, c]");
+    assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `xy`. Refused before (no host row for the iterable).
+/// JDK 25: `xy`. Refused at first (no host row for the iterable), then
+/// counted; now `Iterable.forEach` runs as the JDK runs it.
 #[test]
-fn an_interface_default_on_a_jar_iterable_is_counted() {
+fn an_interface_default_on_a_jar_iterable_runs_as_the_jdk_does() {
     let (text, unknown) = run("iterableDefault");
-    assert_eq!(text, "");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/lang/Iterable#forEach(Ljava/util/function/Consumer;)V",
-            1
-        )
-    );
+    assert_eq!(text, "xy");
+    assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `k=7`. The key and value are `SimpleImmutableEntry`'s state.
+/// JDK 25: `k=7`. The key and value are `SimpleImmutableEntry`'s state,
+/// now kept and read as the JDK keeps them (`jdk_skeletons/map.rs`).
 #[test]
-fn jdk_superclass_state_is_counted() {
+fn jdk_superclass_state_runs_as_the_jdk_does() {
     let (text, unknown) = run("entryState");
-    assert_eq!(text, "null=null");
-    assert_eq!(
-        unknown,
-        vec![
-            (
-                "java/util/AbstractMap$SimpleImmutableEntry#getKey()Ljava/lang/Object;".to_owned(),
-                1
-            ),
-            (
-                "java/util/AbstractMap$SimpleImmutableEntry#getValue()Ljava/lang/Object;"
-                    .to_owned(),
-                1
-            ),
-        ]
-    );
+    assert_eq!(text, "k=7");
+    assert_eq!(unknown, Vec::new());
 }
 
-/// JDK 25: `1|5`. `Map.getOrDefault` calls the map's own `get`.
+/// JDK 25: `1|5`. `Map.getOrDefault` calls the map's own `get`, now as the
+/// JDK does.
 #[test]
-fn a_map_default_on_a_jar_map_is_counted() {
+fn a_map_default_on_a_jar_map_runs_as_the_jdk_does() {
     let (text, unknown) = run("mapDefault");
-    assert_eq!(text, "null|null");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/util/Map#getOrDefault(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            2
-        )
-    );
+    assert_eq!(text, "1|5");
+    assert_eq!(unknown, Vec::new());
 }
 
 /// JDK 25: `2|true|[p, q]`. A subclass of a concrete JDK collection keeps
@@ -241,16 +206,10 @@ fn a_concrete_jdk_collection_subclass_is_still_answered() {
 
 /// JDK 25: `3|true`. A method reference to a JDK interface method runs the
 /// jar object's own `size` (it used to be the host's, from an empty row) and
-/// counts the inherited `contains` template, exactly as the direct calls do.
+/// the inherited `contains` template, exactly as the direct calls do.
 #[test]
-fn method_references_dispatch_and_count_like_the_direct_call() {
+fn method_references_dispatch_like_the_direct_call() {
     let (text, unknown) = run("methodReferences");
-    assert_eq!(text, "3|false");
-    assert_eq!(
-        unknown,
-        counted(
-            "java/util/AbstractCollection#contains(Ljava/lang/Object;)Z",
-            1
-        )
-    );
+    assert_eq!(text, "3|true");
+    assert_eq!(unknown, Vec::new());
 }

@@ -21,7 +21,7 @@ use super::*;
 
 /// Field key suffix (after the array marker) holding an array's component
 /// class marker: `java/lang/String`, `int`, `[I`.
-const ARRAY_COMPONENT_FIELD: &str = "|[#component";
+pub(crate) const ARRAY_COMPONENT_FIELD: &str = "|[#component";
 
 /// `java.lang.String` and every type it extends or implements.
 const STRING_TYPES: &[&str] = &[
@@ -40,11 +40,6 @@ const SEPARATOR_FREE_MARKERS: &[&str] = &[
     "guava-cache-builder",
     "mixin-environment",
     "stack-walker",
-    // The empty optionals (`EMPTY_OPTIONAL*` in lib.rs).
-    "optional",
-    "optional-int",
-    "optional-long",
-    "optional-double",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
@@ -91,7 +86,7 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
 /// The class marker of an array whose elements are `component`: the JVM's
 /// descriptor form (`[Ljava/lang/String;`, `[I`, `[[I`), which the class
 /// surface already reads as an array class.
-fn array_class_marker(component: &str) -> String {
+pub(crate) fn array_class_marker(component: &str) -> String {
     let element = match component {
         "boolean" => "Z".to_owned(),
         "byte" => "B".to_owned(),
@@ -153,6 +148,14 @@ impl<H: Host> Runtime<'_, H> {
         );
     }
 
+    /// The component class recorded for `array`, if any.
+    pub(super) fn array_component(&self, array: &str) -> Option<String> {
+        match self.fields.get(&format!("{array}{ARRAY_COMPONENT_FIELD}")) {
+            Some(Value::Ref(Some(component))) => Some(component.clone()),
+            _ => None,
+        }
+    }
+
     /// `array.getClass()` for an array whose component is known, and
     /// `Class.getComponentType()` of an array class (null for any other
     /// class, as on the JVM).
@@ -192,6 +195,11 @@ mod tests {
             "#ff0000",
             "minecraft:block/stone",
             "config.json",
+            // Spelled like the boxes once were; boxes are no longer text.
+            "integer:5",
+            "true",
+            // Spelled like a path once was (#156 P2).
+            "path:/horizon/game",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
@@ -199,9 +207,6 @@ mod tests {
             "demo/Main#3",
             "list/4",
             "registry/minecraft:item",
-            "integer:5",
-            "true",
-            "path:/horizon/game",
             "string-builder/2",
             "@indy:demo/Main:0:demo/Main#lambda$0()V:",
             "@cmp:natural",

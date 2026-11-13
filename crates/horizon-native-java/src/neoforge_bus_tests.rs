@@ -97,7 +97,7 @@ fn text(value: &str) -> Value {
 }
 
 fn game_bus() -> Value {
-    text(super::GAME_BUS)
+    super::game_bus()
 }
 
 fn mod_bus() -> Value {

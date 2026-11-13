@@ -1,17 +1,16 @@
 //! A source-built NeoForge jar exercises the forked annotation and metadata
 //! path without committing a loader jar or class files to the repository.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{Host, MethodRef, NativeJar, StdHost, Value};
 use std::{fs, io::Write, process::Command};
 use zip::write::SimpleFileOptions;
 
 #[test]
 fn source_built_neoforge_fixture_seeds_loader_and_registration_aliases() {
-    let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-neoforge-fixture-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch::Scratch::new("neoforge-fixture");
     let src = root.join("src");
     let classes = root.join("classes");
     fs::create_dir_all(src.join("demo")).unwrap();

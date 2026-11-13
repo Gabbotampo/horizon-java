@@ -378,13 +378,17 @@ fn class_for_name_fields_and_methods_use_local_markers() {
         fixture.text("fieldFacts"),
         "3|LIMIT,label|LIMIT=int:25,label=java.lang.String:17,count=int:2"
     );
+    // Each `Method.toString` is OpenJDK 25's (two runs alike). Named
+    // departure, older than #156 P10: the array is in the class file's
+    // order, where HotSpot answered `label`, `versionName`, `bump` (an order
+    // the JDK does not specify).
     assert_eq!(
         fixture.text("methodFacts"),
         concat!(
             "3",
-            "|reflect-method/demo/Model#versionName()Ljava/lang/String;",
-            "|reflect-method/demo/Model#label()Ljava/lang/String;",
-            "|reflect-method/demo/Model#bump(I)I"
+            "|public static java.lang.String demo.Model.versionName()",
+            "|public java.lang.String demo.Model.label()",
+            "|public int demo.Model.bump(int)"
         )
     );
     assert_eq!(fixture.text("methodLookup"), "label:0");
@@ -426,18 +430,22 @@ fn annotation_lookup_reports_absence_for_a_class_without_the_annotation() {
 }
 
 #[test]
-fn unknown_reflective_member_fails_with_a_bounded_diagnostic() {
+fn unknown_reflective_member_throws_java_no_such_method_exception() {
     let error = Fixture::build("missing")
         .call("missingMember", "()V")
         .unwrap_err();
     let diagnostic = error.to_string();
+    // `getDeclaredMethod` on a class the runtime holds throws Java's
+    // `NoSuchMethodException` with `Class.methodToString`'s message (OpenJDK 25:
+    // `demo.Model.nope()`), so the caller's `catch` sees what the JVM throws.
     assert!(
-        matches!(&error, NativeError::MissingMethod(member) if member == "demo/Model#nope"),
+        matches!(
+            &error,
+            NativeError::UncaughtException { class, message: Some(message), .. }
+                if class == "java/lang/NoSuchMethodException" && message == "demo.Model.nope()"
+        ),
         "unexpected diagnostic: {diagnostic}"
     );
-    // The diagnostic names both the class and the member, so a loader can report which
-    // reflective call failed instead of panicking.
-    assert!(diagnostic.contains("demo/Model#nope"), "{diagnostic}");
 }
 
 #[test]
@@ -445,8 +453,10 @@ fn record_generated_object_methods_match_java() {
     let fixture = Fixture::build("record-java");
     assert_eq!(fixture.text("recordToString"), "Point[x=3, y=4]");
     assert_eq!(fixture.call("recordEquals", "()Z").unwrap(), Value::Int(1));
-    // `Point(3, 4)` hashes to 31 * (31 * 1 + 3) + 4 in the JVM.
-    assert_eq!(fixture.call("recordHash", "()I").unwrap(), Value::Int(1058));
+    // `ObjectMethods` folds `31 * h + hash(c)` from `0`: `Point(3, 4)` is
+    // `31 * 3 + 4` (OpenJDK 25.0.5 prints 97; this test used to pin 1058,
+    // the fold from `1`, which no JDK computes).
+    assert_eq!(fixture.call("recordHash", "()I").unwrap(), Value::Int(97));
 }
 
 #[test]

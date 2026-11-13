@@ -12,8 +12,17 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// A per-process build counter for fixture directories. Two tests in one test
+/// binary can build the same fixture name on different threads in the same
+/// clock tick (a CI VM's clock can be coarse), and a name made only from the
+/// pid and the time then gives both threads one directory: one writes
+/// `probe.jar` while the other reads it half-written (`Truncated`). The counter
+/// makes every build's directory its own.
+static BUILDS: AtomicU64 = AtomicU64::new(0);
 use zip::write::SimpleFileOptions;
 
 pub struct Fixture {
@@ -71,8 +80,9 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let build = BUILDS.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "horizon-native-java-{test}-{}-{unique}",
+            "horizon-native-java-{test}-{}-{unique}-{build}",
             std::process::id()
         ));
         let classes = root.join("classes");

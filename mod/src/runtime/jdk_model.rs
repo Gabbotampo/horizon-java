@@ -19,7 +19,7 @@
 //!   logger configured to drop the mod's output does.
 //!
 //! The module also answers `Path.resolveSibling`, which the host's path model
-//! lacked. Paths stay virtual (`path:<text>`): no call in this file reads or
+//! lacked. Paths stay virtual (`host_path.rs`): no call in this file reads or
 //! writes the host filesystem.
 
 use crate::runtime::{MethodRef, NativeError, Value, expect_ref, expect_string};
@@ -109,12 +109,12 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
             _ => None,
         },
         // A `WatchEvent.Kind` is only ever a token handed back to `register`
-        // or compared with `==` against the event a key reports. The marker
-        // keeps its enum name so `name()`/`toString` agree; the watch-service
-        // model below never produces an event, so none is ever compared.
+        // or compared with `==` against the event a key reports
+        // (`watch_service.rs`). The marker keeps its enum name so
+        // `name()`/`toString` agree.
         "java/nio/file/StandardWatchEventKinds" => match name {
             "ENTRY_CREATE" | "ENTRY_DELETE" | "ENTRY_MODIFY" | "OVERFLOW" => {
-                Some(Value::Ref(Some(format!("watch-kind/{name}"))))
+                Some(crate::runtime::host_watch::watch_kind(name))
             }
             _ => None,
         },
@@ -275,8 +275,8 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             let pattern = expect_string(args.first()?);
             Some(Ok(Value::Ref(Some(format!("regex-pattern/{pattern}")))))
         }
-        // The default filesystem. Opening a watch service over it is modelled
-        // below; no call here touches the host's disk.
+        // The default filesystem. Its watch services are `watch_service.rs`'s;
+        // no call here touches the host's disk.
         ("java/nio/file/FileSystems", "getDefault", "()Ljava/nio/file/FileSystem;") => {
             Some(Ok(Value::Ref(Some("file-system/default".into()))))
         }
@@ -359,6 +359,13 @@ pub(crate) fn instance_call(
     if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
         return resolve_sibling(r, receiver, args).map(Ok);
     }
+    if let Some(kind) = crate::runtime::host_watch::watch_key(receiver, crate::runtime::HostKind::WatchKind) {
+        return matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("name", "()Ljava/lang/String;")
+        )
+        .then(|| Ok(Value::Ref(Some(kind.to_owned()))));
+    }
     let marker = expect_ref(receiver)?;
     if let Some(canonical) = marker.strip_prefix(CHARSET_PREFIX) {
         return charset_call(r, canonical, args);
@@ -396,53 +403,11 @@ pub(crate) fn instance_call(
         };
     }
     if marker == "file-system/default" {
+        // `newWatchService` is `watch_service.rs`'s.
         return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("newWatchService", "()Ljava/nio/file/WatchService;") => {
-                Some(Ok(Value::Ref(Some("watch-service/default".into()))))
-            }
             ("getSeparator", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some("/".into())))),
             _ => None,
         };
-    }
-    if marker == "watch-service/default" {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            // The virtual filesystem has no external writer, so no event is
-            // ever pending; `poll` answering null is the JVM's "nothing
-            // happened yet", not an invented event. `take` would block the
-            // single thread for ever, so it stays unmodelled and counted.
-            ("poll", "()Ljava/nio/file/WatchKey;") => Some(Ok(Value::Ref(None))),
-            ("poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/nio/file/WatchKey;") => {
-                Some(Ok(Value::Ref(None)))
-            }
-            ("close", "()V") => Some(Ok(Value::Void)),
-            _ => None,
-        };
-    }
-    if marker.starts_with("watch-key/") {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("pollEvents", "()Ljava/util/List;") => Some(Ok(Value::Ref(Some("list".into())))),
-            // A key with no pending events is still valid, so `reset` reports
-            // true and the mod keeps polling. `cancel` has no state to clear
-            // and `isValid` keeps answering true afterwards; a mod that
-            // cancels and then polls is outside the modelled surface.
-            ("reset" | "isValid", "()Z") => Some(Ok(Value::Int(1))),
-            ("cancel", "()V") => Some(Ok(Value::Void)),
-            _ => None,
-        };
-    }
-    if let Some(kind) = marker.strip_prefix("watch-kind/") {
-        return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("name" | "toString", "()Ljava/lang/String;") => {
-                Some(Ok(Value::Ref(Some(kind.to_owned()))))
-            }
-            _ => None,
-        };
-    }
-    // `Path.register(service, kinds...)`: the key names the watched path. The
-    // game never changes a file behind the mod's back, so the key will never
-    // report an event.
-    if r.owner == "java/nio/file/Path" && r.name == "register" {
-        return Some(Ok(Value::Ref(Some(format!("watch-key/{marker}")))));
     }
     None
 }
@@ -486,10 +451,13 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
     ) {
         return None;
     }
-    let path = expect_ref(receiver)?;
-    let path = path.strip_prefix("path:").unwrap_or(path);
-    let other = args.first().map(expect_string).unwrap_or_default();
-    let other = other.strip_prefix("path:").unwrap_or(other);
+    let path = crate::runtime::host_path::path_key(receiver)?;
+    let other = args.first().map(crate::runtime::path_text).unwrap_or_default();
+    // Text a path is made of must encode (`host_path::encodable`); left to
+    // the caller, which counts it.
+    if !crate::runtime::host_path::encodable(other) {
+        return None;
+    }
     let parent = path
         .trim_end_matches('/')
         .rsplit_once('/')
@@ -500,7 +468,7 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
         }
         _ => other.to_owned(),
     };
-    Some(Value::Ref(Some(format!("path:{resolved}"))))
+    Some(crate::runtime::path_value(&resolved))
 }
 
 /// Elements one `StreamSupport.stream` source may yield before the runtime
@@ -733,145 +701,47 @@ impl crate::runtime::StdHost {
 /// value type: java/lang/Integer") refused values the JVM accepts. Only the
 /// public types a library tests for are listed.
 fn platform_supertypes(class: &str) -> &'static [&'static str] {
-    const NUMBER: &[&str] = &[
-        "java/lang/Number",
-        "java/lang/Comparable",
-        "java/io/Serializable",
-        "java/lang/constant/Constable",
-    ];
-    const COMPARABLE_VALUE: &[&str] = &[
-        "java/lang/Comparable",
-        "java/io/Serializable",
-        "java/lang/constant/Constable",
-    ];
-    const LIST: &[&str] = &[
-        "java/util/List",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractList",
-        "java/util/AbstractCollection",
-        "java/util/RandomAccess",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const LINKED_LIST: &[&str] = &[
-        "java/util/List",
-        "java/util/Deque",
-        "java/util/Queue",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSequentialList",
-        "java/util/AbstractList",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SEQUENCED_SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/SequencedSet",
-        "java/util/SequencedCollection",
+    // The classes the platform models answer for. Their supertypes are Java 25's, generated
+    // (`jdk_closure.rs`), not written by hand: the hand rows made `WeakHashMap` a `Cloneable`,
+    // `Hashtable` an `AbstractMap` and `CopyOnWriteArrayList` an `AbstractList` (#163).
+    const CLASSES: &[&str] = &[
+        "java/lang/Integer",
+        "java/lang/Long",
+        "java/lang/Short",
+        "java/lang/Byte",
+        "java/lang/Float",
+        "java/lang/Double",
+        "java/lang/Boolean",
+        "java/lang/Character",
+        "java/util/ArrayList",
+        "java/util/Vector",
+        "java/util/Stack",
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "java/util/LinkedList",
         "java/util/HashSet",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SORTED_SET: &[&str] = &[
-        "java/util/Set",
-        "java/util/SortedSet",
-        "java/util/NavigableSet",
-        "java/util/SequencedSet",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractSet",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const SEQUENCED_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/SequencedMap",
+        "java/util/concurrent/CopyOnWriteArraySet",
+        "java/util/LinkedHashSet",
+        "java/util/TreeSet",
+        "java/util/concurrent/ConcurrentSkipListSet",
         "java/util/HashMap",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
+        "java/util/IdentityHashMap",
+        "java/util/WeakHashMap",
+        "java/util/EnumMap",
+        "java/util/Hashtable",
+        "java/util/LinkedHashMap",
+        "java/util/TreeMap",
+        "java/util/concurrent/ConcurrentSkipListMap",
+        "java/util/concurrent/ConcurrentHashMap",
+        "java/util/ArrayDeque",
+        "java/util/concurrent/ConcurrentLinkedDeque",
+        "java/util/PriorityQueue",
+        "java/util/concurrent/ConcurrentLinkedQueue",
+        "java/io/File",
     ];
-    const SORTED_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/SortedMap",
-        "java/util/NavigableMap",
-        "java/util/SequencedMap",
-        "java/util/AbstractMap",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const CONCURRENT_MAP: &[&str] = &[
-        "java/util/Map",
-        "java/util/concurrent/ConcurrentMap",
-        "java/util/AbstractMap",
-        "java/io/Serializable",
-    ];
-    const DEQUE: &[&str] = &[
-        "java/util/Deque",
-        "java/util/Queue",
-        "java/util/SequencedCollection",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractCollection",
-        "java/lang/Cloneable",
-        "java/io/Serializable",
-    ];
-    const QUEUE: &[&str] = &[
-        "java/util/Queue",
-        "java/util/Collection",
-        "java/lang/Iterable",
-        "java/util/AbstractQueue",
-        "java/util/AbstractCollection",
-        "java/io/Serializable",
-    ];
-    match class {
-        "java/lang/Integer" | "java/lang/Long" | "java/lang/Short" | "java/lang/Byte"
-        | "java/lang/Float" | "java/lang/Double" => NUMBER,
-        "java/lang/Boolean" | "java/lang/Character" => COMPARABLE_VALUE,
-        "java/util/ArrayList"
-        | "java/util/Vector"
-        | "java/util/Stack"
-        | "java/util/concurrent/CopyOnWriteArrayList" => LIST,
-        "java/util/LinkedList" => LINKED_LIST,
-        "java/util/HashSet" | "java/util/concurrent/CopyOnWriteArraySet" => SET,
-        "java/util/LinkedHashSet" => SEQUENCED_SET,
-        "java/util/TreeSet" | "java/util/concurrent/ConcurrentSkipListSet" => SORTED_SET,
-        "java/util/HashMap"
-        | "java/util/IdentityHashMap"
-        | "java/util/WeakHashMap"
-        | "java/util/EnumMap"
-        | "java/util/Hashtable" => MAP,
-        "java/util/LinkedHashMap" => SEQUENCED_MAP,
-        "java/util/TreeMap" | "java/util/concurrent/ConcurrentSkipListMap" => SORTED_MAP,
-        "java/util/concurrent/ConcurrentHashMap" => CONCURRENT_MAP,
-        "java/util/ArrayDeque" | "java/util/concurrent/ConcurrentLinkedDeque" => DEQUE,
-        "java/util/PriorityQueue" | "java/util/concurrent/ConcurrentLinkedQueue" => QUEUE,
-        _ => &[],
+    if CLASSES.contains(&class) {
+        crate::runtime::jdk_closure::below_object(class)
+    } else {
+        &[]
     }
 }
 
@@ -881,21 +751,17 @@ pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
     if crate::runtime::reflect_generic::annotated_type_instance_of(marker, wanted) {
         return true;
     }
-    let class = if let Some((class, _)) = marker.split_once('#') {
-        class
-    } else {
-        match marker.split_once(':').map(|(prefix, _)| prefix) {
-            Some("integer") => "java/lang/Integer",
-            Some("long") => "java/lang/Long",
-            Some("short") => "java/lang/Short",
-            Some("byte") => "java/lang/Byte",
-            Some("float") => "java/lang/Float",
-            Some("double") => "java/lang/Double",
-            Some("character") => "java/lang/Character",
-            Some("boolean") => "java/lang/Boolean",
-            _ => return false,
-        }
+    let Some((class, _)) = marker.split_once('#') else {
+        return false;
     };
+    class_instance_of(class, wanted)
+}
+
+/// Whether an instance of the platform class `class` is a `wanted`.
+pub(crate) fn class_instance_of(class: &str, wanted: &str) -> bool {
+    if class == wanted {
+        return true;
+    }
     let known = match platform_supertypes(class) {
         [] => crate::runtime::java_immutable::supertypes(class),
         known => known,
@@ -937,6 +803,7 @@ pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Valu
         return None;
     }
     let primitive = match value {
+        Value::Boxed(boxed) => boxed.primitive(),
         Value::Ref(Some(_)) => match descriptor {
             "C" => super::boxed_character(value).map(Value::Int),
             "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
@@ -971,49 +838,6 @@ pub(crate) fn class_access_flags(file: &crate::runtime::ClassFile) -> Option<u16
     reader.skip(4).ok()?;
     crate::runtime::read_pool(&mut reader).ok()?;
     reader.u2().ok()
-}
-
-/// The text `String.valueOf` gives a boxed value, for a concatenation
-/// operand typed `desc`.
-///
-/// `"" + Boolean.TRUE` is `"true"`; the runtime's box marker is
-/// `boolean:true`, and pasting the marker made Xaero's config codec reject a
-/// 12-character boolean against its 5-character bound. Only an operand typed
-/// as a box, `Number`, `Comparable`, `Serializable` or `Object` is read as a
-/// box: a `String` operand is text, whatever it spells.
-pub(crate) fn boxed_text(marker: &str, desc: &str) -> Option<String> {
-    if !matches!(
-        desc,
-        "Ljava/lang/Object;"
-            | "Ljava/lang/Number;"
-            | "Ljava/lang/Comparable;"
-            | "Ljava/io/Serializable;"
-            | "Ljava/lang/Boolean;"
-            | "Ljava/lang/Integer;"
-            | "Ljava/lang/Long;"
-            | "Ljava/lang/Short;"
-            | "Ljava/lang/Byte;"
-            | "Ljava/lang/Character;"
-            | "Ljava/lang/Float;"
-            | "Ljava/lang/Double;"
-    ) {
-        return None;
-    }
-    let (prefix, rest) = marker.split_once(':')?;
-    match prefix {
-        "boolean" => matches!(rest, "true" | "false").then(|| rest.to_owned()),
-        "integer" | "long" | "short" | "byte" => {
-            rest.parse::<i64>().ok().map(|value| value.to_string())
-        }
-        "character" => rest
-            .parse::<u32>()
-            .ok()
-            .and_then(char::from_u32)
-            .map(String::from),
-        "double" => rest.parse::<f64>().ok().map(super::format_java_float),
-        "float" => rest.parse::<f64>().ok().map(super::format_java_float32),
-        _ => None,
-    }
 }
 
 /// Whether `marker` names an object this runtime or the host built
@@ -1310,13 +1134,9 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         }
         let mut values = Vec::with_capacity(found.len() + 1);
         if r.name == "walk" {
-            values.push(Value::Ref(Some(format!("path:{path}"))));
+            values.push(crate::runtime::path_value(path));
         }
-        values.extend(
-            found
-                .into_iter()
-                .map(|entry| Value::Ref(Some(format!("path:{entry}")))),
-        );
+        values.extend(found.into_iter().map(|entry| crate::runtime::path_value(&entry)));
         Ok(self.new_stream(class, method, values))
     }
 
@@ -1436,6 +1256,11 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             [key, value, merge] => (key.clone(), value.clone(), Some(merge.clone())),
             _ => return Ok(None),
         };
+        if !guava {
+            // `HashMap::new` with `putIfAbsent`/`merge` (`hash_bulk.rs`).
+            let map = self.hash_map_collect(&key_fn, &value_fn, merge_fn.as_ref(), values)?;
+            return Ok(Some(map));
+        }
         let mut entries: Vec<(Value, Value)> = Vec::new();
         for element in values {
             let key = self.apply_function(&key_fn, element)?;
@@ -1701,26 +1526,23 @@ mod tests {
         );
         let cases = [
             (
-                "path:/horizon/config",
+                "/horizon/config",
                 "defaultconfigs",
-                "path:/horizon/defaultconfigs",
+                "/horizon/defaultconfigs",
             ),
-            (
-                "path:/horizon/config/a.json",
-                "b.json",
-                "path:/horizon/config/b.json",
-            ),
-            ("path:config", "other", "path:other"),
-            ("path:/top", "x", "path:/x"),
-            ("path:/horizon/config", "/abs", "path:/abs"),
+            ("/horizon/config/a.json", "b.json", "/horizon/config/b.json"),
+            ("config", "other", "other"),
+            ("/top", "x", "/x"),
+            ("/horizon/config", "/abs", "/abs"),
         ];
         for (path, other, expected) in cases {
+            let path = crate::runtime::path_value(path);
             assert_eq!(
-                instance_call(&sibling, &text(path), &[text(other)])
+                instance_call(&sibling, &path, &[text(other)])
                     .unwrap()
                     .unwrap(),
-                text(expected),
-                "{path} sibling {other}"
+                crate::runtime::path_value(expected),
+                "{path:?} sibling {other}"
             );
         }
     }

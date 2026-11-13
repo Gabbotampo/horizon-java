@@ -214,7 +214,7 @@ public final class Outside {
         }
     }
 
-    /** Counted: a read through a field taken back out of a list whose copies disagree. */
+    /** A read through a field taken back out of a list that also holds another copy. */
     public static String mixedCopies() throws Exception {
         List<Field> fields = new ArrayList<>();
         Field first = Holder.class.getDeclaredField("secret");
@@ -351,18 +351,17 @@ fn failed_access_get_is_counted() {
     );
 }
 
-/// Counted, not answered: a field read back out of a list holding one copy
-/// with `override` and one without. OpenJDK 27 answers `7` (the first copy);
-/// the list keeps fields by `Field.equals`, so the runtime cannot tell which
-/// copy it hands back.
+/// A field read back out of a list holding one copy with `override` and one
+/// without is the copy that went in: OpenJDK 25 answers `7` (the first copy,
+/// two runs alike). Since #156 P10 a `Field` is a handle that keeps its copy
+/// number in a collection, so the runtime hands back that copy and answers
+/// as Java does (it was counted while lists kept fields as text).
 #[test]
-fn read_through_disagreeing_copies_is_counted() {
+fn read_through_a_copy_taken_back_out_of_a_list_is_that_copy() {
     let fixture = fixture("set-accessible-mixed");
-    counted(
-        &fixture,
-        "mixedCopies",
-        "java/lang/reflect/Field#get(Ljava/lang/Object;)Ljava/lang/Object;",
-    );
+    let (text, unknown) = run(&fixture, "mixedCopies");
+    assert_eq!(text, "7");
+    assert_eq!(unknown, Vec::<(String, usize)>::new());
 }
 
 /// Counted, not answered: `setAccessible(true)` on a JDK class's private

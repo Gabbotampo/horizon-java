@@ -324,7 +324,7 @@ const ARGUMENT_HOOKS: &[&str] = &[
 /// The data interface that declares `name descriptor` as a default among
 /// `implemented` (closed over superinterfaces), the most specific one when
 /// several do (`List.getFirst` over `SequencedCollection.getFirst`).
-fn data_default_owner(
+pub(crate) fn data_default_owner(
     implemented: &[&'static str],
     name: &str,
     descriptor: &str,
@@ -390,11 +390,32 @@ fn close_data_interface(interface: &str, out: &mut Vec<&'static str>) {
     }
 }
 
+/// Every data interface an object of a private JDK class implements: its
+/// `direct` interfaces and its skeleton superclass `skeleton`'s, closed over
+/// their superinterfaces (`jdk_skeletons/`).
+pub(crate) fn data_interfaces_of(direct: &[&str], skeleton: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for interface in direct {
+        close_data_interface(interface, &mut out);
+    }
+    let mut current = Some(skeleton);
+    while let Some(class) = current {
+        if let Some((_, interface)) = SKELETON_INTERFACES.iter().find(|(s, _)| *s == class) {
+            close_data_interface(interface, &mut out);
+        }
+        current = jvm_dispatch::JDK_SKELETONS
+            .iter()
+            .find(|(s, _, _)| *s == class)
+            .map(|(_, superclass, _)| *superclass);
+    }
+    out
+}
+
 /// `Object`'s members that never depend on the object's data.
 const IDENTITY_MEMBERS: &[&str] = &["getClass", "notify", "notifyAll", "wait"];
 
 /// Whether `class` is one of the JDK skeleton classes `jvm_dispatch` knows.
-fn is_skeleton(class: &str) -> bool {
+pub(crate) fn is_skeleton(class: &str) -> bool {
     jvm_dispatch::JDK_SKELETONS
         .iter()
         .any(|(skeleton, _, _)| *skeleton == class)
@@ -512,6 +533,30 @@ impl<H: Host> Runtime<'_, H> {
             }
             return self.host.unknown_operand_call(&counted).map(Some);
         }
+        // A host set of map entries (a map's `entrySet()`) asked
+        // `contains`/`remove` with a jar `Map.Entry`: the JDK reads the jar
+        // entry's `getKey`/`getValue` in an order that depends on the map
+        // (`HashMap`: key, key, value; `TreeMap`: value, key), which the host
+        // neither knows nor can run. Counted, never a silent `false`.
+        if matches!(opcode, 0xb6 | 0xb9)
+            && matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("contains" | "remove", "(Ljava/lang/Object;)Z")
+            )
+            && let (Some(receiver), [argument]) = (receiver, args)
+            && self.stateless_jar_object(argument).is_some()
+            && self.jar_map_entry(argument)
+            && runtime_collection_values(self.host, receiver).is_ok_and(|values| {
+                !values.is_empty()
+                    && values.iter().all(|value| {
+                        parse_collection_value(value).is_ok_and(|value| {
+                            expect_ref(&value).is_some_and(|m| m.starts_with("map-entry/"))
+                        })
+                    })
+            })
+        {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
         let classes = parameter_classes(&r.descriptor);
         let data_arguments = classes
             .iter()
@@ -559,10 +604,21 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(value))
     }
 
+    /// Whether a jar object's class implements `java.util.Map.Entry`.
+    fn jar_map_entry(&self, value: &Value) -> bool {
+        expect_ref(value)
+            .and_then(|marker| jvm_dispatch::constructed_object_class(marker))
+            .is_some_and(|class| self.class_is_instance(class, "java/util/Map$Entry"))
+    }
+
     /// Every data interface `receiver`'s class implements: through its jar
     /// classes and interfaces, and through its JDK skeleton superclass
     /// `base`, closed over their superinterfaces.
-    fn implemented_data_interfaces(&self, receiver: &Value, base: &str) -> Vec<&'static str> {
+    pub(crate) fn implemented_data_interfaces(
+        &self,
+        receiver: &Value,
+        base: &str,
+    ) -> Vec<&'static str> {
         let mut out = Vec::new();
         let Some(class) =
             expect_ref(receiver).and_then(|marker| jvm_dispatch::constructed_object_class(marker))

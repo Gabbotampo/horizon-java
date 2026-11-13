@@ -48,7 +48,7 @@
 //!   `neoforge.mods.toml` lists with no `@Mod` class gets no container here, so its subscribers
 //!   are not injected.
 
-use crate::runtime::neoforge_bus::{GAME_BUS, illegal_argument, mod_bus};
+use crate::runtime::neoforge_bus::{game_bus, illegal_argument, mod_bus};
 use crate::runtime::{AnnotationValue, ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value};
 
 const EVENT_BUS_SUBSCRIBER: &str = "Lnet/neoforged/fml/common/EventBusSubscriber;";
@@ -177,14 +177,14 @@ impl crate::runtime::Runtime<'_, StdHost> {
             if sides(&annotation).is_some_and(|sides| !sides.iter().any(|side| side == dist)) {
                 continue;
             }
-            self.inject_class(&class, &container_bus(container))
+            self.inject_class(&class, &mod_bus(Some(container)))
                 .map_err(wrap)?;
         }
         Ok(())
     }
 
     /// Steps 3 and 4 for one class.
-    fn inject_class(&mut self, class: &str, container_bus: &str) -> Result<(), NativeError> {
+    fn inject_class(&mut self, class: &str, container_bus: &Value) -> Result<(), NativeError> {
         self.ensure_initialized(class)?;
         let methods: Vec<crate::runtime::Method> = self
             .class(class)
@@ -230,9 +230,9 @@ impl crate::runtime::Runtime<'_, StdHost> {
                 continue;
             };
             let bus = if facts.mod_bus {
-                container_bus.to_owned()
+                container_bus.clone()
             } else {
-                GAME_BUS.to_owned()
+                game_bus()
             };
             let target = Value::Ref(Some(format!(
                 "java/lang/reflect/Method#{class}.{}{}",
@@ -265,13 +265,5 @@ fn wrap(error: NativeError) -> NativeError {
             }
         }
         other => other,
-    }
-}
-
-/// The mod bus marker of `container`, as `FMLModContainer#getEventBus` answers it.
-fn container_bus(container: &str) -> String {
-    match mod_bus(Some(container)) {
-        Value::Ref(Some(marker)) => marker,
-        _ => unreachable!("mod_bus is a marker"),
     }
 }
