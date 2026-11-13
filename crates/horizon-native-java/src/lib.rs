@@ -111,6 +111,7 @@ mod open_options;
 mod optionull;
 mod parked_threads;
 pub use parked_threads::ParkedThread;
+mod reference_identity;
 mod references;
 mod reflect_constructors;
 mod reflect_enum;
@@ -7926,6 +7927,11 @@ impl Host for StdHost {
                 Ok(Value::Ref(Some(
                     expect_string(receiver).replace(from, &to.to_string()),
                 )))
+            }
+            // The text is the interned string's; its identity is
+            // `reference_identity.rs`'s.
+            ("java/lang/String", "intern", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(expect_string(receiver).to_string())))
             }
             ("java/lang/String", "trim", "()Ljava/lang/String;") => Ok(Value::Ref(Some(
                 expect_string(receiver)
@@ -23372,6 +23378,9 @@ impl<H: Host> Runtime<'_, H> {
                 None => self.host.invoke(&r, args),
             };
         };
+        // `if_acmp`'s producer analysis, looked up once per frame
+        // (`reference_identity.rs`).
+        let mut identity = reference_identity::FrameIdentity::default();
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
         let mut local = 0;
         if !target.is_static() {
@@ -23996,7 +24005,20 @@ impl<H: Host> Runtime<'_, H> {
                 0xa5 | 0xa6 => {
                     let rhs = pop(&mut stack, class, method, at)?;
                     let lhs = pop(&mut stack, class, method, at)?;
-                    let take = if op == 0xa5 { lhs == rhs } else { lhs != rhs };
+                    // Identity, not value equality, for boxes and strings
+                    // (`reference_identity.rs`).
+                    let same = self.same_reference(
+                        &mut identity,
+                        file,
+                        method,
+                        desc,
+                        target.is_static(),
+                        code,
+                        at,
+                        &lhs,
+                        &rhs,
+                    )?;
+                    let take = if op == 0xa5 { same } else { !same };
                     let offset = read_i16(code, &mut pc)?;
                     let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
                         == AnchorOutcome::Suppress;
